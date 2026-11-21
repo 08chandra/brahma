@@ -112,7 +112,7 @@ import GRDB
     @Test func pinsCommittedRefs() throws {
         let fx = try RefFixture()
         let head = try fx.head()
-        let pinned = try fx.store.pinRef(try fx.ref("src/a.ts"), for: .agent(fx.eng1.id), companyId: fx.c.id, messageRefId: "mr-1")
+        let pinned = try fx.store.pinRef(try fx.ref("src/a.ts"), for: .agent(fx.eng1.id), companyId: fx.c.id, messageRefId: "mr-1", knownValues: [])
         #expect(pinned.rev == head)
         #expect(pinned.canonical == "src/a.ts@\(head)")
         #expect(WorkRef.parse(pinned.canonical, context: fx.ctx) == pinned)
@@ -126,15 +126,15 @@ import GRDB
         let newer = try #require(after.newer)
         #expect(newer.rev == (try fx.head()))
         // An item and the diff pin too.
-        let item = try fx.store.pinRef(try fx.ref("ENG-1"), for: .owner, companyId: fx.c.id, messageRefId: "mr-2")
+        let item = try fx.store.pinRef(try fx.ref("ENG-1"), for: .owner, companyId: fx.c.id, messageRefId: "mr-2", knownValues: [])
         #expect(item.params["was"] == "inReview")
-        let diff = try fx.store.pinRef(try fx.ref("ENG-1:diff"), for: .owner, companyId: fx.c.id, messageRefId: "mr-3")
+        let diff = try fx.store.pinRef(try fx.ref("ENG-1:diff"), for: .owner, companyId: fx.c.id, messageRefId: "mr-3", knownValues: [])
         #expect(diff.rev == (try fx.head("item/ENG-1")))
-        let ask = try fx.store.pinRef(try fx.ref("A-5"), for: .owner, companyId: fx.c.id, messageRefId: "mr-4")
+        let ask = try fx.store.pinRef(try fx.ref("A-5"), for: .owner, companyId: fx.c.id, messageRefId: "mr-4", knownValues: [])
         #expect(ask.params["was"] == "pendingInternal")
         // A reader that can't read it can't pin (share) it.
         #expect(throws: WorkError.self) {
-            try fx.store.pinRef(try fx.ref("F-1"), for: .agent(fx.eng1.id), companyId: fx.c.id, messageRefId: "mr-5")
+            try fx.store.pinRef(try fx.ref("F-1"), for: .agent(fx.eng1.id), companyId: fx.c.id, messageRefId: "mr-5", knownValues: [])
         }
     }
 
@@ -154,7 +154,7 @@ import GRDB
 
     @Test func pinsLiveKinds() throws {
         let fx = try RefFixture()
-        let agent = try fx.store.pinRef(try fx.ref("@eng-3"), for: .owner, companyId: fx.c.id, messageRefId: "mr-a")
+        let agent = try fx.store.pinRef(try fx.ref("@eng-3"), for: .owner, companyId: fx.c.id, messageRefId: "mr-a", knownValues: [])
         #expect(agent.params["was"] == fx.eng3.state.rawValue)
         #expect(agent.canonical == "@eng-3")
         let now = fx.now, cId = fx.c.id, ctoId = fx.cto.id
@@ -163,7 +163,7 @@ import GRDB
                                url: "http://127.0.0.1:{port}/", setById: ctoId, createdAt: now, updatedAt: now).insert(db)
         }
         let preview = try fx.store.pinRef(try fx.ref("preview:web/checkout@iphone"), for: .agent(fx.qa2.id), companyId: fx.c.id,
-                                          messageRefId: "mr-p")
+                                          messageRefId: "mr-p", knownValues: [])
         #expect(preview.params["was"] == "idle")
         #expect(preview.params["main"] == (try fx.head()))
         #expect(preview.params["path"] == "/checkout" && preview.params["viewport"] == "iphone")

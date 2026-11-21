@@ -188,6 +188,8 @@ extension Store {
     /// executive or the owner can re-adopt it), not adopted. An item already flagged keeps its flag and its flagged holder.
     func recordClaimHead(itemId: String, head: String, now: Date) throws {
         try writer.write { db in
+            // Plan C2a: where a tainted turn that claimed it starts recording (whatever the recorded-head checks decide below).
+            try db.execute(sql: "UPDATE workLease SET claimHead = ? WHERE itemId = ?", arguments: [head, itemId])
             guard let item = try WorkItem.fetchOne(db, key: itemId) else { return }
             if !item.branchMoved, let recorded = item.leaseHeadCommit, recorded != head,
                let claimantId = try Self.leaseHolderId(db: db, itemId: itemId), let claimant = try Agent.fetchOne(db, key: claimantId) {

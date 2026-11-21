@@ -16,7 +16,7 @@ import Glibc
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         try cf.fx.git.write("src/a.ts", "pinned bytes\n", in: wt)
         let ref = try cf.fx.ref("ENG-1:src/a.ts@worktree")
-        let pinned = try cf.store.pinRef(ref, for: .agent(cf.fx.eng1.id), companyId: cf.c.id, messageRefId: "mr-w", paths: cf.paths)
+        let pinned = try cf.store.pinRef(ref, for: .agent(cf.fx.eng1.id), companyId: cf.c.id, messageRefId: "mr-w", knownValues: [], paths: cf.paths)
         let blob = try #require(pinned.rev)
         #expect(pinned.canonical == "ENG-1:src/a.ts@worktree")
         #expect(pinned.params["share"] == "mr-w")
@@ -48,9 +48,9 @@ import Glibc
         let ref = try cf.fx.ref("ENG-1:diff@worktree")
         // Without the data home there is nowhere to keep it.
         #expect(throws: WorkError.self) {
-            try cf.store.pinRef(ref, for: .agent(cf.fx.eng1.id), companyId: cf.c.id, messageRefId: "mr-x")
+            try cf.store.pinRef(ref, for: .agent(cf.fx.eng1.id), companyId: cf.c.id, messageRefId: "mr-x", knownValues: [])
         }
-        let pinned = try cf.store.pinRef(ref, for: .agent(cf.fx.eng1.id), companyId: cf.c.id, messageRefId: "mr-d", paths: cf.paths)
+        let pinned = try cf.store.pinRef(ref, for: .agent(cf.fx.eng1.id), companyId: cf.c.id, messageRefId: "mr-d", knownValues: [], paths: cf.paths)
         let id = try #require(pinned.params["snapshot"])
         #expect(pinned.canonical == "ENG-1:diff@worktree")
         let cId = cf.c.id
@@ -73,10 +73,14 @@ import Glibc
         tampered[tampered.count - 2] ^= 0x01
         try tampered.write(to: file)
         #expect(cf.failure { try cf.open(.qa2, pinned: pinned) } == "that ref isn't available to you")
+        // The mismatch is in the activity log (not on stderr).
+        #expect(try cf.store.events(afterId: 0, companyId: cId).contains {
+            $0.kind == .error && $0.text == "ENG-1:diff@worktree's vault copy no longer matches the hash recorded for it"
+        })
 
         // A committed diff's pin keeps its patch in the diff cache, verified on every read.
         let committed = try cf.store.pinRef(try cf.fx.ref("ENG-1:diff"), for: .agent(cf.fx.eng1.id), companyId: cId,
-                                            messageRefId: "mr-c", paths: cf.paths)
+                                            messageRefId: "mr-c", knownValues: [], paths: cf.paths)
         let head = try cf.fx.head("item/ENG-1"), base = try cf.fx.git.git(["merge-base", "main", "item/ENG-1"])
         #expect(committed.rev == head)
         let cached = try #require(try cf.store.writer.read { db in
@@ -133,7 +137,80 @@ import Glibc
         // A private file is never pinned into git: it is shared as a snapshot.
         #expect(throws: WorkError.self) {
             try cf.store.pinRef(try cf.fx.ref(".brahma/labs/eng-1/mine.txt"), for: .agent(cf.fx.eng1.id), companyId: cf.c.id,
-                                messageRefId: "mr-l", paths: cf.paths)
+                                messageRefId: "mr-l", knownValues: [], paths: cf.paths)
         }
+    }
+
+    // MARK: Fix round 1 (I5): nothing is vaulted, cached or hashed into git without a secret scan.
+
+    static let known: [(name: String, value: String)] = [("STRIPE_KEY", "sk_test_51abcdefgh")]
+    static let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not itself trip a scanner
+
+    @Test func snapshotsAreSecretScanned() throws {
+        let cf = try CollabFixture()
+        let lab = cf.workspace.appending(path: ".brahma/labs/eng-1")
+        try Data("key = sk_test_51abcdefgh\n".utf8).write(to: lab.appending(path: "known.txt"))
+        try Data("aws = \(Self.aws)\nok\n".utf8).write(to: lab.appending(path: "pattern.txt"))
+        var bin = Data([0, 1, 2]); bin.append(Data(Self.aws.utf8))
+        try bin.write(to: lab.appending(path: "blob.dat"))
+        func snapshot(_ name: String) throws -> WorkRef {
+            try cf.store.snapshotPrivateFile(companyId: cf.c.id, agentId: cf.fx.eng1.id, workspacePath: ".brahma/labs/eng-1/\(name)",
+                                             readers: [cf.fx.qa2.id], knownValues: Self.known, paths: cf.paths, now: cf.now)
+        }
+        // A stored secret's value refuses the snapshot; nothing is written.
+        #expect(throws: WorkError.forbidden("known.txt contains a stored secret (line 1); remove it before sharing")) { try snapshot("known.txt") }
+        #expect(try cf.store.resource(companyId: cf.c.id, number: 4) == nil)
+        #expect(!FileManager.default.fileExists(atPath: cf.vault.root.appending(path: "resources/F-4.txt").path))
+        // A secret pattern in text: a redacted copy (REDACTED), never the original bytes.
+        let redacted = try snapshot("pattern.txt")
+        let r = try #require(try cf.store.resource(companyId: cf.c.id, number: Int(redacted.id) ?? 0))
+        #expect(r.secretScan == .redacted)
+        let stored = String(decoding: try cf.vault.read(try #require(r.vaultPath), sha256: try #require(r.sha256), maxBytes: Int(r.bytes)), as: UTF8.self)
+        #expect(!stored.contains(Self.aws) && stored.contains("[redacted") && stored.contains("ok"))
+        // A secret pattern in a binary can't be redacted: refused.
+        #expect(throws: WorkError.self) { try snapshot("blob.dat") }
+    }
+
+    @Test func pinsAreSecretScanned() throws {
+        let cf = try CollabFixture()
+        let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
+        try cf.fx.git.write("src/a.ts", "const k = 'sk_test_51abcdefgh'\n", in: wt)
+        func pin(_ s: String, _ id: String) throws -> WorkRef {
+            try cf.store.pinRef(try cf.fx.ref(s), for: .agent(cf.fx.eng1.id), companyId: cf.c.id, messageRefId: id,
+                                knownValues: Self.known, paths: cf.paths)
+        }
+        // The file is never hashed into git, and no share ref is made.
+        #expect(throws: WorkError.forbidden("ENG-1:src/a.ts@worktree contains a stored secret (line 1); remove it before sharing")) {
+            try pin("ENG-1:src/a.ts@worktree", "mr-s1")
+        }
+        #expect((try? cf.fx.git.git(["rev-parse", "--verify", "--quiet", "refs/brahma/shares/mr-s1"])) == nil)
+        try cf.fx.git.write("src/a.ts", "const k = '\(Self.aws)'\n", in: wt)
+        #expect(throws: WorkError.self) { try pin("ENG-1:src/a.ts@worktree", "mr-s2") }
+        // A worktree diff keeps only its redacted text.
+        try cf.fx.git.write("src/a.ts", "one\nTWO\nthree\nsk_test_51abcdefgh\n\(Self.aws)\n", in: wt)
+        let diff = try pin("ENG-1:diff@worktree", "mr-s3")
+        let cId = cf.c.id, id = try #require(diff.params["snapshot"])
+        let row = try #require(try cf.store.writer.read { db in
+            try RefSnapshot.fetchOne(db, sql: "SELECT * FROM refSnapshot WHERE companyId = ? AND id = ?", arguments: [cId, id])
+        })
+        let patch = String(decoding: try cf.vault.read(row.vaultPath, sha256: row.sha256, maxBytes: row.bytes), as: UTF8.self)
+        #expect(patch.contains("src/a.ts") && !patch.contains("sk_test_51abcdefgh") && !patch.contains(Self.aws))
+        #expect(patch.contains("[redacted stored secret STRIPE_KEY]"))
+    }
+
+    @Test func openRefRedactsSecrets() throws {
+        let cf = try CollabFixture()
+        try cf.commit(["src/conf.ts": Data("token = sk_test_51abcdefgh\naws = \(Self.aws)\n".utf8)])
+        let out = try cf.store.openRef(companyId: cf.c.id, reader: .agent(cf.fx.eng1.id), ref: "src/conf.ts", lines: nil, copy: false,
+                                       turnId: nil, context: cf.fx.ctx, knownValues: Self.known, paths: cf.paths, now: cf.now)
+        #expect(!out.text.contains("sk_test_51abcdefgh") && !out.text.contains(Self.aws))
+        #expect(out.text.contains("    | token = [redacted stored secret STRIPE_KEY]"))
+        // A copy of a file holding a stored secret is refused.
+        #expect(throws: WorkError.self) {
+            try cf.store.openRef(companyId: cf.c.id, reader: .agent(cf.fx.eng1.id), ref: "src/conf.ts", lines: nil, copy: true,
+                                 turnId: nil, context: cf.fx.ctx, knownValues: Self.known, paths: cf.paths, now: cf.now)
+        }
+        let inbox = cf.workspace.appending(path: ".brahma/labs/eng-1/in").path
+        #expect(((try? FileManager.default.contentsOfDirectory(atPath: inbox)) ?? []).isEmpty)
     }
 }

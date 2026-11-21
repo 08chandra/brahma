@@ -818,7 +818,9 @@ public actor Orchestrator {
         var launched = false
         // A leaseholder's work turn: continuity of its item's branch is checked at the start (the head must be the recorded one)
         // and the head is recorded again at the end (scan (a), Task 4-wire). `held`: continuity held at the start.
-        var leaseHead: (git: GitWorkspace, item: WorkItem, held: Bool, start: String?)?
+        var leaseHead: (git: GitWorkspace, item: WorkItem, held: Bool)?
+        // Plan C2a: the head of every item branch the agent holds as the turn starts (where its turn-end taint record starts).
+        var heldAtStart: [String: String] = [:]
         // Task 10: the turn's taint (marked once, from the stream's backup path) and the workspace whose lab is recorded at the end.
         var taintMarked = false
         var recordedSources: Set<String> = []
@@ -928,13 +930,13 @@ public actor Orchestrator {
                         // The branch must be where the engine left it (git, off the cooperative pool); a move outside the holder's
                         // turns flags the item and refuses its submits until a manager re-adopts it.
                         let now = clock()
-                        let (held, start) = try await blocking.tryRun {
-                            let start = try g.head(of: g.branchRef(key: leased.key))
-                            return (try store.checkBranchContinuity(item: leased, agent: agent, head: start, now: now), start)
+                        let held = try await blocking.tryRun {
+                            try store.checkBranchContinuity(item: leased, agent: agent, head: try g.head(of: g.branchRef(key: leased.key)), now: now)
                         }
-                        leaseHead = (g, leased, held, start)
+                        leaseHead = (g, leased, held)
                     }
                 }
+                heldAtStart = await blocking.run { store.leaseHeads(agentId: agent.id, workspace: workspace) }
                 // Only work updates to read and nothing to answer: a notice-only turn (cheapest model for `auto` agents). A
                 // leaseholder's updates are its work, so its turns stay work turns.
                 if c.onlyNotices, c.lease == nil { kind = .notice }
@@ -1487,21 +1489,26 @@ public actor Orchestrator {
             }
         }
 
-        // Plan C2a: a holder turn of a session that read outside content records the commits it made (`<head at start>..<head
-        // now>` on `item/<KEY>`) as tainted. The taint is the session's now (ML's `currentTaint`, so a resumed turn that read
-        // nothing itself still counts), read before any fresh-session reset below. Git, off the cooperative pool.
-        if let leaseHead, let start = leaseHead.start {
-            let (store, paths, item, turnId, root) = (self.store, self.paths, leaseHead.item, turn.id, leaseHead.git.root)
+        // Plan C2a: a turn of a session that read outside content records the commits it made on every item branch it held
+        // (`<head at start>..<head now>` on `item/<KEY>`; a lease claimed during the turn from its head at claim, else from the
+        // merge base with `main`) as tainted. The taint is the session's now (ML's `currentTaint`, so a resumed turn that read
+        // nothing itself still counts; unreadable: tainted), read before any fresh-session reset below. A record that fails
+        // marks the item and alerts the owner (`recordTurnTaint`, fail closed). Git, off the cooperative pool.
+        if launched {
+            let (store, paths, turnId, started, leasedItem) = (self.store, self.paths, turn.id, heldAtStart, leaseHead?.item.id)
             await blocking.run {
-                do {
-                    let source: String?
-                    do { source = try store.currentTaint(agentId: agent.id, paths: paths) } catch { source = "session" }
-                    guard let source else { return }
-                    let git = try store.refGit(root)
-                    try store.recordTaintedCommits(companyId: agent.companyId, itemId: item.id, agentId: agent.id, turnId: turnId,
-                                                   headBefore: start, headAfter: try git.head("item/\(item.key)"), source: source,
-                                                   git: git, now: now)
-                } catch { self.log("could not record the tainted commits of \(item.key): \(error)") }
+                let source: String?
+                do { source = try store.currentTaint(agentId: agent.id, paths: paths) } catch { source = "session" }
+                guard let source, let company = try? store.company(id: agent.companyId) else { return }
+                var targets: [(itemId: String, start: String?)] = []
+                let leases = (try? store.leases(agentId: agent.id)) ?? []
+                for lease in leases { targets.append((lease.itemId, started[lease.itemId] ?? lease.claimHead)) }
+                if let leasedItem, !leases.contains(where: { $0.itemId == leasedItem }) { targets.append((leasedItem, started[leasedItem])) }
+                for target in targets {
+                    store.recordTurnTaint(companyId: agent.companyId, itemId: target.itemId, agentId: agent.id, turnId: turnId,
+                                          start: target.start, source: source,
+                                          workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), now: now)
+                }
             }
         }
 
