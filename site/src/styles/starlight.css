@@ -744,6 +744,27 @@ footer .meta {
   }
 }
 
+/* ---- The agent-map grid band (Home, Quick start, 404) ------------------------------- */
+/* A page's top band sits on the app's map grid (visual spec: bg0 with #18202A lines every 24 px),
+ * drawn full-bleed from under the header (Starlight's content panel pads the page top by 32 px)
+ * to a hairline at the band's foot. Two 1 px line patterns, not a colour gradient. */
+.map-band {
+  position: relative;
+  isolation: isolate;
+}
+.map-band::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: calc(-1 * var(--s-6)) calc(50% - 50vw) 0;
+  background-image:
+    linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+  background-size: 24px 24px;
+  background-position: center top;
+  border-bottom: var(--hairline);
+}
+
 /* ---- Misc ---------------------------------------------------------------------------- */
 
 .sl-skip-link {

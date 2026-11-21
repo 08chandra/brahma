@@ -1,0 +1,195 @@
+---
+/**
+ * Two install routes as tabs: Installer and Build from source. Each panel is a named slot
+ * (`installer`, `source`) and has an id, so `/start/#installer` and `/start/#source` select it.
+ *
+ * Without JavaScript the tab strip stays hidden and both panels show stacked, each under its
+ * own heading. The inline script (one listener set, no framework) turns the strip on:
+ * `role="tablist"`, roving tabindex, ←/→ and Home/End move and select (automatic
+ * activation), a click or key press updates the URL hash without scrolling, and a hash
+ * change selects the matching tab. Build from source is selected when the hash names neither.
+ */
+interface Props {
+  headingLevel?: 'h3' | 'h4';
+}
+const { headingLevel: Heading = 'h3' } = Astro.props;
+
+const tabs = [
+  { id: 'installer', label: 'Installer' },
+  { id: 'source', label: 'Build from source' },
+] as const;
+const initial = 'source';
+---
+
+<div class="itabs" data-itabs data-initial={initial}>
+  <div class="itabs__strip" role="tablist" aria-label="Install route" hidden>
+    {
+      tabs.map((tab) => (
+        <button
+          class="itabs__tab"
+          type="button"
+          role="tab"
+          id={`tab-${tab.id}`}
+          aria-controls={tab.id}
+          aria-selected={tab.id === initial ? 'true' : 'false'}
+          tabindex={tab.id === initial ? 0 : -1}
+          data-tab={tab.id}
+        >
+          {tab.label}
+        </button>
+      ))
+    }
+  </div>
+  {
+    tabs.map((tab) => (
+      <section class="itabs__panel" id={tab.id} aria-labelledby={`heading-${tab.id}`} data-panel={tab.id}>
+        <Heading class="itabs__heading label" id={`heading-${tab.id}`}>
+          {tab.label}
+        </Heading>
+        <slot name={tab.id} />
+      </section>
+    ))
+  }
+</div>
+
+<script is:inline>
+  (() => {
+    const root = document.querySelector('[data-itabs]');
+    if (!root) return;
+    const tabs = [...root.querySelectorAll('[role="tab"]')];
+    const panels = [...root.querySelectorAll('[data-panel]')];
+    const select = (id, focus) => {
+      for (const t of tabs) {
+        const on = t.dataset.tab === id;
+        t.setAttribute('aria-selected', String(on));
+        t.tabIndex = on ? 0 : -1;
+        if (on && focus) t.focus();
+      }
+      for (const p of panels) p.hidden = p.dataset.panel !== id;
+    };
+    const fromHash = () => {
+      const id = location.hash.slice(1);
+      if (tabs.some((t) => t.dataset.tab === id)) select(id, false);
+    };
+    const pick = (id, focus) => {
+      select(id, focus);
+      history.replaceState(null, '', `#${id}`);
+    };
+    for (const p of panels) {
+      p.setAttribute('role', 'tabpanel');
+      p.tabIndex = 0;
+    }
+    root.classList.add('is-tabbed');
+    root.querySelector('[role="tablist"]').hidden = false;
+    select(root.dataset.initial, false);
+    fromHash();
+    addEventListener('hashchange', fromHash);
+    root.addEventListener('click', (e) => {
+      const t = e.target.closest('[role="tab"]');
+      if (t) pick(t.dataset.tab, false);
+    });
+    root.addEventListener('keydown', (e) => {
+      const i = tabs.indexOf(e.target);
+      if (i < 0) return;
+      const n = tabs.length;
+      const to = { ArrowRight: (i + 1) % n, ArrowLeft: (i - 1 + n) % n, Home: 0, End: n - 1 }[e.key];
+      if (to === undefined) return;
+      e.preventDefault();
+      pick(tabs[to].dataset.tab, true);
+    });
+  })();
+</script>
+
+<style>
+  .itabs {
+    min-width: 0;
+  }
+  /* Tabs: a hairline strip; the selected tab is marked by a 2 px accent rule under its label
+   * (the app's selection colour) and text0; the others are text1. */
+  .itabs__strip {
+    display: flex;
+    gap: var(--s-1);
+    border-bottom: var(--hairline);
+    margin-bottom: var(--s-5);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .itabs__strip[hidden] {
+    display: none;
+  }
+  .itabs__tab {
+    position: relative;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    height: 2.5rem;
+    padding: 0 var(--s-3);
+    border: 0;
+    border-radius: var(--radius) var(--radius) 0 0;
+    background: transparent;
+    color: var(--text1);
+    font-family: var(--font-sans);
+    font-size: var(--text-ui);
+    font-weight: 500;
+    cursor: pointer;
+    transition:
+      color var(--dur-fast) var(--ease),
+      background-color var(--dur-fast) var(--ease);
+  }
+  .itabs__tab::after {
+    content: '';
+    position: absolute;
+    inset: auto var(--s-3) -1px;
+    height: 2px;
+    background: var(--accent);
+    transform: scaleX(0);
+    transition: transform var(--dur) var(--ease);
+  }
+  .itabs__tab:hover {
+    color: var(--text0);
+    background: var(--bg2);
+  }
+  .itabs__tab[aria-selected='true'] {
+    color: var(--text0);
+  }
+  .itabs__tab[aria-selected='true']::after {
+    transform: scaleX(1);
+  }
+  .itabs__tab:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  @media (pointer: coarse) {
+    .itabs__tab {
+      height: 2.75rem;
+    }
+  }
+
+  .itabs__panel {
+    min-width: 0;
+  }
+  .itabs__panel:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 4px;
+    border-radius: var(--radius);
+  }
+  /* Stacked (no JavaScript): each panel under its own label, a hairline between them. */
+  .itabs:not(.is-tabbed) .itabs__panel + .itabs__panel {
+    margin-top: var(--s-6);
+    padding-top: var(--s-5);
+    border-top: var(--hairline);
+  }
+  .itabs__heading {
+    margin: 0 0 var(--s-3);
+  }
+  /* Tabbed: the tab names the panel; the heading stays for screen readers only. */
+  .is-tabbed .itabs__heading {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+</style>

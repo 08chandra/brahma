@@ -31,7 +31,7 @@ import { site } from '../../site.config.ts';
   }}
 >
   <div class="home not-content">
-    <section class="band" aria-labelledby="home-title">
+    <section class="band map-band" aria-labelledby="home-title">
       <div class="grid">
         <h1 id="home-title" class="home__title display-xl reveal" style="--i: 0">
           <span class="home__title-lead">Run a company of AI agents</span> on your Mac.
@@ -161,24 +161,9 @@ import { site } from '../../site.config.ts';
   }
 
   /* ---- Hero band on the agent-map grid ---------------------------------------------- */
+  /* The grid itself is the shared `.map-band` (starlight.css). */
   .band {
-    position: relative;
-    isolation: isolate;
     padding-block: var(--s-6) var(--s-7);
-  }
-  .band::before {
-    content: '';
-    position: absolute;
-    z-index: -1;
-    /* Up under the header: Starlight's content panel pads the page top by 32 px. */
-    inset: calc(-1 * var(--s-6)) calc(50% - 50vw) 0;
-    /* Two 1 px line patterns, not a colour gradient: the app's map grid. */
-    background-image:
-      linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
-      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
-    background-size: 24px 24px;
-    background-position: center top;
-    border-bottom: var(--hairline);
   }
   @media (min-width: 64em) {
     .band {

@@ -29,7 +29,7 @@ const destinations = [
     head: [{ tag: 'meta', attrs: { name: 'robots', content: 'noindex' } }],
   }}
 >
-  <div class="nf not-content">
+  <div class="nf map-band not-content">
     <div class="nf__numeral reveal" aria-hidden="true">404</div>
 
     <div class="nf__body">
@@ -97,27 +97,13 @@ const destinations = [
     --sl-content-width: var(--grid-max);
   }
 
+  /* The grid behind it is the shared `.map-band` (starlight.css). */
   .nf {
-    position: relative;
-    isolation: isolate;
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     column-gap: var(--grid-gutter);
     row-gap: var(--s-5);
     padding-block: var(--s-6) var(--s-8);
-  }
-  .nf::before {
-    content: '';
-    position: absolute;
-    z-index: -1;
-    inset: calc(-1 * var(--s-6)) calc(50% - 50vw) 0; /* up under the header */
-    /* Two 1 px line patterns, not a colour gradient: the app's map grid. */
-    background-image:
-      linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
-      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
-    background-size: 24px 24px;
-    background-position: center top;
-    border-bottom: var(--hairline);
   }
   @media (min-width: 64em) {
     .nf {

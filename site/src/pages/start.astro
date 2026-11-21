@@ -1,0 +1,779 @@
+---
+/**
+ * Quick start (/start). Five numbered steps from a clean Mac to a running company.
+ *
+ * Grid: Home's 12 columns, 1200 px max. The top band sits on the agent-map grid (the shared
+ * `.map-band`): the title and lede on the left seven columns, a route index of the five steps
+ * on the right five. Below it each step is one row on a strong hairline: an engraved serif
+ * numeral, the step's title and a short brief on the left four columns (sticky on desktop),
+ * the instruments on the right eight — install tabs, code, panels, app captures.
+ *
+ * Single source of truth: every shell block is a file under src/content/quickstart/, imported
+ * raw and rendered verbatim by Expressive Code; scripts/site-quickstart-check.sh executes the
+ * same files against a stand-in `claude`. Rendered through StarlightPage with a bare `hero: {}`
+ * like Home, so <html> gets `data-has-hero` (16 px base) while SiteHero renders nothing.
+ */
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import { Code } from '@astrojs/starlight/components';
+import Label from '../components/Label.astro';
+import Panel from '../components/Panel.astro';
+import InstallTabs from '../components/InstallTabs.astro';
+import { site } from '../../site.config.ts';
+import buildSh from '../content/quickstart/build.sh?raw';
+import connectSh from '../content/quickstart/connect.sh?raw';
+import firstCompanySh from '../content/quickstart/first-company.sh?raw';
+import runSh from '../content/quickstart/run.sh?raw';
+import watchSh from '../content/quickstart/watch.sh?raw';
+
+const title = 'Quick start';
+const description =
+  'Build Brahma from source, connect the claude CLI, create your first company and start the engine. Every command on the page is checked against this tree.';
+
+// The clone line exists only once the repository is public (site.repoURL).
+const cloneDir = site.repoURL.replace(/\/+$/, '').split('/').pop()?.replace(/\.git$/, '') ?? '';
+const cloneSh = site.repoURL !== '' ? `git clone ${site.repoURL}\ncd ${cloneDir}\n` : '';
+
+const route = [
+  { id: 'install', title: 'Install', command: 'swift build' },
+  { id: 'connect', title: 'Connect the claude CLI', command: 'brahma doctor' },
+  { id: 'company', title: 'Create your first company', command: 'brahma company create' },
+  { id: 'run', title: 'Run it and watch', command: 'brahma run' },
+  { id: 'next', title: 'Next steps', command: 'docs' },
+];
+
+const canarySh = `# Write at least one probe line: a command the sandbox must deny.
+brahma canary edit
+
+# Run the canary now (one small haiku turn; uses a little of your plan).
+brahma canary run
+`;
+
+const shots = [
+  {
+    src: 'map',
+    title: 'Mission Control · Initech',
+    alt: 'Brahma’s Mission Control for the demo company Initech: a preview pane, the agent-map panel with six agent cards showing running and sleeping states, and an activity feed of timestamped events.',
+    caption:
+      'Mission Control with the agent-map panel (Initech, 12 agents). Left, the company’s web preview (in this capture, a failed one); right, the agent map, one card per agent with its role and state; below, the activity feed: every state change, turn and message as it happens.',
+  },
+  {
+    src: 'inbox',
+    title: 'Inbox · Initech',
+    alt: 'The Inbox of the demo company Initech: three pending asks — a brief for approval, a pricing decision and an access request — each with Approve, Reject and Send back with a new direction.',
+    caption:
+      'The Inbox of the seeded demo company. Everything only you can decide lands here — briefs, decisions, access requests — with its risk and who asked; approve, reject or send it back with a new direction.',
+  },
+  {
+    src: 'backlog',
+    title: 'Backlog · Initech',
+    alt: 'The Backlog of the demo company Initech: four work items with key, type, title, status, priority, tier, owner and check columns; one bug is in progress.',
+    caption:
+      'The Backlog of the seeded demo company: every work item with its key, status, priority, tier, owner and the check that must pass before it merges.',
+  },
+];
+
+const next = [
+  { href: '/docs/concepts/', title: 'Concepts', body: 'Companies, agents and roles, work items, asks, reviews and the merge queue.' },
+  { href: '/docs/safety/profiles/', title: 'Safety profiles', body: 'Sandboxed, Workspace and Full: what a turn may touch under each.' },
+  { href: '/docs/cli/', title: 'CLI reference', body: 'Every brahma command and flag, generated from this build’s help.' },
+  { href: '/internals/', title: 'Inside Brahma', body: 'How the engine schedules turns, runs them and merges their work.' },
+];
+---
+
+<StarlightPage
+  frontmatter={{
+    title,
+    description,
+    template: 'splash',
+    hero: {},
+    head: [{ tag: 'title', content: `${site.title} · ${title}` }],
+  }}
+>
+  <div class="start not-content">
+    <section class="band map-band" aria-labelledby="start-title">
+      <div class="grid">
+        <div class="start__intro">
+          <h1 id="start-title" class="start__title display-xl reveal" style="--i: 0">
+            From source to a running company.
+          </h1>
+          <p class="start__lede reveal" style="--i: 1">
+            Five steps on your Mac: build Brahma, connect the <code>claude</code> CLI you already use, create a
+            company, then start the engine and watch it work.
+          </p>
+          <p class="start__proof reveal" style="--i: 2">
+            <span class="start__tick" aria-hidden="true"></span>
+            <span>
+              Each shell block below is a file that <code>scripts/site-quickstart-check.sh</code> runs as it is, in a
+              throwaway data home, against a stand-in for the <code>claude</code> CLI.
+            </span>
+          </p>
+        </div>
+
+        <nav class="route reveal" style="--i: 2" aria-label="Steps on this page">
+          <Panel title="Five steps" titleAs="p" flush>
+            <ol class="route__list">
+              {
+                route.map((step, index) => (
+                  <li>
+                    <a class="route__link" href={`#${step.id}`}>
+                      <span class="route__n" aria-hidden="true">
+                        {index + 1}
+                      </span>
+                      <span class="route__title">
+                        {step.title.split(/(claude)/).map((part, i) => (i % 2 === 1 ? <code>{part}</code> : part))}
+                      </span>
+                      <code class="route__cmd">{step.command}</code>
+                    </a>
+                  </li>
+                ))
+              }
+            </ol>
+          </Panel>
+        </nav>
+      </div>
+    </section>
+
+    <div class="steps">
+      <!-- 1 · Install -->
+      <section class="step grid" id="install" aria-labelledby="install-title">
+        <div class="step__aside">
+          <span class="step__num" aria-hidden="true">1</span>
+          <h2 id="install-title" class="step__title"><span class="visually-hidden">Step 1: </span>Install</h2>
+          <p class="step__brief">
+            Until the first stable release, Brahma is built from source: the <code>brahma</code> CLI with Swift, and the
+            Mac app with one optional script.
+          </p>
+        </div>
+        <div class="step__main">
+          <InstallTabs>
+            <div slot="installer" class="stack">
+              <p class="prose">
+                The first stable release is coming; until then build from source. <a href="#source">Build from source</a>
+              </p>
+            </div>
+            <div slot="source" class="stack">
+              <dl class="kv">
+                <div class="kv__row">
+                  <dt class="label">macOS</dt>
+                  <dd>14 or later</dd>
+                </div>
+                <div class="kv__row">
+                  <dt class="label">Swift</dt>
+                  <dd>6, from Xcode or its command line tools</dd>
+                </div>
+                <div class="kv__row">
+                  <dt class="label">claude CLI</dt>
+                  <dd>on your PATH, logged in to your plan</dd>
+                </div>
+              </dl>
+              {
+                cloneSh !== '' ? (
+                  <Code code={cloneSh} lang="sh" title="Terminal" wrap />
+                ) : (
+                  <p class="prose note">The repository is not public yet.</p>
+                )
+              }
+              <Code code={buildSh} lang="sh" title="build.sh" wrap />
+              <p class="prose">
+                <code>swift build</code> builds the CLI only. The Mac app, <code>.build/Brahma.app</code>, comes from{' '}
+                <code>scripts/make-app.sh</code>; it runs the same engine on the same data.
+              </p>
+              <p class="license">
+                Brahma is {site.license} licensed <span aria-hidden="true">→</span>{' '}
+                <a href="/license/">License</a>
+              </p>
+            </div>
+          </InstallTabs>
+        </div>
+      </section>
+
+      <!-- 2 · Connect -->
+      <section class="step grid" id="connect" aria-labelledby="connect-title">
+        <div class="step__aside">
+          <span class="step__num" aria-hidden="true">2</span>
+          <h2 id="connect-title" class="step__title">
+            <span class="visually-hidden">Step 2: </span>Connect the <code>claude</code> CLI
+          </h2>
+          <p class="step__brief">
+            Every agent turn is a headless run of the <code>claude</code> CLI you already use, on your own plan. Brahma
+            needs it on your PATH and logged in, and an owner key for the commands only you may run.
+          </p>
+        </div>
+        <div class="step__main stack">
+          <Code code={connectSh} lang="sh" title="connect.sh" wrap />
+          <Panel title="What brahma doctor checks" titleAs="h3" dense>
+            <dl class="kv kv--flush">
+              <div class="kv__row">
+                <dt class="label">Version</dt>
+                <dd>2.1.312 is the tested minimum; older fails, newer warns and the probe decides</dd>
+              </div>
+              <div class="kv__row">
+                <dt class="label">Flags</dt>
+                <dd>every flag Brahma passes to <code>claude</code> is in its help</dd>
+              </div>
+              <div class="kv__row">
+                <dt class="label">Probe</dt>
+                <dd>a real haiku turn answers, and <code>--resume</code> keeps the role prompt</dd>
+              </div>
+              <div class="kv__row">
+                <dt class="label">Sandbox</dt>
+                <dd>reports the missing canary probes until you write them in step 3</dd>
+              </div>
+            </dl>
+          </Panel>
+          <p class="prose">
+            <code>brahma run</code> and the app run the probe themselves when there is no passing one for your{' '}
+            <code>claude</code> version from the last 24 hours. See <a href="/docs/cli/owner/init/">owner init</a> and{' '}
+            <a href="/docs/cli/doctor/">doctor</a>.
+          </p>
+        </div>
+      </section>
+
+      <!-- 3 · Company -->
+      <section class="step grid" id="company" aria-labelledby="company-title">
+        <div class="step__aside">
+          <span class="step__num" aria-hidden="true">3</span>
+          <h2 id="company-title" class="step__title"><span class="visually-hidden">Step 3: </span>Create your first company</h2>
+          <p class="step__brief">
+            A company is a git workspace, its channels and an org of agents, all on your Mac. Give it a goal when you
+            create it; that is what the org works toward.
+          </p>
+        </div>
+        <div class="step__main stack">
+          <Code code={firstCompanySh} lang="sh" title="first-company.sh" wrap />
+          <p class="prose">
+            Reference: <a href="/docs/cli/company/create/">company create</a> · <a href="/docs/cli/hire/">hire</a> ·{' '}
+            <a href="/docs/cli/say/">say</a>
+          </p>
+          <Panel title="Sandboxed by default" titleAs="h3" class="sandbox">
+            <div class="stack stack--tight">
+              <p class="prose">
+                A new company runs under the <strong>Sandboxed</strong> profile: each turn is confined to its own places in
+                the workspace. A Sandboxed turn starts only after the sandbox canary has passed for your{' '}
+                <code>claude</code> CLI, and the canary’s probes are yours to write. Until it passes, the agents wait and you
+                get a sandbox-check alert naming the reason.
+              </p>
+              <Code code={canarySh} lang="sh" title="Terminal" wrap />
+              <p class="prose">
+                The engine also runs the canary itself while a Sandboxed agent waits. To run a company without the sandbox,{' '}
+                <code>brahma company profile Acme workspace</code> lets its agents’ shells run anywhere you can; read{' '}
+                <a href="/docs/safety/profiles/">Safety profiles</a> first.
+              </p>
+              <p class="prose">
+                Reference: <a href="/docs/cli/canary/edit/">canary edit</a> ·{' '}
+                <a href="/docs/cli/canary/run/">canary run</a> · <a href="/docs/cli/company/profile/">company profile</a>
+              </p>
+            </div>
+          </Panel>
+        </div>
+      </section>
+
+      <!-- 4 · Run -->
+      <section class="step grid" id="run" aria-labelledby="run-title">
+        <div class="step__aside">
+          <span class="step__num" aria-hidden="true">4</span>
+          <h2 id="run-title" class="step__title"><span class="visually-hidden">Step 4: </span>Run it and watch</h2>
+          <p class="step__brief">
+            Start the engine and the company works toward its goal: agents take turns, claim items, review each other’s
+            work and merge. What only you can decide waits in your Inbox.
+          </p>
+        </div>
+        <div class="step__main stack">
+          <Code code={runSh} lang="sh" title="run.sh" wrap />
+          <Code code={watchSh} lang="sh" title="watch.sh" wrap />
+          <p class="prose">
+            In the terminal, <code>brahma run</code> prints a line for each state change, turn and message. The app runs
+            the same engine: while <code>brahma run</code> holds it, the app shows a banner and takes over when the
+            terminal engine stops. Reference: <a href="/docs/cli/run/">run</a> · <a href="/docs/cli/log/">log</a> ·{' '}
+            <a href="/docs/cli/inbox/">inbox</a> · <a href="/docs/cli/status/">status</a>
+          </p>
+          <h3 class="sub label">Where to look in the app</h3>
+          <div class="shots">
+            {
+              shots.map((shot, index) => (
+                <figure class:list={['shot', { 'shot--lead': index === 0 }]}>
+                  <Panel title={shot.title} titleAs="p" flush>
+                    <img
+                      src={`/screenshots/${shot.src}.png`}
+                      srcset={`/screenshots/${shot.src}.png 1x, /screenshots/${shot.src}@2x.png 2x`}
+                      width="1600"
+                      height="1000"
+                      alt={shot.alt}
+                      loading="lazy"
+                      decoding="async"
+                    />
+                  </Panel>
+                  <figcaption>{shot.caption}</figcaption>
+                </figure>
+              ))
+            }
+          </div>
+        </div>
+      </section>
+
+      <!-- 5 · Next -->
+      <section class="step grid" id="next" aria-labelledby="next-title">
+        <div class="step__aside">
+          <span class="step__num" aria-hidden="true">5</span>
+          <h2 id="next-title" class="step__title"><span class="visually-hidden">Step 5: </span>Next steps</h2>
+          <p class="step__brief">How work moves, what a turn may touch, and every command in one place.</p>
+        </div>
+        <div class="step__main">
+          <ul class="next">
+            {
+              next.map((link) => (
+                <li>
+                  <a class="next__link" href={link.href}>
+                    <span class="next__title">
+                      {link.title}
+                      <span class="next__arrow" aria-hidden="true">
+                        →
+                      </span>
+                    </span>
+                    <span class="next__body">{link.body}</span>
+                    <code class="next__path">{link.href}</code>
+                  </a>
+                </li>
+              ))
+            }
+          </ul>
+        </div>
+      </section>
+    </div>
+  </div>
+</StarlightPage>
+
+<style>
+  /* Hallmark · genre: modern-minimal (ops console) · macrostructure: Narrative Workflow · theme: custom "Brahma console"
+   * (locked system: site/docs/design-system.md) · enrichment: real app captures in step 4 · nav: Starlight header ·
+   * footer: Ft2 inline colophon · pre-emit critique: P5 H4 E4 S5 R5 V4 */
+  /* Start is as wide as Home: the 1200 px grid. */
+  :global(html[data-has-hero]:not([data-has-sidebar])) {
+    --sl-content-width: var(--grid-max);
+  }
+
+  .start {
+    --step-gap: var(--s-7);
+  }
+  @media (min-width: 64em) {
+    .start {
+      --step-gap: var(--s-8);
+    }
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    column-gap: var(--grid-gutter);
+    row-gap: var(--s-5);
+  }
+  @media (min-width: 64em) {
+    .grid {
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+    }
+  }
+
+  code {
+    padding: 1px 5px;
+    border-radius: var(--radius);
+    background: var(--bg3);
+    font-size: 0.9em;
+    color: var(--text0);
+  }
+
+  /* ---- Band ------------------------------------------------------------------------------ */
+  .band {
+    padding-block: var(--s-6) var(--s-7);
+  }
+  @media (min-width: 64em) {
+    .band {
+      padding-block: var(--s-8);
+    }
+    .start__intro {
+      grid-column: 1 / span 7;
+    }
+    .route {
+      grid-column: 8 / span 5;
+      align-self: end;
+    }
+  }
+  .start__intro {
+    display: grid;
+    align-content: start;
+    gap: var(--s-5);
+  }
+  .start__title {
+    margin: 0;
+    max-width: 16ch;
+  }
+  .start__lede {
+    margin: 0;
+    font-size: var(--step-1);
+    line-height: 1.5;
+    color: var(--text1);
+    max-width: 44ch;
+  }
+  .start__proof {
+    margin: 0;
+    display: flex;
+    gap: var(--s-3);
+    align-items: baseline;
+    max-width: 52ch;
+    font-size: var(--text-ui);
+    line-height: 1.55;
+    color: var(--text1);
+  }
+  .start__proof code {
+    font-size: 0.92em;
+  }
+  /* A running-green tick: the check passes (colour carries the meaning "verified"). */
+  .start__tick {
+    flex: none;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--ok);
+    transform: translateY(-1px);
+  }
+
+  /* Route index: the five steps as an instrument list — numeral, title, the step's command. */
+  .route {
+    min-width: 0;
+  }
+  .route__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  .route__list li {
+    margin: 0;
+  }
+  .route__list li + li {
+    border-top: var(--hairline);
+  }
+  .route__link {
+    display: grid;
+    grid-template-columns: 1.5rem minmax(0, 1fr) auto;
+    gap: var(--s-3);
+    align-items: baseline;
+    min-height: 2.75rem;
+    padding: var(--s-3) var(--s-4);
+    color: var(--text0);
+    text-decoration: none;
+    transition: background-color var(--dur-fast) var(--ease);
+  }
+  .route__link:hover {
+    background: var(--bg3);
+  }
+  .route__link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .route__n {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--text1);
+    font-variant-numeric: tabular-nums;
+  }
+  .route__title {
+    font-size: var(--text-ui);
+    font-weight: 500;
+  }
+  .route__title code {
+    font-size: 0.92em;
+  }
+  .route__cmd {
+    padding: 0;
+    background: none;
+    font-size: var(--step--1);
+    color: var(--text1);
+    white-space: nowrap;
+  }
+  .route__link:hover .route__cmd {
+    color: var(--text0);
+  }
+  @media (max-width: 30em) {
+    .route__cmd {
+      display: none;
+    }
+  }
+
+  /* ---- Steps ----------------------------------------------------------------------------- */
+  .step {
+    margin: 0;
+    padding-top: var(--s-6);
+    border-top: var(--hairline-strong);
+    scroll-margin-top: calc(var(--sl-nav-height) + var(--s-4));
+  }
+  .step + .step {
+    margin-top: var(--step-gap);
+  }
+  .steps > .step:first-child {
+    margin-top: var(--s-7);
+  }
+  .step__aside {
+    display: grid;
+    align-content: start;
+    gap: var(--s-3);
+  }
+  @media (min-width: 64em) {
+    .step__aside {
+      grid-column: 1 / span 4;
+      position: sticky;
+      top: calc(var(--sl-nav-height) + var(--s-6));
+      align-self: start;
+    }
+    .step__main {
+      grid-column: 5 / span 8;
+    }
+  }
+  .step__num {
+    font-family: var(--font-display);
+    font-size: var(--step-5);
+    line-height: 0.85;
+    color: var(--text2); /* large text: 4.39:1 on bg0, above the 3:1 large-text threshold */
+    font-variant-numeric: lining-nums;
+  }
+  .step__title {
+    margin: 0;
+    font-family: var(--font-display);
+    font-size: var(--step-3);
+    font-weight: 400;
+    line-height: 1.1;
+    color: var(--text0);
+  }
+  .step__title code {
+    font-size: 0.72em;
+    vertical-align: 0.08em;
+  }
+  .step__brief {
+    margin: 0;
+    font-size: var(--step-0);
+    line-height: 1.55;
+    color: var(--text1);
+    max-width: 38ch;
+  }
+  .step__main {
+    min-width: 0;
+  }
+
+  .stack {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr); /* code blocks scroll inside their frames, never widen the page */
+    gap: var(--s-4);
+    min-width: 0;
+  }
+  .stack--tight {
+    gap: var(--s-3);
+  }
+  /* Expressive Code adds its own top margin between siblings; the stack owns spacing here. */
+  .stack > :global(.expressive-code) {
+    margin: 0;
+  }
+
+  .prose {
+    margin: 0;
+    font-size: var(--step-0);
+    line-height: 1.6;
+    color: var(--text1);
+    max-width: 68ch;
+  }
+  .prose strong {
+    color: var(--text0);
+    font-weight: 600;
+  }
+  .note {
+    color: var(--text0);
+  }
+  .prose a,
+  .license a {
+    color: var(--text-link);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+    text-decoration-color: color-mix(in srgb, var(--text-link) 45%, transparent);
+    transition:
+      color var(--dur-fast) var(--ease),
+      text-decoration-color var(--dur-fast) var(--ease);
+  }
+  .prose a:hover,
+  .license a:hover {
+    color: var(--text0);
+    text-decoration-color: var(--text-link);
+  }
+  @media (pointer: coarse) {
+    .prose a,
+    .license a {
+      display: inline-block;
+      padding-block: 0.6875rem;
+      margin-block: -0.6875rem;
+    }
+  }
+
+  /* Inspector-style key–value list (Home's facts). */
+  .kv {
+    margin: 0;
+    display: grid;
+    border-top: var(--hairline);
+  }
+  .kv__row {
+    display: grid;
+    grid-template-columns: 7rem minmax(0, 1fr);
+    gap: var(--s-3);
+    align-items: baseline;
+    padding-block: var(--s-2);
+    border-bottom: var(--hairline);
+  }
+  .kv dt {
+    margin: 0;
+  }
+  .kv dd {
+    margin: 0;
+    font-size: var(--text-ui);
+    line-height: 1.5;
+    color: var(--text0);
+  }
+  .kv--flush {
+    border-top: 0;
+  }
+  .kv--flush .kv__row {
+    padding-inline: var(--s-2);
+  }
+  .kv--flush .kv__row:last-child {
+    border-bottom: 0;
+  }
+  @media (max-width: 30em) {
+    .kv__row {
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--s-1);
+    }
+  }
+
+  .license {
+    margin: var(--s-2) 0 0;
+    padding-top: var(--s-3);
+    border-top: var(--hairline);
+    font-size: var(--text-ui);
+    color: var(--text1);
+  }
+
+  /* The sandbox panel: the warning stripe is the one colour here, and it means "read this first". */
+  .step__main :global(.sandbox) {
+    border-left: 2px solid var(--warn);
+  }
+
+  .sub {
+    margin: var(--s-4) 0 0;
+    padding-top: var(--s-4);
+    border-top: var(--hairline);
+  }
+
+  /* Captures: the agent map leads full width; inbox and backlog share a row from 48 em. */
+  .shots {
+    display: grid;
+    gap: var(--s-6) var(--s-5);
+    grid-template-columns: minmax(0, 1fr);
+  }
+  @media (min-width: 48em) {
+    .shots {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .shot--lead {
+      grid-column: 1 / -1;
+    }
+  }
+  .shot {
+    margin: 0;
+    min-width: 0;
+  }
+  .shot img {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  .shot figcaption {
+    margin-top: var(--s-3);
+    font-size: var(--step--1);
+    line-height: 1.55;
+    color: var(--text1);
+    max-width: 72ch;
+  }
+
+  /* Next steps: an index of hairline rows — title, one line, the path in mono. */
+  .next {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    border-top: var(--hairline);
+  }
+  @media (min-width: 48em) {
+    .next {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      column-gap: var(--s-5);
+    }
+  }
+  .next li {
+    margin: 0;
+    border-bottom: var(--hairline);
+    min-width: 0;
+  }
+  .next__link {
+    display: grid;
+    gap: var(--s-1);
+    padding: var(--s-4) var(--s-2);
+    margin-inline: calc(-1 * var(--s-2));
+    color: var(--text0);
+    text-decoration: none;
+    border-radius: var(--radius);
+    transition: background-color var(--dur-fast) var(--ease);
+  }
+  .next__link:hover {
+    background: var(--bg1);
+  }
+  .next__link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 0;
+  }
+  .next__title {
+    display: inline-flex;
+    gap: var(--s-2);
+    align-items: baseline;
+    font-size: var(--step-1);
+    font-weight: 600;
+  }
+  .next__arrow {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--text1);
+    transition: transform var(--dur-fast) var(--ease);
+  }
+  .next__link:hover .next__arrow {
+    transform: translateX(2px);
+    color: var(--text-link);
+  }
+  .next__body {
+    font-size: var(--text-ui);
+    line-height: 1.5;
+    color: var(--text1);
+  }
+  .next__path {
+    justify-self: start;
+    margin-top: var(--s-1);
+    padding: 0;
+    background: none;
+    font-size: var(--step--1);
+    color: var(--text-link);
+  }
+
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+</style>
