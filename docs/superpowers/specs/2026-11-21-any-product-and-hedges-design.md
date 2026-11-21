@@ -53,6 +53,20 @@
     Where beating a feature locally is impossible, or would break a security constraint, §10 and §11 say so plainly and give the strongest compliant alternative. **The safety model is never weakened to win a row.**
 15. **Atoms row:** Brahma provides deployable app templates with login, a database and payments. Payments go through Approved channels with per-transaction owner approval unless the owner sets a cap. Nothing deploys without owner approval.
 
+### Answers to the open questions (owner, binding)
+
+16. **Codex v1 runs in API-key mode only.** ChatGPT-plan sign-in is added only if a probe proves Codex can keep its token unreadable by agent commands (§8.1.5).
+17. **"Phone can do more."** Money approvals and limit raises are also allowed from the phone, passkey-protected. Tailscale HTTPS is the accepted prerequisite. The design is fail-closed:
+    - every phone approval is passkey-signed per action, and its signed payload names the exact amount, recipient and limit change;
+    - money approvals from the phone stay within any caps the owner set on the Mac, and each needs a fresh passkey assertion;
+    - limit raises from the phone are bounded per day, by a Mac-side setting that caps them (default: at most 2× the current limit), with a cooling-off notice;
+    - Mac-only: connecting new accounts or channels, entering or changing secrets, `trust-import`, resuming after STOP, turning channels back on, and removing caps entirely;
+    - STOP and CHANNELS OFF work from either device.
+
+    The full design is §8.7.4.
+18. **PR-mode trust is a trust list the owner controls.** Changes authored by a listed GitHub account, or merged through PRs a listed account approved, are trusted. The list starts with only the connecting account. Everything else is tainted until `trust-import` (§8.5.3).
+19. **Dogfood #2 is the content pack's 15–25-page cited research report,** built to PDF/EPUB (§13.3).
+
 ### Standing constraints (unchanged)
 
 - The owner never pastes tokens in chat. Agents never handle secrets.
@@ -69,7 +83,7 @@ A fresh builder read this spec against `main`, `plan4a-previews` and the S and R
 - **Provider OAuth:** owner-created tokens in v1, §8.4.3.
 - **The HTTPS requirement for passkeys:** §8.7.4.
 
-The builder's small calls are also recorded: the `BrahmaRuntime` placement, MCP-endpoint taint, owner price rows, and the soak harness in X6a. Two questions go to the owner: which product dogfood #2 builds, and the Tailscale dependency. Both are in §16 with the other owner questions, Q1–Q4.
+The builder's small calls are also recorded: the `BrahmaRuntime` placement, MCP-endpoint taint, owner price rows, and the soak harness in X6a. Two questions went to the owner: which product dogfood #2 builds, and the Tailscale dependency. The owner answered them, with Q1–Q4, as decisions 16–19.
 
 ---
 
@@ -280,7 +294,7 @@ What X2 must establish by probe before writing the adapter (task X2-0). Facts be
   Codex's built-in sandbox is set to off inside it, because Seatbelt profiles cannot nest. Brahma's profile is the wall. The consequence is that the harness and the agent's commands share one profile, so **the harness may hold no credential**. That is why:
 - **Auth (controller's call): Codex v1 runs in API-key mode only.** An OpenAI API key is stored engine-held (`brahma secret set <co> OPENAI_API_KEY`) and injected by the model proxy (§8.2.3). Codex is pointed at the proxy with a per-turn placeholder token *(probe: base-URL override)*.
   - **ChatGPT-plan login is "unavailable".** Codex would have to read its own token file inside the shared profile, where agent commands could read it too (P1, P7 fail).
-  - A later probe may find that Codex's own sandbox can deny reads of its auth store and enforce a domain allowlist. Subscription mode would then be added as a second Codex shape, gated the same way. This is **theirs question Q1** (§16).
+  - A later probe may find that Codex's own sandbox can deny reads of its auth store and enforce a domain allowlist. Subscription mode would then be added as a second Codex shape, gated the same way. **(owner, decision 16: API key only for v1; ChatGPT-plan sign-in only if a probe proves Codex can keep its token unreadable by agent commands.)**
 - **Taint:** `.launchTainted` unless a synchronous hook mechanism passes a gate. The engine-side MCP endpoint marks the session tainted itself, before returning, whenever it serves EXTERNAL or tainted content, the same rule `brahma mcp` follows today **(builder-check resolution)**. A Codex turn is untainted only when its shape has web search off, an empty network allowlist, no third-party MCP tools, and the company is not import-marked.
 - **Usage:** `.proxyMetered`. The proxy counts tokens and dollars from the API responses. Rate-limit snapshots from the JSONL stream are recorded when present *(probe)* but never needed.
 - **Canary:** both layers run for Codex shapes. The live layer is a small Codex turn built like a real one and judged only from its raw stream, the same contract as the Claude canary.
@@ -557,7 +571,7 @@ Rules:
 - the amount is within the per-transaction and period caps;
 - it is not the first payment to that payee.
 
-**Refunds and payouts are `money`.** Changing a cap is an owner decision on the Mac only (§8.7.4).
+**Refunds and payouts are `money`.** Changing a cap is always an owner decision. Lowering or setting a cap works on either device. Raising one from the phone is bounded (§8.7.4). Removing a cap entirely is Mac-only (owner, decision 17).
 
 #### 8.4.6 The approval card (Inbox)
 
@@ -636,9 +650,11 @@ How the card is decided:
 
 #### 8.5.3 Remote `main` coming back
 
-Commits that arrive on remote `main` from teammates are fetched by the hardened fetch (fsck, no filters, no hooks). Whether they are trusted is **theirs question Q3** (§16). The recommended answer, built as the default unless the owner says otherwise:
-- commits merged through a PR approved by a trusted login, or authored by one, are trusted;
-- anything else marks the company `import: github` until the owner runs `brahma company trust-import`, the existing command.
+Commits that arrive on remote `main` from teammates are fetched by the hardened fetch (fsck, no filters, no hooks). Which of them are trusted is set by **owner decision 18**:
+- **The trust list is the owner's.** It is edited with `brahma issues <co> trust|untrust <login>` and starts with only the account that connected GitHub. Editing it is an owner act; an agent can never change it.
+- **Trusted:** commits authored by a listed login, or merged through a PR that a listed login approved.
+- **Anything else** marks the company `import: github` until the owner runs `brahma company trust-import`, the existing command.
+- The same list decides issue trust (§8.5.2).
 
 ### 8.6 Proof: measurement and benchmark (X6; owner, decisions 5 and 13)
 
@@ -742,10 +758,49 @@ Each is `BRAHMA_LIVE=1` and owner-provided:
   - **The local-network option is dropped.** There is no Brahma CA on the phone and no native companion app in v1 (theirs question Q2).
 - **Not reachable.** Without Tailscale HTTPS the feature is unavailable. **There is never a public listener.** Tailscale Funnel (public exposure) is refused by the doctor check.
 - **Approving.** A push notification links to the page. The page shows the same card as the Inbox, rendered from the engine with untrusted text escaped. Approval is a passkey assertion **over the ask id and its payload hash**, so a replayed or altered approval fails.
-- **What the phone may decide.** Recommended default, **theirs question Q2** (§16):
-  - **yes:** ordinary asks, gates (PRD, sprint plans), deploy approvals, and channel actions within an existing grant (including tainted-session per-action approvals);
-  - **Mac only:** creating or widening grants, connecting accounts, money actions above a phone limit (default $0, so all money is Mac-only), `trust-import`, `accounts on`, `resume` after an emergency stop, secrets, and lab taint clears.
-- **The phone can always press STOP and CHANNELS OFF.** Stopping is the safe direction.
+- **What the phone may decide (owner, decision 17: "Phone can do more").**
+  - **Allowed from the phone:**
+    - ordinary asks and gates (PRD, sprint plans);
+    - deploy approvals;
+    - channel actions, including tainted-session per-action approvals;
+    - **money approvals**;
+    - **limit raises** (rate limits, spend caps, allowlist additions on an existing grant).
+
+    The money and limit rules below apply to the last two.
+  - **Mac only:**
+    - connecting new accounts or channels;
+    - entering or changing secrets;
+    - `trust-import`;
+    - `resume` after an emergency stop;
+    - `accounts on`;
+    - **removing a cap entirely**.
+
+    Also Mac-only, **(controller's call)**:
+    - **creating a grant where none existed**, because a "raise" from zero has no bound;
+    - lab taint clears;
+    - device pairing and the phone-limit settings themselves.
+  - **Either device:** STOP and CHANNELS OFF. Stopping is the safe direction.
+- **Every phone approval is a fresh, per-action passkey assertion (owner).**
+  - **The challenge** is engine-generated, single-use, and expires after 5 minutes **(controller's call)**.
+  - **The signed payload** is a canonical encoding of:
+    - the ask id and the action's payload hash;
+    - for money: **the exact amount, currency and recipient**;
+    - for a limit change: **the exact limit, its old value and its new value**.
+  - **The page renders those same fields from the engine's record.** The engine verifies the signature against what it is about to execute, so a page showing one amount cannot approve another.
+  - **No approval session is reused.** Each money approval needs its own new assertion with user verification (Face ID or Touch ID); a batch "approve all" never covers money.
+- **Money from the phone (owner).** A phone money approval must fit inside every cap the owner set on the Mac: per transaction, per period, and the payee allowlist. A payment that would exceed a cap cannot be approved on the phone. The card says "over your cap: raise the cap first", and raising it follows the next rule.
+- **Limit raises from the phone (owner; numbers are controller's call where marked).**
+  - **Size:** each raise is at most **2× the current value** (the Mac-side setting `brahma settings phone-raise-max <factor>`, default 2, settable only on the Mac).
+  - **Count:** at most **2 raises per limit per day**, and **5 raise actions per company per day** across all limits **(controller's call)**.
+  - **Allowlist additions:** at most **3 new recipients, payees or domains per grant per day** **(controller's call)**.
+  - **Cooling-off notice (owner; mechanism is controller's call):** a phone raise takes effect after **15 minutes**. During that window a notice goes to the Mac app, the Inbox and every paired device, and the raise can be cancelled from either device. A cancelled raise never applies.
+  - **Never raised from the phone:** a cap that is unset (removing a cap is Mac-only), the phone-raise settings themselves, and any limit on a grant created in the last 24 hours **(controller's call)**.
+- **Fail closed.** Any of the following refuses the approval with the reason shown on the page, and the ask stays pending for the Mac:
+  - a stale challenge, a signature over different fields, or an unknown or expired device;
+  - a cap that changed between render and assertion;
+  - an engine that is stopped;
+  - Tailscale Serve unavailable.
+- **Audit.** Every phone decision is a channel-log or ask-log row naming the device, the signed fields and the assertion counter.
 - **Device management.** Devices are listed and revocable (`brahma devices`, new). They expire after 90 days without use.
 
 ### 8.8 Container/VM isolation mode (X8; owner, decision 11)
@@ -897,7 +952,9 @@ DLP is advisory in the same sense as the command classifier: it errs toward aski
 - **Phone:**
   - passkey-signed approvals over the payload hash;
   - tailnet HTTPS only (Tailscale Serve, never Funnel);
-  - a Mac-only list for widening and money;
+  - a fresh per-action assertion over the exact amount, recipient or limit change;
+  - money only inside the caps set on the Mac; limit raises at most 2× per raise, capped per day, with a 15-minute cooling-off;
+  - Mac-only: new accounts, secrets, trust-import, resume after STOP, channels on, removing caps;
   - devices revocable and expiring.
 - **Slack:** never an approval path. Others' messages are tainted. The owner's identity maps to chat only.
 
@@ -1046,7 +1103,8 @@ Existing: 4a → C → 4b leftovers → S → R → P → dogfood.
    → X3 (any product)  ∥  X2 (Codex)  ∥  X6b (bench)
    → X4 (Approved channels: email + GitHub; security review + red team)
    → X5 (PR mode + issue import)
-   → DOGFOOD #2 (one non-software product + one software company in PR mode; channels dry-run, then live)
+   → DOGFOOD #2 (content pack: a 15–25-page cited research report built to PDF/EPUB (owner, decision 19)
+                 + one software company in PR mode; channels dry-run, then live)
    → X9 ∥ X7 ∥ X8
    → X10 → X11
    → owner publishes bench results (decision 5)
@@ -1094,7 +1152,7 @@ Existing: 4a → C → 4b leftovers → S → R → P → dogfood.
 | Blob store diverges from git (a lost blob) | Hash-verified on every read, included in backups and snapshots, fail closed |
 | VM mode performance on big repositories | X8-0 measures it; VM mode stays optional; Seatbelt remains the default |
 | Lid-closed instructions need `sudo` | The owner runs the one command; Brahma never escalates; on battery, Brahma drains and sleeps |
-| Phone approval page as an attack surface | Tailnet HTTPS only (Serve, never Funnel), passkey over the payload hash, a Mac-only list for widening, an Opus security review and red team |
+| Phone approval page as an attack surface | Tailnet HTTPS only (Serve, never Funnel), a fresh passkey assertion per action over the exact amount, recipient or limit, bounded raises with cooling-off, a Mac-only list (accounts, secrets, trust-import, resume, channels on, cap removal), an Opus security review and red team |
 | Benchmark gaming or contamination | Post-cutoff issues, hidden tests, published raw results, baselines, three runs, open scorer |
 | Concept-budget creep | Every surface placed in §12; P's usability review gate applies to new panels |
 
@@ -1109,28 +1167,17 @@ Existing: 4a → C → 4b leftovers → S → R → P → dogfood.
 
 ## 16. Open questions for the owner ("theirs")
 
-Each has a recommended answer. Plan X is written so the recommended answer is what gets built unless the owner says otherwise.
+None open. Q1–Q4 were answered on 2026-11-21 and are recorded as owner decisions 16–19.
 
-- **Q1. Codex on a ChatGPT subscription.**
-  - **Question:** is Codex v1 acceptable in API-key mode only (an OpenAI API key, billed per use, under Brahma's dollar caps)?
-  - **Why it's yours:** under whole-process Seatbelt, a ChatGPT-plan login would put Codex's own token where agent commands could read it, which breaks the parity rule (decision 3). Subscription mode returns only if a probe shows Codex's own sandbox can hide its auth store and enforce a domain allowlist.
-  - **Recommended:** yes. Ship API-key Codex now and keep the subscription shape as a gated follow-up.
-- **Q2. Phone approvals.**
-  - **Question 1:** do you accept Tailscale, with MagicDNS and HTTPS certificates enabled, as a hard prerequisite? Passkeys need HTTPS, so the local-network option is dropped.
-  - **Question 2:** do you accept this split?
-    - **The phone decides:** ordinary asks, gates, deploys, and channel actions within an existing grant, including per-action approvals for tainted sessions.
-    - **The Mac only:** creating or widening grants, connecting accounts, all money actions, `trust-import`, turning channels back on, resuming after STOP, secrets and lab taint clears.
-    - **Either can:** press STOP and CHANNELS OFF.
-  - **Recommended:** yes to both. A native companion app is the alternative, at a much higher cost.
-- **Q3. PR mode: teammates' commits from GitHub.**
-  - **Question:** when teammates' commits arrive on remote `main`, which count as trusted?
-  - **Recommended:**
-    - **Trusted:** commits authored by, or merged through a PR approved by, a login on your trust list (default: the account that connected GitHub).
-    - **Not trusted (anything else):** marks the company as imported (tainted) until you run `brahma company trust-import`.
-- **Q4. Dogfood #2's non-software product.**
-  - **Question:** which family is it?
-  - **Why it's yours:** it decides which pack, kits, toolchains and previews X3 finishes first.
-  - **Recommended:** `content`, a 15–25 page research report with citations, built to a PDF/EPUB edition. It needs only pandoc, exercises the fact-check (`cite`) and owner sign-off paths, and is the lowest risk. `business` (a plan plus a financial model) is the runner-up.
+**Consequence for X3 staging (from decision 19):** X3 delivers, before dogfood #2:
+- pack schema v2;
+- the check-kit framework;
+- the blob store;
+- the complete `content` pack, with the `words`, `style`, `links`, `cite`, `spell`, `structure` and `build` kits;
+- the pandoc toolchain;
+- the EPUB preview and PDF diff.
+
+The `media`, `physical` and `business` packs, their toolchains and the audio and STEP previews follow after dogfood #2 **(controller's call)**.
 
 ## Follow-ups (not in Plan X)
 
