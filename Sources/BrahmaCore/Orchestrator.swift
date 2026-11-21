@@ -102,6 +102,11 @@ public actor Orchestrator {
     /// Consecutive lease turns that could not start for want of a worktree, per item.
     var worktreeFailures: [String: Int] = [:]
     static let maxWorktreeFailures = 3
+    /// Consecutive turns per agent the runner stopped before they ran because no exact record could name their process.
+    var unrecordedTurns: [String: Int] = [:]
+    static let maxUnrecordedTurns = 3
+    /// The reason that keys the engine alert raised after `maxUnrecordedTurns` such turns in a row.
+    static let unrecordedTurnReason = "turn-record"
     var lastSweep: [String: Date] = [:]
     /// Company-active time of each company's last deadlock/aging scan.
     var lastLiveness: [String: Double] = [:]
@@ -1398,7 +1403,18 @@ public actor Orchestrator {
         } catch {
             failure = String(describing: error)
         }
-        if !launched, !spentGrants.isEmpty {
+        // The runner stopped the child it had just spawned because no exact record could name it (its start time unreadable,
+        // or its leader record unwritable). Its `.spawned` event made it look launched, but the turn never ran (Task 9c fix
+        // round 4): for every account it was not launched. Its one-use grants are given back, an Ultra turn gets no charge
+        // floor and keeps its approval, and the item is charged nothing. Taint and the lab still treat it as launched (fail
+        // closed: a process did exist).
+        let unrecorded: Bool
+        switch runnerError as? TurnError {
+        case .startNotRecorded?, .leaderNotRecorded?: unrecorded = true
+        default: unrecorded = false
+        }
+        let ran = launched && !unrecorded
+        if !ran, !spentGrants.isEmpty {
             let ids = spentGrants
             attempt { try store.restoreGrants(ids: ids) }
             log("@\(agent.name)'s turn did not start: its one-use grants were given back")
@@ -1410,6 +1426,9 @@ public actor Orchestrator {
         // Only a rejection or overage is a limit; `allowed_warning` (any window) is not.
         let limited = lastInfo.map(UsageGate.isHardLimit) ?? false
         let end: TurnEnd
+        // Set where the turn ends on the fixed infrastructure delay with no infrastructure class (a missing worktree, a turn
+        // that could not be recorded): the delay outlives `noteOutcome` (it would otherwise retry on the very next tick).
+        var infraDelayed = false
         // The hold for an active usage limit; HTTP 429 with no rejecting rate-limit event records one so the gate closes for
         // every company.
         func noteUsageLimit() -> Date {
@@ -1448,6 +1467,7 @@ public actor Orchestrator {
                                            error: WorktreeSetupError(reason: unavailable.reason), now: now)
             attempt { try store.noteReviewWorktreeFailure(itemId: unavailable.itemId, agentId: agent.id, reason: unavailable.reason, now: now) }
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
+            infraDelayed = true
             end = .interrupted()
         } else if let unavailable = worktreeUnavailable {
             // Not the agent's fault and nothing ran: back to ready after the short fixed infrastructure delay. After
@@ -1470,6 +1490,7 @@ public actor Orchestrator {
                 log("worktree of \(unavailable.key) unavailable for @\(agent.name): \(unavailable.reason)")
             }
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
+            infraDelayed = true
             end = .interrupted()
         } else if Task.isCancelled {
             end = .interrupted(partial: result)
@@ -1477,18 +1498,25 @@ public actor Orchestrator {
             end = .interrupted()
         } else if agentCapped {
             end = .interrupted(partial: result)
-        } else if case .startNotRecorded? = runnerError as? TurnError {
-            // Nothing ran: the runner killed the child it had just spawned because its start time could not be read, so no exact
-            // record could name it (Task 9c fix round 3). The engine's fault, not the agent's: `interrupted`, so no charge to the
-            // agent or the item (no failure count, no backoff, the lease kept), the scheduler retries it as any interrupted turn,
-            // and the owner can see why in the activity.
+        } else if unrecorded {
+            // Nothing ran: the runner killed the child it had just spawned because no exact record could name it (Task 9c fix
+            // rounds 3 and 4). The engine's fault, not the agent's: `interrupted`, so no charge to the agent or the item (no
+            // failure count, no backoff, the lease kept, nothing spent: `ran` above). It is retried after the short fixed
+            // infrastructure delay, never on the next tick, and after `maxUnrecordedTurns` in a row the owner is alerted.
+            let why = if case .startNotRecorded? = runnerError as? TurnError {
+                "the start time of its process could not be read, so the engine could not record it"
+            } else {
+                "the engine could not write the record of its process"
+            }
             attempt {
                 try store.appendEvent(ActivityEvent(
                     companyId: agent.companyId, agentId: agent.id, turnId: turn.id, kind: .error,
-                    text: "@\(agent.name)'s turn was stopped before it ran: the start time of its process could not be read, so the "
-                        + "engine could not record it; it is retried",
+                    text: "@\(agent.name)'s turn was stopped before it ran: \(why); it is retried in "
+                        + "\(Int(EngineHealth.infraCooldown)) s",
                     createdAt: now))
             }
+            await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
+            infraDelayed = true
             end = .interrupted()
         } else if case .interrupted? = runnerError as? TurnError {
             // SIGTERM, or killed with background work pending (even after an early result): not the agent's doing.
@@ -1561,9 +1589,9 @@ public actor Orchestrator {
             observation: state.observation,
             modeModel: modeDecision?.model, modeEffort: modeDecision?.effort,
             stopReason: agentCapped ? UltraAccounting.agentCapStop : nil,
-            chargeAtLeastLE: ultraReserved && launched
+            chargeAtLeastLE: ultraReserved && ran
                 ? Self.ultraChargeFloor(ultraPlan, end: end, runnerError: runnerError, agentCapped: agentCapped) : nil,
-            releasesUltra: ultraReserved && launched)
+            releasesUltra: ultraReserved && ran)
         attempt {
             infra = try store.endTurn(agentId: agent.id, turn: turn, end: end,
                                       deliveredItemIds: (ctx?.inboxItemIds ?? []) + (ctx?.quietItemIds ?? []),
@@ -1617,10 +1645,22 @@ public actor Orchestrator {
             }
         }
         if ultraReserved, let plan = ultraPlan {
-            await endUltraRun(plan, turnId: turn.id, companyId: agent.companyId, launched: launched)
+            await endUltraRun(plan, turnId: turn.id, companyId: agent.companyId, launched: ran)
+        }
+        // A persistent cause (the process table or the run directory failing the engine) would retry forever, every 15 s:
+        // after `maxUnrecordedTurns` such turns in a row the owner hears of it once (engine-written text only).
+        if await noteUnrecordedTurn(agentId: agent.id, unrecorded) == Self.maxUnrecordedTurns {
+            attempt {
+                try EngineAlerts.raise(
+                    store: store,
+                    text: "@\(agent.name)'s last \(Self.maxUnrecordedTurns) turns were stopped before they ran: the engine could not "
+                        + "record their process (its start time could not be read, or the record could not be written). It keeps "
+                        + "retrying every \(Int(EngineHealth.infraCooldown)) s. If this goes on, relaunch Brahma.",
+                    now: now, reason: Self.unrecordedTurnReason, companyId: agent.companyId)
+            }
         }
         let outcome = end.outcome
-        await noteOutcome(agentId: agent.id, infra: infra, interrupted: outcome == .interrupted, now: now)
+        await noteOutcome(agentId: agent.id, infra: infra, interrupted: outcome == .interrupted, keepCooldown: infraDelayed, now: now)
     }
 
     /// `markTainted`, and when that write fails the flag file (fail closed, M2) before the error ends the turn.

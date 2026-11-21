@@ -50,11 +50,14 @@ public enum TurnError: Error, Equatable {
     /// `waitedSeconds` of awake time: no new turn of it starts. No pid is involved: the earlier turn has not ended yet.
     case earlierTurnInFlight(waitedSeconds: Int)
     /// The turn's leader could not be recorded under the run directory right after the spawn (M8): the owner-command ancestry
-    /// check would not know it, so the turn is stopped (fail closed) and the reason logged.
+    /// check would not know it, so the turn is stopped (fail closed) before its prompt is written and the reason logged. The
+    /// engine books it as `startNotRecorded` (Task 9c fix round 4).
     case leaderNotRecorded(reason: String)
     /// The leader's start time could not be read right after the spawn (Task 9c fix round 3), so no exact record could name it
     /// and no stop set could ever prove it: the child was killed at once (the runner's own unreaped child) and the turn never
-    /// ran. The engine's fault, not the agent's: not charged, retried after the infrastructure delay.
+    /// ran. The engine's fault, not the agent's: booked as not launched (nothing charged to the agent or the item, its one-use
+    /// grants and Ultra approval kept), retried after the fixed 15 s infrastructure delay (`EngineHealth.infraCooldown`), and
+    /// the owner alerted after `Orchestrator.maxUnrecordedTurns` in a row.
     case startNotRecorded
 }
 
@@ -350,9 +353,11 @@ public struct ClaudeProcessRunner: TurnRunning {
         // Linux has no per-fd equivalent; a Linux host must ignore SIGPIPE process-wide.
         _ = fcntl(input.fileDescriptor, F_SETNOSIGPIPE, 1)
         #endif
-        let prompt = Data(request.prompt.utf8)
+        // A turn stopped because it could not be recorded never gets its prompt (Task 9c fix round 4): it is booked as not
+        // launched, so it must not do any work in the grace before its kill lands.
+        let prompt = unrecorded == nil && !startUnreadable ? Data(request.prompt.utf8) : Data()
         DispatchQueue.global().async {
-            try? input.write(contentsOf: prompt)
+            if !prompt.isEmpty { try? input.write(contentsOf: prompt) }
             try? input.close()
         }
 

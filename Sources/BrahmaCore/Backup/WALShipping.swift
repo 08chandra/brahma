@@ -324,22 +324,22 @@ public final class WALShipper: @unchecked Sendable {
     /// litestream for this config exists that this engine cannot prove it started: the one the pid file names without a
     /// matching start (`StaleOutcome.unprovenLive`), or any other found by a read-only look at the process table
     /// (`foreignLitestream`, repeated before every launch, Task 9c fix round 3). Two litestreams must not replicate one
-    /// database, and nothing unproven is ever signalled; `onPaused` tells the owner.
+    /// database, and nothing unproven is ever signalled; `onPaused` tells the owner, called after the lock is released (it
+    /// writes to the database, and a concurrent `stop` must not wait on that).
     public func start() {
-        lock.lock(); defer { lock.unlock() }
-        guard task == nil else { return }
-        let outcome = Self.reapStale(paths: paths, grace: grace)
-        if let text = outcome.text { note(text) }
-        if case .unprovenLive(let pid, _) = outcome {
-            onPaused?(.foreign(pid: pid))
-            return
+        let paused: PauseReason? = lock.withLock {
+            guard task == nil else { return nil }
+            let outcome = Self.reapStale(paths: paths, grace: grace)
+            if let text = outcome.text { note(text) }
+            if case .unprovenLive(let pid, _) = outcome { return .foreign(pid: pid) }
+            if let pid = Self.foreignLitestream(paths: paths, excluding: nil) {
+                note("litestream pid \(pid) is replicating this database and this engine did not start it; WAL shipping is paused until it is stopped")
+                return .foreign(pid: pid)
+            }
+            task = Task.detached { [self] in await supervise() }
+            return nil
         }
-        if let pid = Self.foreignLitestream(paths: paths, excluding: nil) {
-            note("litestream pid \(pid) is replicating this database and this engine did not start it; WAL shipping is paused until it is stopped")
-            onPaused?(.foreign(pid: pid))
-            return
-        }
-        task = Task.detached { [self] in await supervise() }
+        if let paused { onPaused?(paused) }
     }
 
     /// A live `litestream replicate -config <this config>` of this user other than `excluding` (this shipper's own child), or
@@ -432,6 +432,7 @@ public final class WALShipper: @unchecked Sendable {
                     if attempts == 2 {
                         task = nil
                         lock.unlock()
+                        // Outside the lock, as on the foreign path: the owner's notice is a database write.
                         onPaused?(.startUnreadable)
                         continuation.resume(returning: -3)
                         return

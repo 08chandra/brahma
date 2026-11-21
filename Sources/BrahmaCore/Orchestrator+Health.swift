@@ -19,8 +19,9 @@ extension Orchestrator {
     // MARK: Called by finished turns
 
     /// A turn ended. Counts infrastructure failures for the network and account rules and starts the agent's
-    /// fixed cooldown; any other outcome breaks an account streak.
-    func noteOutcome(agentId: String, infra: InfraClass, interrupted: Bool, now: Date) {
+    /// fixed cooldown; any other outcome breaks an account streak. `keepCooldown`: the turn set the fixed delay itself with no
+    /// infrastructure class (a missing worktree, a turn that could not be recorded), so it stands.
+    func noteOutcome(agentId: String, infra: InfraClass, interrupted: Bool, keepCooldown: Bool = false, now: Date) {
         switch infra {
         case .network:
             health.networkFailures.append(now)
@@ -31,7 +32,15 @@ extension Orchestrator {
             if !interrupted { health.accountStreak = 0 }
         }
         // The cooldown itself is set before the turn is recorded (`setInfraCooldown`).
-        if infra == .none { infraCooldown[agentId] = nil }
+        if infra == .none, !keepCooldown { infraCooldown[agentId] = nil }
+    }
+
+    /// Counts the agent's turns in a row that were stopped because they could not be recorded (any other turn end resets it);
+    /// returns the count.
+    func noteUnrecordedTurn(agentId: String, _ unrecorded: Bool) -> Int {
+        guard unrecorded else { unrecordedTurns[agentId] = nil; return 0 }
+        unrecordedTurns[agentId, default: 0] += 1
+        return unrecordedTurns[agentId] ?? 0
     }
 
     // MARK: Background results
