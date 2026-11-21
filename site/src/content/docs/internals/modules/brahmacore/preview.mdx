@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-`PreviewRunner` runs every company's preview surfaces from the engine-accepted `main`. Each start is a fresh export of that commit under the data home, with no `.git`, keyed by surface, commit and start, so nothing a build left behind carries over. `WebAdapter` runs the surface's build to completion and then its server as a long-running process, both under the context's sandbox policy; a preview is ready once its URL answers and only if it listens on the loopback. `PortAllocator` hands out ports; `PreviewLog` writes the log through descriptor-safe opens; `EngineLayout` names the engine-owned places under a workspace's `.brahma`. The HTTP probe never follows a redirect.
+`PreviewRunner` runs every company's preview surfaces from the engine-accepted `main`. Each start is a fresh export of that commit under the data home, with no `.git`, keyed by surface, commit and start, so nothing a build left carries over. `WebAdapter` runs the surface's build, then its server as a long-running process, both under the context's sandbox policy; a preview is ready once its URL answers, and only if it listens on the loopback. `PortAllocator` hands out ports; `PreviewLog` writes the log through descriptor-safe opens; `EngineLayout` names the engine-owned places under `.brahma`. The HTTP probe never follows a redirect.
 
 ## Key types
 

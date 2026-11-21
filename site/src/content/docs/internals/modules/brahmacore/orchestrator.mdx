@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-`Orchestrator` is a Swift actor, one per machine, across all companies. At start it recovers turns an earlier engine left running. Each tick it checks the owner's stop and the engine holds, reaps leases, sweeps reviews, asks and timers, runs memory ingest and the handbook refresh, applies the usage gate and the turn budget, and then starts turns for the agents the scheduler picks; each turn runs as a child task that builds the sandbox, compiles the profile, runs the `claude` process and ends the turn in one store transaction. The `Orchestrator+<topic>.swift` files are its steps: budget, canary, checks, health, leases, merge, modes, preview, release, restore, review, sandbox, stop, timers, Ultra. `OrchestratorLock` is the `flock` on the data home that keeps a second engine out. `BrahmaPaths` names every place under the data home.
+`Orchestrator` is a Swift actor, one per machine. At start it recovers turns left running. Each tick it checks the stop and holds, reaps leases, sweeps reviews, asks and timers, runs memory ingest and the handbook refresh, applies the usage gate and the turn budget, then starts turns for the agents the scheduler picks; each turn is a child task that builds the sandbox, compiles the profile, runs the `claude` process and ends the turn in one store transaction. `OrchestratorLock` is the `flock` that keeps a second engine off the data home; `BrahmaPaths` names every place under it.
 
 ## Key types
 

@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-A turn is one `claude -p` child process: prompt on stdin, `stream-json` on stdout. `TurnProfile` is everything that decides how it is launched, and `TurnProfileCompiler` is the only place that becomes argv, a settings file and the engine-set child environment. `ClaudeProcessRunner` is the production `TurnRunning`; `StreamParser` turns each output line into typed events and `TurnStreamState` adds them up (the last result is the outcome, usage is summed). `RolePrompt` and `OperatingRules` are the system prompt; `TurnDigest` is the turn-start orientation built from the store and the workspace. `PreToolHook` is the engine's `PreToolUse` hook on `Agent`, `Task` and `Workflow`. `TurnAudit` is what the engine expects the CLI to report and checks afterwards.
+A turn is one `claude -p` child process: prompt on stdin, `stream-json` on stdout. `TurnProfile` is everything that decides how it is launched, and `TurnProfileCompiler` is the only place that becomes argv, a settings file and the child environment. `ClaudeProcessRunner` is the production `TurnRunning`; `StreamParser` turns each output line into typed events and `TurnStreamState` adds them up (the last result is the outcome, usage is summed). `RolePrompt` and `OperatingRules` are the system prompt; `TurnDigest` is the turn-start orientation. `PreToolHook` is the engine's `PreToolUse` hook on `Agent`, `Task` and `Workflow`. `TurnAudit` is what the engine expects the CLI to report.
 
 ## Key types
 

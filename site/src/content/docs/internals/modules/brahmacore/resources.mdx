@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-A resource is a file or a link the owner gives a company. `ResourceIntake.inspect` opens every dropped file without following links, checks it against the drop rules, gives it a default trust and scans it for secrets through the same descriptor, before anything is copied. `DropTrust` is the default: a file from inside a workspace or the data home, a document type, a large text file or anything macOS marked as downloaded is external until the owner says otherwise. `ContentScan` streams the secret scan in chunks so a large file never sits in memory whole. `ContentVault` is where the bytes live, `<home>/vault/<companyId>/resources/`, with engine-named read-only files. Every store operation here is the owner's; agents only read through `recall`.
+A resource is a file or link the owner gives a company. `ResourceIntake.inspect` opens every dropped file without following links, checks the drop rules, assigns a default trust and scans for secrets through the same descriptor, before anything is copied. `DropTrust` is the default: files from a workspace or the data home, document types, large text files and anything macOS marked as downloaded are external until the owner says otherwise. `ContentScan` streams the secret scan in chunks. `ContentVault` keeps the bytes outside every workspace as engine-named read-only files. Store operations here are the owner's; agents only read through `recall`.
 
 ## Key types
 

@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-An item's `CheckSpec` is a shell command. `CheckRunning` runs it and never throws: whatever went wrong is part of the `CheckOutcome` (exit code, timed out, the tail of its output). `ProcessCheckRunner` is the plain runner: its own process group, a timeout counted in awake time, SIGTERM then SIGKILL to the group, and never a signal to a group it has reaped. Checks never run in the workspace: a submission's run uses a detached checkout under the data home and a merge check a `.git`-free export. `CheckScripts` is where the engine keeps a check's saved scripts in the workspace, and `CheckReach` and `PathRules` classify what a check touches.
+An item's `CheckSpec` is a shell command. `CheckRunning` runs it and never throws: whatever went wrong is part of the `CheckOutcome` (exit code, timed out, output tail). `ProcessCheckRunner` is the plain runner: its own process group, an awake-time timeout, SIGTERM then SIGKILL to the group, never a signal to a group it has reaped. Checks never run in the workspace: a submission's run uses a detached checkout under the data home, a merge check a `.git`-free export. `CheckScripts` is where the engine keeps a check's saved scripts; `CheckReach` and `PathRules` classify what a check touches.
 
 ## Key types
 

@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-`MemoryIndex` is one scoped full-text index (FTS5) over everything a company has written: messages, items, asks, decisions, hand-offs, retros, handbook pages, resources and remembered facts. Every query is bound to one company and read through the access engine, so a doc of another company answers exactly like a missing one. `MemoryIngest` is the tick step that advances a cursor per source and upserts new docs; its cursors survive a restore. `EpisodeRecorder` writes an `episode` entry at the end of each successful turn, never through a model. `MemoryQuery` turns typed text into quoted FTS literals only. `Replay` renders one agent's day or one item's history; `StorageMeter` measures a company's footprint.
+`MemoryIndex` is one scoped full-text index (FTS5) over everything a company has written: messages, items, asks, decisions, hand-offs, retros, handbook, resources, remembered facts. Every query is bound to one company and filtered by the access engine; another company's doc answers like a missing one. `MemoryIngest`, the tick step, advances a cursor per source and upserts new docs; cursors survive a restore. `EpisodeRecorder` writes an `episode` entry after each successful turn, never through a model. `MemoryQuery` turns typed text into quoted FTS literals only. `Replay` renders one agent's day or one item's history; `StorageMeter` measures a company's footprint.
 
 ## Key types
 

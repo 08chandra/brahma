@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-An `OwnerNotice` is a message from the engine to the owner that is not an ask. `OwnerPrefs` holds the owner's notification, quiet-hours, digest and sleep settings. `DigestBuilder` renders the daily digest with agent text escaped so it can never form markup. `HumanTask` templates are the tasks the owner does by hand (an account, a domain, test keys), with engine-written steps, links and paste-back fields. `NoticeDelivery` plans which banners and pushes go out; `PushDispatcher` sends them through an ntfy or Pushover channel, coalesced outside quiet hours, capped per day, and marks them pushed only after a 2xx. `AskQuota` caps how many open owner requests one agent may hold at a time.
+An `OwnerNotice` is an engine message to the owner that is not an ask. `OwnerPrefs` holds the owner's notification, quiet-hours, digest and sleep settings. `DigestBuilder` renders the daily digest with agent text escaped, never markup. `HumanTask` templates are the tasks the owner does by hand (an account, a domain, test keys), with engine-written steps, links and paste-back fields. `NoticeDelivery` plans which banners and pushes go out; `PushDispatcher` sends them through an ntfy or Pushover channel, coalesced outside quiet hours, capped per day, marked pushed only after a 2xx. `AskQuota` caps the open owner requests one agent may hold.
 
 ## Key types
 

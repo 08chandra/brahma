@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-`Store` is the database. One `Store.swift` opens it, runs the migrations and owns the writer; the 47 `Store+<topic>.swift` files are the operations, one topic each: work items and leases, asks and their lifecycle, messaging, sprints, grants, secrets (names and flags; values stay in the vault), memory and memory entries, handbook, hosting and releases, previews, timers, notices and digests, taint, verification, the main guard, and the engine's own holds and credentials. Every process (the app, the CLI, the engine, each turn's MCP server) opens the same file, so the store is also the message bus. Every company-scoped query is bound to one `companyId`: another company's row answers like a missing one.
+`Store` is the database. `Store.swift` opens it, migrates it and owns the writer; the 47 `Store+<topic>.swift` files are the operations, one topic each: work items and leases, asks, messaging, sprints, grants, secrets (names and flags; values stay in the vault), memory, handbook, hosting and releases, previews, timers, notices and digests, taint, verification, the main guard, and the engine's holds and credentials. Every process (app, CLI, engine, each turn's MCP server) opens the same file, so the store is also the message bus. Every company-scoped query is bound to one `companyId`: another company's row answers like a missing one.
 
 ## Key types
 

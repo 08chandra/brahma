@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-Small pieces the rest of the library stands on. `AwakeTime` is the one clock every timeout counts on: it stands still while the Mac sleeps, so a backstop that spans a night does not fire on wake. `Blocking` runs git, `waitUntilExit` and lock polling on threads of their own so they never occupy a Swift concurrency worker; `EngineGitGuard` reports a git launch that happened outside one. `EngineFiles` opens, creates and removes engine files under a workspace's `.brahma` by descriptor only, so a planted link can never redirect it; `UnsafeEngineFile` is what it refuses. `SHA256` is pure Swift for security-relevant hashes; `StableHash` is FNV-1a for stable ids. `OwnerKey` and `OwnerKeyStore` are the owner's key and where its hash lives.
+Small pieces the library stands on. `AwakeTime` is the one clock every timeout counts on: it stands still while the Mac sleeps, so a backstop spanning a night never fires on wake. `Blocking` runs git, `waitUntilExit` and lock polling on their own threads, off the Swift concurrency pool; `EngineGitGuard` reports git launched elsewhere. `EngineFiles` works on engine files under `.brahma` by descriptor only, so a planted link cannot redirect it; `UnsafeEngineFile` is its refusal. `SHA256` is pure Swift for security hashes; `StableHash` is FNV-1a for stable ids. `OwnerKey` and `OwnerKeyStore` are the owner key and where its hash lives.
 
 ## Key types
 

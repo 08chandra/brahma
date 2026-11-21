@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-An extension is a Claude Code plugin folder reduced to what Brahma runs: skills, commands, agents and assets. `ExtensionImporter` copies a source into staging under size and name limits and drops every part Brahma does not run. `ExtensionValidator` is an allowlist over the staged package; hooks, MCP and LSP servers, binaries outside `assets/` and unparseable frontmatter are refused. `ExtensionLibrary` runs the install pipeline (validate, one owner-only ask, materialize read-only, bind) and computes the per-role mounts from `RoleBundle`. `BuiltinExtensions` are Brahma's own, pinned by tree hash. `ExtensionTry` runs a working folder in one throwaway turn.
+An extension is a `claude` plugin folder reduced to what Brahma runs: skills, commands, agents and assets. `ExtensionImporter` copies a source into staging under size and name limits and drops every part Brahma does not run. `ExtensionValidator` is an allowlist over the staged package; hooks, MCP and LSP servers, binaries outside `assets/` and unparseable frontmatter are refused. `ExtensionLibrary` runs the install pipeline (validate, one owner-only ask, materialize read-only, bind) and computes the per-role mounts from `RoleBundle`. `BuiltinExtensions` are Brahma's own, pinned by tree hash. `ExtensionTry` runs a working folder in one throwaway turn.
 
 ## Key types
 

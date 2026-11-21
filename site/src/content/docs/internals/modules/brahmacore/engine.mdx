@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-What the engine knows about itself as a whole, across companies. `Doctor` checks that the installed `claude` still behaves the way the engine's argv and stream parsing assume, and `ModeCanary` does the same for each compiled settings shape without calling a model. `EngineHealth` classifies failures and decides when the whole engine pauses on a hold (`HoldReason`: the CLI changed, disk is low, the network or account is down), and `EngineAlerts` puts those holds in front of the owner as asks. `PlanTier` is the owner's plan setting, which sizes the per-mode caps and new companies. `CompanyClock` is the company-active clock every timeout in the work system counts on.
+What the engine knows about itself as a whole, across companies. `Doctor` checks that the installed `claude` still behaves the way the engine's argv and stream parsing assume; `ModeCanary` does the same for each compiled settings shape without calling a model. `EngineHealth` classifies failures and decides when the whole engine pauses on a hold (`HoldReason`: the CLI changed, disk low, network or account down); `EngineAlerts` puts those holds in front of the owner as asks. `PlanTier` is the owner's plan setting, which sizes the per-mode caps and new companies. `CompanyClock` is the company-active clock the work system's timeouts count on.
 
 ## Key types
 

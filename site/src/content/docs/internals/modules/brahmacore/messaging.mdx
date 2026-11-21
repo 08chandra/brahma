@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-`MessageRouter` is the one way a message enters the store: it writes the row, fans out inbox items to the recipients, and marks which of them wake. `WakePolicy` is the rule: channel membership is not attention. Only a direct address (a DM or an `@mention`), a reply to someone the agent waits on, or a permitted `@here` or `@team` broadcast wakes an agent; broadcasts are limited to managers and executives and rate-limited per hour. System messages never wake anybody. A message whose text impersonates the owner is flagged on the way in.
+`MessageRouter` is the one way a message enters the store: it writes the row, fans out inbox items to the recipients, and marks which of them wake. `WakePolicy` is the rule: channel membership is not attention. Only a direct address (a DM or an `@mention`), a reply to someone the agent waits on, or a permitted `@here` or `@team` broadcast wakes an agent; broadcasts are limited to managers and executives, `2` per hour. System messages in channels never wake anybody; a system DM does. A message whose text impersonates the owner is flagged on the way in.
 
 ## Key types
 

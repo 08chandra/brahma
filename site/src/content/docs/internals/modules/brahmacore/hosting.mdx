@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-A `HostingAdapter` turns a company's hosting settings and a staged build into a `DeployPlan`: the steps to install the pinned provider CLI token-free, deploy, and roll back. Two adapters exist: Cloudflare Pages through `wrangler pages` (the default) and Vercel through the `vercel` CLI, whose token travels in the step's environment only, never in argv. `Placeholder` is the engine-written page a rollback deploys when there is no previous release. `ProviderProbe` is the hidden, owner-only live test of a provider with the owner's own token. The adapter headers record which parts were checked against the CLI packages' source only and not yet against the real service.
+A `HostingAdapter` turns hosting settings and a staged build into a `DeployPlan`: install the pinned provider CLI token-free, deploy, roll back. Two adapters exist: Cloudflare Pages through `wrangler pages` (the default) and Vercel through the `vercel` CLI, whose token travels in the step's environment only, never in argv. `Placeholder` is the engine-written page a rollback deploys when there is no previous release. `ProviderProbe` is the hidden, owner-only live test of a provider with the owner's own token. The adapter headers record which parts were checked against the CLI packages' source only, not yet against the real service.
 
 ## Key types
 

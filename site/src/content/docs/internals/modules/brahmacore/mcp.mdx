@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-`MCPServer` reads JSON-RPC lines on stdin and writes them on stdout; nothing else goes to stdout. It serves `CompanyTools`, the tools one agent may call: items, dependencies, comments and leases; posting messages; proposing decisions and asking the owner; memory and handbook; `request_access`, `request_secret` and `use_secret`; previews and deploys; `propose_extension`. Every call is attributed to the acting agent, checked against the live turn credential in the store, filtered by the agent's role, and refused while the session is tainted unless the tool is taint-safe. Output that lists agent-written text is JSON with sorted keys or quoted blocks, so no title can forge another entry. The server runs in its own process, `brahma mcp`, one per turn.
+`MCPServer` speaks JSON-RPC lines on stdin and stdout; nothing else goes to stdout. It serves `CompanyTools`, the tools one agent may call: items, dependencies, comments, leases; messages; decisions and asks to the owner; memory and handbook; `request_access`, `request_secret` and `use_secret`; previews and deploys; `propose_extension`. Every call is attributed to the acting agent, checked against the store's live turn credential, filtered by role, and refused while the session is tainted unless the tool is taint-safe. Agent-written text is listed as sorted-key JSON or quoted blocks, so no title can forge another entry. It runs as `brahma mcp`, one process per turn.
 
 ## Key types
 
@@ -25,7 +25,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 - **Calls Messaging.** Posts go through `MessageRouter`.
 - **Calls Safety and Org.** `TaintPolicy` decides which tools a tainted session may still call; the role filter is built from `CompanyToolNames`.
 - **Calls Memory.** `search_memory` and `recall` query `MemoryIndex`.
-- **Read by Sandbox.** The compiled Claude Code settings deny the high-risk tool names as `mcp__company__<tool>` permission rules.
+- **Read by Sandbox.** The compiled `claude` settings file denies the high-risk tool names as `mcp__company__<tool>` permission rules.
 
 <ModuleFacts module="BrahmaCore" area="MCP" />
 

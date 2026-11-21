@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-The rules of the work system, as pure code the store and the engine call. `WorkPolicy` says which actor may change which group of item fields. `AutonomyPolicy` and `AutonomyPreset` say how much the owner wants to be asked; `ReservedMatters` are the categories no preset ever approves. `TierBudget` is what an item may spend by effort tier: turns, counted tokens and cost. `ModePolicy.select` decides each turn's mode, model and effort with one reason string per step. `ReviewDigest` is what a reviewer sees: spec, check result and the real diff, never the author's conversation. `Handoff`, `ProgressFile` and `NotesFile` are the files agents leave for each other. `MergeSafety`, `Liveness`, `WaitForGraph` and `Watchdog` catch collisions, stalls, deadlocks and loops.
+The work system's rules, as pure code. `WorkPolicy` says which actor may change which item fields. `AutonomyPolicy` and `AutonomyPreset` say how much the owner wants to be asked; `ReservedMatters` are the categories no preset ever approves. `TierBudget` caps an item's turns, counted tokens and cost by effort tier. `ModePolicy.select` decides each turn's mode, model and effort with one reason string per step. `ReviewDigest` is what a reviewer sees: spec, check result and the real diff, never the author's conversation. `Handoff`, `ProgressFile` and `NotesFile` are what agents leave each other. `MergeSafety`, `Liveness`, `WaitForGraph` and `Watchdog` catch collisions, stalls, deadlocks and loops.
 
 ## Key types
 

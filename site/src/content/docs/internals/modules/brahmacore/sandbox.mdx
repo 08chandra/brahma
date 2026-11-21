@@ -1,6 +1,6 @@
 ---
 title: Sandbox
-description: "What one turn may touch, compiled into the Claude Code settings and shell prefix the claude process runs with, and into the Seatbelt profile for checks and previews with an egress proxy as their only way out."
+description: "What one turn may touch, compiled into the settings file and shell prefix the `claude` process runs with, and into the Seatbelt profile for checks and previews with an egress proxy as their only way out."
 ---
 
 import ModuleFacts from '../../../../../components/ModuleFacts.astro';
@@ -8,7 +8,7 @@ import SourceLink from '../../../../../components/SourceLink.astro';
 
 ## Purpose
 
-The sandbox is the structural wall between an agent's turn and the owner's data, the engine's database and files, the common git dir and the other agents. `SandboxScope.forTurn` computes what one turn may read and write. `ClaudeSettingsCompiler` turns that scope, the profile and the mode into the settings file every turn runs with (`--settings <file>`, `--setting-sources ""`), including the permission deny rules for the high-risk company tools. `ShellPrefix` is the Bash prefix. For commands the engine runs itself, `SeatbeltRunner` runs `sandbox-exec -p <profile> /bin/sh -c <command>` with a `SeatbeltProfile` built from the same scope, and `EgressProxy` is an HTTP CONNECT proxy on loopback that admits TLS to allowed domains on port 443 only. Off macOS, `UnavailableSandboxRunner` fails closed.
+The sandbox is the wall between an agent's turn and the owner's data, the engine's database and files, the common git dir and other agents. `SandboxScope.forTurn` computes what one turn may touch. `ClaudeSettingsCompiler` turns that scope, the profile and the mode into the settings file every turn runs with (`--settings <file>`, `--setting-sources ""`), with deny rules for the high-risk company tools; `ShellPrefix` is the Bash prefix. For commands the engine runs itself, `SeatbeltRunner` wraps `sandbox-exec` in a `SeatbeltProfile` from the same scope, and `EgressProxy` admits TLS only to allowed domains on port 443. Off macOS, `UnavailableSandboxRunner` fails closed.
 
 ## Key types
 
