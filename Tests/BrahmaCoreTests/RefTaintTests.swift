@@ -503,6 +503,25 @@ import GRDB
         #expect(Set(try h.rows().map(\.sha)).isSuperset(of: Set(shas.all)))
     }
 
+    /// R3-3 (Ruling 20): an item claimed, then released mid-turn by a session tainted only through the hook flag file
+    /// (`sessionTainted` stays false), is marked (5-lite's sticky `taintedOrigin`) at the turn's end: the marking takes the
+    /// turn's whole claim log, not only the leases held at the end, and reads the flag where the turn's taint is read.
+    @Test func flagOnlyTaintMarksItemReleasedMidTurn() async throws {
+        let h = try Holder(claim: false)
+        let (store, engId, companyId, key, home) = (h.store, h.eng.id, h.company.id, h.item.key, h.world.paths.home)
+        try await h.turn {
+            let tools = CompanyTools(store: store, companyId: companyId, agentId: engId)
+            _ = try tools.call(name: "claim_lease", arguments: ["key": .string(key)])
+            #expect(TaintFlag.write(home: home, agentId: engId, source: TaintPolicy.hookErrorSource))
+            _ = try tools.call(name: "release_lease", arguments: ["key": .string(key)])
+        }
+        #expect(try store.lease(itemId: h.item.id) == nil)
+        #expect(try store.agent(id: engId)?.sessionTainted == false)
+        #expect(try store.workItem(id: h.item.id)?.taintedOrigin == true)
+        // An item it never touched is left alone.
+        #expect(try store.workItem(id: h.other.id)?.taintedOrigin == false)
+    }
+
     /// R2-2 (ruling 6), R3-4: a release and a re-claim in the same turn can't move the start past commits made before them.
     /// Both claims have a trusted head here (the engine recorded each), so a record starting at the last claim would miss the
     /// first commit: only the first claim's head is the start.
@@ -1188,48 +1207,136 @@ import GRDB
         try Self.expectArtifact(cf2, b, tainted: false)
     }
 
-    /// Ruling 17: when the history can't say whether the item was tainted when it was published, the artifact is tainted: a
-    /// row cleared at the publish instant (equal times count), a row marked cleared without a time, a company row with no
-    /// item, an item done now or whose status changed since (the sticky mark may have dropped on the way to done), or a
-    /// lookup that fails.
+    /// Ruling 17 (ordered by Ruling 19's sequence): when the history can't say whether the item was tainted when it was
+    /// published, the artifact is tainted: a row marked cleared without a time, a company row with no item, an item done now
+    /// or whose status changed since (the sticky mark may have dropped on the way to done), a publish or clearing with no
+    /// sequence, or a lookup that fails. Each case on a fresh world whose artifact reads clean first.
     @Test func worktreeArtifactUndeterminableIsTainted() throws {
-        let cf = try CollabFixture()
-        let cId = cf.c.id
-        let (_, item, a) = try Self.worktreeArtifact(cf, taintedCommit: true, clearBeforePublish: true)
-        try Self.expectArtifact(cf, a, tainted: false)
-        func set(_ sql: String, _ args: StatementArguments) throws { try cf.store.writer.write { db in try db.execute(sql: sql, arguments: args) } }
-        let cleared = try #require(try cf.store.writer.read { db in
-            try Date.fetchOne(db, sql: "SELECT clearedAt FROM taintedCommit WHERE companyId = ? AND itemId = ?", arguments: [cId, item.id])
-        })
-        // Cleared at the very instant it was published.
-        try set("UPDATE taintedCommit SET clearedAt = ? WHERE companyId = ? AND itemId = ?", [a.createdAt, cId, item.id])
-        try Self.expectArtifact(cf, a, tainted: true)
+        func fresh() throws -> (cf: CollabFixture, item: WorkItem, a: Artifact) {
+            let cf = try CollabFixture()
+            let (_, item, a) = try Self.worktreeArtifact(cf, taintedCommit: true, clearBeforePublish: true)
+            try Self.expectArtifact(cf, a, tainted: false)
+            return (cf, item, a)
+        }
+        func set(_ cf: CollabFixture, _ sql: String, _ args: StatementArguments) throws {
+            try cf.store.writer.write { db in try db.execute(sql: sql, arguments: args) }
+        }
         // Marked cleared with no time.
-        try set("UPDATE taintedCommit SET clearedAt = NULL WHERE companyId = ? AND itemId = ?", [cId, item.id])
-        try Self.expectArtifact(cf, a, tainted: true)
-        try set("UPDATE taintedCommit SET clearedAt = ? WHERE companyId = ? AND itemId = ?", [cleared, cId, item.id])
-        try Self.expectArtifact(cf, a, tainted: false)
+        do {
+            let (cf, item, a) = try fresh()
+            try set(cf, "UPDATE taintedCommit SET clearedAt = NULL WHERE companyId = ? AND itemId = ?", [cf.c.id, item.id])
+            try Self.expectArtifact(cf, a, tainted: true)
+        }
         // A company row whose item is unknown (`itemId` NULL), not cleared before the publish.
-        try set("""
-            INSERT INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt) VALUES (?, ?, NULL, NULL, NULL, ?, ?)
-            """, [cId, String(repeating: "e", count: 40), "docs.swift.org", cf.now.addingTimeInterval(30)])
+        do {
+            let (cf, _, a) = try fresh()
+            try set(cf, """
+                INSERT INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt) VALUES (?, ?, NULL, NULL, NULL, ?, ?)
+                """, [cf.c.id, String(repeating: "e", count: 40), "docs.swift.org", cf.now.addingTimeInterval(30)])
+            try Self.expectArtifact(cf, a, tainted: true)
+        }
+        // A status change since the publish (its sequence is later, whatever its wall time).
+        do {
+            let (cf, item, a) = try fresh()
+            try set(cf, """
+                INSERT INTO workItemEvent (companyId, itemId, actorId, kind, text, createdAt, createdActive) VALUES (?, ?, 'owner', 'statusChanged', 'x', ?, 0)
+                """, [cf.c.id, item.id, cf.now.addingTimeInterval(-3600)])
+            try Self.expectArtifact(cf, a, tainted: true)
+        }
+        // The item done now (and not once it is back in progress with no event).
+        do {
+            let (cf, item, a) = try fresh()
+            try set(cf, "UPDATE workItem SET status = 'done' WHERE companyId = ? AND id = ?", [cf.c.id, item.id])
+            try Self.expectArtifact(cf, a, tainted: true)
+            try set(cf, "UPDATE workItem SET status = 'inProgress' WHERE companyId = ? AND id = ?", [cf.c.id, item.id])
+            try Self.expectArtifact(cf, a, tainted: false)
+        }
+        // No sequence for the publish, or for the clearing: their order can't be established.
+        do {
+            let (cf, _, a) = try fresh()
+            try set(cf, "DELETE FROM taintOrder WHERE companyId = ? AND kind = 'publish'", [cf.c.id])
+            try Self.expectArtifact(cf, a, tainted: true)
+        }
+        do {
+            let (cf, _, a) = try fresh()
+            try set(cf, "DELETE FROM taintOrder WHERE companyId = ? AND kind = 'clear'", [cf.c.id])
+            try Self.expectArtifact(cf, a, tainted: true)
+        }
+        // The order can't be read.
+        do {
+            let (cf, _, a) = try fresh()
+            try set(cf, "CREATE TEMP TABLE taintOrder (broken INTEGER)", [])
+            try Self.expectArtifact(cf, a, tainted: true)
+        }
+    }
+
+    /// R3-2 (Ruling 19): a clearing whose wall time is earlier than the publish but which happened after it (a later
+    /// sequence) leaves the artifact tainted: publish and clearing are ordered by the database's sequence, never the clock.
+    @Test func clearingOrderedBySequenceNotWallClock() throws {
+        let cf = try CollabFixture()
+        let (_, item, a) = try Self.worktreeArtifact(cf, taintedCommit: true)
         try Self.expectArtifact(cf, a, tainted: true)
-        try set("UPDATE taintedCommit SET clearedBy = 'owner', clearedAt = ? WHERE companyId = ? AND itemId IS NULL",
-                [cf.now.addingTimeInterval(-60), cId])
-        try Self.expectArtifact(cf, a, tainted: false)
-        // A status change since the publish, or the item done now.
-        try set("""
-            INSERT INTO workItemEvent (companyId, itemId, actorId, kind, text, createdAt, createdActive) VALUES (?, ?, 'owner', 'statusChanged', 'x', ?, 0)
-            """, [cId, item.id, a.createdAt.addingTimeInterval(5)])
+        try cf.store.clearTaintedCommits(itemId: item.id, by: "review", now: cf.now.addingTimeInterval(-3600))
+        let cleared = try #require(try cf.store.writer.read { db in
+            try Date.fetchOne(db, sql: "SELECT clearedAt FROM taintedCommit WHERE companyId = ? AND itemId = ?", arguments: [cf.c.id, item.id])
+        })
+        #expect(cleared < a.createdAt)
         try Self.expectArtifact(cf, a, tainted: true)
-        try set("DELETE FROM workItemEvent WHERE companyId = ? AND itemId = ? AND kind = 'statusChanged' AND text = 'x'", [cId, item.id])
-        try Self.expectArtifact(cf, a, tainted: false)
-        try set("UPDATE workItem SET status = 'done' WHERE companyId = ? AND id = ?", [cId, item.id])
+        #expect(try cf.store.refTaint(try cf.fx.ref(a.ref), companyId: cf.c.id) == (true, Store.sessionReason("docs.swift.org")))
+    }
+
+    // MARK: P2 fix round 3 (R3-1: publish-time taint through a neighbouring item's commit)
+
+    /// Item B (a designer's lease, branch at `branchAt`), its worktree artifact published a second after the fixture's clock.
+    static func neighbourArtifact(_ cf: CollabFixture, branchAt: String) throws -> (item: WorkItem, artifact: Artifact) {
+        let designer = try Self.designer(cf)
+        let (item, wt) = try Self.leased(cf, designer)
+        try cf.fx.git.git(["branch", "item/\(item.key)", branchAt])
+        try Data("<p>mock</p>\n".utf8).write(to: wt.appending(path: "mock.html"))
+        let a = try cf.store.publishArtifact(companyId: cf.c.id, by: .agent(designer.id), sourcePath: "mock.html", title: "Mock",
+                                             itemKey: nil, baseDirectory: wt, now: cf.now.addingTimeInterval(1))
+        #expect(!a.tainted)
+        return (item, a)
+    }
+
+    /// R3-1: B's branch holds X, a tainted commit recorded under ENG-1 (A). B's artifact is tainted when published; ENG-1's
+    /// review (or the owner's vouch) clearing X afterwards does not launder it.
+    @Test func neighbourCommitTaintedAtPublishStaysTainted() throws {
+        let cf = try CollabFixture()
+        let x = try Self.taintItemCommit(cf)
+        let (b, a) = try Self.neighbourArtifact(cf, branchAt: x)
+        #expect(b.key == "ENG-2")
         try Self.expectArtifact(cf, a, tainted: true)
-        try set("UPDATE workItem SET status = 'inProgress' WHERE companyId = ? AND id = ?", [cId, item.id])
+        try cf.store.clearTaintedCommits(itemId: cf.fx.item.id, by: "review", now: cf.now.addingTimeInterval(60))
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cf.c.id) == (false, nil))     // B is clean now
+        try Self.expectArtifact(cf, a, tainted: true)
+        #expect(try cf.store.refTaint(try cf.fx.ref(a.ref), companyId: cf.c.id) == (true, Store.sessionReason("docs.swift.org")))
+        let cf2 = try CollabFixture()
+        let x2 = try Self.taintItemCommit(cf2)
+        let (_, a2) = try Self.neighbourArtifact(cf2, branchAt: x2)
+        try cf2.store.vouchItem(itemId: cf2.fx.item.id, now: cf2.now.addingTimeInterval(60))
+        try Self.expectArtifact(cf2, a2, tainted: true)
+    }
+
+    /// R3-1 control: B never held a tainted commit (ENG-1's X is not on B's branch): clean, before and after X is cleared.
+    @Test func neighbourWithoutTaintedCommitIsClean() throws {
+        let cf = try CollabFixture()
+        _ = try Self.taintItemCommit(cf)
+        let (_, a) = try Self.neighbourArtifact(cf, branchAt: try cf.fx.head())
         try Self.expectArtifact(cf, a, tainted: false)
-        // The history can't be read.
-        try set("CREATE TEMP TABLE workItemEvent (broken INTEGER)", [])
+        try cf.store.clearTaintedCommits(itemId: cf.fx.item.id, by: "review", now: cf.now.addingTimeInterval(60))
+        try Self.expectArtifact(cf, a, tainted: false)
+    }
+
+    /// R3-1: once X (uncleared at the publish) is cleared, B's history must be read to know it never held X: a B branch that
+    /// can't be read is tainted.
+    @Test func neighbourBranchUnreadableIsTainted() throws {
+        let cf = try CollabFixture()
+        _ = try Self.taintItemCommit(cf)
+        let (b, a) = try Self.neighbourArtifact(cf, branchAt: try cf.fx.head())
+        try cf.store.clearTaintedCommits(itemId: cf.fx.item.id, by: "review", now: cf.now.addingTimeInterval(60))
+        try Self.expectArtifact(cf, a, tainted: false)
+        try cf.fx.git.git(["branch", "-D", "item/\(b.key)"])
         try Self.expectArtifact(cf, a, tainted: true)
     }
 

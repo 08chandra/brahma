@@ -1736,6 +1736,33 @@ enum Migrations {
                 t.column("createdAt", .datetime).notNull()
             }
         }
+        m.registerMigration("vC-taint-order") { db in
+            // Plan C, P2 fix round 3 (Ruling 19): a monotonic order (SQLite AUTOINCREMENT, never reused or reordered) of the
+            // events whose sequence decides an artifact's taint at publish: its publish, the clearing of a tainted commit, and
+            // a status change or merge of an item. Written by triggers in the same transaction as each, so no code path (4a's
+            // publish included: its table gets a trigger, not a column) can skip it. Wall-clock times never order these.
+            try db.create(table: "taintOrder") { t in
+                t.autoIncrementedPrimaryKey("seq")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("kind", .text).notNull()                // publish | clear | status
+                t.column("subject", .text).notNull()             // artifact id | taintedCommit sha | workItem id
+            }
+            try db.create(index: "taintOrder_subject", on: "taintOrder", columns: ["companyId", "kind", "subject"])
+            try db.execute(sql: """
+                CREATE TRIGGER taintOrder_publish AFTER INSERT ON artifact
+                BEGIN INSERT INTO taintOrder (companyId, kind, subject) VALUES (NEW.companyId, 'publish', NEW.id); END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER taintOrder_clear AFTER UPDATE OF clearedBy ON taintedCommit
+                WHEN OLD.clearedBy IS NULL AND NEW.clearedBy IS NOT NULL
+                BEGIN INSERT INTO taintOrder (companyId, kind, subject) VALUES (NEW.companyId, 'clear', NEW.sha); END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER taintOrder_status AFTER INSERT ON workItemEvent
+                WHEN NEW.kind IN ('statusChanged', 'merged')
+                BEGIN INSERT INTO taintOrder (companyId, kind, subject) VALUES (NEW.companyId, 'status', NEW.itemId); END
+                """)
+        }
     }
 }
 
