@@ -102,10 +102,13 @@ struct ArtifactPreviewView: View {
     }
 
     /// The owner's per-artifact scripts switch: a chip with the state, then a small bordered button that flips it; its help
-    /// says what turning scripts on means (engine-written).
+    /// says what turning scripts on means (engine-written). In the compact row only the button shows (its outlined or filled
+    /// icon is the state), so the kind and provenance chips keep their room.
     @ViewBuilder private func scriptsToggle(compact: Bool) -> some View {
         let on = model.artifactScriptsEnabled(artifact)
-        StatusChip(label: on ? ArtifactScripts.onChip : ArtifactScripts.offChip, color: on ? BrahmaTheme.warning : BrahmaTheme.text2)
+        if !compact {
+            StatusChip(label: on ? ArtifactScripts.onChip : ArtifactScripts.offChip, color: on ? BrahmaTheme.warning : BrahmaTheme.text2)
+        }
         let title = on ? ArtifactScripts.disableTitle : ArtifactScripts.enableTitle
         Button { model.setArtifactScripts(!on, artifact: artifact) } label: {
             Label(title, systemImage: on ? "curlybraces.square.fill" : "curlybraces.square")
