@@ -34,10 +34,13 @@ struct VouchGroup: ParsableCommand {
         }
     }
 
-    /// `brahma vouch file <company> <path>` (C2b fix round 5, Ruling 38): the secret gate refused a file for its structure
-    /// (a PDF whose structure couldn't be verified, a format or archive method it can't open) and named this command. The
-    /// owner vouches for exactly the bytes it refused under that name in that company (`Store.vouchFile`; `--sha256` picks
-    /// one when the name was refused as more than one version): those bytes then pass the structure check, while every
+    /// `brahma vouch file <company> --sha256 <64 hex> <path>` (C2b fix round 5, Ruling 38): the secret gate refused a file for
+    /// its structure (a PDF whose structure couldn't be verified, a format or archive method it can't open) and named this
+    /// command. The owner vouches for exactly the bytes it refused under that name in that company (`Store.vouchFile`).
+    /// Breaker B-2 and Ruling 40 (B-4): `--sha256` is required, the full hash, and must name the version refused LAST for
+    /// that file (identified by its canonical name; a shown name only when it is one file's), so a command printed
+    /// before the file was rewritten vouches nothing (the refusal shows the current version): those bytes then pass the
+    /// structure check, while every
     /// byte the gate can read is still scanned for stored secrets and secret patterns. Any change to the file ends the
     /// vouch. No taint is cleared. An owner activity line; the refusal's alert is closed.
     struct VouchFile: ParsableCommand {
@@ -46,7 +49,7 @@ struct VouchGroup: ParsableCommand {
             abstract: "Vouch for a file Brahma refused for its structure (owner only).")
         @Argument(help: "Company name or slug.") var company: String
         @Argument(help: "The file's name as the refusal shows it.") var path: String
-        @Option(help: "The refused version's sha256 (at least 12 hex digits), when there is more than one.") var sha256: String?
+        @Option(help: "The refused version's full sha256 (64 hex digits), as the refusal prints it (required).") var sha256: String
 
         func run() throws {
             try requireOwnerShell()

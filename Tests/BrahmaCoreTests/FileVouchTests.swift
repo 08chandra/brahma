@@ -24,15 +24,16 @@ struct UnverifiedPDFReader: ArchiveReader {
     static let known = SecretGateTests.known
     static let value = SecretGateTests.value
 
-    /// The suffix every structure refusal ends with: the exact command for `canonical` in `company`.
-    static func command(_ company: Company, _ canonical: String) -> String {
-        " — the owner can vouch for this exact file: brahma vouch file \(company.slug) \(canonical)"
+    /// The suffix every structure refusal ends with: the exact command for `canonical` in `company`, naming the refused
+    /// bytes' full sha256 (breaker B-2, Ruling 40 (B-4): all 64 hex digits, which the command requires).
+    static func command(_ company: Company, _ canonical: String, _ data: Data) -> String {
+        " — the owner can vouch for this exact file: brahma vouch file \(company.slug) --sha256 \(SHA256.hex(data)) \(SecretGate.shellQuoted(canonical))"
     }
 
-    /// `error` without the vouch command for `canonical` in `company` when it ends with exactly that command (the tests of
-    /// the refusals themselves compare the rest).
-    static func withoutCommand(_ error: WorkError, _ company: Company, _ canonical: String) -> WorkError {
-        let suffix = command(company, canonical)
+    /// `error` without the vouch command for `canonical` in `company` (for `data`) when it ends with exactly that command
+    /// (the tests of the refusals themselves compare the rest).
+    static func withoutCommand(_ error: WorkError, _ company: Company, _ canonical: String, _ data: Data) -> WorkError {
+        let suffix = command(company, canonical, data)
         guard case .invalid(let message) = error, message.hasSuffix(suffix) else { return error }
         return .invalid(String(message.dropLast(suffix.count)))
     }
@@ -75,7 +76,7 @@ struct UnverifiedPDFReader: ArchiveReader {
         let reader = try EmbeddedContentTests.reader(cf)
         let file = Self.anomalous()
         let refused = outcome { try check(cf, file, archives: reader) }
-        #expect(refused == "this PDF's structure couldn't be verified" + Self.command(cf.c, "doc.pdf"), "\(refused)")
+        #expect(refused == "this PDF's structure couldn't be verified" + Self.command(cf.c, "doc.pdf", file), "\(refused)")
         let rows = try vouchRows(cf, cf.c.id)
         #expect(rows.count == 1 && (rows.first?["sha256"] as String?) == SHA256.hex(file) && (rows.first?["vouchedAt"] as Date?) == nil)
         let cId = cf.c.id
@@ -88,7 +89,7 @@ struct UnverifiedPDFReader: ArchiveReader {
         #expect(try alerts().filter { Store.isFileVouchAlert($0) }.count == 1)
         let taintBefore = try dumpTaint(cf)
 
-        let vouch = try cf.store.vouchFile(companyId: cId, canonical: "doc.pdf", now: cf.now)
+        let vouch = try cf.store.vouchFile(companyId: cId, canonical: "doc.pdf", sha256: Self.full(file), now: cf.now)
         #expect(vouch.sha256 == SHA256.hex(file))
         #expect(outcome { try check(cf, file, archives: reader) } == "clean")
         #expect(try alerts().filter { Store.isFileVouchAlert($0) }.isEmpty, "the refusal alert is still open after the vouch")
@@ -102,14 +103,14 @@ struct UnverifiedPDFReader: ArchiveReader {
         // Another canonical name, or the same name and bytes in company B: not vouched.
         #expect(outcome { try check(cf, file, canonical: "other.pdf", archives: reader) }.hasPrefix("this PDF's structure couldn't be verified"))
         let other = outcome { try check(cf, file, companyId: cf.fx.d.id, archives: reader) }
-        #expect(other == "this PDF's structure couldn't be verified" + Self.command(cf.fx.d, "doc.pdf"), "\(other)")
+        #expect(other == "this PDF's structure couldn't be verified" + Self.command(cf.fx.d, "doc.pdf", file), "\(other)")
 
         // What the gate can read is still scanned: a stored value, and a secret pattern, seen only decoded.
         for (name, hidden) in [("value.pdf", "key \(Self.value)"), ("pattern.pdf", "key \(SecretGateTests.aws)")] {
             let pdf = Self.anomalous(hidden: hidden)
             #expect(!String(decoding: pdf, as: UTF8.self).contains(hidden))
             #expect(outcome { try check(cf, pdf, canonical: name, archives: reader) }.hasPrefix("this PDF's structure couldn't be verified"))
-            _ = try cf.store.vouchFile(companyId: cId, canonical: name, now: cf.now)
+            _ = try cf.store.vouchFile(companyId: cId, canonical: name, sha256: Self.full(pdf), now: cf.now)
             let after = outcome { try check(cf, pdf, canonical: name, archives: reader) }
             #expect(after.contains("contains a stored secret") || after.contains("looks like it contains a secret"), "\(name): \(after)")
         }
@@ -123,25 +124,25 @@ struct UnverifiedPDFReader: ArchiveReader {
         let cId = cf.c.id
         let clean = UnverifiedPDFReader(parts: [PDFPart(kind: .decodedStream, data: Data("hello".utf8))])
         let pdf = Data("%PDF-1.7 a file the helper flagged".utf8)
-        #expect(outcome { try check(cf, pdf, archives: clean) } == "this PDF's structure couldn't be verified" + Self.command(cf.c, "doc.pdf"))
-        _ = try cf.store.vouchFile(companyId: cId, canonical: "doc.pdf", now: cf.now)
+        #expect(outcome { try check(cf, pdf, archives: clean) } == "this PDF's structure couldn't be verified" + Self.command(cf.c, "doc.pdf", pdf))
+        _ = try cf.store.vouchFile(companyId: cId, canonical: "doc.pdf", sha256: Self.full(pdf), now: cf.now)
         #expect(outcome { try check(cf, pdf, archives: clean) } == "clean")
         // (Other bytes: verdicts are cached by the bytes, and a real reader reads the same bytes the same way.)
         let held = Data("%PDF-1.7 another flagged file".utf8)
         let holding = UnverifiedPDFReader(parts: [PDFPart(kind: .decodedStream, data: Data("key \(Self.value)".utf8))])
         #expect(outcome { try check(cf, held, canonical: "held.pdf", archives: holding) }.hasPrefix("this PDF's structure couldn't be verified"))
-        _ = try cf.store.vouchFile(companyId: cId, canonical: "held.pdf", now: cf.now)
+        _ = try cf.store.vouchFile(companyId: cId, canonical: "held.pdf", sha256: Self.full(held), now: cf.now)
         #expect(outcome { try check(cf, held, canonical: "held.pdf", archives: holding) }.contains("contains a stored secret"))
 
         let gz = Data([0x1F, 0x8B, 0x08, 0x00]) + Data("compressed bytes".utf8)
         let gzRefusal = "logs.gz is compressed as gzip, which can't be scanned for secrets; share the files inside instead"
         #expect(outcome { try check(cf, gz, ext: "gz", canonical: "logs.gz", archives: UnavailableArchiveReader()) }
-                == gzRefusal + Self.command(cf.c, "logs.gz"))
-        _ = try cf.store.vouchFile(companyId: cId, canonical: "logs.gz", now: cf.now)
+                == gzRefusal + Self.command(cf.c, "logs.gz", gz))
+        _ = try cf.store.vouchFile(companyId: cId, canonical: "logs.gz", sha256: Self.full(gz), now: cf.now)
         #expect(outcome { try check(cf, gz, ext: "gz", canonical: "logs.gz", archives: UnavailableArchiveReader()) } == "clean")
         let gzKey = Data([0x1F, 0x8B, 0x08, 0x00]) + Data(" key \(SecretGateTests.aws) ".utf8)
         #expect(outcome { try check(cf, gzKey, ext: "gz", canonical: "key.gz", archives: UnavailableArchiveReader()) }.hasPrefix("key.gz is compressed as gzip"))
-        _ = try cf.store.vouchFile(companyId: cId, canonical: "key.gz", now: cf.now)
+        _ = try cf.store.vouchFile(companyId: cId, canonical: "key.gz", sha256: Self.full(gzKey), now: cf.now)
         #expect(outcome { try check(cf, gzKey, ext: "gz", canonical: "key.gz", archives: UnavailableArchiveReader()) }.hasPrefix("pattern"))
 
         // The stored member's bytes are a stand-in of the same length; the reader hands back what it would inflate.
@@ -151,8 +152,8 @@ struct UnverifiedPDFReader: ArchiveReader {
         }
         let members = StubArchiveReader(members: [("readme.txt", Data("key \(Self.value)".utf8))])
         let method = "this archive uses compression or encryption that can't be scanned for secrets"
-        #expect(outcome { try check(cf, zip, ext: "zip", canonical: "bundle.zip", archives: members) } == method + Self.command(cf.c, "bundle.zip"))
-        _ = try cf.store.vouchFile(companyId: cId, canonical: "bundle.zip", now: cf.now)
+        #expect(outcome { try check(cf, zip, ext: "zip", canonical: "bundle.zip", archives: members) } == method + Self.command(cf.c, "bundle.zip", zip))
+        _ = try cf.store.vouchFile(companyId: cId, canonical: "bundle.zip", sha256: Self.full(zip), now: cf.now)
         #expect(outcome { try check(cf, zip, ext: "zip", canonical: "bundle.zip", archives: members) }.contains("contains a stored secret"))
         let cleanZip = try SecretGateTests.zip {
             $0.add("secret.bin", "cipher text", flags: 1)
@@ -160,24 +161,24 @@ struct UnverifiedPDFReader: ArchiveReader {
         }
         let cleanMembers = StubArchiveReader(members: [("readme.txt", Data("hello".utf8))])
         #expect(outcome { try check(cf, cleanZip, ext: "zip", canonical: "clean.zip", archives: cleanMembers) }.hasPrefix(method))
-        _ = try cf.store.vouchFile(companyId: cId, canonical: "clean.zip", now: cf.now)
+        _ = try cf.store.vouchFile(companyId: cId, canonical: "clean.zip", sha256: Self.full(cleanZip), now: cf.now)
         #expect(outcome { try check(cf, cleanZip, ext: "zip", canonical: "clean.zip", archives: cleanMembers) } == "clean")
 
-        // One name refused as two versions: the vouch says which (by sha256), or refuses to guess.
+        // One name refused as two versions: the vouch takes the one refused last, by its sha256 (breaker B-2: always given).
         let v1 = Data("%PDF-1.7 version one".utf8), v2 = Data("%PDF-1.7 version two".utf8)
         for v in [v1, v2] { _ = outcome { try check(cf, v, canonical: "multi.pdf", archives: clean) } }
-        #expect(throws: WorkError.self) { try cf.store.vouchFile(companyId: cId, canonical: "multi.pdf", now: cf.now) }
         #expect(throws: WorkError.self) { try cf.store.vouchFile(companyId: cId, canonical: "multi.pdf", sha256: "abc", now: cf.now) }
-        let picked = try cf.store.vouchFile(companyId: cId, canonical: "multi.pdf", sha256: String(SHA256.hex(v2).prefix(12)), now: cf.now)
+        #expect(throws: WorkError.self) { try cf.store.vouchFile(companyId: cId, canonical: "multi.pdf", sha256: "zz" + Self.full(v2), now: cf.now) }
+        let picked = try cf.store.vouchFile(companyId: cId, canonical: "multi.pdf", sha256: Self.full(v2), now: cf.now)
         #expect(picked.sha256 == SHA256.hex(v2))
         #expect(outcome { try check(cf, v2, canonical: "multi.pdf", archives: clean) } == "clean")
         #expect(outcome { try check(cf, v1, canonical: "multi.pdf", archives: clean) }.hasPrefix("this PDF's structure couldn't be verified"))
 
         // Nothing refused under that name: nothing to vouch for. A refusal that isn't about structure records nothing.
-        #expect(throws: WorkError.self) { try cf.store.vouchFile(companyId: cId, canonical: "never.pdf", now: cf.now) }
+        #expect(throws: WorkError.self) { try cf.store.vouchFile(companyId: cId, canonical: "never.pdf", sha256: Self.full(pdf), now: cf.now) }
         let unread = Data("%PDF-1.7 a file no helper read".utf8)
         #expect(outcome { try check(cf, unread, canonical: "no-helper.pdf", archives: UnavailableArchiveReader()) } == "PDFs can't be scanned on this machine")
-        #expect(throws: WorkError.self) { try cf.store.vouchFile(companyId: cId, canonical: "no-helper.pdf", now: cf.now) }
+        #expect(throws: WorkError.self) { try cf.store.vouchFile(companyId: cId, canonical: "no-helper.pdf", sha256: Self.full(unread), now: cf.now) }
         // A name that holds a stored value is never echoed: not in the refusal, the alert, or the record.
         let named = "src/\(Self.value).pdf"
         let message = outcome { try check(cf, pdf, canonical: named, archives: clean) }
@@ -187,6 +188,143 @@ struct UnverifiedPDFReader: ArchiveReader {
             #expect(!message.contains(piece))
             #expect(!dump.contains(piece), "the database holds a piece of the value")
         }
+    }
+
+    /// `data`'s full sha256 (64 hex digits), as the refusal prints it (Ruling 40, B-4).
+    static func full(_ data: Data) -> String { SHA256.hex(data) }
+
+    func fileAlerts(_ cf: CollabFixture) throws -> [Ask] {
+        let cId = cf.c.id
+        return try cf.store.writer.read { db in
+            try Ask.fetchAll(db, sql: "SELECT * FROM ask WHERE companyId = ? AND kind = 'engineAlert' AND status = 'pendingOwner'", arguments: [cId])
+        }.filter { Store.isFileVouchAlert($0) }
+    }
+
+    func vouchRefusal(_ body: () throws -> FileVouch) -> String? {
+        do { _ = try body(); return nil } catch let e as WorkError { return e.message } catch { return "\(error)" }
+    }
+
+    /// Breaker B-2 (Ruling 28's class, a stale action): the command printed in the refusal and in the alert names the
+    /// refused bytes' sha256 (12 hex digits), and the vouch needs it. It vouches only the version the gate refused LAST under
+    /// that name: the command printed for an earlier version (the file rewritten since, and refused again) is refused, and
+    /// the message shows the version refused last and its command; that one vouches it. When the old version comes back
+    /// (refused again), its own command vouches it. The reviewer's order too: v1 vouched in the Inbox, v2 refused, v1's
+    /// command pasted: refused (never a "vouched" that leaves v2 refused without saying so).
+    @Test func staleVouchCommandRefused() throws {
+        let cf = try CollabFixture()
+        let cId = cf.c.id
+        let reader = UnverifiedPDFReader(parts: [PDFPart(kind: .decodedStream, data: Data("hello".utf8))])
+        let structure = "this PDF's structure couldn't be verified"
+        let v1 = Data("%PDF-1.7 spec, version one".utf8), v2 = Data("%PDF-1.7 spec, version two".utf8)
+        let (p1, p2) = (Self.full(v1), Self.full(v2))
+        let first = outcome { try check(cf, v1, canonical: "spec.pdf", archives: reader) }
+        #expect(first == structure + Self.command(cf.c, "spec.pdf", v1), "\(first)")
+        let summaries = try fileAlerts(cf).map(\.summary)
+        #expect(summaries.contains { $0.contains("brahma vouch file \(cf.c.slug) --sha256 \(p1) spec.pdf") }, "\(summaries)")
+        // An agent rewrites the file: v2 is refused too, its own command printed.
+        #expect(outcome { try check(cf, v2, canonical: "spec.pdf", archives: reader) } == structure + Self.command(cf.c, "spec.pdf", v2))
+        // v1's command, pasted now: refused, naming v2 and its command; nothing vouched.
+        let stale = vouchRefusal { try cf.store.vouchFile(companyId: cId, canonical: "spec.pdf", sha256: p1, now: cf.now) }
+        #expect(stale?.contains("brahma vouch file \(cf.c.slug) --sha256 \(p2) spec.pdf") == true, "\(stale ?? "vouched")")
+        #expect(try vouchRows(cf, cId).allSatisfy { ($0["vouchedAt"] as Date?) == nil })
+        #expect(outcome { try check(cf, v2, canonical: "spec.pdf", archives: reader) }.hasPrefix(structure))
+        // v2's command vouches v2 (and only v2).
+        #expect(try cf.store.vouchFile(companyId: cId, canonical: "spec.pdf", sha256: p2, now: cf.now).sha256 == SHA256.hex(v2))
+        #expect(outcome { try check(cf, v2, canonical: "spec.pdf", archives: reader) } == "clean")
+        #expect(outcome { try check(cf, v1, canonical: "spec.pdf", archives: reader) }.hasPrefix(structure))
+        // v1 came back and was refused again just now: it is the version refused last; its command vouches it.
+        #expect(try cf.store.vouchFile(companyId: cId, canonical: "spec.pdf", sha256: p1, now: cf.now).sha256 == SHA256.hex(v1))
+        #expect(outcome { try check(cf, v1, canonical: "spec.pdf", archives: reader) } == "clean")
+
+        // The reviewer's order.
+        let n1 = Data("%PDF-1.7 notes, version one".utf8), n2 = Data("%PDF-1.7 notes, version two".utf8)
+        _ = outcome { try check(cf, n1, canonical: "notes.pdf", archives: reader) }
+        let alert = try #require(try fileAlerts(cf).first { $0.summary.contains("notes.pdf") })
+        #expect(try cf.store.vouchFile(alertAskId: alert.id, now: cf.now).sha256 == SHA256.hex(n1))
+        #expect(outcome { try check(cf, n2, canonical: "notes.pdf", archives: reader) } == structure + Self.command(cf.c, "notes.pdf", n2))
+        let pasted = vouchRefusal { try cf.store.vouchFile(companyId: cId, canonical: "notes.pdf", sha256: Self.full(n1), now: cf.now) }
+        #expect(pasted?.contains("--sha256 \(Self.full(n2))") == true, "\(pasted ?? "vouched")")
+        #expect(outcome { try check(cf, n2, canonical: "notes.pdf", archives: reader) }.hasPrefix(structure))
+        #expect(outcome { try check(cf, n1, canonical: "notes.pdf", archives: reader) } == "clean")
+    }
+
+    /// Ruling 40 (B-4): the vouch binds the exact file. Only the full 64-hex sha256 vouches (a 12-hex prefix is refused,
+    /// nothing vouched). The name is matched by its canonical identity only: two files whose names show the same (here two
+    /// long names cut at the same place) make the shown name ambiguous: refused, both listed, neither vouched; one file's
+    /// name with the other's sha256 vouches nothing. Each alert's Inbox action vouches exactly the (name, bytes) it showed.
+    @Test func vouchBindsTheExactFileAndFullHash() throws {
+        let cf = try CollabFixture()
+        let cId = cf.c.id
+        let reader = UnverifiedPDFReader(parts: [PDFPart(kind: .decodedStream, data: Data("hello".utf8))])
+        let structure = "this PDF's structure couldn't be verified"
+        // A prefix never vouches; the full hash does.
+        let doc = Data("%PDF-1.7 a flagged report".utf8)
+        _ = outcome { try check(cf, doc, canonical: "report.pdf", archives: reader) }
+        let short = vouchRefusal { try cf.store.vouchFile(companyId: cId, canonical: "report.pdf", sha256: String(SHA256.hex(doc).prefix(12)), now: cf.now) }
+        #expect(short?.contains("64") == true, "\(short ?? "vouched")")
+        #expect(try vouchRows(cf, cId).allSatisfy { ($0["vouchedAt"] as Date?) == nil })
+        #expect(try cf.store.vouchFile(companyId: cId, canonical: "report.pdf", sha256: Self.full(doc), now: cf.now).sha256 == SHA256.hex(doc))
+        #expect(outcome { try check(cf, doc, canonical: "report.pdf", archives: reader) } == "clean")
+
+        // Two files whose names show the same.
+        let stem = "docs/" + String(repeating: "a", count: 260)
+        let (nameA, nameB) = (stem + "-one.pdf", stem + "-two.pdf")
+        let shownA = SecretGate.shown(nameA, knownValues: Self.known)
+        #expect(shownA == SecretGate.shown(nameB, knownValues: Self.known) && shownA != nameA)
+        let a = Data("%PDF-1.7 file A".utf8), b = Data("%PDF-1.7 file B".utf8)
+        #expect(outcome { try check(cf, a, canonical: nameA, archives: reader) }.hasPrefix(structure))
+        #expect(outcome { try check(cf, b, canonical: nameB, archives: reader) }.hasPrefix(structure))
+        func vouched(_ data: Data) throws -> Bool {
+            try vouchRows(cf, cId).contains { ($0["sha256"] as String?) == SHA256.hex(data) && ($0["vouchedAt"] as Date?) != nil }
+        }
+        let ambiguous = vouchRefusal { try cf.store.vouchFile(companyId: cId, canonical: shownA, sha256: Self.full(a), now: cf.now) }
+        #expect(ambiguous?.contains("more than one file") == true && ambiguous?.contains(String(SHA256.hex(a).prefix(12))) == true
+                && ambiguous?.contains(String(SHA256.hex(b).prefix(12))) == true, "\(ambiguous ?? "vouched")")
+        #expect(try !vouched(a) && !vouched(b))
+        // A's name with B's bytes: nothing (B is not a version of A).
+        #expect(vouchRefusal { try cf.store.vouchFile(companyId: cId, canonical: nameA, sha256: Self.full(b), now: cf.now) } != nil)
+        #expect(try !vouched(a) && !vouched(b))
+        // B's alert vouches B, exactly.
+        let alertB = try #require(try fileAlerts(cf).first { $0.summary.contains(SHA256.hex(b)) })
+        let rowB = try cf.store.vouchFile(alertAskId: alertB.id, now: cf.now)
+        #expect(rowB.sha256 == SHA256.hex(b) && rowB.canonicalHash == Store.canonicalHash(nameB))
+        #expect(try vouched(b) && !vouched(a))
+        #expect(outcome { try check(cf, b, canonical: nameB, archives: reader) } == "clean")
+        #expect(outcome { try check(cf, a, canonical: nameA, archives: reader) }.hasPrefix(structure))
+        // A by its own name and full hash.
+        #expect(try cf.store.vouchFile(companyId: cId, canonical: nameA, sha256: Self.full(a), now: cf.now).canonicalHash == Store.canonicalHash(nameA))
+        #expect(outcome { try check(cf, a, canonical: nameA, archives: reader) } == "clean")
+        // B's vouch is B's name's: B's bytes under A's name are refused.
+        #expect(outcome { try check(cf, b, canonical: nameA, archives: reader) }.hasPrefix(structure))
+    }
+
+    /// Breaker B-3: a PDF the helper could not read back at all (more than 64 revisions, so nothing was read; or an
+    /// unverified read whose output does not hold together) is refused, and the refusal says it can't be vouched for and
+    /// why: never the vouch command, nothing recorded, no alert, even when the owner already vouched for those bytes.
+    @Test func unreadableUnverifiedPDFsCantBeVouched() throws {
+        let cf = try CollabFixture()
+        let cId = cf.c.id
+        let pdf = Data("%PDF-1.7 a file the helper flagged".utf8)
+        _ = outcome { try check(cf, pdf, archives: UnverifiedPDFReader(parts: [])) }
+        _ = try cf.store.vouchFile(companyId: cId, canonical: "doc.pdf", sha256: Self.full(pdf), now: cf.now)
+        func scripted(_ code: Int32, _ output: Data) -> SandboxedUnzipReader {
+            SandboxedUnzipReader(runner: ScriptedRunner(parts: output, outcome: CheckOutcome(exitCode: code, timedOut: false, tail: "")),
+                                 scratch: { try cf.vault.makeTempDir() }, pdfHelper: URL(fileURLWithPath: "/usr/bin/true"))
+        }
+        let garbled = outcome { try check(cf, pdf, archives: scripted(5, Data("BRAHMA-PDF/1\n".utf8))) }
+        #expect(garbled == SandboxedPDFReader.unverifiedUnread.message, "\(garbled)")
+        #expect(garbled.contains("can't be vouched for") && !garbled.contains("brahma vouch file"))
+        // (Other bytes: the refusal above is cached by the bytes.)
+        let tooMany = outcome { try check(cf, pdf + Data(" more".utf8), archives: scripted(10, Data("BRAHMA-PDF/1\n".utf8))) }
+        #expect(tooMany == SandboxedPDFReader.tooManyRevisions.message, "\(tooMany)")
+        #expect(tooMany.contains("more than 64 revisions") && tooMany.contains("can't be vouched for"))
+        // With the real helper: 65 revisions, not vouched; nothing is recorded for it, and no alert is raised.
+        guard EmbeddedContentTests.helperReady else { return }
+        let reader = try EmbeddedContentTests.reader(cf)
+        let many = SplitBuild.additive(65)
+        let refused = outcome { try check(cf, many, canonical: "many.pdf", archives: reader) }
+        #expect(refused == SandboxedPDFReader.tooManyRevisions.message, "\(refused)")
+        #expect(try vouchRows(cf, cId).count == 1 && !(try fileAlerts(cf).contains { $0.summary.contains("many.pdf") }))
     }
 
     func dumpTaint(_ cf: CollabFixture) throws -> String {
@@ -226,20 +364,28 @@ struct UnverifiedPDFReader: ArchiveReader {
             return (at != nil, passes, try store.events(afterId: 0, companyId: h.company.id).map(\.text))
         }
         let noKey = try home(initOwner: false)
-        let refusedNoKey = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf"], home: noKey.home.url)
+        let sha = Self.full(noKey.pdf)
+        let refusedNoKey = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--sha256", sha], home: noKey.home.url)
         #expect(refusedNoKey.status != 0 && refusedNoKey.stderr.contains("owner key missing"), "\(refusedNoKey.stderr)")
         #expect(try vouched(noKey).vouched == false)
 
         let h = try home(initOwner: true)
-        let agent = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf"], home: h.home.url, extra: ["BRAHMA_AGENT_ID": "agent-1"])
+        let agent = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--sha256", sha], home: h.home.url, extra: ["BRAHMA_AGENT_ID": "agent-1"])
         #expect(agent.status != 0 && agent.stderr.contains("owner commands can't run inside an agent turn"), "\(agent.stderr)")
         let afterAgent = try vouched(h)
         #expect(!afterAgent.vouched && !afterAgent.passes)
-        #expect(try runBrahma(["vouch", "file", "nosuch", "docs/spec.pdf"], home: h.home.url).status != 0)
-        let unknown = try runBrahma(["vouch", "file", "acme", "docs/other.pdf"], home: h.home.url)
+        #expect(try runBrahma(["vouch", "file", "nosuch", "docs/spec.pdf", "--sha256", sha], home: h.home.url).status != 0)
+        // Breaker B-2: the sha256 is required; without it nothing is vouched.
+        let bare = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf"], home: h.home.url)
+        #expect(bare.status != 0 && bare.stderr.contains("--sha256"), "\(bare.stderr)")
+        // Ruling 40 (B-4): the full hash, never a prefix.
+        let prefixed = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--sha256", String(sha.prefix(12))], home: h.home.url)
+        #expect(prefixed.status != 0, "\(prefixed.stdout)")
+        #expect(try vouched(h).vouched == false)
+        let unknown = try runBrahma(["vouch", "file", "acme", "docs/other.pdf", "--sha256", sha], home: h.home.url)
         #expect(unknown.status != 0, "\(unknown.stdout)")
 
-        let owner = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf"], home: h.home.url)
+        let owner = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--sha256", sha], home: h.home.url)
         #expect(owner.status == 0, "\(owner.stderr)")
         #expect(owner.stdout.contains("docs/spec.pdf") && owner.stdout.contains(String(SHA256.hex(h.pdf).prefix(12))), "\(owner.stdout)")
         let after = try vouched(h)
