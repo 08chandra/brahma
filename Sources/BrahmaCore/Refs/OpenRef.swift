@@ -347,19 +347,16 @@ extension Store {
         case .artifact(let a):
             // 4a's engine-written copy (write-denied to every turn), opened at its entry file through SafeFS (a descriptor walk
             // that follows no link), and only where 4a puts it: `.brahma/artifacts/<folder>/<entry>`. 4a records no hash.
-            let folder = (a.storedPath as NSString).lastPathComponent
-            let entry = a.entryFile.split(separator: "/", omittingEmptySubsequences: false)
-            guard a.storedPath == ".brahma/artifacts/\(folder)", !folder.isEmpty, !folder.hasPrefix("."), !entry.isEmpty,
-                  entry.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { throw VaultError.missing }
+            guard RefAccess.artifactFolder(a) != nil else { throw VaultError.missing }
             let ext = ArtifactKind.ext(of: a.entryFile)
             let fs = try SafeFS(workspace: workspace, ownHandle: nil)
             let file: SafeFile
             do {
                 file = try fs.open(workspacePath: "\(a.storedPath)/\(a.entryFile)", maxBytes: cap)
             } catch SafeFSError.tooLarge(let size) {
-                let kind = ArtifactKind.from(ext: ext)
-                if whole || kind?.isText ?? true { return try tooLarge(a.ref, size) }
-                return metadata(TextExtract.metadata(kind: kind, bytes: size))
+                // Labelled by the row's kind (a folder's or a glTF set's entry may not name it by its extension).
+                if whole || a.kind.isText { return try tooLarge(a.ref, size) }
+                return metadata(TextExtract.metadata(kind: a.kind, bytes: size))
             }
             let size = file.size
             return Content(body: .bytes(try file.readAll(), ext: ext), rev: nil,

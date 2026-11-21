@@ -264,8 +264,11 @@ public struct SafeGit: Sendable {
         return sha
     }
 
-    public func lsTree(rev: String, cap: Int) throws -> (entries: [TreeEntry], truncated: Bool) {
-        let out = try output(["ls-tree", "-r", "-l", "-z", "--end-of-options", try Self.sha(rev)])
+    /// The blobs of the tree at `rev` (recursively), or only those at or under `path` (a literal pathspec).
+    public func lsTree(rev: String, path: String? = nil, cap: Int) throws -> (entries: [TreeEntry], truncated: Bool) {
+        var args = ["ls-tree", "-r", "-l", "-z", "--end-of-options", try Self.sha(rev)]
+        if let path { args += ["--", try Self.checkPath(path)] }
+        let out = try output(args)
         var entries: [TreeEntry] = []
         for record in out.split(separator: 0, omittingEmptySubsequences: true) {
             guard let tab = record.firstIndex(of: 9) else { continue }

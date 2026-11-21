@@ -179,6 +179,8 @@ extension Store {
         if taint.tainted {
             details.tainted = true
             details.taintReason = taint.reason
+            // Ruling 16: an artifact tainted by its source, not only by its row, never shows its agent-written title either.
+            if case .artifact(let a) = found.subject.record { details.title = "\(a.ref) (untrusted)" }
         }
         if let source = ref.params["taint"] { details.provenance = .external("tainted-session:\(source)") }
         let resolved = ResolvedRef(ref: ref, reader: reader, visibility: .full, title: details.title, subtitle: details.subtitle,
@@ -230,7 +232,8 @@ extension Store {
                            provenance: Provenance(raw: r.provenance) ?? .external(r.provenance), tainted: r.tainted,
                            taintReason: r.taintReason, state: state, pinned: ref)
         case .artifact(let a):
-            // 4a's title is agent-controlled: sanitized here; a tainted publisher's title is never shown (4a's digest rule).
+            // 4a's title is agent-controlled: sanitized here; a tainted one is never shown (4a's digest rule; the source-derived
+            // taint of ruling 16 hides it too, in `resolveDetailed`).
             return Details(title: a.tainted ? "\(a.ref) (untrusted)" : Self.safe(a.title), subtitle: "\(a.ref) · \(a.kind.rawValue)",
                            bytes: Int(clamping: a.bytes), provenance: a.provenance, tainted: a.tainted,
                            taintReason: a.tainted ? a.taintReason ?? "outside content" : nil, pinned: ref)
