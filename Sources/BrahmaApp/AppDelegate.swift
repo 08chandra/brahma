@@ -128,7 +128,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.quitSignals += Int(min(max(source.data, 1), 1000))
-                    if self.quitSignals > 1 { self.forceQuit() } else { AppDelegate.requestQuit() }
+                    // A signal during a ⌘Q-started stop is the owner's second quit request too (fix round 1, M7).
+                    if self.quitting || self.quitSignals > 1 { self.forceQuit() } else { AppDelegate.requestQuit() }
                 }
             }
             source.resume()
@@ -241,13 +242,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// A second SIGTERM or SIGINT (Task 9c): the owner wants the app gone now. Every process group the engine started is
-    /// killed (its own records only: turns, checks, merges, previews), in-flight turns are recorded interrupted, and the
-    /// process exits at once, without waiting out the bounded stop. Only engine-written text is logged.
+    /// A second SIGTERM or SIGINT (Task 9c): the owner wants the app gone now. When this app is the engine, every process group
+    /// it recorded is killed (turns, checks, merges, previews, its litestream), in-flight turns are recorded interrupted
+    /// (`EngineHost.forceStop`); when it is not (a terminal engine owns the processes, or none started), nothing is signalled.
+    /// Either way the process exits at once, without waiting out the bounded stop. Only engine-written text is logged.
     func forceQuit() -> Never {
-        let signalled = model?.engine?.forceStop()
-        let groups = signalled.map { "\($0.terminated.count) process group(s) signalled" } ?? "no engine running here"
-        FileHandle.standardError.write(Data("brahma: second quit request: \(groups); exiting now\n".utf8))
+        let killed = model?.engine?.forceStop()
+        let what = killed.map { "\($0.groups.terminated.count) process group(s) signalled\($0.litestream.map { "; \($0)" } ?? "")" }
+            ?? "not the engine here, nothing signalled"
+        FileHandle.standardError.write(Data("brahma: second quit request: \(what); exiting now\n".utf8))
         exit(0)
     }
 

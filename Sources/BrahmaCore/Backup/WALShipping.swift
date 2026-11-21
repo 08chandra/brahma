@@ -362,7 +362,9 @@ public final class WALShipper: @unchecked Sendable {
                 }
                 starts += 1
                 process = child
-                let record = "\(child.pid)\n\(WALShipping.configURL(paths: paths).path)\n"
+                // pid, config, and the leader's start time (Task 9c fix round 1): a stop path signals it only while all three match.
+                let start = ProcessTable.entry(child.pid)?.start ?? 0
+                let record = "\(child.pid)\n\(WALShipping.configURL(paths: paths).path)\n\(start)\n"
                 if (try? TranscriptCapture.writePrivate(Data(record.utf8), to: Self.pidFile(paths: paths))) == nil {
                     note("could not write \(Self.pidFile(paths: paths).path)")
                 }
@@ -400,20 +402,33 @@ public final class WALShipper: @unchecked Sendable {
         if child.hasExited() { child.finish() }
     }
 
+    /// The litestream the pid file names, ended now (SIGTERM, then SIGKILL at once) when its argv shows it is litestream
+    /// `replicate -config <this config>` and its start time is the one recorded: the forced exit's and the expired bound's best
+    /// effort (Task 9c fix round 1, M2). Returns a line for the log, or nil when there was no pid file.
+    public static func killRecorded(paths: BrahmaPaths) -> String? { reapStale(paths: paths, grace: 0, requireStart: true) }
+
     /// A litestream an earlier engine left running for this config (named by the pid file): stopped (SIGTERM, `grace`, SIGKILL)
-    /// only when its argv shows it is litestream `replicate -config <this config>`. The pid file is removed either way.
-    /// Returns a line for the log, or nil when there was no pid file.
-    static func reapStale(paths: BrahmaPaths, grace: TimeInterval) -> String? {
+    /// only when its argv shows it is litestream `replicate -config <this config>` and, when the record carries the leader's
+    /// start time (every record this engine writes does; `requireStart` demands it), that time still matches. The pid file is
+    /// removed either way. Returns a line for the log, or nil when there was no pid file.
+    static func reapStale(paths: BrahmaPaths, grace: TimeInterval, requireStart: Bool = false) -> String? {
         let file = pidFile(paths: paths)
         guard let data = EngineFiles.readNoFollow(file, under: paths.runDir, limit: 4096) else { return nil }
         defer { unlink(file.path) }
         let config = WALShipping.configURL(paths: paths).path
-        guard let pid = String(decoding: data, as: UTF8.self).split(separator: "\n").first.flatMap({ Int32($0) }), pid > 1 else {
+        let lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
+        guard let pid = lines.first.flatMap({ Int32($0) }), pid > 1 else {
             return "removed an unreadable \(file.lastPathComponent)"
         }
         guard kill(pid, 0) == 0 || errno == EPERM else { return nil }          // gone already
         guard let argv = ProcessArguments.of(pid), isLitestream(argv, config: config) else {
             return "\(file.lastPathComponent) named pid \(pid), which is not litestream for this config; it was left alone"
+        }
+        let recordedStart = lines.count > 2 ? Double(lines[2]) : nil
+        if requireStart || recordedStart != nil {
+            guard let recordedStart, ProcessTable.entry(pid)?.start == recordedStart else {
+                return "\(file.lastPathComponent) named pid \(pid), whose start time is not the recorded one; it was left alone"
+            }
         }
         kill(pid, SIGTERM)
         let soft = AwakeTime.uptime() + grace

@@ -1,12 +1,12 @@
 import Foundation
 
 /// The engine's bounded shutdown (Plan 4a Task 9c). The owner's quit and stop must be prompt: everything the engine has in
-/// flight is cancelled and then waited for together (the turn kill and `PreviewRunner.stopAll` side by side, never one after
-/// the other), the whole wait bounded by `bound`. When the bound passes the shutdown proceeds to exit anyway, and what was
-/// still running is named (engine-written names only) for the log. A second quit request during the shutdown goes through
-/// `force`: a best-effort SIGKILL of every process group the engine recorded (turns, checks, merges, previews), the
-/// in-progress turns recorded `interrupted`, and the caller exits at once. Nothing here signals a process the engine did
-/// not start: the groups come from the engine's own records (`EmergencyStop.recordedGroups`), never from a scan.
+/// flight is cancelled and then waited for together (the turn kill, `PreviewRunner.stopAll`, litestream's and caffeinate's
+/// stops side by side, never one after the other), the whole wait bounded by `bound`. When the bound passes the shutdown
+/// proceeds to exit anyway: what was still running is named (engine-written names only) for the log, and the process groups
+/// the engine recorded are killed (`killEngineProcesses`). A second quit request during the shutdown goes through `force`:
+/// the same kill, the in-progress turns recorded `interrupted`, and the caller exits at once. Nothing here signals a process
+/// the engine did not record: the groups are `EmergencyStop.engineGroups` (every source start-time checked), never a scan.
 public enum EngineShutdown {
     /// The hard bound on the whole shutdown (awake time).
     public static let bound: Duration = .seconds(10)
@@ -23,8 +23,9 @@ public enum EngineShutdown {
     }
 
     /// Runs every step at once and returns once all have finished, or once `bound` of awake time has passed, whichever comes
-    /// first: the names of the steps still running then (empty when all finished in time). A step left running is not
-    /// cancelled here (its work was cancelled by the caller already); it simply no longer holds the exit.
+    /// first: the names of the steps still running then (empty when all finished in time). The timer runs on its own thread
+    /// (`ResumeOnce.fire(afterAwake:)`), not on the cooperative pool, so steps that block pool threads cannot delay it. A step
+    /// left running is not cancelled here (its work was cancelled by the caller already); it simply no longer holds the exit.
     public static func run(_ steps: [Step], bound: Duration = bound) async -> [String] {
         guard !steps.isEmpty else { return [] }
         let pending = Pending(names: steps.map(\.name))
@@ -37,27 +38,54 @@ public enum EngineShutdown {
                     if pending.finished(step.name) { once.fire() }
                 }
             }
-            let timer = Task.detached {
-                try? await AwakeTime.sleep(for: bound)
-                once.fire()
-            }
-            once.onFire { timer.cancel() }
+            once.fire(afterAwake: bound)
         }
         return pending.left
     }
 
-    /// The second quit request: SIGTERM then at once SIGKILL to every process group the engine recorded: the turns' leaders
-    /// the runner recorded at spawn (`Store.recordedTurnLeaders`, under `<runDir>/turns`: a turn the first quit already
-    /// recorded `interrupted` still has its `claude` winding down, and only this record still names it), the in-progress
-    /// turns' pids in the database, the checks' and merges' children and the previews' servers (`EmergencyStop.recordedGroups`).
-    /// Each pid counts only while its start time still matches its record, so a reused pid is never signalled. Then the
-    /// in-progress turns are recorded `interrupted` and their agents put back to `ready` (`recoverInterruptedTurns`, the same
-    /// write the next engine's start would make). Blocking; what was signalled is returned for the caller's log.
-    public static func force(store: Store, paths: BrahmaPaths, now: Date = Store.now()) -> EmergencyStop.Signalled {
-        let groups = EmergencyStop.recordedGroups(store: store).union(Store.recordedTurnLeaders(paths: paths))
-        let signalled = EmergencyStop.signalGroups(groups, grace: 0)
+    /// Runs blocking `body` on its own thread (not the actor, not the cooperative pool) and returns when it is done.
+    public static func onThread(_ body: @escaping @Sendable () -> Void) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            Thread.detachNewThread {
+                body()
+                continuation.resume()
+            }
+        }
+    }
+
+    /// What the forced exit or an expired bound killed: the groups signalled and the litestream line, if any.
+    public struct Killed: Equatable, Sendable {
+        public var groups: EmergencyStop.Signalled
+        public var litestream: String?
+
+        public init(groups: EmergencyStop.Signalled = .init(), litestream: String? = nil) {
+            self.groups = groups
+            self.litestream = litestream
+        }
+    }
+
+    /// Best-effort SIGKILL of everything the engine recorded as its own: SIGTERM then at once SIGKILL to
+    /// `EmergencyStop.engineGroups` (the one stop every path shares), and the litestream its pid file names (argv-checked;
+    /// `WALShipper.killRecorded`). caffeinate (`-w <engine pid>`) ends by itself when the engine exits. Blocking.
+    public static func killEngineProcesses(store: Store, paths: BrahmaPaths) -> Killed {
+        Killed(groups: EmergencyStop.signalEngineGroups(store: store, paths: paths, grace: 0),
+               litestream: WALShipper.killRecorded(paths: paths))
+    }
+
+    /// The second quit request, from the process that holds the engine lock (the caller checks: another engine's work is never
+    /// touched): `killEngineProcesses`, then the in-progress turns recorded `interrupted` and their agents put back to `ready`
+    /// (`recoverInterruptedTurns`, the same write the next engine's start would make). Blocking; what was killed is returned
+    /// for the caller's log.
+    public static func force(store: Store, paths: BrahmaPaths, now: Date = Store.now()) -> Killed {
+        let killed = killEngineProcesses(store: store, paths: paths)
         _ = try? store.recoverInterruptedTurns(now: now)
-        return signalled
+        return killed
+    }
+
+    /// `bound` as the log shows it (`10 s`, `0.3 s`).
+    public static func seconds(_ d: Duration) -> String {
+        let s = Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18
+        return s == s.rounded() ? "\(Int(s)) s" : String(format: "%.1f s", s)
     }
 
     /// The step names not yet finished.
@@ -79,8 +107,7 @@ public enum EngineShutdown {
     }
 }
 
-/// Resumes its continuation exactly once, whichever caller fires first (the engine's one bounded wait; the app's engine host
-/// has the same race on its side of the boundary).
+/// Resumes its continuation exactly once, whichever caller fires first (the engine's bounded waits and the app's engine host).
 public final class ResumeOnce: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Never>?
@@ -99,6 +126,9 @@ public final class ResumeOnce: @unchecked Sendable {
         if now { c.resume() }
     }
 
+    /// Whether `fire` has run.
+    public var hasFired: Bool { lock.withLock { fired } }
+
     /// Runs `body` when `fire` is first called (at once when it already was).
     public func onFire(_ body: @escaping @Sendable () -> Void) {
         let runNow = lock.withLock { () -> Bool in
@@ -107,6 +137,16 @@ public final class ResumeOnce: @unchecked Sendable {
             return false
         }
         if runNow { body() }
+    }
+
+    /// Fires after `bound` of awake time unless fired before, from a dedicated thread (a hard timer: the cooperative pool's
+    /// load cannot delay it). The thread polls `AwakeTime` every 50 ms and ends as soon as the race is decided.
+    public func fire(afterAwake bound: Duration) {
+        let deadline = AwakeTime.deadline(after: bound)
+        Thread.detachNewThread { [self] in
+            while !hasFired, AwakeTime.now < deadline { usleep(50_000) }
+            fire()
+        }
     }
 
     public func fire() {

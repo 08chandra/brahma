@@ -8,10 +8,18 @@ import BrahmaAppModel
 /// and root come from the model (`AppModel.fileBody(for:)`, the stat'd entry under the company's workspace); never from a
 /// path built here. When the model says a pinned artifact was deleted (`artifactNotice`), that shows beside the picker,
 /// with the list and picker still usable. Titles are agent-controlled (`Text(verbatim:)`).
+///
+/// "Reveal in Finder" (Task 9c fix round 1) reveals the vetted 0600 copy `OpenInHandoff` makes, through the same seam as the
+/// file card's "Open in…" (`openCopy`, Finder as the opener, any artifact kind): Finder is never pointed at the agent's path. An
+/// entry that fails the vetting (a link, a bundle, an execute bit, a launch-capable name) has the button disabled, with the
+/// engine-written reason as its help and a chip beside it.
 struct ArtifactPreviewView: View {
     let artifact: Artifact
     let all: [Artifact]
     let model: AppModel
+    /// Why the entry cannot be revealed right now (engine-written), or nil; re-vetted when the entry changes.
+    @State private var revealRefusal: String?
+    @State private var revealing = false
 
     private var fileBody: FileBody? {
         model.fileBody(for: artifact) ?? model.snapshot.preview.workspace.map { PreviewBodies.fileBody(artifact, workspace: $0) }
@@ -72,13 +80,34 @@ struct ArtifactPreviewView: View {
             }
             Spacer(minLength: 0)
             if let url = fileBody?.url {
-                Button { NSWorkspace.shared.activateFileViewerSelecting([url]) } label: {
+                if let revealRefusal, !compact {
+                    Text(verbatim: revealRefusal).font(BrahmaTheme.monoTiny).foregroundStyle(BrahmaTheme.warning).lineLimit(1)
+                }
+                Button { reveal(url) } label: {
                     Label("Reveal in Finder", systemImage: "folder").labelStyle(compact ? AnyLabelStyle.iconOnly : .titleAndIcon)
                 }
                 .buttonStyle(.brahma)
                 .fixedSize()
-                .help("Reveal in Finder")
+                .disabled(revealRefusal != nil || revealing)
+                .help(revealRefusal ?? "Reveal a vetted copy in Finder")
+                .task(id: url) { revealRefusal = OpenInHandoff.vet(url, kinds: nil).map(OpenInHandoff.message) }
             }
+        }
+    }
+
+    /// The copy is made off the main actor; Finder is given the copy on it (`activateFileViewerSelecting` has no result, so a
+    /// revealed copy counts as opened). The data home is the model's.
+    private func reveal(_ url: URL) {
+        guard !revealing else { return }
+        revealing = true
+        let folder = OpenInHandoff.folder(paths: model.paths)
+        Task { @MainActor in
+            let result = await OpenInHandoff.openCopy(url, into: folder, kinds: nil) { copy in
+                NSWorkspace.shared.activateFileViewerSelecting([copy])
+                return true
+            }
+            if case .failure(let why) = result { revealRefusal = OpenInHandoff.message(why) }
+            revealing = false
         }
     }
 

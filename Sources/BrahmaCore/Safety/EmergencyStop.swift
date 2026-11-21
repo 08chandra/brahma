@@ -124,6 +124,11 @@ public enum EmergencyStop {
     public struct Signalled: Equatable, Sendable {
         public var terminated: [Int32] = []
         public var killed: [Int32] = []
+
+        public init(terminated: [Int32] = [], killed: [Int32] = []) {
+            self.terminated = terminated
+            self.killed = killed
+        }
     }
 
     /// The live (non-zombie) processes of the owner's own user in group `pgid`, never this process's own group.
@@ -157,17 +162,33 @@ public enum EmergencyStop {
         return out
     }
 
-    /// The groups of every turn the database records as in progress (`Store.runningTurnPids`; each turn's `claude` leads its
-    /// own session and group), and of every check and merge child the engine recorded at spawn (`ChildGroups`, under the
-    /// data home's `run/children`; only leaders whose start time still matches), and of every preview server Plan L's
-    /// `previewState` records (`previewGroups`, L-5lite-A).
+    /// The groups of every turn the database records as in progress (`Store.runningTurnLeaders`: each turn's `claude` leads
+    /// its own session and group; only pids that still lead a group of ours started no earlier than the turn, Task 9c fix round
+    /// 1), and of every check and merge child the engine recorded at spawn (`ChildGroups`, under the data home's
+    /// `run/children`; only leaders whose start time still matches), and of every preview server Plan L's `previewState`
+    /// records (`previewGroups`, L-5lite-A). Every source is start-time checked: a recycled pid is never in the set.
     public static func recordedGroups(store: Store) -> Set<Int32> {
-        var groups = (try? store.runningTurnPids()) ?? []
+        var groups = (try? store.runningTurnLeaders()) ?? []
         if let home = store.dataHome {
             groups.formUnion(ChildGroups.liveLeaders(in: ChildGroups.directory(runDir: home.appending(path: "run", directoryHint: .isDirectory))))
         }
         groups.formUnion(previewGroups(store: store))
         return groups
+    }
+
+    /// Every process group the engine recorded, for the stop paths (Task 9c fix round 1, controller ruling 1): `recordedGroups`
+    /// plus the turn leaders the runner recorded at spawn under `<runDir>/turns` (`Store.recordedTurnLeaders`, start-time
+    /// checked). The latter still names a `claude` whose turn the engine already recorded `interrupted` but which is winding
+    /// down, which no database row does any more.
+    public static func engineGroups(store: Store, paths: BrahmaPaths) -> Set<Int32> {
+        recordedGroups(store: store).union(Store.recordedTurnLeaders(paths: paths))
+    }
+
+    /// The one stop every path uses: STOP EVERYTHING, `brahma stop`, a quit whose bound passed, and the second quit signal
+    /// (`EngineShutdown.force`) all signal exactly `engineGroups` (SIGTERM, `grace`, SIGKILL; `grace` 0 is SIGKILL right behind
+    /// SIGTERM). Nothing the engine did not record is ever signalled. Blocking.
+    public static func signalEngineGroups(store: Store, paths: BrahmaPaths, grace: TimeInterval = grace) -> Signalled {
+        signalGroups(engineGroups(store: store, paths: paths), grace: grace)
     }
 
     /// The groups of the preview servers recorded `building`, `starting` or `running`, each only while its pid still leads

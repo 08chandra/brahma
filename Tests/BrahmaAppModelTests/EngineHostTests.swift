@@ -200,11 +200,30 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
         #expect(h.status == .embedded)
         let stopping = Task { await h.stop(timeout: .seconds(60)) }
         try await eventually(timeout: .seconds(10)) { h.status == .stopping }
-        let started = AwakeTime.now
-        let signalled = h.forceStop()
-        #expect(signalled.terminated.isEmpty)
-        await stopping.value
-        #expect(AwakeTime.now - started < .seconds(10))
+        let killed = try #require(h.forceStop())
+        #expect(killed.groups.terminated.isEmpty)
+        await stopping.value   // returns only because forceStop ended the wait: the children never go
         #expect(h.status == .stopped)
+    }
+
+    /// Fix round 1, I1: a host that is not the engine (`.external`: a terminal `brahma run`, here `h1`, owns the processes)
+    /// signals nothing and writes nothing on `forceStop`; the other engine's running turn stays running.
+    @Test func forceStopWhenNotTheEngineSignalsNothing() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, ceo, _, _) = try seedAcme(store, paths)
+        try dmCeo(store, acme)
+        let h1 = host(paths, store, StubRunner(mode: .hangUntilCancelled)), h2 = host(paths, store)
+        await h1.start(tools: tools)
+        try await eventually { try store.agent(id: ceo.id)?.state == .running }
+        await h2.start(tools: tools)
+        #expect(h2.status == .external)
+        #expect(h2.forceStop() == nil)
+        #expect(try store.agent(id: ceo.id)?.state == .running, "the other engine's turn is untouched")
+        #expect(try store.lastTurn(agentId: ceo.id)?.outcome == .inProgress)
+        let stopped = host(paths, store)
+        #expect(stopped.status == .stopped && stopped.forceStop() == nil)
+        await h2.stop()
+        await h1.stop()
+        #expect(try store.agent(id: ceo.id)?.state == .ready)
     }
 }

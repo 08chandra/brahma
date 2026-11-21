@@ -67,6 +67,8 @@ public final class EngineHost {
     @ObservationIgnored private var rememberedTools: Result<EngineTools, EngineSetupError>?
     /// The bounded wait of the `stop` in progress, so a second quit request can end it at once (`forceStop`).
     @ObservationIgnored private var pendingStop: ResumeOnce?
+    /// Set by `forceStop` while a stop is pending: the stop's own backstop then kills nothing twice.
+    @ObservationIgnored private var forced = false
 
     /// The engine the app builds again after a restore (the model has a new store). It carries the same owner key store and
     /// the same secret vault as the first engine, so the restarted engine's redactor still loads the company's secrets and
@@ -163,12 +165,15 @@ public final class EngineHost {
         await start(tools: tools)
     }
 
-    /// How long `stop` waits for the engine by default: the engine bounds its own shutdown at `EngineShutdown.bound` and logs
-    /// what was still running; this backstop sits 2 s behind it, so the engine's own log line comes first.
+    /// How long `stop` waits for the engine by default: the engine bounds its own shutdown at `EngineShutdown.bound` (litestream
+    /// and caffeinate included) and logs what was still running; this backstop sits 2 s behind it, so the engine's own log line
+    /// comes first. The backstop's clock starts before anything is awaited (fix round 1, I2).
     public static let stopTimeout: Duration = EngineShutdown.bound + .seconds(2)
 
     /// Cancels the engine and waits for it to wind down, but never longer than `timeout`: the engine's shutdown is bounded
-    /// (`Orchestrator.shutdown`, Task 9c) and this wait is the backstop behind it.
+    /// (`Orchestrator.shutdown`, Task 9c) and this wait is the backstop behind it. When the backstop fires first (the engine's
+    /// loop never reached its own shutdown), the engine's recorded process groups and its litestream are killed here
+    /// (`EngineShutdown.killEngineProcesses`), as the engine's own expired bound would.
     public func stop(timeout: Duration = stopTimeout) async {
         switch status {
         case .embedded:
@@ -178,12 +183,15 @@ public final class EngineHost {
             status = .stopping
             if let task = engineTask {
                 task.cancel()
-                // litestream stops even when a stuck child keeps `runForever` from returning within the timeout.
-                await engine?.stopWALShipping()
-                await engine?.stopSleepPrevention()
-                await Self.waitBounded(task, timeout: timeout, once: once)
+                let returned = await Self.waitBounded(task, timeout: timeout, once: once)
+                if !returned, !forced {
+                    let killed = EngineShutdown.killEngineProcesses(store: store, paths: paths)
+                    FileHandle.standardError.write(Data(("brahma: the engine did not stop within \(EngineShutdown.seconds(timeout)); "
+                        + "killed \(killed.groups.terminated.count) recorded process group(s)\(killed.litestream.map { "; \($0)" } ?? "")\n").utf8))
+                }
             }
             pendingStop = nil
+            forced = false
             engineTask = nil
             engine = nil
             lock = nil
@@ -195,32 +203,43 @@ public final class EngineHost {
         }
     }
 
-    /// A second quit request while `stop` runs (Task 9c, the owner's second SIGTERM or SIGINT): every process group the engine
-    /// recorded (turns, checks, merges, previews) is signalled with SIGKILL right behind SIGTERM, the in-progress turns are
-    /// recorded `interrupted` (`EngineShutdown.force`), and the pending `stop` returns at once instead of waiting out its
-    /// bound. Nothing the engine did not start is signalled. Returns what was signalled, for the caller's log.
+    /// A second quit request while `stop` runs (Task 9c, the owner's second SIGTERM or SIGINT). Only when this host holds the
+    /// engine lock (`.embedded` or `.stopping`; fix round 1 I1): every process group this engine recorded (turns, checks,
+    /// merges, previews; each start-time checked) is signalled with SIGKILL right behind SIGTERM, its litestream with them,
+    /// the in-progress turns are recorded `interrupted` (`EngineShutdown.force`), and the pending `stop` returns at once
+    /// instead of waiting out its bound. In every other state (`.external`: a terminal `brahma run` owns those processes;
+    /// `.starting`: the lock is not held and the database's in-progress rows are an earlier engine's) nothing is signalled and
+    /// nothing is written; a pending wait is still ended. Returns what was killed, nil when this host is not the engine.
     @discardableResult
-    public func forceStop() -> EmergencyStop.Signalled {
-        let signalled = EngineShutdown.force(store: store, paths: paths)
-        pendingStop?.fire()
-        return signalled
+    public func forceStop() -> EngineShutdown.Killed? {
+        defer { pendingStop?.fire() }
+        guard status == .embedded || status == .stopping else { return nil }
+        forced = true
+        return EngineShutdown.force(store: store, paths: paths)
     }
 
-    /// Two unstructured tasks race into a resume-once continuation (`once`, which `forceStop` can fire too). A task group
-    /// would wait for both children at scope exit, so it would not bound anything.
-    private static func waitBounded(_ task: Task<Void, Never>, timeout: Duration, once: ResumeOnce) async {
+    /// The engine's task races a hard timer (a dedicated thread, `ResumeOnce.fire(afterAwake:)`) into `once`, which
+    /// `forceStop` can fire too. A task group would wait for both children at scope exit, so it would not bound anything.
+    /// True when the engine returned by itself.
+    private static func waitBounded(_ task: Task<Void, Never>, timeout: Duration, once: ResumeOnce) async -> Bool {
+        let returned = Returned()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             once.install(continuation)
             Task.detached {
                 await task.value
+                returned.set()
                 once.fire()
             }
-            let timer = Task.detached {
-                // Awake time (`AwakeTime`): a Mac that sleeps while the engine winds down does not cut the wait short.
-                try? await AwakeTime.sleep(for: timeout)
-                once.fire()
-            }
-            once.onFire { timer.cancel() }
+            // Awake time (`AwakeTime`): a Mac that sleeps while the engine winds down does not cut the wait short.
+            once.fire(afterAwake: timeout)
         }
+        return returned.value
+    }
+
+    private final class Returned: @unchecked Sendable {
+        private let lock = NSLock()
+        private var flag = false
+        func set() { lock.withLock { flag = true } }
+        var value: Bool { lock.withLock { flag } }
     }
 }

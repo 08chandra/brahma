@@ -74,8 +74,8 @@ struct Run: AsyncParsableCommand {
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
             source.setEventHandler {
                 if quitSignals.add(Int(min(source.data, 1000))) > 1 {
-                    let signalled = EngineShutdown.force(store: store, paths: paths)
-                    FileHandle.standardError.write(Data("brahma: second signal: \(signalled.terminated.count) process group(s) signalled; exiting now\n".utf8))
+                    let killed = EngineShutdown.force(store: store, paths: paths)
+                    FileHandle.standardError.write(Data("brahma: second signal: \(killed.groups.terminated.count) process group(s) signalled; exiting now\n".utf8))
                     Darwin.exit(130)
                 }
                 engine.cancel()

@@ -37,6 +37,9 @@ ln -s "$BRAHMA_CLAUDE" "$BIN/claude"
 
 fail() { echo "SMOKE FAILED: $1" >&2; exit 1; }
 
+# SMOKE_CASES=E,F runs only those cases (default: all). Every case stands alone on the seeded home.
+want() { case ",${SMOKE_CASES:-A,B,C,D,E,F}," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
 start_cli() {
   PATH="$BIN:$PATH" "$CLI" run >"$TMP/cli.out" 2>&1 &
   CLI_PID=$!
@@ -50,6 +53,7 @@ stop_cli() {
   [ "$status" -eq 0 ] || fail "brahma run exited $status after SIGINT"
 }
 
+if want A; then
 # (A) App embeds the engine; quitting pauses it; the bundled MCP helper path works end to end.
 # The app is held until @ceo's fake-turn DM is in the log (a first launch after a clean build can take well over a fixed
 # hold before the engine's first turn finishes), then released; 90 s is only the upper bound.
@@ -73,7 +77,9 @@ echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=embedded.* release
 if "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running'; then fail "case A: agents still running after quit"; fi
 "$CLI" log Acme @ceo | grep -q 'Acknowledged (fake turn).' || fail "case A: no fake-turn DM from @ceo"
 echo "SMOKE OK case=A fake-turn-dm after $(( $(date +%s) - START ))s"
+fi
 
+if want B; then
 # (B) A terminal engine holds the lock: the app shows it as external.
 start_cli
 sleep 2
@@ -85,7 +91,9 @@ echo "$OUT"
 [ "$STATUS" -eq 0 ] || fail "case B exit $STATUS"
 echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=external' || fail "case B: expected engine=external"
 stop_cli
+fi
 
+if want C; then
 # (C) The terminal engine stops while the app runs: the app takes over.
 start_cli
 sleep 1
@@ -97,7 +105,9 @@ wait "$APP_PID" || fail "case C: app exited non-zero"
 APP_PID=""
 cat "$TMP/app.out"
 grep -q '^SMOKE OK companies=3 agents=10 engine=embedded' "$TMP/app.out" || fail "case C: expected engine=embedded after takeover"
+fi
 
+if want D; then
 # (D) Closing the main window keeps the app and engine alive in the menu bar; reopening restores the window.
 set +e
 OUT="$($APP --smoke-test --smoke-close-window --smoke-hold=2)"
@@ -106,23 +116,42 @@ set -e
 echo "$OUT"
 [ "$STATUS" -eq 0 ] || fail "case D exit $STATUS"
 echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=embedded.* lifecycle=ok$' || fail "case D: expected lifecycle=ok"
+fi
 
+# Starts the app with a lingering fake turn in flight (cases E and F) and waits until the fake claude has recorded its pid: it
+# does so once it is lingering (after its MCP DM), so a SIGTERM before that would end it on the spot and prove nothing about the
+# stop. Sets APP_PID and RUNNING.
+start_lingering_turn() {
+  local tag="$1"
+  rm -f "$TMP/turn-$tag.pid"
+  "$CLI" say Acme @ceo "Status update, please." >/dev/null
+  # Turns get an allowlisted environment, so the fake claude reads its settings from this file in the data home.
+  printf 'export FAKE_CLAUDE_SLEEP=60\nexport FAKE_CLAUDE_PIDFILE=%q\n' "$TMP/turn-$tag.pid" >"$BRAHMA_HOME/fake-claude.env"
+  $APP --smoke-test --smoke-hold=120 >"$TMP/app-$tag.out" 2>&1 &
+  APP_PID=$!
+  for _ in $(seq 1 300); do
+    [ -s "$TMP/turn-$tag.pid" ] && "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running' && break
+    sleep 0.2
+  done
+  [ -s "$TMP/turn-$tag.pid" ] || fail "case $tag: fake turn recorded no pid"
+  RUNNING="$("$CLI" status | grep -Eo '^  @[a-z0-9_-]+  running' | head -1 | awk '{print $1}')"
+  [ -n "$RUNNING" ] || fail "case $tag: no turn in flight"
+}
+
+# After the app exited (cases E and F): the fake claude (its bash and its sleep) must be gone, no agent running, the turn interrupted.
+check_turn_ended() {
+  local tag="$1"
+  while read -r pid; do
+    if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null; fail "case $tag: app exited with claude child $pid alive"; fi
+  done <"$TMP/turn-$tag.pid"
+  if "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running'; then fail "case $tag: agents still running after quit"; fi
+  "$CLI" status | grep -Eq "^  $RUNNING  .*last turn: interrupted" || fail "case $tag: $RUNNING's turn not recorded interrupted"
+}
+
+if want E; then
 # (E) A second SIGTERM while the first quit is stopping the engine forces the exit (Task 9c): the turn's process group is
 # killed (the engine's own records only), the turn is recorded interrupted, and the app is gone well inside the 10 s bound.
-"$CLI" say Acme @ceo "Status update, please." >/dev/null
-# Turns get an allowlisted environment, so the fake claude reads its settings from this file in the data home.
-printf 'export FAKE_CLAUDE_SLEEP=60\nexport FAKE_CLAUDE_PIDFILE=%q\n' "$TMP/turn-e.pid" >"$BRAHMA_HOME/fake-claude.env"
-$APP --smoke-test --smoke-hold=120 >"$TMP/app-e.out" 2>&1 &
-APP_PID=$!
-# The fake turn records its pid once it is lingering (after its MCP DM); a SIGTERM before that would end it on the spot and
-# prove nothing about the stop.
-for _ in $(seq 1 300); do
-  [ -s "$TMP/turn-e.pid" ] && "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running' && break
-  sleep 0.2
-done
-[ -s "$TMP/turn-e.pid" ] || fail "case E: fake turn recorded no pid"
-RUNNING="$("$CLI" status | grep -Eo '^  @[a-z0-9_-]+  running' | head -1 | awk '{print $1}')"
-[ -n "$RUNNING" ] || fail "case E: no turn in flight"
+start_lingering_turn E
 kill -TERM "$APP_PID"
 sleep 0.1
 kill -TERM "$APP_PID" 2>/dev/null || true
@@ -133,12 +162,27 @@ while kill -0 "$APP_PID" 2>/dev/null; do
 done
 wait "$APP_PID" || true
 APP_PID=""
-# The forced exit kills the turn's group first; the fake claude (its bash and its sleep) must be gone.
-while read -r pid; do
-  if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null; fail "case E: app exited with claude child $pid alive"; fi
-done <"$TMP/turn-e.pid"
-if "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running'; then fail "case E: agents still running after quit"; fi
-"$CLI" status | grep -Eq "^  $RUNNING  .*last turn: interrupted" || fail "case E: $RUNNING's turn not recorded interrupted"
+grep -q '^brahma: second quit request: ' "$TMP/app-E.out" || fail "case E: the app did not take the forced path"
+check_turn_ended E
 echo "SMOKE OK case=E double-sigterm exited=$(( $(date +%s) - START ))s agent=$RUNNING turn=interrupted"
+fi
+
+if want F; then
+# (F) One SIGTERM quits through the graceful path (Task 9c fix round 1): the engine's bounded shutdown ends the turn (the fake
+# claude lingers 2 s after SIGTERM) and the app exits inside the 10 s bound without the forced path and without the bound passing.
+start_lingering_turn F
+kill -TERM "$APP_PID"
+START=$(date +%s)
+while kill -0 "$APP_PID" 2>/dev/null; do
+  [ $(( $(date +%s) - START )) -le 10 ] || fail "case F: app still running 10 s after SIGTERM"
+  sleep 0.2
+done
+wait "$APP_PID" || true
+APP_PID=""
+if grep -q '^brahma: second quit request: ' "$TMP/app-F.out"; then fail "case F: the app took the forced path on one SIGTERM"; fi
+if grep -q 'shutdown bound of .* passed' "$TMP/app-F.out"; then fail "case F: the shutdown ran out to its bound"; fi
+check_turn_ended F
+echo "SMOKE OK case=F single-sigterm exited=$(( $(date +%s) - START ))s agent=$RUNNING turn=interrupted"
+fi
 
 echo "SMOKE PASSED"

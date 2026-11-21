@@ -467,17 +467,20 @@ public actor Orchestrator {
         _ = await shutdown(bound: shutdownBound)
     }
 
-    /// The engine is stopping (Plan 4a Task 9c). Litestream stops first (SIGTERM, then SIGKILL after the grace) and the sleep
-    /// guard with it; then every task in flight is cancelled (a turn's `claude` gets SIGTERM and, after `killGrace`, SIGKILL)
-    /// and waited for, `previewRunner.stopAll()` runs at the same time (every preview's process group stopped, recorded
-    /// `engine stopped`; the next engine starts them again), and the runner's `waitForChildren` too, all under one bound
-    /// (`EngineShutdown.run`). Past the bound the shutdown returns anyway and logs what was still running, by engine-written
-    /// name (task kinds and engine ids only). Returns those names (tests read them).
+    /// The engine is stopping (Plan 4a Task 9c). Every task in flight is cancelled (a turn's `claude` gets SIGTERM and, after
+    /// `killGrace`, SIGKILL) and waited for; `previewRunner.stopAll()` (every preview's process group stopped, recorded `engine
+    /// stopped`; the next engine starts them again), the runner's `waitForChildren`, litestream's stop (SIGTERM, then SIGKILL
+    /// after the grace, on its own thread so it never blocks the actor) and caffeinate's run at the same time, all under one
+    /// bound (`EngineShutdown.run`, fix round 1 I2: nothing runs before the clock starts). Past the bound the shutdown logs
+    /// what was still running, by engine-written name (task kinds and engine ids only), kills every process group the engine
+    /// recorded (`EngineShutdown.killEngineProcesses`, fix round 1 M1) and returns anyway. Returns those names (tests read them).
     @discardableResult
     func shutdown(bound: Duration = EngineShutdown.bound) async -> [String] {
-        stopWALShipping()
-        await stopSleepPrevention()
+        let shipper = walShipper
+        walShipper = nil
         var steps: [EngineShutdown.Step] = []
+        if let shipper { steps.append(EngineShutdown.Step(name: "litestream") { await EngineShutdown.onThread { shipper.stop() } }) }
+        steps.append(EngineShutdown.Step(name: "sleep guard") { [sleepGuard] in await sleepGuard.shutdown() })
         func add(_ name: String, _ task: Task<Void, Never>?) {
             guard let task else { return }
             task.cancel()
@@ -499,7 +502,9 @@ public actor Orchestrator {
         steps.append(EngineShutdown.Step(name: "turn children") { [runner] in await runner.waitForChildren() })
         let left = await EngineShutdown.run(steps, bound: bound)
         if !left.isEmpty {
-            log("shutdown bound of \(bound.components.seconds) s passed; still running: \(left.sorted().joined(separator: ", ")); exiting anyway")
+            let killed = EngineShutdown.killEngineProcesses(store: store, paths: paths)
+            log("shutdown bound of \(EngineShutdown.seconds(bound)) passed; still running: \(left.sorted().joined(separator: ", ")); "
+                + "killed \(killed.groups.terminated.count) recorded process group(s)\(killed.litestream.map { "; \($0)" } ?? ""); exiting anyway")
         }
         return left
     }

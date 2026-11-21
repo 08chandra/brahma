@@ -229,13 +229,15 @@ extension AppModel {
         }
     }
 
-    /// STOP EVERYTHING (after the owner confirmed `EmergencyStop.confirmText`): the stop is recorded, then every recorded turn's
-    /// process group is signalled from here as well, so an engine that is wedged (or runs in a terminal) cannot keep agents
-    /// running. The engine cancels its turns and checks at its next tick.
+    /// STOP EVERYTHING (after the owner confirmed `EmergencyStop.confirmText`): the stop is recorded, then every process group
+    /// the engine recorded is signalled from here as well (`EmergencyStop.signalEngineGroups`, the one stop every path shares:
+    /// turns in progress and turns still winding down, checks, merges, previews), so an engine that is wedged (or runs in a
+    /// terminal) cannot keep agents running. The engine cancels its turns and checks at its next tick.
     public func stopEverything() async {
+        let paths = self.paths
         await ownerWrite("stop everything") { store in
             try store.emergencyStop(note: nil, by: "app", now: Date())
-            _ = EmergencyStop.signalGroups(EmergencyStop.recordedGroups(store: store))
+            _ = EmergencyStop.signalEngineGroups(store: store, paths: paths)
         }
     }
 
