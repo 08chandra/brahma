@@ -1,11 +1,12 @@
 # Plan P — Polish before dogfood (design)
 
-**Status:** design, 2026-11-21, revised after the owner's decisions of 01:13 and 01:16 (see below). The owner approved the scope (design analysis items 1–3). Build order: 4a → C → 4b leftovers → S → R → **P** → first dogfood run.
+**Status:** design, 2026-11-21, revised after the owner's decisions of 01:13, 01:16 and 01:25 (see below). The owner approved the scope (design analysis items 1–3). Build order: 4a → C → 4b leftovers → S → R → **P** → first dogfood run.
 **Plan:** `docs/superpowers/plans/2026-11-21-planP-polish.md`.
 **Inputs:**
 - `2026-11-21-design-analysis-input.md` (*analysis §n*)
 - `2026-10-21-brahma-design-v2.md` §1.3 (concept budget), §4.12 (app layout)
 - `docs/superpowers/specs/2026-10-20-visual-design.md` (the binding look for the polish pass)
+- `2026-11-21-usability-review-input.md` (*review #n*; its screenshots are in `/Users/chandra/.claude/jobs/6d89b87c/tmp/usability/shots/`)
 - `2026-10-20-visual-design.md` (BrahmaTheme)
 - Plan R spec (`2026-11-21-restructure-service-design.md`, *R §n*)
 - Ledgers under `*/.superpowers/sdd/` (4a, C, 5-lite, L)
@@ -22,7 +23,7 @@ P builds on R. It uses R's module split, R's in-process service host for tests, 
 - **Rejected:**
   - the navigation restructure, meaning the former layout A: a 7-row five-noun sidebar with tabs, the Mission Control strip and the Insights pane;
   - folding the standalone Activity page.
-- **Kept:** today's sidebar (14 fixed rows plus channels and DMs) and every screen's layout, with their detailed, dense look. Nothing moves and nothing is removed from a screen.
+- **Kept:** today's sidebar (14 fixed rows plus channels and DMs) and every screen's layout, with their detailed, dense look. Nothing moves and nothing is removed from a screen. The only exceptions are the five fixes the owner approved at 01:25.
 - **Instead:**
   - a **polish pass** on the existing layouts (§5.1);
   - a **performance pass** on heavy views (§5.1.5);
@@ -33,6 +34,30 @@ P builds on R. It uses R's module split, R's in-process service host for tests, 
 - **Rejected:** regrouping commands under nouns, a `brahma dev …` namespace, renames, and deprecation aliases.
 - **Kept:** every command name, path, option, argument, exit code and stdout format.
 - **Instead:** P improves the CLI's **help text, examples and error messages** only (§5.2).
+
+### 01:25 — usability review: five fixes approved, the rest held
+
+The owner read the usability review (`2026-11-21-usability-review-input.md`) and approved these for P (§5.1.7):
+
+1. **The agent map is reachable** (review #1). Mount `AgentMapPanel` in Mission Control's AGENT MAP slot, and delete the "COMING SOON" wording. If the 4b leftovers already did the slot swap, P only adds an **Open map** button and a **Window › Agent Map** menu item.
+2. **The company goal is visible, and Budget gets the weekly share control** (review #2). The goal is a GOAL key-value in the top bar's second row. Budget gets a WEEKLY SHARE panel that sets exactly what `brahma settings share` sets.
+3. **Keyboard and VoiceOver** (review #3), with no visual change. This covers a `Commands` scene, arrow-key selection in tables, focus states, and button traits and labels.
+4. **Stuck agents and Inbox wording** (review #4 wording, review #5):
+   - blocker text leads with the cause, and the agent offers **Retry now** and **Open permissions** actions;
+   - the green "Approved by @ceo" on pending Inbox cards is fixed;
+   - the "N asks wait for you" chip links to the Inbox.
+5. **Sidebar exception:** the Inbox moves up to its own spot at the top of the sidebar. **This is the only sidebar change the owner allows.**
+
+Also in scope: the review's **"Quick polish"** list, visual only. It is folded into the polish tasks.
+
+**Held for later owner approval and not built in P:** the review's other hard-to-use items, #6 (activity feed), #7 (engine vocabulary), #9 (form validation timing), #10 (empty/error/loading behaviour) and #11 (control patterns). From #8 (truncation) and #12 (accessibility/contrast), P builds only the parts that the 01:13 polish scope already covers and that change nothing but drawing:
+- column widths and flexible cells;
+- `.help` on truncated cells;
+- middle truncation;
+- the `text2` contrast token;
+- 24 pt hit areas through `contentShape`, with no change to the drawn size.
+
+Anything else in #8 and #12 is held. These items are listed in the usability findings file with status `proposed` (§5.1.6).
 
 ### 01:16 — Plan R engine defaults confirmed
 
@@ -92,6 +117,7 @@ P builds on R. It uses R's module split, R's in-process service host for tests, 
 
 - **No layout change.**
   - Every screen keeps its panels, columns, controls, rows and order, and the sidebar keeps its 14 fixed rows.
+  - The only exceptions are the 01:25 approved fixes (§5.1.7). Each one updates the inventory baseline in its own commit, tagged `approved U-n`, with the diff listed.
   - `ScreenInventoryTests` compares the accessibility inventory of every screen before and after the polish (§5.1.1). Polish may add labels, help text and focus order. It may not add, remove or move elements.
   - **No CLI change beyond text.** The command tree, options, exit codes and the stdout of every non-help command are unchanged. `CLITreeFrozenTests` pins the tree from Task 8.
 - **No script breakage.** Normal stdout and `--json` output stay byte-identical, and exit codes do not change. Only `--help` output and stderr error text change.
@@ -158,7 +184,7 @@ P builds on R. It uses R's module split, R's in-process service host for tests, 
 - **Keyboard:**
   - Tab and Shift-Tab follow reading order. Arrow keys move the selection in tables and lists. Return opens the selected item, and Esc closes sheets and popovers.
   - ⌘F focuses the screen's existing filter or search field, where it has one.
-  - Shortcuts that exist today are kept. **No new navigation shortcuts.**
+  - Shortcuts that exist today are kept. The new ones come only from approved fix U-3 (§5.1.7).
 - **Icon-only buttons** get `.help` plus an accessibility label.
 - **Reduce Motion** is respected: no flash, no pulse, and instant transitions.
 
@@ -209,6 +235,19 @@ P builds on R. It uses R's module split, R's in-process service host for tests, 
 - **Nothing in this file is built until the owner marks it `approved`.** Polish continues on everything else in the meantime.
 - Navigation restructure is out of scope (decision 01:13) and is not re-proposed.
 - When P ends, the controller sends the file to the owner. Fixes approved before Task 15 finishes may be built in P, as a task appended by the controller. Later approvals become a follow-up plan.
+
+#### 5.1.7 Approved usability fixes (owner 01:25)
+
+| Id | Fix | Exact behaviour | Layout effect (allowed) |
+|---|---|---|---|
+| U-1 | The agent map is reachable (review #1) | **If the merged 4b leftovers did not mount it:** `MissionControlView`'s AGENT MAP slot hosts `AgentMapPanel(model:)`, keeping the 4b controls (search, follow, fit, vacancies, replay, pop-out). The placeholder and its "MAP VIEW COMING SOON" chip are deleted. `AppModel.apply(.map)` selects Mission Control as today, now with the real map visible. **If they did:** P adds only an **Open map** button in the panel header and a **Window › Agent Map** menu item (⌘⇧M), both calling `openWindow(id: AgentMapPanel.windowId)`. | Slot content changes; slot position and size do not. |
+| U-2 | Goal and weekly share (review #2) | **Top bar, row 2:** a `GOAL` key-value with `company.goal` in `Text(verbatim:)`, one line, tail-truncated, full text in `.help`. It is read-only (editing the goal is not approved). **Budget:** a new first panel, WEEKLY SHARE. It has a 10–100 % slider in 5 % steps plus a mono value. It reads `store.weeklyShare()` and writes `store.setWeeklyShare(_:)`, the same calls `brahma settings share` makes (`SettingsCommands.swift:56`), with the same validation and the same activity line. The help line reads "Share of your weekly Claude allowance the companies may use; the rest is kept for you." | One new top-bar key-value and one new Budget panel above the existing three |
+| U-3 | Keyboard and VoiceOver (review #3) | **A `Commands` scene in `BrahmaApp.swift`:** New Company ⌘N, New Item ⌘⇧N, Hire ⌘⇧H, Find ⌘F (focuses the top-bar search field), Inbox ⌘I, and ⌘1…⌘9 for the sidebar's fixed rows in their order after U-5. ⌃⌥⌘. Stop Everything already exists in the menu extra and is mirrored in the app menu. **Tables:** Agents, Backlog, Memory, Resources, the Handbook tree, Grants and Inbox rows become `Button(.plain)` rows, as `SearchResultsView` already is, with `.onMoveCommand` ↑/↓ on the container, Return to open, and a visible focus ring. **Accessibility:** every interactive row and icon button gets `.isButton` and a label. | None (no visual change apart from focus rings) |
+| U-4 | Stuck agents and Inbox wording (review #4 wording, #5) | **`BlockerText.describe`** (`Formatting.swift:73-83`) leads with the cause for `.retry`: `Turn failed: <cause> — retrying at HH:mm`. The cause is the last turn's failure line, flattened, with middle truncation in tables and the full text in `.help`. The inspector's BLOCKER row shows the same. **Owner actions** go under LAST TURN in the agent inspector when the failure class is known. **Retry now** calls a new `Store.ownerRetryNow(agentId:now:)`, which moves `blocked(.retry)` → `ready`, records an activity line, and refuses any other state. **Open permissions** selects Company › Settings at its permissions section when the failure class is sandbox scope or permissions. **Inbox cards:** the internal approval line (`InboxView.swift:137`) renders as `C-suite OK: @ceo` in `text1`, not `success`. Green is kept for RECENTLY DECIDED. **The WHY chip:** when the first stall reason is pending asks, clicking it selects the Inbox. Other reasons keep the popover, which gains an **Open Inbox** button whenever asks are pending. | Two buttons in the agent inspector; text changes |
+| U-5 | Inbox at the top of the sidebar (review #4 placement) | The **Inbox** row, with its count chip and its two indented sub-rows **Grants** and **Digest**, moves out of the WORK group to the top of the sidebar, above Mission Control, followed by the usual section spacing. The row style is unchanged, and so are the order and content of the other 13 rows. (Architect's call: Grants and Digest travel with Inbox because they are its indented sub-rows today. Leaving them under WORK is a one-line change if the owner prefers.) | The only sidebar change |
+
+- The Quick-polish list (review "Quick polish", 12 items) is merged into the audit sheet as Polish rows (Task 10) and built in the polish tasks.
+- The review's other items go into the usability findings file as `proposed` (§5.1.6, Task 11).
 
 ### 5.2 CLI help, examples and errors (architect's call within decision 01:16)
 
@@ -347,6 +386,7 @@ CREATE TRIGGER ct_workItem_u AFTER UPDATE ON workItem BEGIN UPDATE changeTopic S
 
 | What | Count | How |
 |---|---|---|
+| Approved usability fixes (01:25) | 5 (U-1…U-5) + 12 quick-polish items | Plan P Tasks 12a–12c; inventory baseline updated per fix, tagged `approved U-n` |
 | Screens in the polish pass | 41 top-level view files + 6 subfolders (`planC-collab`) | Audit → polish, layout frozen by `ScreenInventoryTests` |
 | Theme literals outside `Theme/` | counted by `ThemeLintTests` in Task 12 | Shrink-only baseline |
 | Contrast-failing tokens | `text2` (2.92–4.39), `accent` as text (2.65–3.98), `killed` as text (1.35–2.03) | Fixed via two token value changes and one new token (§5.1.2) |

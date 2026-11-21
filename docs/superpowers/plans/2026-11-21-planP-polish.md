@@ -4,6 +4,7 @@
 
 **Goal:** Before the first dogfood run:
 - every existing screen gets a polish pass against the visual-design spec, keeping its layout and content (owner decision 01:13). Hard-to-use spots go to the owner as a write-up and are not changed until approved;
+- the five usability fixes the owner approved at 01:25 are built: the agent map, goal and weekly share, keyboard and VoiceOver, stuck agents and Inbox wording, and the Inbox at the top of the sidebar;
 - every CLI command, kept exactly as it is, gets clear help, examples and actionable errors (owner decision 01:16);
 - a deterministic goal-to-preview test runs on every task;
 - the ten recurring flakes are fixed at the root, and the unit tier runs in under 90 s;
@@ -20,7 +21,7 @@
 
 **Tech Stack:** Swift 6.2 toolchain (manifest `swift-tools-version: 6.0`, `.macOS(.v14)`), GRDB.swift 7.x (SQLite triggers, `PRAGMA data_version`), swift-argument-parser 1.5+, Swift Testing, SwiftUI/AppKit (app targets only), bash for scripts.
 
-**Spec:** `/Users/chandra/agent-company/.claude/worktrees/plan-refactor-polish/docs/superpowers/specs/2026-11-21-polish-design.md` (cited as *spec §n*), including its "Owner decisions, 2026-11-21" (01:13 app, 01:16 CLI and engine). It builds on the Plan R spec `2026-11-21-restructure-service-design.md` (*R §n*) and on R's plan.
+**Spec:** `/Users/chandra/agent-company/.claude/worktrees/plan-refactor-polish/docs/superpowers/specs/2026-11-21-polish-design.md` (cited as *spec §n*), including its "Owner decisions, 2026-11-21" (01:13 app, 01:16 CLI and engine, 01:25 approved usability fixes U-1…U-5; spec §5.1.7). The usability review input is `docs/superpowers/specs/2026-11-21-usability-review-input.md`. It builds on the Plan R spec `2026-11-21-restructure-service-design.md` (*R §n*) and on R's plan.
 
 **Builds on, all merged first:** 4a, C, the 4b leftovers, S and **R**. P uses these R deliverables:
 - the module and test targets;
@@ -66,6 +67,8 @@ P additions:
 - **The app's layouts are frozen** (decision 01:13).
   - Every screen keeps its panels, columns, controls, rows and order, and the sidebar keeps its 14 fixed rows.
   - The `ScreenInventoryTests` baseline (Task 10) may gain labels, help and identifiers only.
+  - The only exceptions are the approved fixes U-1…U-5 (Tasks 12a–12c). Each updates the baseline in its own commit, tagged `approved U-n`. U-5 (Inbox to the top) is the only sidebar change.
+- **Held review items are not built:** review #6, #7, #9, #10, #11, and the non-drawing parts of #8 and #12 (spec "Owner decisions", 01:25).
 - **Usability findings are proposals.** Nothing in `docs/superpowers/audits/2026-11-planP-usability-findings.md` is built until the owner marks it `approved`.
 - **Owner gates do not change.** Message edits never move a `requireOwnerShell()` or `BRAHMA_AGENT_ID` check.
 - **Tests are never deleted or `.disabled`** to fix a flake. A test moved to `.process` keeps a unit-tier sibling that covers its logic.
@@ -96,7 +99,7 @@ P additions:
 
 ## Review Focus
 
-1. **Polish quietly changes a screen.** Examples: a removed column, a reordered panel, a control moved into an overflow menu, agent text cut with no way to read the rest. Expected: the inventory diff shows only added labels and help, and full text stays reachable through `.help`. → Task 10 `ScreenInventoryTests.inventoryUnchanged`; Task 12 `TruncationTests.fullTextInHelp`.
+1. **Polish quietly changes a screen.** Examples: a removed column, a reordered panel, a control moved into an overflow menu, agent text cut with no way to read the rest. Expected: the inventory diff shows only added labels and help, and full text stays reachable through `.help`. → Task 10 `ScreenInventoryTests.inventoryUnchanged`; Task 12 `TruncationTests.fullTextInHelp`. Approved changes appear only in commits tagged `approved U-n`, and Task 12a `SidebarOrderTests.inboxFirstOthersUnchanged` pins the one sidebar move.
 2. **A change made by another process never shows up** (a CLI `brahma approve`, an agent's `brahma mcp` write, a restore), or the app keeps a stale Inbox count. Expected: visible within 250 ms with the service up and within 2 s without it. A restore forces a full reload. → Task 5 `ChangeTopicsTests.crossProcessWriteBumpsTopic`; Task 7 `ChangeSubscriptionTests.epochChangeReloadsAll`, `fallbackPollsWithoutService`.
 3. **A new table added by a later plan is silently not observed.** Expected: the build fails until the table is mapped or marked unobserved with a reason. → Task 5 `ChangeTopicsTests.everyTableMapped`.
 4. **A help example or hint names a command or option that does not exist,** or an improved error message leaks agent text unescaped or drops the original cause. Expected: every example parses, every hint resolves, `safe()` still wraps agent text, and the cause is still present. → Task 8 `CLIHelpTests.examplesParse`; Task 9 `CLIHintTests.everyHintResolves`, `CLIErrorStyleTests.causeKept`, `agentTextStillSafe`.
@@ -399,7 +402,7 @@ README.md
 
 - [ ] **Step 1:** `scripts/make-app.sh debug`, then `scripts/ui-inventory.sh --write-baseline`. Commit the baseline **before any visual change**.
 - [ ] **Step 2: Write `ScreenInventoryTests.inventoryUnchanged`.** It runs the script without `--write-baseline` and diffs the result. Allowed: added labels, help and identifiers. Anything else fails, and the diff is printed. Run it. Expected: PASS.
-- [ ] **Step 3:** Run `scripts/ui-snapshot.sh` for every screen × state of spec §5.1.1, and read every PNG. Fill the audit sheet against spec §5.1.2–§5.1.5 and the visual-design spec lines. Classify each finding. A finding that changes content, location or flow is **Usability**, never Polish.
+- [ ] **Step 3:** Run `scripts/ui-snapshot.sh` for every screen × state of spec §5.1.1, and read every PNG. Fill the audit sheet against spec §5.1.2–§5.1.5 and the visual-design spec lines. Add the review's 12 "Quick polish" items, plus the drawing-only parts of review #8 and #12, as Polish rows citing `review QP-n` / `review #8`. Classify each finding. A finding that changes content, location or flow is **Usability**, never Polish.
 - [ ] **Step 4: Commit** the audit sheet, its screenshots (`docs/superpowers/audits/img/`) and the harness flags.
 
 ### Task 11: Usability write-up for the owner (owner-gated)
@@ -411,7 +414,10 @@ README.md
 - Consumes: Task 10's audit rows classed **Usability**.
 - Produces: the owner-facing file in the spec §5.1.6 format.
 
-- [ ] **Step 1:** For each Usability row, write one entry:
+- [ ] **Step 0:** Seed the file from `2026-11-21-usability-review-input.md`.
+  - Entries U-1…U-5 have status `approved (owner 2026-11-21 01:25)`, each linked to Task 12a, 12b or 12c.
+  - Review #6, #7, #9, #10, #11 and the held parts of #8 and #12 have status `proposed` (*held at 01:25*), with the review's own screen, problem, why, fix and effort.
+- [ ] **Step 1:** For each new Usability row from Task 10's audit, write one entry:
   - **Screen:** the view and state, plus a snapshot path.
   - **Problem:** one sentence.
   - **Why:** the evidence, such as clicks or steps counted, a misleading label, a hidden state, an error without a next step, or a citation to the analysis.
@@ -449,6 +455,99 @@ README.md
 - [ ] **Step 3:** Change the token values. Add the states and tokens. Replace every `accent` used as a text colour with `accentText`, which `grep` lists. On `bg4` rows use `text1` for tertiary text.
 - [ ] **Step 4:** Run the tests and `ScreenInventoryTests`. Take before/after snapshots of Mission Control, Backlog and Inbox for the owner. Expected: PASS, with the inventory unchanged.
 - [ ] **Step 5: Commit**, with the before/after PNG paths in the body. This is the one commit to revert if the owner vetoes the lighter `text2`.
+
+### Task 12a: Approved fixes U-1, U-2, U-5 — map, goal, weekly share, Inbox at the top
+
+**Files:**
+- Modify:
+  - `Sources/BrahmaApp/Views/MissionControlView.swift` (U-1)
+  - `Sources/BrahmaApp/BrahmaApp.swift` (the Window › Agent Map item, if needed)
+  - `Views/TopBar.swift` (U-2 goal)
+  - `Views/BudgetView.swift` and `Sources/BrahmaAppModel/Budget/BudgetModel.swift` (U-2 weekly share)
+  - `Views/Sidebar.swift` (U-5)
+  - `Tests/Fixtures/ui-inventory/*.json`: the baseline update is tagged `approved U-1`, `U-2` or `U-5` in the commit body
+- Create: `Tests/BrahmaAppModelTests/{WeeklySharePanelTests,SidebarOrderTests}.swift`
+
+**Interfaces:**
+- Consumes: `store.weeklyShare()` and `store.setWeeklyShare(_:)` (the same calls as `brahma settings share`), and `AgentMapPanel(model:)` with its `windowId`.
+- Produces:
+  - `BudgetModel.weeklyShare: Double { get }` and `func setWeeklyShare(percent: Int) async`. It clamps to 10…100 in steps of 5, with the same validation as the CLI. On error it sets `errorMessage` with the CLI's message text.
+  - `SidebarLayout.fixedRows: [SidebarItem]`, the model-side order used by the view and by ⌘1…⌘9: `[.inbox, .inboxGrants, .inboxDigest, .missionControl, .activity, .agents, .backlog, .board, .releases, .handbook, .resources, .budget, .companySettings, .settingsBackups]`.
+
+- [ ] **Step 1: Check what 4b's leftovers did.** If `MissionControlView` already hosts `AgentMapPanel`, U-1 is the **Open map** header button plus **Window › Agent Map** (⌘⇧M). Otherwise mount `AgentMapPanel(model:)` in the AGENT MAP slot and delete the placeholder and its "MAP VIEW COMING SOON" text. Record which case applied in the commit body.
+- [ ] **Step 2: Write the tests:**
+  - `WeeklySharePanelTests.readsStoreValue`.
+  - `setWritesSameAsCLI`: after `setWeeklyShare(percent: 40)`, `store.weeklyShare() == 0.40` and the activity line equals the CLI's.
+  - `clampsAndSteps` (7 → 10, 43 → 45).
+  - `SidebarOrderTests.inboxFirstOthersUnchanged`: `SidebarLayout.fixedRows` minus Inbox, Grants and Digest equals today's 11-row order.
+  - `goalLineIsVerbatimAndTruncated` (the top-bar model string; `.help` carries the full goal).
+- [ ] **Step 3:** Run them. Expected: FAIL. Implement:
+  - the GOAL key-value in top bar row 2, read-only, `Text(verbatim:)`;
+  - the WEEKLY SHARE panel first on Budget, with the spec §5.1.7 help line;
+  - the sidebar renders from `SidebarLayout.fixedRows`.
+- [ ] **Step 4:** Run `scripts/ui-inventory.sh` and diff. Expected: only the U-1, U-2 and U-5 changes. Update the baseline. Take UI snapshots of Mission Control, Budget and the sidebar, then read them.
+- [ ] **Step 5:** Run the full suite and `ScreenInventoryTests`. Expected: green.
+- [ ] **Step 6: Commit** (`approved U-1, U-2, U-5`).
+
+### Task 12b: Approved fix U-3 — keyboard and VoiceOver
+
+**Files:**
+- Modify:
+  - `Sources/BrahmaApp/BrahmaApp.swift`, adding a `Commands` scene
+  - `Views/TopBar.swift`, adding a search-field focus binding
+  - `Views/{AgentsView,BacklogView,GrantsView,InboxView}.swift`, `Views/Handbook/{HandbookView,MemoryBrowserView}.swift`, `Views/Resources/ResourcesView.swift`: rows become `Button(.plain)`, the containers get `.onMoveCommand`, and focus rings are added
+  - icon-only buttons across `Views/**`: `.isButton` traits and labels
+- Create: `Sources/BrahmaAppModel/Presentation/AppCommands.swift`, `Tests/BrahmaAppModelTests/AppCommandsTests.swift`
+
+**Interfaces:**
+- Produces:
+  - `enum AppCommand: CaseIterable { newCompany, newItem, hire, find, inbox, section(Int), stopEverything }`, with `shortcut` (⌘N, ⌘⇧N, ⌘⇧H, ⌘F, ⌘I, ⌘1…⌘9, ⌃⌥⌘.) and `func perform(on: AppModel)`.
+  - `AppModel.moveSelection(_ direction: MoveDirection, in list: SelectableList)`, for the Agents, Backlog, Memory, Resources, Handbook, Grants and Inbox lists.
+
+- [ ] **Step 1: Write the tests:**
+  - `AppCommandsTests.shortcutsUniqueAndMatchSpec`.
+  - `sectionNumbersFollowSidebarLayout`: ⌘1 is Inbox and ⌘4 is Mission Control, following `SidebarLayout.fixedRows`.
+  - `findFocusesSearch`.
+  - `moveSelectionStepsAndClamps`.
+  - `inboxCommandSelectsInbox`.
+  - `noShortcutCollidesWithComposer`: ↩, ⇧↩ and ⇥ are untouched.
+- [ ] **Step 2:** Run them. Expected: FAIL. Implement.
+- [ ] **Step 3:** VoiceOver check: run `--ui-inventory`, then confirm every row and icon button has the `button` role and a non-empty label. Encode this as `ScreenInventoryTests.everyInteractiveElementLabelled`. Expected: PASS, and the inventory diff shows only labels, traits and identifiers.
+- [ ] **Step 4:** Manual keyboard pass. For each table: Tab into it, ↑/↓, Return opens, Esc closes the inspector or sheet. Record a one-line result per screen in the commit body.
+- [ ] **Step 5:** Run the full suite. Commit (`approved U-3`).
+
+### Task 12c: Approved fix U-4 — stuck agents, Inbox wording, WHY chip
+
+**Files:**
+- Modify:
+  - `Sources/BrahmaAppModel/Presentation/Formatting.swift` (`BlockerText.describe`)
+  - `Sources/BrahmaAppModel/Agents/AgentDetail.swift` (failure class, actions)
+  - `Views/AgentsView.swift` (the inspector actions under LAST TURN)
+  - `Views/InboxView.swift:137` (the internal line in `text1`)
+  - `Sources/BrahmaAppModel/Inbox/InboxPresentation.swift` (`internalLine` text)
+  - `Views/TopBar.swift` (WHY chip and popover)
+  - `Sources/BrahmaDomain/Lifecycle/Store+Control.swift` or wherever R put the agent lifecycle Store extension (`ownerRetryNow`)
+- Create: `Tests/BrahmaAppModelTests/{BlockerTextTests,StuckAgentActionsTests,InboxWordingTests}.swift`, `Tests/BrahmaDomainTests/OwnerRetryNowTests.swift`
+
+**Interfaces:**
+- Produces:
+  - `BlockerText.describe(_:handles:timeZone:lastFailure:)`. The new `lastFailure: String?` defaults to nil. For `.retry` with a failure it returns `"Turn failed: \(flat(lastFailure)) — retrying at HH:mm"`, and otherwise today's text unchanged.
+  - `enum FailureClass { sandboxScope, permissions, usage, network, other }` with `static func classify(_ failure: String) -> FailureClass`. It matches the engine's own fixed prefixes (`"sandbox scope:"`, …), listed from the merged code in Step 1.
+  - `AgentDetail.actions: [StuckAction]`, where `StuckAction` is `retryNow` or `openPermissions`.
+  - `extension Store { public func ownerRetryNow(agentId: String, now: Date) throws -> Bool }`. It is owner-only like `setPaused`, moves `blocked(.retry)` → `ready` conditionally, appends the activity line `"owner: retry now for @<handle>"`, and returns false for any other state.
+  - `InboxRow.internalLine`, which becomes `"C-suite OK: @\(handle)"`.
+  - `TopBarModel.whyAction`, which is `.openInbox` when the first stall reason is pending asks, else `.popover`.
+
+- [ ] **Step 1:** Using the merged engine code, list the exact failure-line prefixes that `FailureClass.classify` maps. Write them into the test fixture.
+- [ ] **Step 2: Write the tests:**
+  - `BlockerTextTests.retryLeadsWithCause`, `otherBlockersUnchanged`, `causeFlattenedAndVerbatim` (a newline and an ANSI escape in the cause are flattened).
+  - `StuckAgentActionsTests.sandboxScopeOffersRetryAndPermissions`, `unknownOffersRetryOnly`, `openPermissionsSelectsSettings`.
+  - `OwnerRetryNowTests.retryBlockedBecomesReady`, `otherStatesRefused`, `agentCannotCall`: the `CompanyTools` surface has no path to it, and a static scan confirms it is called only from `BrahmaAppModel`.
+  - `InboxWordingTests.pendingInternalLineNotGreenText` (the text and the colour token `text1`) and `recentlyDecidedStaysGreen`.
+  - `whyChipOpensInboxWhenAsks`.
+- [ ] **Step 3:** Run them. Expected: FAIL. Implement.
+- [ ] **Step 4:** Run `--ui-inventory` and diff. Expected: only the two inspector buttons and the popover's **Open Inbox** button. Update the baseline. Take UI snapshots of an agent with a sandbox-scope failure (seed one, as the review's scratch run did) and of the Inbox, then read them.
+- [ ] **Step 5:** Run the full suite. Commit (`approved U-4`).
 
 ### Task 13: Polish A — shell, Mission Control, Activity, Agents, chat
 
@@ -598,12 +697,13 @@ README.md
 
 - **Spec coverage:**
   - §5.1 polish: Task 10 (audit and inventory), Task 12 (tokens and contrast), Tasks 13–15 (screens), Task 16 (performance), Task 11 (usability).
+  - §5.1.7 approved fixes: Task 12a (U-1, U-2, U-5), Task 12b (U-3), Task 12c (U-4).
   - §5.2 CLI: Tasks 8–9.
   - §5.3 golden path: Tasks 17–18.
   - §5.4 determinism and speed: Tasks 1–4 and 19.
   - §5.5 notifications: Tasks 5–7.
   - §6 migration: Tasks 1, 5, 8–10 and 12.
   - Owner decisions: 01:13 is covered by Tasks 10–16 with the frozen inventory. 01:16 CLI is covered by Tasks 8–9 with the frozen tree. 01:16 engine is in Plan R.
-- **Execution order:** 1 → 20 as numbered. Determinism comes first, so every later task runs on a fast, stable suite. The usability write-up (Task 11) goes to the owner early, so approvals can land while polish runs.
-- **Name consistency:** `Topic`, `ChangeTopics`, `ChangedEvent`, `ChangeFeed`, `ChangeSubscription`, `SnapshotPart`, `CommandTree`, `PortAllocating`, `ProcessInspecting`, `Signal`, `TemplateRepo`, `TestTier`, `EmptyState`/`LoadingState`/`ErrorState`, `ThemeContrast`, `TruncatedText`, `PerfBudgets`, `ScriptedTurnRunner`.
-- **Estimated build effort:** 20 tasks. Tasks 1, 5–7, 12, 16 and 17 carry most of the design risk. Tasks 8–9 and 13–15 are long but mechanical. Roughly 9–11 implementer-days, or about 2 calendar weeks with review rounds.
+- **Execution order:** 1 → 12, then 12a, 12b, 12c, then 13 → 20. Determinism comes first, so every later task runs on a fast, stable suite. The usability write-up (Task 11) goes to the owner early, so approvals can land while polish runs.
+- **Name consistency:** `Topic`, `ChangeTopics`, `ChangedEvent`, `ChangeFeed`, `ChangeSubscription`, `SnapshotPart`, `CommandTree`, `PortAllocating`, `ProcessInspecting`, `Signal`, `TemplateRepo`, `TestTier`, `EmptyState`/`LoadingState`/`ErrorState`, `ThemeContrast`, `TruncatedText`, `PerfBudgets`, `ScriptedTurnRunner`, `SidebarLayout`, `AppCommand`, `FailureClass`, `StuckAction`, `Store.ownerRetryNow`.
+- **Estimated build effort:** 23 tasks (1–20 plus 12a–12c). Tasks 1, 5–7, 12, 12a–12c, 16 and 17 carry most of the design risk. Tasks 8–9 and 13–15 are long but mechanical. Roughly 12–14 implementer-days, or about 2.5 calendar weeks with review rounds.
