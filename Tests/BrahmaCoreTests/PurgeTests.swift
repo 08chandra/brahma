@@ -299,7 +299,7 @@ final class ExclusiveFence: @unchecked Sendable {
     private let finished = DispatchSemaphore(value: 0)
 
     init(home: URL, companyId: String) {
-        Thread.detachNewThread { [held, done, finished] in
+        Thread.detachNewThread { [held, done, finished] in   // scope-escape: holds the fence lock only; no scratch dirs
             _ = try? PurgeFence.withExclusive(home: home, companyId: companyId) { held.signal(); done.wait() }
             finished.signal()
         }
