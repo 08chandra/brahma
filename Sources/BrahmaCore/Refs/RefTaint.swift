@@ -831,8 +831,9 @@ extension Store {
     /// that read outside content makes a tainted snapshot (`provenance .external("tainted-session:<source>")`); otherwise its
     /// provenance is the agent. Not ML's `addResources` (the owner's drop path). The bytes pass the secret gate first
     /// (`SecretGate.check`, C2b): a stored secret's value (raw, encoded or in an archive member) refuses the snapshot, as does
-    /// an archive that can't be scanned (`archives`); a secret pattern stores a redacted copy (text; `secretScan = redacted`,
-    /// `sourceDetail` = the lab path, the owner's original) or refuses (binary).
+    /// an archive or PDF that can't be scanned (`archives`); a secret pattern stores a redacted copy (text, checked again
+    /// through the gate, `SecretGate.redactedCopy`; `secretScan = redacted`, `sourceDetail` = the lab path, the owner's
+    /// original) or refuses (binary, a container, or a pattern found only in decoded content).
     public func snapshotPrivateFile(companyId: String, agentId: String, workspacePath: String, readers: [String],
                                     knownValues: [(name: String, value: String)], paths: BrahmaPaths, now: Date,
                                     archives: (any ArchiveReader)? = nil) throws -> WorkRef {
@@ -872,7 +873,8 @@ extension Store {
             guard SecretGate.isRedactable(data, ext: ArtifactKind.ext(of: fileName)) else {
                 throw SecretGate.binaryRefusal(fileName, label: label, what: "sent", knownValues: knownValues)
             }
-            data = RedactedCopy.make(data, findings: [], knownValues: knownValues)
+            data = try SecretGate.redactedCopy(data, ext: ArtifactKind.ext(of: fileName), canonical: fileName,
+                                               archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, store: self)
             secretScan = .redacted
         }
         let taint = try currentTaint(agentId: agentId, paths: paths)

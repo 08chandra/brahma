@@ -118,50 +118,67 @@ public struct SeatbeltRunner: SandboxedRunner {
             }
         }
         let cancel = GroupRun.CancelFlag()
-        let (grace, clock) = (termGrace, self.clock)
-        let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
-        // Everything the run starts is newer than this; it bounds the B-I4 sweep so a recycled pid is never killed.
-        let since = ProcessTable.startStamp(slack: 1)
-        // The per-run marker the profile allows and the sweep probes for; survives the check deleting its own checkout.
-        let marker = Self.runMarker()
-        let onStraggler = self.onStraggler
         let groups = ChildGroups.current
         // `prepare` (the Seatbelt render, the `EngineFiles` mkdir/fchmod of TMPDIR and the per-run caches) and the B-I4 sweep
         // are blocking, so they run on the check's own thread next to the run, never the cooperative pool (B-M6).
         let outcome = await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<CheckOutcome, Never>) in
                 let thread = Thread { [self] in
-                    let prepared: Prepared
-                    do { prepared = try prepare(command: command, environment: environment, policy: policy, proxyPort: port, marker: marker) } catch {
-                        Self.removeTemp(policy)   // a partly created TMPDIR goes too (N6)
-                        continuation.resume(returning: GroupRun.fail("could not run the check in the sandbox: \(error)", outputURL: outputURL))
-                        return
-                    }
-                    var result = GroupRun.run(executable: Self.sandboxExec, arguments: prepared.arguments,
-                                              workingDirectory: cwd, timeout: seconds, outputURL: outputURL,
-                                              environment: prepared.environment, termGrace: grace, clock: clock, cancel: cancel,
-                                              groups: groups)
-                    // B-I4: kill anything the run left behind, recognized by the run's marker (even if it deleted its
-                    // checkout). N2: killed stragglers leave the outcome as it is (tools that daemonize are normal) and are
-                    // reported; only ones that could not be killed or classified, or an unreadable process table, make the
-                    // run inconclusive — nothing unaccounted for is ever counted as a pass or a failure.
-                    let swept = SandboxSweep.run(probe: SandboxProbe(machMarker: marker), since: since)
-                    if !swept.clean { onStraggler?(StragglerReport(checkout: policy.writable[0], result: swept)) }
-                    if swept.inconclusive {
-                        let why = swept.tableUnreadable ? "the process table could not be read"
-                            : "\(swept.survivors.count) process(es) could not be killed or identified"
-                        result = CheckOutcome(exitCode: nil, timedOut: false,
-                                              tail: (result.tail.isEmpty ? "" : result.tail + "\n")
-                                                + "the check left processes running outside its group and \(why); recorded inconclusive")
-                    }
-                    Self.removeTemp(policy)
-                    continuation.resume(returning: result)
+                    continuation.resume(returning: runHere(command: command, cwd: cwd, environment: environment, timeout: timeout,
+                                                           outputURL: outputURL, policy: policy, port: port, cancel: cancel, groups: groups))
                 }
                 thread.name = "brahma-sandboxed-check"
                 thread.start()
             }
         } onCancel: { cancel.set() }
         return outcome
+    }
+
+    /// C2b fix round 2: the whole run on the calling thread (every step of it blocks anyway), for synchronous callers that
+    /// must not wait on the cooperative pool. A policy with network needs its egress proxy started first (`proxyNow`).
+    public func runBlocking(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+                            policy: SandboxPolicy) -> CheckOutcome {
+        let port: UInt16?
+        do { port = try policy.allowedDomains.map { try proxies.proxyNow(for: $0).port } } catch {
+            return GroupRun.fail("could not run the check: the egress proxy did not start (\(error))", outputURL: outputURL)
+        }
+        return runHere(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, policy: policy,
+                       port: port, cancel: GroupRun.CancelFlag(), groups: ChildGroups.current)
+    }
+
+    /// One run, start to end, on the current thread: `prepare`, the run, the B-I4 sweep, the temp removal.
+    func runHere(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL, policy: SandboxPolicy,
+                 port: UInt16?, cancel: GroupRun.CancelFlag, groups: ChildGroups?) -> CheckOutcome {
+        let (grace, clock) = (termGrace, self.clock)
+        let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
+        // Everything the run starts is newer than this; it bounds the B-I4 sweep so a recycled pid is never killed.
+        let since = ProcessTable.startStamp(slack: 1)
+        // The per-run marker the profile allows and the sweep probes for; survives the check deleting its own checkout.
+        let marker = Self.runMarker()
+        let prepared: Prepared
+        do { prepared = try prepare(command: command, environment: environment, policy: policy, proxyPort: port, marker: marker) } catch {
+            Self.removeTemp(policy)   // a partly created TMPDIR goes too (N6)
+            return GroupRun.fail("could not run the check in the sandbox: \(error)", outputURL: outputURL)
+        }
+        var result = GroupRun.run(executable: Self.sandboxExec, arguments: prepared.arguments,
+                                  workingDirectory: cwd, timeout: seconds, outputURL: outputURL,
+                                  environment: prepared.environment, termGrace: grace, clock: clock, cancel: cancel,
+                                  groups: groups)
+        // B-I4: kill anything the run left behind, recognized by the run's marker (even if it deleted its
+        // checkout). N2: killed stragglers leave the outcome as it is (tools that daemonize are normal) and are
+        // reported; only ones that could not be killed or classified, or an unreadable process table, make the
+        // run inconclusive — nothing unaccounted for is ever counted as a pass or a failure.
+        let swept = SandboxSweep.run(probe: SandboxProbe(machMarker: marker), since: since)
+        if !swept.clean { onStraggler?(StragglerReport(checkout: policy.writable[0], result: swept)) }
+        if swept.inconclusive {
+            let why = swept.tableUnreadable ? "the process table could not be read"
+                : "\(swept.survivors.count) process(es) could not be killed or identified"
+            result = CheckOutcome(exitCode: nil, timedOut: false,
+                                  tail: (result.tail.isEmpty ? "" : result.tail + "\n")
+                                    + "the check left processes running outside its group and \(why); recorded inconclusive")
+        }
+        Self.removeTemp(policy)
+        return result
     }
 
     public func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {

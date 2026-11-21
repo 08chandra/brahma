@@ -28,11 +28,19 @@ public enum ArchiveReadError: Error, Equatable, Sendable, CustomStringConvertibl
     static let unavailable = ArchiveReadError.refused("archives can't be read on this machine")
 }
 
-/// Reads members of a zip archive the engine holds in memory (a vault resource, a git blob).
+/// Reads the insides of containers the engine holds in memory (a vault resource, a git blob) outside the engine: the
+/// members of a zip, and (C2b fix round 2) the decoded parts of a PDF.
 public protocol ArchiveReader: Sendable {
     /// The members of the zip `data` whose names `wanted` accepts, in archive order, each at most `limits.bytes` and all of
     /// them together too. Throws `ArchiveReadError`.
     func members(of data: Data, wanted: @Sendable (String) -> Bool, limits: ArchiveLimits) throws -> [(name: String, data: Data)]
+    /// Every decoded part of the PDF `data` (`SandboxedPDFReader`), at most `maxBytes` in all, within `timeout`. Throws
+    /// `ArchiveReadError`; a reader without the PDF helper refuses (`"PDFs can't be scanned on this machine"`).
+    func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart]
+}
+
+extension ArchiveReader {
+    public func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] { throw SandboxedPDFReader.unavailable }
 }
 
 /// Where no sandbox exists: nothing is unpacked.
@@ -51,17 +59,24 @@ public struct UnavailableArchiveReader: ArchiveReader {
 /// plain (`[A-Za-z0-9._/-]` plus `[` and `]`, no `..`) are asked for; a `[` is passed as `[[]`, so `unzip`'s wildcard
 /// matching takes every name literally (Office's `[Content_Types].xml` included). An unzip failure is never masked by the
 /// pipe into `head` (it leaves a `.err` file), and every member must come out at exactly the size the central directory
-/// declares; either refuses the read. The temp directory is removed whatever happens.
+/// declares; either refuses the read. The temp directory is removed whatever happens. With `pdfHelper` (the `brahma-pdf`
+/// binary, `SandboxedPDFReader.locate`) it reads PDFs too, through the same runner; without it a PDF is refused.
 public struct SandboxedUnzipReader: ArchiveReader {
     public static let unzip = "/usr/bin/unzip"
     public static let timeout: Duration = .seconds(60)
 
     let runner: any SandboxedRunner
     let scratch: @Sendable () throws -> URL
+    let pdfHelper: URL?
 
     /// `scratch` makes a fresh private directory for one read (`Vault.makeTempDir`).
-    public init(runner: any SandboxedRunner, scratch: @escaping @Sendable () throws -> URL) {
-        self.runner = runner; self.scratch = scratch
+    public init(runner: any SandboxedRunner, scratch: @escaping @Sendable () throws -> URL, pdfHelper: URL? = nil) {
+        self.runner = runner; self.scratch = scratch; self.pdfHelper = pdfHelper
+    }
+
+    public func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] {
+        guard let pdfHelper else { throw SandboxedPDFReader.unavailable }
+        return try SandboxedPDFReader(runner: runner, helper: pdfHelper, scratch: scratch).parts(of: data, maxBytes: maxBytes, timeout: timeout)
     }
 
     public func members(of data: Data, wanted: @Sendable (String) -> Bool, limits: ArchiveLimits) throws -> [(name: String, data: Data)] {
@@ -103,11 +118,10 @@ public struct SandboxedUnzipReader: ArchiveReader {
         }.joined(separator: " && ")
         let policy = SandboxPolicy(writable: [outDir], readable: [heldDir], network: .none, toolchain: false)
         let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
-        let outcome = Self.wait {
-            await runner.run(command: command, cwd: outDir, environment: environment, timeout: Self.timeout,
-                             outputURL: dir.appending(path: "unzip.log"), policy: policy)
-        }
-        guard outcome?.exitCode == 0 else { throw ArchiveReadError.unreadable }
+        // On this thread (`runBlocking`): never a wait on the cooperative pool, which parallel readers could exhaust.
+        let outcome = runner.runBlocking(command: command, cwd: outDir, environment: environment, timeout: Self.timeout,
+                                         outputURL: dir.appending(path: "unzip.log"), policy: policy)
+        guard outcome.exitCode == 0 else { throw ArchiveReadError.unreadable }
         var result: [(name: String, data: Data)] = []
         var total = 0
         for (i, name) in names.enumerated() {
@@ -135,22 +149,6 @@ public struct SandboxedUnzipReader: ArchiveReader {
 
     /// `name` as an `unzip` pattern that matches only itself: each `[` becomes the class `[[]` (a lone `]` is literal).
     static func literal(_ name: String) -> String { name.replacingOccurrences(of: "[", with: "[[]") }
-
-    /// Runs the sandboxed command to completion from synchronous code (the store's callers are synchronous): the runner's own
-    /// timeout ends it; nil only if it never reported back.
-    static func wait(_ body: @escaping @Sendable () async -> CheckOutcome) -> CheckOutcome? {
-        final class Box: @unchecked Sendable {
-            let done = DispatchSemaphore(value: 0)
-            var value: CheckOutcome?
-        }
-        let box = Box()
-        Task.detached {
-            box.value = await body()
-            box.done.signal()
-        }
-        guard box.done.wait(timeout: .now() + SafeGit.seconds(timeout) + 30) == .success else { return nil }
-        return box.value
-    }
 }
 
 /// The text `open_ref` shows for bytes that are not plain text (design §4.6: nothing untrusted is parsed in process beyond

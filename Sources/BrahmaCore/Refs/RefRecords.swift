@@ -207,7 +207,8 @@ extension Store {
 }
 
 /// Tests only: seams of the ref code (`Store.refHooks`): the git runner `refGit` uses (a fake that fails), a company read
-/// that fails at a turn's taint record, the purge fence's data home for an in-memory store, and a step inside a purge.
+/// that fails at a turn's taint record, the purge fence's data home for an in-memory store, a step inside a purge, and a
+/// redaction that misses (C2b fix round 2).
 final class RefHooks: @unchecked Sendable {
     private let lock = NSLock()
     private var runner: (any GitProcessRunning)?
@@ -225,4 +226,8 @@ final class RefHooks: @unchecked Sendable {
     var afterPurgeTurnCheck: (@Sendable () throws -> Void)? { lock.withLock { afterTurnCheck } }
     func setFenceHome(_ home: URL?) { lock.withLock { fence = home } }
     func setAfterPurgeTurnCheck(_ body: (@Sendable () throws -> Void)?) { lock.withLock { afterTurnCheck = body } }
+    private var redaction: (@Sendable (Data) -> Data)?
+    /// Makes the redacted copies the gate checks again (a redaction that misses something), in place of `RedactedCopy.make`.
+    var redactedCopy: (@Sendable (Data) -> Data)? { lock.withLock { redaction } }
+    func setRedactedCopy(_ body: (@Sendable (Data) -> Data)?) { lock.withLock { redaction = body } }
 }

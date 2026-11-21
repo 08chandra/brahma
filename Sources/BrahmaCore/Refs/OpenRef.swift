@@ -74,8 +74,10 @@ extension Store {
     /// stored secret's value refuses the read or the copy (`"<ref> contains a stored secret (line n); remove it before
     /// sharing"`, an engine alert, the value never echoed), and so does an archive or Office file that can't be scanned. A
     /// secret pattern is redacted in what is shown (ML's `ContentScan.redact`, which also blanks every stored value's forms),
-    /// and a copy is the redacted copy (`RedactedCopy`; a binary with a pattern is refused). `archives` reads Office files
-    /// (none: `UnavailableArchiveReader`, so an archive is refused). A purged ref answers `"that ref was purged by the owner"`.
+    /// and a copy is the redacted copy (`SecretGate.redactedCopy`, checked again through the whole gate; a binary or a
+    /// container with a pattern is refused, and so is a pattern found only inside decoded content). `archives` reads Office
+    /// files and PDFs (none: `UnavailableArchiveReader`, so they are refused). A purged ref answers `"that ref was purged by
+    /// the owner"`.
     public func openRef(companyId: String, reader: Reader, pinned ref: WorkRef, lines: String?, copy: Bool, turnId: String?,
                         knownValues: [(name: String, value: String)], paths: BrahmaPaths, now: Date,
                         archives: (any ArchiveReader)? = nil) throws -> OpenRefResult {
@@ -138,7 +140,9 @@ extension Store {
                 guard SecretGate.isRedactable(content.data, ext: content.ext) else {
                     throw SecretGate.binaryRefusal(canonical, label: label, what: "copied", knownValues: knownValues)
                 }
-                copied.body = .bytes(RedactedCopy.make(content.data, findings: [], knownValues: knownValues), ext: content.ext)
+                copied.body = .bytes(try SecretGate.redactedCopy(content.data, ext: content.ext, canonical: canonical,
+                                                                 archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues,
+                                                                 store: self), ext: content.ext)
             }
             return try materialize(copied, ref: r.pinned, canonical: canonical, companyId: companyId, agentId: copier.agentId,
                                    handle: copier.handle, workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true),
@@ -411,7 +415,8 @@ extension Store {
         let raw = Data(try git.diff(base: base, head: head, path: file).patch.utf8)
         _ = try SecretGate.check(raw, ext: "patch", canonical: canonical, archives: UnavailableArchiveReader(), knownValues: knownValues,
                                  store: self, companyId: companyId)
-        let data = RedactedCopy.make(raw, findings: [], knownValues: knownValues)
+        let data = try SecretGate.redactedCopy(raw, ext: "patch", canonical: canonical, archives: UnavailableArchiveReader(),
+                                               knownValues: knownValues, store: self)
         let patch = String(decoding: data, as: UTF8.self)
         let id = UUID().uuidString
         let written = try vault.write(data, area: .diffcache, name: "\(id).patch")

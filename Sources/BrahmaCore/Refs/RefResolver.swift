@@ -82,7 +82,9 @@ extension Store {
                 case .concierge: provenance = .engine
                 }
                 let fileName = ref.id.split(separator: "/").last.map(String.init) ?? ref.id
-                let number = try vaultShareCopy(companyId: companyId, data: RedactedCopy.make(data, findings: [], knownValues: knownValues),
+                let redacted = try SecretGate.redactedCopy(data, ext: ext, canonical: ref.canonical, archives: archives ?? UnavailableArchiveReader(),
+                                                           knownValues: knownValues, store: self)
+                let number = try vaultShareCopy(companyId: companyId, data: redacted,
                                                 fileName: fileName, sourceDetail: Self.unpinned(ref).canonical, scope: subject.access,
                                                 readerSet: subject.readerSet, futureHolders: subject.futureHolders, provenance: provenance,
                                                 taint: source, secretScan: .redacted, paths: paths, now: Store.now())
@@ -115,7 +117,8 @@ extension Store {
             let taint = try source ?? contentSource(ref, item: item)
             let id = UUID().uuidString
             let vault = Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths))
-            let data = RedactedCopy.make(raw, findings: [], knownValues: knownValues)
+            let data = try SecretGate.redactedCopy(raw, ext: "patch", canonical: ref.canonical, archives: UnavailableArchiveReader(),
+                                                   knownValues: knownValues, store: self)
             let written = try vault.write(data, area: .snapshots, name: "\(id).patch")
             do {
                 try writer.write { db in

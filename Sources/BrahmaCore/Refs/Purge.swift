@@ -224,7 +224,8 @@ extension Store {
                 args += StatementArguments(shareIds)
             }
             try db.execute(sql: sql + ")", arguments: args)
-            try PurgeLog(companyId: companyId, canonical: canonical, vaultPaths: try json(report.vaultPaths), gitRefs: try json(report.gitRefs),
+            // The log keeps the name as every message shows it: stored values and secret patterns redacted (fix round 2).
+            try PurgeLog(companyId: companyId, canonical: shown, vaultPaths: try json(report.vaultPaths), gitRefs: try json(report.gitRefs),
                          backupsFlagged: try json(report.backupsFlagged), createdAt: now).insert(db)
             let holders = "\(report.backupsFlagged.count) backups and \(report.transcripts.count) transcripts may still contain it"
                 + (stillInHistory ? "; it is still in the company's git history" : "")

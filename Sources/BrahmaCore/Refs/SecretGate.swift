@@ -3,8 +3,9 @@ import GRDB
 
 // Plan C Task C2b (design §4.5): the one secret gate every byte C shares, snapshots, opens, copies or renders goes through.
 // The streaming scan is ML's `ContentScan` (chunked, with an overlap of at least the longest needle; findings never carry
-// the matched text). C adds only the forms ML does not scan: encoded copies of each stored value (`EncodedForms`) and the
-// members of zip-based archives (`ArchiveMemberScan`).
+// the matched text). C adds only the forms ML does not scan: encoded copies of each stored value (`EncodedForms`), the
+// members of zip-based archives (`ArchiveMemberScan`), and what PDFs and PNGs hold decoded (`EmbeddedContent`; a PDF only
+// through the sandboxed `brahma-pdf` helper, never parsed in the engine).
 
 /// The encoded forms of stored secret values a file may hold instead of the value itself.
 public enum EncodedForms {
@@ -70,14 +71,17 @@ public enum EncodedForms {
 
 /// The members of a zip-based archive (zip, docx, xlsx, pptx and the like), read through the engine's `ArchiveReader` and
 /// scanned one by one. Fail closed (C2b fix round 1, rulings 29 and 30):
-/// - an archive is any bytes with a zip local header anywhere or an end record near the end (a polyglot or a renamed zip),
-///   and its central directory must be self-consistent and tile from byte 0 (ML's `ZipInventory`), so prepended data refuses;
+/// - an archive is any bytes with an end record near the end, or a plausible zip local header anywhere (C2b fix round 2,
+///   ruling 32: a polyglot or a renamed zip), and its central directory must be self-consistent and tile from byte 0 (ML's
+///   `ZipInventory`), so prepended data refuses;
 /// - an entry is a directory only when its name ends in `/` and both its sizes are 0; every other entry (whatever its
 ///   directory flags) is a file the reader must return, exactly once, with exactly the length the directory declares;
-/// - only stored (0) and deflate (8) members, never an encrypted one; a link entry refuses;
+/// - only stored (0) and deflate (8) members, never an encrypted one, and a local header whose encryption bit differs from
+///   the central directory's refuses (fix round 2, m-1); a link entry refuses;
 /// - nested archives are opened with ONE budget (`ArchiveScanBudget`: decompressed bytes, entries, depth and time) for all
 ///   levels together;
-/// - a member that is gzip, bzip2, xz, zstd, 7z or rar data can't be scanned and refuses.
+/// - a member compressed in a format the engine can't open (`unscannableFormat`) refuses; a member that is itself an
+///   archive, a PDF or a PNG is opened in turn (`EmbeddedContent`).
 public enum ArchiveMemberScan {
     public static let maxDepth = 3
     /// Extensions read as archives even when their bytes do not look like one (they then fail to read, and are refused).
@@ -90,16 +94,43 @@ public enum ArchiveMemberScan {
     static let overBudget = ArchiveReadError.refused("this archive expands too much to scan for secrets")
     static let unscannableMethod = ArchiveReadError.refused("this archive uses compression or encryption that can't be scanned for secrets")
 
-    /// Bytes that hold a zip: a local header anywhere, or an end record within the last 64 KB + 22 bytes (where every zip
-    /// reader looks), or a name that says zip.
+    /// Bytes that hold a zip: an end record within the last 64 KB + 22 bytes (where every zip reader looks), a plausible
+    /// local header anywhere (`plausibleLocalHeader`), or a name that says zip. Four bytes `PK\x03\x04` followed by anything
+    /// else are not a zip (ruling 32).
     public static func isArchive(_ data: Data, ext: String) -> Bool {
         if archiveExts.contains(ext.lowercased()) { return true }
-        if data.range(of: zipMagic) != nil { return true }
         let tail = max(data.startIndex, data.endIndex - (65_535 + 22))
-        return data.range(of: endMagic, in: tail..<data.endIndex) != nil
+        if data.range(of: endMagic, in: tail..<data.endIndex) != nil { return true }
+        var from = data.startIndex
+        while from < data.endIndex, let r = data.range(of: zipMagic, in: from..<data.endIndex) {
+            if plausibleLocalHeader(data, at: r.lowerBound) { return true }
+            from = r.lowerBound + 1
+        }
+        return false
     }
 
-    /// The compressed format whose magic `data` starts with, among those the engine can't open: gzip, bzip2, xz, zstd, 7z, rar.
+    /// The compression methods APPNOTE names (stored, shrunk, reduced, imploded, deflate, deflate64, bzip2, LZMA, zstd, xz,
+    /// JPEG, WavPack, PPMd, AES and the rest).
+    static let knownMethods: Set<Int> = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 14, 16, 18, 19, 20, 93, 94, 95, 96, 97, 98, 99]
+
+    /// Whether a zip local header parses at `offset` (an index of `data`): a sane version needed (at most 6.3, a known host),
+    /// a known method, a name of at most 1 KiB, the name and extra field inside the bytes, and a compressed size that fits
+    /// in what is left (or zip64's marker, or 0 with a data descriptor). Every read is bounds-checked first.
+    static func plausibleLocalHeader(_ data: Data, at offset: Data.Index) -> Bool {
+        guard offset >= data.startIndex, data.endIndex - offset >= 30 else { return false }
+        func u16(_ k: Int) -> Int { Int(data[offset + k]) | Int(data[offset + k + 1]) << 8 }
+        func u32(_ k: Int) -> Int { u16(k) | u16(k + 2) << 16 }
+        let version = u16(4), flags = u16(6), method = u16(8)
+        let compressed = u32(18), nameLength = u16(26), extraLength = u16(28)
+        guard version & 0xFF <= 63, version >> 8 <= 30, knownMethods.contains(method), nameLength <= 1024 else { return false }
+        let left = data.endIndex - offset - 30 - nameLength - extraLength
+        guard left >= 0 else { return false }
+        if compressed == 0xFFFF_FFFF || (compressed == 0 && flags & 0x08 != 0) { return true }
+        return compressed <= left
+    }
+
+    /// The compressed format whose magic `data` starts with, among those the engine can't open: gzip, bzip2, xz, zstd, 7z,
+    /// rar (ruling 29), and Unix compress (`.Z`), lz4, lzip, lzma-alone, cab and xar (fix round 2).
     public static func unscannableFormat(_ data: Data) -> String? {
         let b = [UInt8](data.prefix(8))
         func starts(_ m: [UInt8]) -> Bool { b.count >= m.count && Array(b[0..<m.count]) == m }
@@ -109,6 +140,12 @@ public enum ArchiveMemberScan {
         if starts([0x28, 0xB5, 0x2F, 0xFD]) { return "zstd" }
         if starts([0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]) { return "7z" }
         if starts([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07]) { return "rar" }
+        if starts([0x1F, 0x9D]) { return "compress" }
+        if starts([0x04, 0x22, 0x4D, 0x18]) || starts([0x02, 0x21, 0x4C, 0x18]) { return "lz4" }
+        if starts(Array("LZIP".utf8)) { return "lzip" }
+        if starts([0x5D, 0x00, 0x00]) { return "lzma" }
+        if starts(Array("MSCF".utf8) + [0, 0, 0, 0]) { return "cab" }
+        if starts(Array("xar!".utf8)) { return "xar" }
         return nil
     }
 
@@ -138,7 +175,10 @@ public enum ArchiveMemberScan {
         let files = entries.filter { !isDirectoryEntry($0) }
         if files.contains(where: \.isSymlink) { throw ArchiveReadError.unsafe }
         guard files.count <= ArchiveLimits.maxMembers else { throw tooMany }
-        if files.contains(where: { ($0.method != 0 && $0.method != 8) || $0.flags & 0x1 != 0 }) { throw unscannableMethod }
+        // m-1: the local header's encryption bit must agree with the central directory's.
+        if files.contains(where: { ($0.method != 0 && $0.method != 8) || $0.flags & 0x1 != 0 || $0.localFlags & 0x1 != $0.flags & 0x1 }) {
+            throw unscannableMethod
+        }
         budget.entries -= files.count
         guard budget.entries >= 0, files.reduce(0, { $0 + $1.uncompressedSize }) <= budget.bytes else { throw overBudget }
         guard !files.isEmpty else { return [] }
@@ -153,21 +193,15 @@ public enum ArchiveMemberScan {
         guard budget.bytes >= 0, !budget.expired else { throw overBudget }
         var found: [ScanFinding] = []
         for member in members {
-            if let format = unscannableFormat(member.data) {
-                throw ArchiveReadError.refused("this archive holds \(format) data, which can't be scanned for secrets")
-            }
-            var hits = try scanBytes(member.data, expanded: expanded, chunk: chunk)
+            // Refused when compressed in a format the engine can't open; scanned; opened again when it is an archive, a PDF
+            // or a PNG itself (one level down, on the same budget).
+            var hits = try EmbeddedContent.inner(member.data, ext: (member.name as NSString).pathExtension, container: "archive",
+                                                 archives: archives, expanded: expanded, budget: budget, level: level, chunk: chunk)
             // Office text split across runs (`<w:t>sk_</w:t><w:t>…</w:t>`): the member's text between its tags, joined.
             if member.name.lowercased().hasSuffix(".xml") || member.name.lowercased().hasSuffix(".rels") {
                 let text = TextExtract.stripTags(String(decoding: member.data, as: UTF8.self), lineBreaks: [])
                 hits += try ContentScan.scan(data: Data(text.utf8), isText: true, knownValues: expanded, chunk: chunk)
             }
-            let ext = (member.name as NSString).pathExtension
-            if isArchive(member.data, ext: ext) {
-                hits += try scan(member.data, archives: archives, expanded: expanded, budget: budget, level: level + 1, chunk: chunk)
-            }
-            // R1-9: a PDF's or PNG's compressed streams, on the same budget.
-            hits += try EmbeddedStreams.scan(member.data, ext: ext, expanded: expanded, budget: budget, chunk: chunk)
             found += hits.map { ScanFinding(label: $0.label, line: 0, isKnownValue: $0.isKnownValue) }
         }
         var seen = Set<String>()
@@ -186,21 +220,30 @@ public enum ArchiveMemberScan {
     }
 }
 
-/// What one archive scan may spend across every nesting level together (C2b fix round 1): decompressed bytes
-/// (`ArchiveLimits.maxBytes`), file entries (`ArchiveLimits.maxMembers`), levels (`ArchiveMemberScan.maxDepth`) and awake
-/// time (`seconds`). Shared by reference: an inner archive spends what the outer one left.
+/// What one check may spend on everything decoded from its bytes, across every nesting level together (C2b fix rounds 1
+/// and 2): decompressed bytes (`ArchiveLimits.maxBytes`), entries (`maxEntries`: every archive member and every decoded PDF
+/// stream; one archive still holds at most `ArchiveLimits.maxMembers`), levels (`ArchiveMemberScan.maxDepth`) and awake
+/// time (`seconds`, the PDF helper's time limit included). Shared by reference: an inner level spends what the outer left.
 final class ArchiveScanBudget {
+    static let maxEntries = 10_000
+
     var bytes: Int
     var entries: Int
     let depth: Int
     let deadline: TimeInterval
 
-    init(bytes: Int = ArchiveLimits.maxBytes, entries: Int = ArchiveLimits.maxMembers, depth: Int = ArchiveMemberScan.maxDepth,
+    init(bytes: Int = ArchiveLimits.maxBytes, entries: Int = ArchiveScanBudget.maxEntries, depth: Int = ArchiveMemberScan.maxDepth,
          seconds: TimeInterval = 120) {
         self.bytes = bytes; self.entries = entries; self.depth = depth; deadline = AwakeTime.uptime() + seconds
     }
 
     var expired: Bool { AwakeTime.uptime() > deadline }
+
+    /// The time left, or nil once it is spent.
+    var remaining: Duration? {
+        let left = deadline - AwakeTime.uptime()
+        return left > 0 ? .milliseconds(Int((left * 1000).rounded(.down))) : nil
+    }
 }
 
 /// What the gate found in some bytes: nothing, a stored secret's value (the first, by line; never the value itself), or a
@@ -241,11 +284,13 @@ public final class ScanCache: @unchecked Sendable {
 public enum SecretGate {
     /// The verdict for `data`, refusing a stored secret's value: `WorkError.invalid("<canonical> contains a stored secret
     /// (line <n>); remove it before sharing")` (no line for a binary or an archive member) and an engine alert; the value is
-    /// never echoed. An archive that can't be read refuses too: `"archives can't be scanned on this machine"` (no reader),
-    /// or the reader's reason (`"this archive expands too much to preview safely"`, …), and so do bytes compressed in a
-    /// format the engine can't open (`"<canonical> is compressed as gzip, which can't be scanned for secrets; share the files
-    /// inside instead"`; also bzip2, xz, zstd, 7z, rar). A pattern is returned for the caller to redact (text) or refuse
-    /// (binary). `canonical` names the bytes in every message and alert only after the stored values (and their encoded
+    /// never echoed. An archive or PDF that can't be read refuses too: `"archives can't be scanned on this machine"` (no
+    /// reader), `"PDFs can't be scanned on this machine"` (no PDF helper), or the reader's reason (`"this archive expands
+    /// too much to preview safely"`, `"this PDF is encrypted, …"`, …), and so do bytes compressed in a format the engine
+    /// can't open (`"<canonical> is compressed as gzip, which can't be scanned for secrets; share the files inside
+    /// instead"`; `unscannableFormat`). A secret pattern found only inside decoded content refuses (`decodedRefusal`: no
+    /// redaction of the raw bytes would remove it); one in the raw bytes is returned for the caller to redact (text, through
+    /// `redactedCopy`) or refuse (binary or a container). `canonical` names the bytes in every message and alert only after the stored values (and their encoded
     /// forms) and the secret patterns are redacted from it (`shown`).
     public static func check(_ data: Data, ext: String, canonical: String, archives: any ArchiveReader,
                              knownValues: [(name: String, value: String)], store: Store, companyId: String,
@@ -290,31 +335,56 @@ public enum SecretGate {
     static func compute(_ data: Data, ext: String, archives: any ArchiveReader, knownValues: [(name: String, value: String)],
                         chunk: Int, shown: String) throws -> ScanVerdict {
         let expanded = EncodedForms.expand(knownValues)
-        var findings = try ArchiveMemberScan.scanBytes(data, expanded: expanded, chunk: chunk)
-        if let known = findings.first(where: \.isKnownValue) { return .knownValue(known) }
+        let raw = try ArchiveMemberScan.scanBytes(data, expanded: expanded, chunk: chunk)
+        if let known = raw.first(where: \.isKnownValue) { return .knownValue(known) }
         // Ruling 29: compressed data the engine can't open is never passed as clean.
         if let format = ArchiveMemberScan.unscannableFormat(data) {
             throw WorkError.invalid("\(shown) is compressed as \(format), which can't be scanned for secrets; share the files inside instead")
         }
-        // One budget for everything decoded from these bytes: archive members at every level, PDF and PNG streams (R1-6, R1-9).
-        let budget = ArchiveScanBudget()
+        // One budget for everything decoded from these bytes: archive members, PDF parts and PNG text at every level
+        // (R1-6, ruling 33).
+        let decoded: [ScanFinding]
         do {
-            if ArchiveMemberScan.isArchive(data, ext: ext) {
-                findings += try ArchiveMemberScan.scan(data, archives: archives, expanded: expanded, budget: budget, level: 0, chunk: chunk)
-            }
-            findings += try EmbeddedStreams.scan(data, ext: ext, expanded: expanded, budget: budget, chunk: chunk)
+            decoded = try EmbeddedContent.scan(data, ext: ext, archives: archives, expanded: expanded, budget: ArchiveScanBudget(),
+                                               level: 0, chunk: chunk)
         } catch let e as ArchiveReadError {
             throw WorkError.invalid(e == .unavailable ? "archives can't be scanned on this machine" : e.message)
         }
-        if let known = findings.first(where: \.isKnownValue) { return .knownValue(known) }
-        if let pattern = findings.first { return .pattern(label: pattern.label, line: pattern.line) }
+        if let known = decoded.first(where: \.isKnownValue) { return .knownValue(known) }
+        // R2-3 (N-1): a pattern found only in decoded content is not in the bytes a redaction would change: refused, never
+        // a "redacted" copy that still holds it.
+        if let pattern = decoded.first { throw decodedRefusal(shown, label: pattern.label) }
+        if let pattern = raw.first { return .pattern(label: pattern.label, line: pattern.line) }
         return .clean
     }
 
-    /// `canonical` as a message may show it: every secret pattern and every form of every stored value redacted (a ref named
-    /// after a secret never echoes it), on one line, at most 200 characters.
+    /// The refusal of a secret pattern found inside decoded content (an archive member, a PDF part, a PNG text chunk).
+    static func decodedRefusal(_ shown: String, label: String) -> WorkError {
+        WorkError.invalid("\(shown) looks like it contains a secret (\(label)) inside compressed or embedded content, which can't be "
+                          + "redacted, so it can't be shared, copied or shown")
+    }
+
+    /// A name withheld whole: what `shown` says for a ref whose name holds a secret split by white space or invisible
+    /// characters.
+    static let withheldName = "[a name that holds a secret]"
+
+    /// `canonical` as a message may show it: flattened onto one line first, then every secret pattern and every form of
+    /// every stored value redacted (a ref named after a secret never echoes it), at most 200 characters. Fix round 2 (m-2):
+    /// characters a flattening or a display drops or turns into a space (line and paragraph separators, zero-width and
+    /// direction marks, controls, white space) can split a value in a name and put it back together later; when the name
+    /// without them still holds a secret after the redaction, the whole name is withheld (`withheldName`).
     static func shown(_ canonical: String, knownValues: [(name: String, value: String)]) -> String {
-        Store.flat(ContentScan.redact(text: canonical, findings: [], knownValues: EncodedForms.expand(knownValues)), max: 200)
+        let expanded = EncodedForms.expand(knownValues)
+        let redacted = ContentScan.redact(text: Store.flat(canonical, max: Int.max), findings: [], knownValues: expanded)
+        let skeleton = String(String.UnicodeScalarView(redacted.unicodeScalars.filter { !isInvisible($0) }))
+        if ContentScan.redact(text: skeleton, findings: [], knownValues: expanded) != skeleton { return withheldName }
+        return Store.flat(redacted, max: 200)
+    }
+
+    /// White space, controls, and the format characters `Store.clean` removes or a renderer may not show.
+    static func isInvisible(_ s: Unicode.Scalar) -> Bool {
+        CharacterSet.whitespacesAndNewlines.contains(s) || CharacterSet.controlCharacters.contains(s)
+            || s.properties.generalCategory == .format || s.value == 0x2028 || s.value == 0x2029
     }
 
     static func refusal(_ canonical: String, _ finding: ScanFinding, knownValues: [(name: String, value: String)]) -> WorkError {
@@ -328,9 +398,29 @@ public enum SecretGate {
                           + "can't be redacted, so it isn't \(what)")
     }
 
-    /// Whether `data` is text as the gate reads it (no NUL in the first 8 KB) and not an archive.
+    /// Whether `data` is text as the gate reads it (no NUL in the first 8 KB) and no container: not an archive, a PDF or a
+    /// PNG (a redaction of their raw text would not reach what they hold decoded).
     static func isRedactable(_ data: Data, ext: String) -> Bool {
         !data.prefix(OpenRefLimits.binarySniffBytes).contains(0) && !ArchiveMemberScan.isArchive(data, ext: ext)
+            && !EmbeddedContent.isPDF(data, ext: ext) && !EmbeddedContent.isPNG(data)
+    }
+
+    /// R2-3: the redacted copy of `data` (`RedactedCopy.make`), checked again through the whole gate: refused unless the copy
+    /// itself is clean, so no copy ever holds what the redaction missed.
+    static func redactedCopy(_ data: Data, ext: String, canonical: String, archives: any ArchiveReader,
+                             knownValues: [(name: String, value: String)], store: Store) throws -> Data {
+        let copy = store.refHooks.redactedCopy?(data) ?? RedactedCopy.make(data, findings: [], knownValues: knownValues)
+        let label = shown(canonical, knownValues: knownValues)
+        let again: ScanVerdict
+        do {
+            again = try compute(copy, ext: ext, archives: archives, knownValues: knownValues, chunk: ContentScan.chunkBytes, shown: label)
+        } catch {
+            throw WorkError.invalid("\(label) still looks like it holds a secret after redaction, so no copy of it is made")
+        }
+        guard again == .clean else {
+            throw WorkError.invalid("\(label) still looks like it holds a secret after redaction, so no copy of it is made")
+        }
+        return copy
     }
 }
 
@@ -347,7 +437,9 @@ public enum RedactedCopy {
 extension Store {
     /// The app's render point (C6's `RefBodies`): the gate's verdict for bytes about to be drawn, cached by `sha256` (which
     /// must be the bytes' hash) and the secrets version. A stored value is `.knownValue` (the app blanks it) and alerts the
-    /// owner; nothing here throws for it. `archives` reads Office members (none: archives refuse).
+    /// owner; nothing here throws for it. A secret pattern inside decoded content (an archive member, a PDF, a PNG text
+    /// chunk) can't be blanked in a rendering and is refused (thrown). `archives` reads Office members and PDFs (none: they
+    /// refuse).
     public func scanForRender(companyId: String, sha256: String, data: Data, ext: String,
                               knownValues: [(name: String, value: String)], archives: (any ArchiveReader)? = nil) throws -> ScanVerdict {
         guard SHA256.hex(data) == sha256.lowercased() else { throw WorkError.invalid("the bytes to render don't match their hash") }
@@ -369,13 +461,14 @@ extension Store {
            row.addedVia == "share", row.secretScan == .redacted {
             let context = RefContext(companyId: companyId, keyPrefixes: [Store.keyPrefix(slug: company.slug)])
             guard let source = row.sourceDetail, let parsed = WorkRef.parse(source, context: context), parsed.kind == .file else {
-                throw WorkError.notFound("the original of \(row.ref) is no longer available")
+                throw WorkError.notFound("the original of \(SecretGate.shown(row.ref, knownValues: knownValues)) is no longer available")
             }
             target = parsed
         }
         let r = try resolveDetailed(target, reader: .owner, companyId: companyId, messageRefId: nil)
         guard r.resolved.visibility == .full, let subject = r.subject, let found = r.company else {
-            throw WorkError.notFound(target == ref ? Self.refUnavailable : "the original of \(ref.canonical) is no longer available")
+            throw WorkError.notFound(target == ref ? Self.refUnavailable
+                                     : "the original of \(SecretGate.shown(ref.canonical, knownValues: knownValues)) is no longer available")
         }
         guard r.resolved.state != .purged else { throw WorkError.invalid(Self.purgedText) }
         let content: Content
@@ -384,7 +477,8 @@ extension Store {
         } catch let e as WorkError {
             throw e
         } catch {
-            throw WorkError.notFound(target == ref ? Self.refUnavailable : "the original of \(ref.canonical) is no longer available")
+            throw WorkError.notFound(target == ref ? Self.refUnavailable
+                                     : "the original of \(SecretGate.shown(ref.canonical, knownValues: knownValues)) is no longer available")
         }
         let data = content.data
         _ = try SecretGate.check(data, ext: content.ext, canonical: ref.canonical, archives: archives ?? UnavailableArchiveReader(),
