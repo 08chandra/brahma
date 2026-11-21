@@ -159,6 +159,118 @@ import GRDB
         await f.x.runner.stopAll()
     }
 
+    /// Fix round 1, I1: the owner's stop halts a demo already in progress: the running demo command is cancelled, no later
+    /// surface demos, nothing is recorded, and the sprint stays pending for after the resume.
+    @Test func stopHaltsRunningDemo() async throws {
+        let f = try Fx()
+        // The first run (the start) exits at once; the second (the sprint demo) marks itself and blocks.
+        try f.cli("slow", demo: "test -f once || { touch once; exit 0; }; touch second; sleep 60")
+        try f.cli("fast", demo: "echo fast")
+        let sprint = try f.reviewSprint()
+        let runner = f.x.runner
+        let demo = Task { await runner.demo(sprint: sprint) }
+        let sandbox = f.x.sandbox
+        #expect(await PreviewRunnerTests.waitUntil(.seconds(120)) {
+            sandbox.calls.contains { $0.command.hasPrefix("test -f once") && FileManager.default.fileExists(atPath: $0.cwd.appending(path: "second").path) }
+        }, "the slow demo never reached its blocking step")
+        // The owner's stop lands mid-demo: the flag, then the observer. The blocked command (60 s) is cancelled, so the
+        // demo ends with the stop, not with the sleep (measured from the stop, not from the load-dependent setup).
+        let stopped = Date()
+        _ = try f.store.emergencyStop(note: "test", by: "owner", now: f.x.now)
+        await runner.stopAll(reason: "stopped by the owner")
+        let outcome = await demo.value
+        #expect(outcome == nil)
+        #expect(Date().timeIntervalSince(stopped) < 30, "the blocked demo command was not cancelled")
+        #expect(sandbox.calls.filter { $0.command == "echo fast" }.count == 1, "the second surface's demo ran after the stop")
+        let rows = try f.rows(sprint), posts = try f.posts().filter { $0.senderId == "system" }
+        #expect(rows.isEmpty && posts.isEmpty)
+        #expect(try DemoRunner.pending(store: f.store).map(\.id) == [sprint.id])
+        #expect(try f.store.resumeAfterStop(now: f.x.now))
+    }
+
+    /// Fix round 1, M3: the demo's debounce bypass applies to the sprint's company only; another company's moved `main` keeps
+    /// its debounce.
+    @Test func settledOnlyForSprintCompany() async throws {
+        let f = try Fx()
+        try f.cli("tool", demo: "echo hello")
+        let beta = try f.x.w.company("Beta")
+        let dev = try f.x.w.hire(beta, "devops")
+        let g = GitFixture(existing: URL(fileURLWithPath: beta.workspacePath, isDirectory: true))
+        func land(_ text: String) throws -> String {
+            try g.write("README.md", text); try g.git(["add", "-A"]); try g.git(["commit", "-q", "-m", "change"])
+            return try f.store.acceptMainCommit(companyId: beta.id).head
+        }
+        let first = try land("one")
+        _ = try CompanyTools(store: f.store, companyId: beta.id, agentId: dev.id).call(
+            name: "set_preview_command", arguments: ["name": .string("btool"), "kind": .string("cli"), "demo": .string("echo beta")])
+        let lag = Date().timeIntervalSince(f.x.now); if lag > -1 { f.x.w.clock.advance(lag + 1) }
+        await f.x.settle()
+        func betaState() throws -> PreviewState {
+            let surface = try #require(try f.store.previewSurfaces(companyId: beta.id).first)
+            return try #require(try f.store.previewStates(companyId: beta.id)[surface.id])
+        }
+        #expect(try betaState().commit == first && f.x.sandbox.calls.filter { $0.command == "echo beta" }.count == 1)
+        // Beta's main moves right before Acme's sprint demo: the demo must not restart Beta's surface.
+        let second = try land("two")
+        f.x.w.clock.advance(1)
+        let outcome = try #require(await f.x.runner.demo(sprint: try f.reviewSprint()))
+        #expect(outcome.post.hasPrefix("Sprint 1 review demo at"))
+        #expect(try betaState().commit == first, "Beta's debounce was bypassed")
+        #expect(f.x.sandbox.calls.filter { $0.command == "echo beta" }.count == 1)
+        // After the debounce the normal pass restarts it.
+        f.x.w.clock.advance(PreviewRunner.debounce + 1)
+        await f.x.settle()
+        #expect(try betaState().commit == second)
+        await f.x.runner.stopAll()
+    }
+
+    /// Fix round 1, M6: results that cannot be recorded do not re-run the demo forever: after `maxDemoAttempts` the engine
+    /// gives the sprint up with one `failed` row and a post that it failed; a demoed sprint is never demoed again.
+    @Test func recordFailureIsBounded() async throws {
+        let f = try Fx()
+        try f.cli("tool", demo: "echo hello")
+        let sprint = try f.reviewSprint()
+        await f.x.runner.failDemoRecords(with: WorkError.invalid("boom"))
+        for attempt in 1..<PreviewRunner.maxDemoAttempts {
+            let outcome = await f.x.runner.demo(sprint: sprint)
+            #expect(outcome == nil, "attempt \(attempt)")
+            #expect(try f.rows(sprint).isEmpty)
+            #expect(try DemoRunner.pending(store: f.store).map(\.id) == [sprint.id])
+        }
+        let demos = f.x.sandbox.calls.filter { $0.command == "echo hello" }.count
+        #expect(demos == PreviewRunner.maxDemoAttempts, "one start plus one demo per attempt: \(demos)")
+        // The last allowed attempt gives up: one failed row, the failure post, no "ready" line, not pending.
+        #expect(await f.x.runner.demo(sprint: sprint) == nil)
+        let rows = try f.rows(sprint)
+        #expect(rows.count == 1 && rows.first?.surfaceName == DemoRunner.failedName && rows.first?.ok == false, "\(rows)")
+        let posts = try f.posts().filter { $0.senderId == "system" }.map(\.text)
+        #expect(posts == ["Sprint 1 review demo failed: its results could not be recorded."], "\(posts)")
+        let ready = try f.events().filter { $0.hasPrefix("Sprint 1 demo ready") }
+        #expect(ready.isEmpty)
+        #expect(try DemoRunner.pending(store: f.store).isEmpty)
+        // Already demoed: another call runs nothing.
+        await f.x.runner.failDemoRecords(with: nil)
+        #expect(await f.x.runner.demo(sprint: sprint) == nil)
+        #expect(f.x.sandbox.calls.filter { $0.command == "echo hello" }.count == PreviewRunner.maxDemoAttempts + 1)
+        await f.x.runner.stopAll()
+    }
+
+    /// Fix round 1, M7: a paused company's review sprints are not demoed.
+    @Test func pendingSkipsPausedCompanies() async throws {
+        let f = try Fx()
+        let sprint = try f.reviewSprint()
+        #expect(try DemoRunner.pending(store: f.store).map(\.id) == [sprint.id])
+        var company = try #require(try f.store.company(id: f.company.id))
+        company.status = .paused
+        try f.store.updateCompany(company)
+        #expect(try DemoRunner.pending(store: f.store).isEmpty)
+        try await f.tick()
+        #expect(try f.rows(sprint).isEmpty)
+        company.status = .running
+        try f.store.updateCompany(company)
+        #expect(try DemoRunner.pending(store: f.store).map(\.id) == [sprint.id])
+    }
+
     @Test func migrationCreatesTheTable() throws {
         let store = try Store.inMemory()
         let columns = try store.writer.read { db in try db.columns(in: "previewDemo").map(\.name) }

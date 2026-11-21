@@ -170,8 +170,9 @@ enum AppleBuild {
 
 /// An iOS Simulator preview. `start` needs the owner's approval on the surface (`outsideSandboxApprovedAt`, Task 4's gate),
 /// else it is `unavailable` with the waiting message and nothing is asked of the Simulator. Then: the build (`AppleBuild`),
-/// `app_path` resolved inside the run (`AppBundle.locate`: a `.app` directory), the company's own device (`Brahma <slug>`,
-/// created with the surface's `device` type when listed, else the first iPhone), `boot` (an already booted device is fine),
+/// `app_path` resolved inside the run (`AppBundle.locate`: a `.app` directory), the surface's own device
+/// (`Brahma <company slug>-<surface name>`, created with the surface's `device` type when listed, else the first iPhone),
+/// `boot` (an already booted device is fine),
 /// `install`, `launch(bundle_id)`: `running` with `simulatorId`. `stop` terminates the app and shuts the device down. `demo`
 /// saves a screenshot to `previewLogs/<name>-demo-<sprint>.png` (`"<name>: screenshot saved"`). Every Simulator failure is
 /// reported with the engine's own words; simctl's output goes to the surface log.
@@ -195,22 +196,35 @@ public struct IOSAdapter: PreviewAdapter {
         do { app = try AppBundle.locate(appPath: appPath, run: c.run) } catch {
             return PreviewUpdate(status: .failed, message: PreviewRunner.text(error))
         }
-        let (simulator, name, device, log) = (deps.simulator, SimctlController.deviceName(slug: c.company.slug), c.surface.device, c.logURL)
+        let (simulator, device, log) = (deps.simulator, c.surface.device, c.logURL)
+        let name = SimctlController.deviceName(slug: c.company.slug, surface: c.surface.name)
+        // The device this start booted: shut down again when the start does not end running (fix round 1, M1), so a failed
+        // install or launch, or a cancel, leaves nothing booted.
+        var booted: String?
+        func shutDown() async {
+            guard let udid = booted else { return }
+            _ = try? await AppleBuild.offPool { try simulator.shutdown(udid) }
+        }
         do {
             let udid = try await AppleBuild.offPool { try simulator.ensureDevice(name: name, deviceType: device) }
             if Task.isCancelled { return PreviewUpdate(status: .stopped, message: nil) }
             try await AppleBuild.offPool { try simulator.boot(udid) }
+            booted = udid
+            if Task.isCancelled { await shutDown(); return PreviewUpdate(status: .stopped, message: nil) }
             try await AppleBuild.offPool { try simulator.install(udid, app: app) }
             try await AppleBuild.offPool { try simulator.launch(udid, bundleId: bundleId) }
             if Task.isCancelled {
                 _ = try? await AppleBuild.offPool { try simulator.terminate(udid, bundleId: bundleId) }
-                return PreviewUpdate(status: .stopped, message: nil, simulatorId: udid)
+                await shutDown()
+                return PreviewUpdate(status: .stopped, message: nil)
             }
             return PreviewUpdate(status: .running, message: nil, simulatorId: udid)
         } catch let failure as SimctlFailure {
+            await shutDown()
             Self.append(failure.detail, to: log, redactor: c.redactor)
             return PreviewUpdate(status: .failed, message: failure.message)
         } catch {
+            await shutDown()
             return PreviewUpdate(status: .failed, message: "Simulator failed: \(Store.flat(PreviewRunner.text(error), max: 160))")
         }
     }
@@ -352,6 +366,9 @@ public struct SimctlController: SimulatorControlling {
     init(exec: @escaping Exec, available: @escaping @Sendable () -> Bool) { self.exec = exec; self.available = available }
 
     public static func deviceName(slug: String) -> String { devicePrefix + slug }
+    /// `Brahma <company slug>-<surface name>`: one device per iOS surface (fix round 1, I2), so each surface's `device` type is
+    /// honoured and one surface's stop never shuts down a sibling's device. Both parts are engine-validated slugs.
+    public static func deviceName(slug: String, surface: String) -> String { devicePrefix + slug + "-" + surface }
     public static func isBrahmaDevice(_ name: String) -> Bool { name.hasPrefix(devicePrefix) }
 
     struct Device: Equatable, Sendable {

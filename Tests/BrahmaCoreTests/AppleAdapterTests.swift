@@ -17,18 +17,25 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
     private var _calls: [Call] = []
     var unavailable: String?
     var udid = "SIM-1"
+    /// Device UDIDs by device name (else `udid`).
+    var udids: [String: String] = [:]
+    /// Verbs that fail (`boot`, `install`, `launch`) with a `SimctlFailure`.
+    var failing: Set<String> = []
     /// Device UDIDs `shutdownLeftovers` reports as shut down.
     var leftovers: [String] = []
     var calls: [Call] { lock.withLock { _calls } }
     private func record(_ c: Call) { lock.withLock { _calls.append(c) } }
+    private func fail(_ verb: String) throws {
+        if failing.contains(verb) { throw SimctlFailure(message: "Simulator \(verb) failed (exit 1)", detail: "\(verb): nope") }
+    }
 
     init(unavailable: String? = nil) { self.unavailable = unavailable }
 
     func availability() -> String? { unavailable }
-    func ensureDevice(name: String, deviceType: String?) throws -> String { record(.ensureDevice(name, deviceType)); return udid }
-    func boot(_ udid: String) throws { record(.boot(udid)) }
-    func install(_ udid: String, app: URL) throws { record(.install(udid, app)) }
-    func launch(_ udid: String, bundleId: String) throws { record(.launch(udid, bundleId)) }
+    func ensureDevice(name: String, deviceType: String?) throws -> String { record(.ensureDevice(name, deviceType)); return udids[name] ?? udid }
+    func boot(_ udid: String) throws { record(.boot(udid)); try fail("boot") }
+    func install(_ udid: String, app: URL) throws { record(.install(udid, app)); try fail("install") }
+    func launch(_ udid: String, bundleId: String) throws { record(.launch(udid, bundleId)); try fail("launch") }
     func terminate(_ udid: String, bundleId: String) throws { record(.terminate(udid, bundleId)) }
     func shutdown(_ udid: String) throws { record(.shutdown(udid)) }
     func screenshot(_ udid: String, to: URL) throws {
@@ -56,7 +63,8 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
     static let build = "mkdir -p build/App.app/Contents/MacOS && printf '%s' built > build/App.app/built.txt"
 
     static func setup(kind: PreviewKind, build: String? = AppleAdapterTests.build, appPath: String = "build/App.app",
-                      approved: Bool = true, bundleId: String? = "com.acme.app", device: String? = "iPhone 15 Pro") throws -> Setup {
+                      approved: Bool = true, bundleId: String? = "com.acme.app", device: String? = "iPhone 15 Pro",
+                      name: String? = nil, simulator: FakeSimulator = FakeSimulator()) throws -> Setup {
         let dir = try tempDir().resolvedForSandbox
         let runDir = dir.appending(path: "run", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: runDir, withIntermediateDirectories: true)
@@ -64,7 +72,7 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
         try FileManager.default.createDirectory(at: layout.workspace, withIntermediateDirectories: true)
         _ = try EngineFiles.directory(workspace: layout.workspace, ".brahma/preview/logs")
         let now = Date()
-        let surface = PreviewSurface(id: "s1", companyId: "c1", name: kind == .ios ? "phone" : "mac", kind: kind.rawValue, position: 0,
+        let surface = PreviewSurface(id: "s1", companyId: "c1", name: name ?? (kind == .ios ? "phone" : "mac"), kind: kind.rawValue, position: 0,
                                      build: build, run: nil, url: nil, setById: "owner", createdAt: now, updatedAt: now,
                                      appPath: appPath, bundleId: kind == .ios ? bundleId : nil, device: kind == .ios ? device : nil,
                                      outsideSandboxApprovedAt: approved && kind == .ios ? now : nil)
@@ -82,7 +90,6 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
                                      port: 0, policy: policies.policy, environment: environment, logURL: layout.previewLog(name: surface.name),
                                      timeouts: PreviewTimeouts(poll: .milliseconds(50)), appPolicy: policies.appPolicy, redactor: redactor)
         let sandbox = FakeSandbox()
-        let simulator = FakeSimulator()
         var deps = PreviewDependencies.fake(sandbox: sandbox)
         deps.simulator = simulator
         deps.macApps = ProcessMacAppLauncher(guiAllowed: true)
@@ -131,9 +138,9 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
         #expect(calls.first?.environment["BRAHMA_DERIVED_DATA"] == s.run.appending(path: ".build/DerivedData").path)
         #expect(calls.first?.policy.writable == [s.run.resolvedForSandbox] && calls.first?.policy.readable == [s.run.resolvedForSandbox])
         #expect(calls.first?.policy.toolchain == true)
-        // Then the simctl sequence on the company's own device.
+        // Then the simctl sequence on the surface's own device (`Brahma <company slug>-<surface name>`).
         let app = s.run.appending(path: "build/App.app")
-        #expect(s.simulator.calls == [.ensureDevice("Brahma acme", "iPhone 15 Pro"), .boot("SIM-1"),
+        #expect(s.simulator.calls == [.ensureDevice("Brahma acme-phone", "iPhone 15 Pro"), .boot("SIM-1"),
                                       .install("SIM-1", app.resolvedForSandbox), .launch("SIM-1", "com.acme.app")], "\(s.simulator.calls)")
         // The demo: a screenshot in the engine's logs directory, named for the surface and the sprint.
         let state = PreviewState(surfaceId: "s1", companyId: "c1", status: .running, updatedAt: Date(), simulatorId: "SIM-1")
@@ -150,6 +157,54 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
         await adapter.stop(s.context, state: state)
         #expect(Array(s.simulator.calls.suffix(2)) == [.terminate("SIM-1", "com.acme.app"), .shutdown("SIM-1")])
     }
+
+    /// Fix round 1, I2: every iOS surface has its own device, so one surface's `device` type is honoured and its stop never
+    /// shuts down a sibling's device.
+    @Test func iosDevicePerSurface() async throws {
+        let sim = FakeSimulator()
+        sim.udids = ["Brahma acme-phone": "SIM-P", "Brahma acme-pad": "SIM-T"]
+        let phone = try Self.setup(kind: .ios, simulator: sim)
+        let pad = try Self.setup(kind: .ios, device: "iPad Pro 13-inch (M5)", name: "pad", simulator: sim)
+        let p = await IOSAdapter(deps: phone.deps).start(phone.context)
+        let t = await IOSAdapter(deps: pad.deps).start(pad.context)
+        #expect(p.status == .running && p.simulatorId == "SIM-P", "\(p)")
+        #expect(t.status == .running && t.simulatorId == "SIM-T", "\(t)")
+        #expect(sim.calls.contains(.ensureDevice("Brahma acme-phone", "iPhone 15 Pro")) && sim.calls.contains(.ensureDevice("Brahma acme-pad", "iPad Pro 13-inch (M5)")))
+        #expect(SimctlController.deviceName(slug: "acme", surface: "phone") == "Brahma acme-phone" && SimctlController.isBrahmaDevice("Brahma acme-phone"))
+        // Stopping the phone leaves the pad's device alone.
+        await IOSAdapter(deps: phone.deps).stop(phone.context, state: PreviewState(surfaceId: "s1", companyId: "c1", status: .running, updatedAt: Date(), simulatorId: "SIM-P"))
+        #expect(sim.calls.contains(.shutdown("SIM-P")) && !sim.calls.contains(.shutdown("SIM-T")), "\(sim.calls)")
+        #expect(sim.calls.filter { if case .shutdown = $0 { return true }; return false }.count == 1)
+        // The scripted controller creates the per-surface device rather than reusing the company-wide one in the fixture.
+        let script = SimctlScript(devices: try Self.fixture("simctl-devices"), types: try Self.fixture("simctl-devicetypes"))
+        let ctl = SimctlController(exec: script.exec, available: { true })
+        #expect(try ctl.ensureDevice(name: SimctlController.deviceName(slug: "acme", surface: "phone"), deviceType: "iPhone 15 Pro") == "NEW-UDID-1")
+        #expect(script.argvs.last == ["create", "Brahma acme-phone", "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro"], "\(script.argvs)")
+    }
+
+    /// Fix round 1, M1: a start that fails after `boot` (install, launch) shuts the device down again; nothing stays booted.
+    @Test func iosFailedStartShutsDown() async throws {
+        for verb in ["install", "launch"] {
+            let sim = FakeSimulator()
+            sim.failing = [verb]
+            let s = try Self.setup(kind: .ios, simulator: sim)
+            let update = await IOSAdapter(deps: s.deps).start(s.context)
+            #expect(update.status == .failed && update.message == "Simulator \(verb) failed (exit 1)" && update.simulatorId == nil, "\(verb): \(update)")
+            #expect(sim.calls.last == .shutdown("SIM-1"), "\(verb): \(sim.calls)")
+            #expect(sim.calls.contains(.boot("SIM-1")))
+            // simctl's own words went to the sealed log, not the message.
+            #expect(Self.text(s.context.logURL)?.contains("\(verb): nope") == true)
+        }
+        // A boot failure: nothing to shut down.
+        let sim = FakeSimulator()
+        sim.failing = ["boot"]
+        let s = try Self.setup(kind: .ios, simulator: sim)
+        let update = await IOSAdapter(deps: s.deps).start(s.context)
+        #expect(update.status == .failed && update.message == "Simulator boot failed (exit 1)")
+        #expect(!sim.calls.contains(.shutdown("SIM-1")))
+    }
+
+    static func text(_ url: URL) -> String? { (try? Data(contentsOf: url)).map { String(decoding: $0, as: UTF8.self) } }
 
     @Test func iosNeedsOwnerApproval() async throws {
         let s = try Self.setup(kind: .ios, approved: false)
@@ -292,7 +347,9 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
         // An app that exits at once is a failed start, never left in the table.
         let quick = try Self.setup(kind: .macos, build: "true")
         try Self.writeApp(quick.run.appending(path: "build/App.app"), executable: "App", body: "exit 7")
-        let gone = await MacAppAdapter(deps: quick.deps).start(quick.context)
+        var quickContext = quick.context
+        quickContext.timeouts = PreviewTimeouts(poll: .seconds(2))   // one liveness check after `poll`; generous under suite load
+        let gone = await MacAppAdapter(deps: quick.deps).start(quickContext)
         #expect(gone.status == .failed && gone.message == "exited during start (exit 7)" && quick.deps.processes.count == 0, "\(gone)")
     }
 

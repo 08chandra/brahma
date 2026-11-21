@@ -88,7 +88,17 @@ public actor PreviewRunner: EmergencyStopObserver {
     var stopping = 0
     /// Bumped by every `stopAll` (Task 3 M1): a pass that began before it brings nothing up after it (`launch` and the
     /// pass's own writes check that the epoch they started in is still current).
-    private var stopEpoch = 0
+    var stopEpoch = 0
+    /// The sprint-review demo in flight (Plan 4a Task 7), cancelled by `stop` like the starts (fix round 1, I1).
+    var demoTask: Task<DemoOutcome?, Never>?
+    /// Sprint id → how many times its demo's results could not be recorded (fix round 1, M6; `maxDemoAttempts`).
+    var demoAttempts: [String: Int] = [:]
+    /// Tests only: makes the demo's record step throw.
+    var demoRecordFailure: (any Error)?
+    /// After this many record failures the engine gives the sprint up: one `failed` row and a post that it failed.
+    static let maxDemoAttempts = 3
+
+    func failDemoRecords(with error: (any Error)?) { demoRecordFailure = error }
 
     struct Run: Sendable {
         var company: Company
@@ -123,10 +133,11 @@ public actor PreviewRunner: EmergencyStopObserver {
 
     // MARK: The pass
 
-    public func reconcile(now: Date) async { await reconcile(now: now, settled: false) }
+    public func reconcile(now: Date) async { await reconcile(now: now, settledCompany: nil) }
 
-    /// `settled`: treat a moved `main` as past its debounce (the sprint-review demo wants the current `main` now).
-    func reconcile(now: Date, settled: Bool) async {
+    /// `settledCompany`: that company's moved `main` counts as past its debounce (the sprint-review demo wants its current
+    /// `main` now; every other company keeps the debounce, fix round 1 M3).
+    func reconcile(now: Date, settledCompany: String?) async {
         guard stopping == 0 else { return }
         let epoch = stopEpoch
         if !recovered {
@@ -153,7 +164,7 @@ public actor PreviewRunner: EmergencyStopObserver {
             }
             guard let main = company.mainCommit else { continue }
             if mainSeen[company.id]?.commit != main { mainSeen[company.id] = (main, now) }
-            let mainSettled = settled || now.timeIntervalSince(mainSeen[company.id]?.at ?? now) >= Self.debounce
+            let mainSettled = settledCompany == company.id || now.timeIntervalSince(mainSeen[company.id]?.at ?? now) >= Self.debounce
             for surface in surfaces {
                 guard let kind = surface.previewKind, kind != .artifact else { continue }
                 let state = states[surface.id] ?? PreviewState(surfaceId: surface.id, companyId: company.id, updatedAt: now)
@@ -522,6 +533,11 @@ public actor PreviewRunner: EmergencyStopObserver {
         stopping += 1
         stopEpoch += 1
         defer { stopping -= 1 }
+        // A sprint demo in flight (its reconcile passes, a running demo command) is cancelled first (fix round 1, I1).
+        if let demo = demoTask {
+            demo.cancel()
+            _ = await demo.value
+        }
         while !starts.isEmpty {
             for task in starts.values { task.cancel() }
             await waitForStarts()
