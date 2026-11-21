@@ -19,8 +19,8 @@
   2. Canary probe per configured local port: unreachable from agent Bash on every backend.
   3. `gemini` adapter: Messages ↔ `generateContent`/`streamGenerateContent`, function calling, usage metadata; goldens.
   4. `azure-openai` adapter: deployment-scoped URLs, `api-key` header, `api-version` pinned per release; reuses the Chat Completions translation.
-  5. `bedrock` adapter: Converse/ConverseStream, SigV4 in-gateway (no AWS SDK), event-stream framing; keys `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` as company secrets.
-  6. `vertex` adapter: service-account JSON as a company secret, JWT → access token in gateway memory only, refreshed before expiry; Gemini and Anthropic-on-Vertex model families.
+  5. `bedrock` adapter: Converse/ConverseStream, SigV4 in-gateway (no AWS SDK), event-stream framing; keys as company secrets named `BRAHMA_KEY_BEDROCK_ID`/`BRAHMA_KEY_BEDROCK_SECRET` (never `AWS_*`, which could be a test key).
+  6. `vertex` adapter: service-account JSON as the company secret `BRAHMA_KEY_VERTEX`, JWT → access token in gateway memory only, refreshed before expiry; Gemini and Anthropic-on-Vertex model families.
   7. Offline mode: a company whose every route is `local` with an empty allowlist runs with the network off; doctor line; `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` verified by an egress-log probe.
   8. Red team (Opus): SigV4 and JWT handling, key leakage in signed URLs and errors, LAN host abuse.
 - **Depends on:** X1 (gateway, meter, probe, routes).
