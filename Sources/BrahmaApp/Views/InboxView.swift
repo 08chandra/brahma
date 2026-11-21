@@ -246,6 +246,11 @@ private struct InboxCard: View {
                 if row.canAcknowledge {
                     Button("Acknowledge") { run { _ = await model.acknowledge(askId: row.id) } }.buttonStyle(.brahmaPrimary).disabled(busy)
                 }
+                if row.canVouchRestore {
+                    // Plan C P2 (Ruling 26): the owner vouches for the commits the restore could not place.
+                    Button("Vouch for restored commits") { run { await model.vouchRestoredCommits(askId: row.id) } }
+                        .buttonStyle(.brahma).disabled(busy)
+                }
                 if row.canRescind {
                     Button("Rescind…") { showRescind = true }.buttonStyle(.brahma)
                         .popover(isPresented: $showRescind, arrowEdge: .bottom) { rescindPopover }

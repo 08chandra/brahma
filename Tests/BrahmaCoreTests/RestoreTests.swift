@@ -915,6 +915,225 @@ import GRDB
         }
     }
 
+    // MARK: Plan C P2 breaker fix: every epoch counts (B-1: Ruling 24), its range starts at its own main (B-2: Ruling 25),
+    // the owner's vouch (B-3: Ruling 26), and the vouch launders no turn's row (B-4)
+
+    /// A new item in `store` (the restored database) whose branch is `item/<KEY>` at `start`.
+    private func restoredItem(_ w: TaintWorld, _ store: Store, _ title: String, at start: String) throws -> WorkItem {
+        let item = try store.createWorkItem(companyId: w.acme.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: title, checkSpec: CheckSpec(command: "true", paths: ["src/\(UUID().uuidString.prefix(8))"]), status: .ready))
+        try w.git.git(["branch", "item/\(item.key)", start])
+        return item
+    }
+
+    /// B-1 (Ruling 24): a listed epoch protects more than the commits it listed. A commit dangling at the restore (made on a
+    /// branch deleted before it, so the listing never saw it) and revived after it onto a new item's branch reads tainted: its
+    /// commit ref, a key-less file at it and the item's diff. `main`'s own history stays clean, and after the owner's vouch
+    /// the revived refs read by the usual rules (clean: no row names them).
+    @Test func listedRestoreTaintsADanglingCommitRevivedAfterIt() throws {
+        let w = try TaintWorld()
+        let onMain = try w.recordMain()
+        let snapshot = try w.service.snapshot(reason: .manual)
+        try w.git.git(["checkout", "-q", "-b", "scratch"])
+        try w.git.write("src/dangling.ts", "dangling \(UUID().uuidString)\n")
+        try w.git.git(["add", "--", "src/dangling.ts"])
+        try w.git.git(["commit", "-q", "-m", "dangling"])
+        let sha = try w.git.git(["rev-parse", "HEAD"])
+        try w.git.git(["checkout", "-q", "main"])
+        try w.git.git(["branch", "-q", "-D", "scratch"])
+        let restored = try w.restoreOverUnreadable(snapshot)
+        let listed = try restored.writer.read { db in
+            try Bool.fetchOne(db, sql: "SELECT listed FROM restoreEpoch WHERE companyId = ?", arguments: [w.acme.id])
+        }
+        #expect(listed == true, "the restore did not list")
+        #expect(try restored.writer.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [w.acme.id, sha])
+        } == 0, "the dangling commit was listed after all")
+        let item = try restoredItem(w, restored, "Revive", at: sha)      // a clean session moves a branch onto it
+        for ref in ["commit:\(sha)", "commit:\(sha.prefix(7))", "src/dangling.ts@\(sha)", "\(item.key):diff"] {
+            #expect(try w.tainted(restored, ref), "\(ref) read clean under a listed epoch")
+        }
+        #expect(try !w.tainted(restored, "commit:\(onMain)"))
+        #expect(try !w.tainted(restored, "README.md@\(onMain)"))
+        try restored.vouchRestoredCommits(companyId: w.acme.id, now: Date())
+        for ref in ["commit:\(sha)", "src/dangling.ts@\(sha)", "\(item.key):diff"] {
+            #expect(try !w.tainted(restored, ref), "\(ref) after the owner's vouch")
+        }
+    }
+
+    /// B-2 (Ruling 25): the epoch's range runs from the epoch's own `main`, never live `main`. After the restore a commit X is
+    /// merged into `main` (and recorded there), so live `main`'s merge base with X is X itself: `src/x.ts@X`, the merged item's
+    /// diff, the rev-less `src/x.ts` (main's head), and an artifact published from the main checkout whose bytes X wrote all
+    /// read tainted, under a listed and an unlisted epoch; a file X did not touch stays clean. After the owner's vouch they
+    /// read by the usual rules (clean).
+    @Test func restoreEpochRangeStartsAtTheEpochsOwnMain() throws {
+        for listed in [true, false] {
+            let w = try TaintWorld()
+            let onMain = try w.recordMain()
+            let snapshot = try w.service.snapshot(reason: .manual)
+            let restored: Store
+            if listed {
+                restored = try w.restoreOverUnreadable(snapshot)
+            } else {
+                let gitDir = URL(fileURLWithPath: w.acme.workspacePath, isDirectory: true).appending(path: ".git")
+                let away = URL(fileURLWithPath: w.acme.workspacePath, isDirectory: true).appending(path: ".git-away")
+                try FileManager.default.moveItem(at: gitDir, to: away)
+                defer { try? FileManager.default.moveItem(at: away, to: gitDir) }
+                restored = try w.restoreOverUnreadable(snapshot)
+            }
+            let epochListed = try restored.writer.read { db in
+                try Bool.fetchOne(db, sql: "SELECT listed FROM restoreEpoch WHERE companyId = ?", arguments: [w.acme.id])
+            }
+            #expect(epochListed == listed)
+            let item = try restoredItem(w, restored, "Merged", at: onMain)
+            try w.git.git(["checkout", "-q", "item/\(item.key)"])
+            try w.git.write("src/x.ts", "x \(UUID().uuidString)\n")
+            try w.git.write("page.html", "<p>from X</p>\n")
+            try w.git.git(["add", "--", "src/x.ts", "page.html"])
+            try w.git.git(["commit", "-q", "-m", "x"])
+            let x = try w.git.git(["rev-parse", "HEAD"])
+            try w.git.git(["checkout", "-q", "main"])
+            try w.git.git(["merge", "-q", "--ff-only", "item/\(item.key)"])
+            try restored.recordMainCommit(companyId: w.acme.id, commit: x)
+            let artifact = try restored.publishArtifact(companyId: w.acme.id, by: .owner, sourcePath: "page.html", title: "Page",
+                                                        itemKey: nil, baseDirectory: URL(fileURLWithPath: w.acme.workspacePath, isDirectory: true))
+            let refs = ["src/x.ts@\(x)", "page.html@\(x)", "\(item.key):diff", "src/x.ts", artifact.ref, "commit:\(x)"]
+            for ref in refs {
+                #expect(try w.tainted(restored, ref), "listed \(listed): \(ref) read clean once live main moved past X")
+            }
+            #expect(try !w.tainted(restored, "README.md"), "listed \(listed): a file X did not touch")
+            #expect(try !w.tainted(restored, "README.md@\(x)"), "listed \(listed)")
+            try restored.vouchRestoredCommits(companyId: w.acme.id, now: Date())
+            for ref in refs {
+                #expect(try !w.tainted(restored, ref), "listed \(listed): \(ref) after the owner's vouch")
+            }
+        }
+    }
+
+    /// B-4: the carry never gives a turn's tainted row a restore epoch, so the owner's restore vouch can't clear it. An item is
+    /// done in S0, reopened and worked by a tainted session (row for X, no epoch), S1 taken; a restore of S0 over an unreadable
+    /// database lists X under its epoch; a readable restore of S1 then merges the two rows: X keeps no epoch, and after the
+    /// vouch it is still uncleared and tainted.
+    @Test func restoreVouchLeavesATurnTaintedCommitTainted() throws {
+        let w = try TaintWorld()
+        _ = try w.recordMain()
+        let (item, _) = try w.item("Turn")
+        try w.env.store.writer.write { db in
+            try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id])
+            try db.execute(sql: "UPDATE workItem SET status = 'done' WHERE id = ?", arguments: [item.id])
+        }
+        let s0 = try w.service.snapshot(reason: .manual)
+        try w.env.store.writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET status = 'inProgress' WHERE id = ?", arguments: [item.id])
+        }
+        let x = try w.commit(on: item, "src/turn.ts", tainted: true)
+        let s1 = try w.service.snapshot(reason: .manual)
+        let first = try w.restoreOverUnreadable(s0)
+        #expect(try first.writer.read { db in
+            try String.fetchOne(db, sql: "SELECT restoreEpoch FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [w.acme.id, x])
+        } != nil, "the first restore did not list X under its epoch")
+        try first.close()
+        _ = try w.service.restore(try w.service.planRestore(snapshot: s1))
+        let second = try Store(path: w.env.paths.database.path, backupsDir: w.env.paths.backupsDir)
+        let row = try #require(try second.writer.read { db in
+            try Row.fetchOne(db, sql: "SELECT restoreEpoch, source FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [w.acme.id, x])
+        })
+        #expect(row["restoreEpoch"] as String? == nil, "a turn's row took the epoch of the earlier restore's listing")
+        #expect(row["source"] as String == "docs.swift.org")
+        try second.vouchRestoredCommits(companyId: w.acme.id, now: Date())
+        #expect(try second.writer.read { db in
+            try String.fetchOne(db, sql: "SELECT clearedBy FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [w.acme.id, x])
+        } == nil, "the restore vouch cleared a turn's tainted commit")
+        #expect(try w.tainted(second, "commit:\(x)"), "a turn-tainted commit read clean after the restore vouch")
+    }
+
+    /// B-3 (Ruling 26): a data home with Acme and an uncleared restore epoch (no recorded main: every commit tainted) holding
+    /// one listed commit row.
+    private func epochHome(initOwner: Bool) throws -> (home: OwnerTestHome, company: Company, sha: String) {
+        let home = try OwnerTestHome(initOwner: initOwner)
+        let paths = ownerPaths(home.url)
+        try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        let store = try Store(path: paths.database.path, backupsDir: paths.backupsDir)
+        let company = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: paths.workspaces)
+        let sha = String(repeating: "d4", count: 20)
+        try store.writer.write { db in
+            try RestoreEpoch(id: "epoch-1", companyId: company.id, mainCommit: nil, listed: true, source: RestoreCarry.unreadableCommitTaintSource,
+                             createdAt: Date(), clearedBy: nil, clearedAt: nil).insert(db)
+            try db.execute(sql: """
+                INSERT INTO taintedCommit (companyId, sha, source, createdAt, restoreEpoch) VALUES (?, ?, ?, ?, 'epoch-1')
+                """, arguments: [company.id, sha, RestoreCarry.unreadableCommitTaintSource, Date()])
+        }
+        try store.close()
+        return (home, company, sha)
+    }
+
+    private func epochState(_ home: OwnerTestHome, _ company: Company, _ sha: String) throws -> (epochCleared: String?, commitCleared: String?, commitTainted: Bool, otherTainted: Bool) {
+        let paths = ownerPaths(home.url)
+        let store = try Store(path: paths.database.path, backupsDir: paths.backupsDir)
+        defer { try? store.close() }
+        let (epoch, commit) = try store.writer.read { db in
+            (try String.fetchOne(db, sql: "SELECT clearedBy FROM restoreEpoch WHERE id = 'epoch-1'"),
+             try String.fetchOne(db, sql: "SELECT clearedBy FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [company.id, sha]))
+        }
+        let other = String(repeating: "e5", count: 20)
+        return (epoch, commit, try store.refTaint(WorkRef(kind: .commit, id: sha), companyId: company.id).tainted,
+                try store.refTaint(WorkRef(kind: .commit, id: other), companyId: company.id).tainted)
+    }
+
+    /// B-3 (Ruling 26): `brahma vouch restore <company>` is the owner's way to clear a restore epoch: as the owner it clears
+    /// the epoch and its rows (each clearing sequenced, an owner activity line), and refs then read by the usual rules; from an
+    /// agent's shell (`BRAHMA_AGENT_ID`) or without the owner key it is refused and changes nothing.
+    @Test func cliVouchRestoreOwnerOnly() throws {
+        let noKey = try epochHome(initOwner: false)
+        let refusedNoKey = try runBrahma(["vouch", "restore", "acme"], home: noKey.home.url)
+        #expect(refusedNoKey.status != 0 && refusedNoKey.stderr.contains("owner key missing"), "\(refusedNoKey.stderr)")
+        let afterNoKey = try epochState(noKey.home, noKey.company, noKey.sha)
+        #expect(afterNoKey.epochCleared == nil && afterNoKey.commitCleared == nil && afterNoKey.commitTainted && afterNoKey.otherTainted)
+
+        let h = try epochHome(initOwner: true)
+        let before = try epochState(h.home, h.company, h.sha)
+        #expect(before.commitTainted && before.otherTainted)
+        let agent = try runBrahma(["vouch", "restore", "acme"], home: h.home.url, extra: ["BRAHMA_AGENT_ID": "agent-1"])
+        #expect(agent.status != 0 && agent.stderr.contains("owner commands can't run inside an agent turn"), "\(agent.stderr)")
+        let afterAgent = try epochState(h.home, h.company, h.sha)
+        #expect(afterAgent.epochCleared == nil && afterAgent.commitCleared == nil && afterAgent.commitTainted && afterAgent.otherTainted)
+        #expect(try runBrahma(["vouch", "restore", "nosuch"], home: h.home.url).status != 0)
+
+        let owner = try runBrahma(["vouch", "restore", "acme"], home: h.home.url)
+        #expect(owner.status == 0, "\(owner.stderr)")
+        #expect(owner.stdout.contains("Acme"), "\(owner.stdout)")
+        let after = try epochState(h.home, h.company, h.sha)
+        #expect(after.epochCleared == "owner" && after.commitCleared == "owner")
+        #expect(!after.commitTainted && !after.otherTainted, "refs still read tainted after the owner's vouch")
+        let paths = ownerPaths(h.home.url)
+        let store = try Store(path: paths.database.path, backupsDir: paths.backupsDir)
+        defer { try? store.close() }
+        let (clears, lines) = try store.writer.read { db in
+            (try String.fetchAll(db, sql: "SELECT subject FROM taintOrder WHERE companyId = ? AND kind = 'clear'", arguments: [h.company.id]),
+             try String.fetchAll(db, sql: "SELECT text FROM activityEvent WHERE companyId = ? AND kind = 'access' AND agentId IS NULL",
+                                 arguments: [h.company.id]))
+        }
+        #expect(clears.contains("restore-epoch:epoch-1") && clears.contains(h.sha), "\(clears)")
+        #expect(lines.contains { $0.contains("Owner vouched for the commits a restore could not place") }, "\(lines)")
+        // Nothing left to clear: a second run says so and succeeds.
+        let again = try runBrahma(["vouch", "restore", "acme"], home: h.home.url)
+        #expect(again.status == 0, "\(again.stderr)")
+    }
+
+    /// B-3: no agent tool reaches the restore vouch: no company tool is named for it, and no tool source calls it or writes a
+    /// restore epoch's clearing.
+    @Test func noAgentToolReachesTheRestoreVouch() throws {
+        #expect(!CompanyToolNames.all.contains { $0.contains("vouch") })
+        var reaches: [String] = []
+        for (path, text) in try EngineGitGuardTests.sources(under: "Sources/BrahmaCore/MCP") {
+            let code = EngineGitGuardTests.code(text)
+            if code.range(of: #"\bvouch(RestoredCommits|Item)\b|UPDATE\s+restoreEpoch"#, options: .regularExpression) != nil {
+                reaches.append(path)
+            }
+        }
+        #expect(reaches.isEmpty, "a tool path reaches the restore vouch: \(reaches)")
+    }
+
     @Test func cliRestoreOwnerOnly() throws {
         let home = try OwnerTestHome(initOwner: false)
         // No owner key in this data home: refused.
