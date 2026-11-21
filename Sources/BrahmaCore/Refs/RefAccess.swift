@@ -1,0 +1,227 @@
+import Foundation
+import GRDB
+
+/// Whether a reader may read a ref: in full (with C's access word), locked behind an approver role, or refused.
+public enum RefDecision: Equatable, Sendable {
+    case allowed(RefAccessLabel)
+    case locked(approverRole: String)
+    case refused
+}
+
+/// Read access for refs (design §4.2), decided by ML's one access engine (`MemoryAccess.level`) with no second predicate.
+/// Every lookup is bound to the company (`companyId = ?`); an object of another company, an unknown one and a reader of
+/// another company are all `.refused` here (the resolver shows the first two as `.missing`).
+///
+/// The class per kind: file, diff, commit, item, run, preview, release, agent and sprint are company; a `.brahma` lab, home
+/// or notes path is private to its agent; a message or thread follows its channel (members, else locked) or DM
+/// (participants, else refused); a channel its members; a resource its stored scope, reader set and future holders (a
+/// flagged one is secret); a kb page its page restriction (and a named section's markers); a memory entry its memory doc;
+/// an ask ML's per-party class (owner, requester, internal approver, decider; else refused); a fact the owner's.
+public enum RefAccess {
+    public static func canRead(_ reader: Reader, _ ref: WorkRef, companyId: String, db: Database,
+                               catalog: PackCatalog = .builtin) throws -> RefDecision {
+        guard let ctx = try readerContext(reader, companyId: companyId, db: db, catalog: catalog),
+              let subject = try subject(ref, companyId: companyId, db: db) else { return .refused }
+        return decide(ctx, subject)
+    }
+
+    /// Nil for an agent that is not of this company.
+    static func readerContext(_ reader: Reader, companyId: String, db: Database, catalog: PackCatalog) throws -> ReaderContext? {
+        do {
+            return try ReaderContext.load(db: db, catalog: catalog, companyId: companyId, reader: reader)
+        } catch WorkError.forbidden(_) {
+            return nil
+        }
+    }
+
+    static func decide(_ ctx: ReaderContext, _ s: Subject) -> RefDecision {
+        let level = MemoryAccess.level(ctx, access: s.access, sensitivity: s.sensitivity, readerSet: s.readerSet,
+                                       restrictions: s.restrictions, futureHolders: s.futureHolders)
+        if case .full = level {
+            return .allowed(RefAccessLabel.label(access: s.access, sensitivity: s.sensitivity, restrictions: s.restrictions,
+                                                 readerSet: s.readerSet))
+        }
+        if s.sensitivity == .hrPerf || s.sensitivity == .secret || s.access == .ownerOnly || s.refusedWhenUnreadable {
+            return .refused
+        }
+        return .locked(approverRole: "owner")
+    }
+
+    // MARK: Subjects
+
+    /// The object a ref names, as the access engine and the resolver read it.
+    struct Subject {
+        var access: AccessClass = .company
+        var sensitivity: Sensitivity = .normal
+        var readerSet: Set<String>?
+        var restrictions: [Restriction] = []
+        var futureHolders = false
+        /// A non-reader is refused, not offered an approver (a DM, an ask, an agent's private place, a fact).
+        var refusedWhenUnreadable = false
+        var record: Record
+    }
+
+    enum Record {
+        /// A tracked path (main or an item branch) or a worktree path; `place` is the agent handle of a private `.brahma` place.
+        case file(place: String?)
+        case diff(WorkItem)
+        case commit
+        case item(WorkItem, ownerHandle: String?)
+        case ask(Ask)
+        case kb(KBPage, section: String?)
+        case memory(MemoryEntry, authorHandle: String)
+        case resource(Resource)
+        case preview(PreviewSurface, status: PreviewStatus?)
+        case run(VerificationRun, itemKey: String)
+        case release(version: String, status: String)
+        case message(Message, Channel)
+        case agent(Agent)
+        case channel(Channel, members: Int)
+        case sprint(Sprint)
+        case fact
+    }
+
+    /// The object of this company `ref` names, or nil (unknown, another company's, or a 4a artifact).
+    static func subject(_ ref: WorkRef, companyId: String, db: Database) throws -> Subject? {
+        switch ref.kind {
+        case .file:
+            if let key = ref.itemKey { guard try item(db, companyId, key) != nil else { return nil } }
+            guard let place = privatePlace(ref) else { return Subject(record: .file(place: nil)) }
+            guard ref.branch == nil, ref.rev == nil,
+                  let agent = try Agent.fetchOne(db, sql: "SELECT * FROM agent WHERE companyId = ? AND name = ?",
+                                                 arguments: [companyId, place]) else { return nil }
+            return Subject(access: .agent(agent.id), readerSet: [agent.id], refusedWhenUnreadable: true, record: .file(place: place))
+        case .diff:
+            return try item(db, companyId, ref.id).map { Subject(record: .diff($0)) }
+        case .commit:
+            return Subject(record: .commit)
+        case .item:
+            guard let item = try item(db, companyId, ref.id) else { return nil }
+            let owner = try item.ownerId.flatMap { try handle(db, companyId, $0) }
+            return Subject(record: .item(item, ownerHandle: owner))
+        case .ask:
+            guard let n = Int(ref.id), let ask = try Ask.fetchOne(db, sql: "SELECT * FROM ask WHERE companyId = ? AND number = ?",
+                                                                  arguments: [companyId, n]) else { return nil }
+            let scope = try MemoryIngest.askScope(ask) { h in
+                try String.fetchOne(db, sql: "SELECT id FROM agent WHERE companyId = ? AND name = ?", arguments: [companyId, h])
+            }
+            return Subject(access: scope.access, sensitivity: scope.sensitivity, readerSet: scope.readerSet,
+                           restrictions: scope.restrictions, refusedWhenUnreadable: true, record: .ask(ask))
+        case .kb:
+            guard let page = try Store.kbPage(db: db, companyId: companyId, path: ref.id) else { return nil }
+            var restrictions: [Restriction] = page.pageRestriction.map { [$0] } ?? []
+            let section = ref.params["section"]
+            if let section {
+                let slug = KBMarkdown.slug(section)
+                if let s = KBMarkdown.sections(page.body, page: page.pageRestriction).first(where: { $0.slug == slug }) {
+                    restrictions = s.restrictions
+                }
+            }
+            return Subject(restrictions: restrictions, record: .kb(page, section: section))
+        case .memory:
+            guard let n = Int(ref.id), let entry = try MemoryEntry.fetchOne(db, sql: """
+                SELECT * FROM memoryEntry WHERE companyId = ? AND number = ? AND removedAt IS NULL AND purgedAt IS NULL
+                """, arguments: [companyId, n]) else { return nil }
+            let author = try handle(db, companyId, entry.authorId) ?? entry.authorId
+            var s = Subject(access: entry.access ?? .ownerOnly, record: .memory(entry, authorHandle: author))
+            // The memory doc carries what ML decided for it (sensitivity, reader set, restrictions); its fields fail closed.
+            if let doc = try Row.fetchOne(db, sql: """
+                SELECT * FROM memoryDoc WHERE companyId = ? AND source = 'memory' AND ref = ? AND removedAt IS NULL
+                ORDER BY updatedAt DESC LIMIT 1
+                """, arguments: [companyId, entry.ref]) {
+                let decoder = JSONDecoder()
+                guard let access = AccessClass(kind: doc["accessKind"], id: doc["accessId"]),
+                      let sensitivity = Sensitivity(rawValue: doc["sensitivity"]),
+                      let restrictions = try? decoder.decode([[String]].self, from: Data((doc["restrictions"] as String).utf8))
+                else { return Subject(access: .ownerOnly, record: s.record) }
+                if let raw: String = doc["readerSet"] {
+                    guard let ids = try? decoder.decode([String].self, from: Data(raw.utf8)) else {
+                        return Subject(access: .ownerOnly, record: s.record)
+                    }
+                    s.readerSet = Set(ids)
+                }
+                s.access = access
+                s.sensitivity = sensitivity
+                s.restrictions = restrictions.map(Set.init)
+                s.futureHolders = doc["futureHolders"]
+            }
+            return s
+        case .artifact:
+            // 4a-gap: Artifact (4a Task 6). No artifact rows exist yet: every AR-<n> is unknown (refused here, missing when
+            // resolved), the answer the design gives an unknown object.
+            return nil
+        case .resource:
+            guard let n = Int(ref.id), let r = try Store.resource(db: db, companyId: companyId, number: n), r.removedAt == nil
+            else { return nil }
+            return Subject(access: r.scope, sensitivity: r.secretScan == .flagged ? .secret : .normal, readerSet: r.readerSet,
+                           futureHolders: r.futureHolders, record: .resource(r))
+        case .preview:
+            guard let surface = try PreviewSurface.fetchOne(db, sql: "SELECT * FROM previewSurface WHERE companyId = ? AND name = ?",
+                                                            arguments: [companyId, ref.id]) else { return nil }
+            let state = try PreviewState.fetchOne(db, sql: "SELECT * FROM previewState WHERE companyId = ? AND surfaceId = ?",
+                                                  arguments: [companyId, surface.id])
+            return Subject(record: .preview(surface, status: state?.status))
+        case .run:
+            let run: VerificationRun?
+            if let key = ref.params["item"] {
+                guard let item = try item(db, companyId, key) else { return nil }
+                run = try VerificationRun.fetchOne(db, sql: """
+                    SELECT * FROM verificationRun WHERE companyId = ? AND itemId = ? ORDER BY createdAt DESC, rowid DESC LIMIT 1
+                    """, arguments: [companyId, item.id])
+            } else {
+                run = try VerificationRun.fetchOne(db, sql: "SELECT * FROM verificationRun WHERE companyId = ? AND id = ?",
+                                                   arguments: [companyId, ref.id])
+            }
+            guard let run else { return nil }
+            let key = try String.fetchOne(db, sql: "SELECT key FROM workItem WHERE companyId = ? AND id = ?",
+                                          arguments: [companyId, run.itemId]) ?? "?"
+            return Subject(record: .run(run, itemKey: key))
+        case .release:
+            guard let n = Int(ref.id), let row = try Row.fetchOne(db, sql: "SELECT version, status FROM release WHERE companyId = ? AND number = ?",
+                                                                  arguments: [companyId, n]) else { return nil }
+            return Subject(record: .release(version: row["version"], status: row["status"]))
+        case .message, .thread:
+            guard let m = try Message.fetchOne(db, sql: "SELECT * FROM message WHERE companyId = ? AND id = ?",
+                                               arguments: [companyId, ref.id]),
+                  let channel = try Channel.fetchOne(db, sql: "SELECT * FROM channel WHERE companyId = ? AND id = ?",
+                                                     arguments: [companyId, m.channelId]) else { return nil }
+            let dm = channel.kind == .dm
+            return Subject(access: dm ? .dm(channel.id) : .channel(channel.id), refusedWhenUnreadable: dm, record: .message(m, channel))
+        case .agent:
+            guard let agent = try Agent.fetchOne(db, sql: "SELECT * FROM agent WHERE companyId = ? AND name = ?",
+                                                 arguments: [companyId, ref.id]) else { return nil }
+            return Subject(record: .agent(agent))
+        case .channel:
+            guard let channel = try Channel.fetchOne(db, sql: "SELECT * FROM channel WHERE companyId = ? AND name = ? AND kind = 'channel'",
+                                                     arguments: [companyId, ref.id]) else { return nil }
+            let members = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM channelMember WHERE channelId = ?", arguments: [channel.id]) ?? 0
+            return Subject(access: .channel(channel.id), record: .channel(channel, members: members))
+        case .sprint:
+            guard let n = Int(ref.id), let sprint = try Sprint.fetchOne(db, sql: "SELECT * FROM sprint WHERE companyId = ? AND number = ?",
+                                                                        arguments: [companyId, n]) else { return nil }
+            return Subject(record: .sprint(sprint))
+        case .fact:
+            return Subject(access: .ownerOnly, refusedWhenUnreadable: true, record: .fact)
+        }
+    }
+
+    /// The agent handle owning a private `.brahma` place the path is in (`labs/<h>/…`, `home/<h>/…`,
+    /// `notes/agents/<h>.md`), or nil for any other path.
+    static func privatePlace(_ ref: WorkRef) -> String? {
+        let parts = ref.id.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 3, parts[0] == ".brahma" else { return nil }
+        switch parts[1] {
+        case "labs", "home": return parts[2]
+        case "notes" where parts.count == 4 && parts[2] == "agents" && parts[3].hasSuffix(".md"): return String(parts[3].dropLast(3))
+        default: return nil
+        }
+    }
+
+    static func item(_ db: Database, _ companyId: String, _ key: String) throws -> WorkItem? {
+        try WorkItem.fetchOne(db, sql: "SELECT * FROM workItem WHERE companyId = ? AND key = ?", arguments: [companyId, key])
+    }
+
+    static func handle(_ db: Database, _ companyId: String, _ agentId: String) throws -> String? {
+        try String.fetchOne(db, sql: "SELECT name FROM agent WHERE companyId = ? AND id = ?", arguments: [companyId, agentId])
+    }
+}
