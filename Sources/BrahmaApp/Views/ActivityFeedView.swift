@@ -115,6 +115,10 @@ struct ActivityRow: View {
         case .release: "shippingbox"
         case .resource: "paperclip"
         case .merge: "arrow.triangle.merge"
+        case .share: "square.and.arrow.up"
+        case .access: "lock"
+        case .export: "arrow.down.doc"
+        case .show: "eye"
         }
     }
 
@@ -133,6 +137,10 @@ struct ActivityRow: View {
         case .release: BrahmaTheme.success
         case .resource: BrahmaTheme.accent
         case .merge: BrahmaTheme.success
+        case .share: BrahmaTheme.accent
+        case .access: BrahmaTheme.warning
+        case .export: BrahmaTheme.text1
+        case .show: BrahmaTheme.accent
         }
     }
 }

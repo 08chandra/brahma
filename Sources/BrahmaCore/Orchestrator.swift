@@ -818,7 +818,7 @@ public actor Orchestrator {
         var launched = false
         // A leaseholder's work turn: continuity of its item's branch is checked at the start (the head must be the recorded one)
         // and the head is recorded again at the end (scan (a), Task 4-wire). `held`: continuity held at the start.
-        var leaseHead: (git: GitWorkspace, item: WorkItem, held: Bool)?
+        var leaseHead: (git: GitWorkspace, item: WorkItem, held: Bool, start: String?)?
         // Task 10: the turn's taint (marked once, from the stream's backup path) and the workspace whose lab is recorded at the end.
         var taintMarked = false
         var recordedSources: Set<String> = []
@@ -928,10 +928,11 @@ public actor Orchestrator {
                         // The branch must be where the engine left it (git, off the cooperative pool); a move outside the holder's
                         // turns flags the item and refuses its submits until a manager re-adopts it.
                         let now = clock()
-                        let held = try await blocking.tryRun {
-                            try store.checkBranchContinuity(item: leased, agent: agent, head: try g.head(of: g.branchRef(key: leased.key)), now: now)
+                        let (held, start) = try await blocking.tryRun {
+                            let start = try g.head(of: g.branchRef(key: leased.key))
+                            return (try store.checkBranchContinuity(item: leased, agent: agent, head: start, now: now), start)
                         }
-                        leaseHead = (g, leased, held)
+                        leaseHead = (g, leased, held, start)
                     }
                 }
                 // Only work updates to read and nothing to answer: a notice-only turn (cheapest model for `auto` agents). A
@@ -1483,6 +1484,24 @@ public actor Orchestrator {
                     try store.recordTurnEndHead(item: leaseHead.item, agent: agent, head: head,
                                                 isDescendant: { try git.isAncestor($0, of: head) }, now: now)
                 } catch { self.log("could not record the head of \(key): \(error)") }
+            }
+        }
+
+        // Plan C2a: a holder turn of a session that read outside content records the commits it made (`<head at start>..<head
+        // now>` on `item/<KEY>`) as tainted. The taint is the session's now (ML's `currentTaint`, so a resumed turn that read
+        // nothing itself still counts), read before any fresh-session reset below. Git, off the cooperative pool.
+        if let leaseHead, let start = leaseHead.start {
+            let (store, paths, item, turnId, root) = (self.store, self.paths, leaseHead.item, turn.id, leaseHead.git.root)
+            await blocking.run {
+                do {
+                    let source: String?
+                    do { source = try store.currentTaint(agentId: agent.id, paths: paths) } catch { source = "session" }
+                    guard let source else { return }
+                    let git = try store.refGit(root)
+                    try store.recordTaintedCommits(companyId: agent.companyId, itemId: item.id, agentId: agent.id, turnId: turnId,
+                                                   headBefore: start, headAfter: try git.head("item/\(item.key)"), source: source,
+                                                   git: git, now: now)
+                } catch { self.log("could not record the tainted commits of \(item.key): \(error)") }
             }
         }
 

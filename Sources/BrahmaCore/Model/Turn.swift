@@ -76,6 +76,8 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
 /// is Plan ML's (owner resources added, vouched, rescoped or purged); `merge` is Plan 4a's (the merge queue landed an item).
 public enum ActivityKind: String, Codable, Sendable {
     case stateChanged, message, toolUse, turnStarted, turnFinished, usage, error, work, approval, preview, release, resource, merge
+    /// Plan C: shares, access decisions and refusals (vouches, purges), exports and show requests.
+    case share, access, export, show
 }
 
 public struct ActivityEvent: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
