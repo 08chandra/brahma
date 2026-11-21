@@ -1668,8 +1668,21 @@ enum Migrations {
                 t.column("createdAt", .datetime).notNull()
                 t.column("clearedBy", .text)                     // review|owner
                 t.column("clearedAt", .datetime)
+                t.column("carriedTo", .text)                     // the engine's rebase recorded its replay
                 t.primaryKey(["companyId", "sha"])
             }
+            // Every claim, with the turn it was made in and the branch head it trusted (nil: none could be): a tainted turn's
+            // record covers each item it claimed, even one it released before the turn ended.
+            try db.create(table: "leaseClaim") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("agentId", .text).notNull()
+                t.column("itemId", .text).notNull()
+                t.column("turnId", .text)
+                t.column("claimHead", .text)
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "leaseClaim_turn", on: "leaseClaim", columns: ["agentId", "turnId"])
             try db.create(index: "taintedCommit_item", on: "taintedCommit", columns: ["companyId", "itemId"])
             try db.create(table: "purgeLog") { t in
                 t.primaryKey("id", .text)
