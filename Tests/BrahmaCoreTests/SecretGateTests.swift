@@ -680,7 +680,7 @@ struct StubArchiveReader: ArchiveReader {
         let noise = rng.bytes(5000) + Data([0x50, 0x4B, 0x03, 0x04]) + Data(repeating: 0xFF, count: 40) + rng.bytes(3000)
         #expect(!ArchiveMemberScan.isArchive(noise, ext: "bin"))
         #expect(try check(cf, noise, ext: "bin", canonical: "noise.bin") == .clean)
-        // A header with an absurd name length, or data running past the end, is no header either.
+        // A name that runs past the end of the bytes is no header (amended ruling 32: only whether it fits counts).
         var header = Data([0x50, 0x4B, 0x03, 0x04, 20, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         header += Data([0x10, 0, 0, 0, 0x10, 0, 0, 0, 0x00, 0x08, 0, 0])   // sizes 16, name length 2048
         #expect(!ArchiveMemberScan.isArchive(rng.bytes(100) + header + rng.bytes(100), ext: "bin"))
@@ -755,5 +755,113 @@ struct StubArchiveReader: ArchiveReader {
         }
         #expect(!texts.isEmpty)
         for text in texts { for piece in Self.pieces(Self.value) { #expect(!text.contains(piece)) } }
+    }
+
+    // MARK: Fix round 3
+
+    /// A zip local header alone (no central directory), as the reviewer's `zipv.py` writes it: `version`, `name`, and the
+    /// deflated `text`, then a line of notes.
+    static func lone(version: UInt16, name: String, method: UInt16 = 8, text: String) -> Data {
+        let data = Data(text.utf8)
+        let comp = (try? (data as NSData).compressed(using: .zlib) as Data) ?? Data()   // raw DEFLATE
+        func le16(_ v: UInt16) -> [UInt8] { [UInt8(v & 0xFF), UInt8(v >> 8)] }
+        func le32(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8(v >> 24)] }
+        var out = Data([0x50, 0x4B, 0x03, 0x04] + le16(version) + le16(0) + le16(method) + le16(0) + le16(0))
+        out += Data(le32(ZipBuilder.crc32(data)) + le32(UInt32(comp.count)) + le32(UInt32(data.count)) + le16(UInt16(name.utf8.count)) + le16(0))
+        return out + Data(name.utf8) + comp + Data("\nmore notes\n".utf8)
+    }
+
+    /// R3-4 (amended ruling 32): a `PK\x03\x04` header is an archive when its method is a zip method, its name fits in the
+    /// bytes and its data stays in them (or, deflated, decodes); the version and the name's length don't matter.
+    @Test func archiveDetectionIgnoresVersionAndNameCaps() throws {
+        let cf = try CollabFixture()
+        let leak = "leak \(Self.aws) end\n"
+        for (name, data) in [("ver.txt", Self.lone(version: 0xFFFF, name: "a.txt", text: leak)),
+                             ("name4k.txt", Self.lone(version: 20, name: String(repeating: "n", count: 4096), text: leak)),
+                             ("ok.txt", Self.lone(version: 20, name: "a.txt", text: leak))] {
+            #expect(!String(decoding: data, as: UTF8.self).contains(Self.aws))
+            #expect(ArchiveMemberScan.isArchive(data, ext: "txt"), "\(name)")
+            #expect(throws: WorkError.self, "\(name)") { try check(cf, data, canonical: name) }
+        }
+        // A deflated entry whose declared size runs past the end still counts when its data decodes.
+        var lying = Self.lone(version: 20, name: "a.txt", text: leak)
+        lying[18] = 0xFF; lying[19] = 0xFF; lying[20] = 0xFF; lying[21] = 0x0F
+        #expect(ArchiveMemberScan.isArchive(lying, ext: "txt"))
+        // An unknown method is no zip: random bytes holding such a header are plain bytes.
+        var rng = SeededBytes(state: 0x32)
+        let unknown = rng.bytes(300) + Self.lone(version: 20, name: "a.txt", method: 0x7777, text: "x") + rng.bytes(300)
+        #expect(!ArchiveMemberScan.isArchive(unknown, ext: "bin"))
+        #expect(try check(cf, unknown, ext: "bin", canonical: "noise.bin") == .clean)
+    }
+
+    /// A reader that counts its launches.
+    final class CountingReader: ArchiveReader, @unchecked Sendable {
+        let lock = NSLock()
+        var launches = 0
+        let answer: @Sendable (Data) throws -> [(name: String, data: Data)]
+        init(_ answer: @escaping @Sendable (Data) throws -> [(name: String, data: Data)]) { self.answer = answer }
+        func members(of data: Data, wanted: @Sendable (String) -> Bool, limits: ArchiveLimits) throws -> [(name: String, data: Data)] {
+            lock.withLock { launches += 1 }
+            return try answer(data)
+        }
+    }
+
+    /// R3-5 (m-A): one check launches at most `ArchiveScanBudget.maxLaunches` sandboxed readers; a refusal is cached like
+    /// a verdict (the same bytes are not read again), except one that may pass later (no reader, a reader that could not
+    /// run or ran out of time).
+    @Test func readerLaunchesCappedAndRefusalsCached() throws {
+        let cf = try CollabFixture()
+        // Five nested levels of one zip each, with a cap of three launches.
+        var levels: [Data] = [try Self.packed([("leaf.txt", Data("leaf".utf8))], tag: "level 0")]
+        for i in 1...4 { levels.append(try Self.packed([("next.zip", levels[i - 1])], tag: "level \(i)")) }
+        let all = levels
+        let nested = CountingReader { data in
+            guard let i = all.firstIndex(of: data) else { return [] }
+            return i == 0 ? [("leaf.txt", Data("leaf".utf8))] : [("next.zip", all[i - 1])]
+        }
+        #expect(throws: ArchiveMemberScan.tooManyLaunches) {
+            try ArchiveMemberScan.scan(levels[2], archives: nested, knownValues: [],
+                                       budget: ArchiveScanBudget(bytes: 100_000, depth: 10, launches: 2))
+        }
+        #expect(nested.launches == 2)
+        #expect(try ArchiveMemberScan.scan(levels[2], archives: nested, knownValues: [],
+                                           budget: ArchiveScanBudget(bytes: 100_000, depth: 10, launches: 3)).isEmpty)
+        // A refusal is cached: the second check of the same bytes launches nothing.
+        let bomb = CountingReader { _ in throw ArchiveReadError.refused("this archive expands too much to preview safely") }
+        let bytes = try Self.packed([("a.txt", Data("a".utf8))], tag: "cached refusal")
+        for _ in 0..<3 {
+            #expect(throws: WorkError.invalid("this archive expands too much to preview safely")) {
+                try check(cf, bytes, ext: "zip", canonical: "bomb.zip", archives: bomb)
+            }
+        }
+        #expect(bomb.launches == 1)
+        // The cached refusal names the ref it is asked about, not the first one.
+        let gz = Data([0x1F, 0x8B, 0x08, 0x00]) + Data("cached gzip".utf8)
+        #expect(throws: WorkError.invalid("one.gz is compressed as gzip, which can't be scanned for secrets; share the files inside instead")) {
+            try check(cf, gz, ext: "gz", canonical: "one.gz")
+        }
+        #expect(throws: WorkError.invalid("two.gz is compressed as gzip, which can't be scanned for secrets; share the files inside instead")) {
+            try check(cf, gz, ext: "gz", canonical: "two.gz")
+        }
+        // No reader: refused, not cached; with a reader the same bytes pass.
+        let fine = try Self.packed([("a.txt", Data("fine".utf8))], tag: "transient")
+        #expect(throws: WorkError.invalid("archives can't be scanned on this machine")) { try check(cf, fine, ext: "zip", canonical: "f.zip") }
+        let good = CountingReader { _ in [("a.txt", Data("fine".utf8))] }
+        #expect(try check(cf, fine, ext: "zip", canonical: "f.zip", archives: good) == .clean)
+    }
+
+    /// R3-8 (m-D): a redacted copy whose re-check could not run (no reader, over the budget) says so.
+    @Test func redactedCopyRecheckSaysWhy() throws {
+        let cf = try CollabFixture()
+        let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
+        try cf.fx.git.write("src/conf.ts", "const key = '\(Self.aws)'\n", in: wt)
+        let pdf = PDFBuild.flate("hello")
+        cf.store.refHooks.setRedactedCopy { _ in pdf }
+        #expect(throws: WorkError.invalid("no redacted copy of ENG-1:src/conf.ts@worktree is made: the copy couldn't be checked again "
+                                          + "(PDFs can't be scanned on this machine)")) {
+            try cf.store.pinRef(try cf.fx.ref("ENG-1:src/conf.ts@worktree"), for: .agent(cf.fx.eng1.id), companyId: cf.c.id,
+                                messageRefId: "mr-why", knownValues: Self.known, paths: cf.paths)
+        }
+        cf.store.refHooks.setRedactedCopy(nil)
     }
 }

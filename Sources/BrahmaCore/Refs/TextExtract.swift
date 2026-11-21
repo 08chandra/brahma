@@ -64,6 +64,8 @@ public struct UnavailableArchiveReader: ArchiveReader {
 public struct SandboxedUnzipReader: ArchiveReader {
     public static let unzip = "/usr/bin/unzip"
     public static let timeout: Duration = .seconds(60)
+    static let tooLong = ArchiveReadError.refused("this archive took too long to scan for secrets")
+    static let couldNotRun = ArchiveReadError.refused("the archive reader could not run, so this archive can't be scanned for secrets")
 
     let runner: any SandboxedRunner
     let scratch: @Sendable () throws -> URL
@@ -121,7 +123,10 @@ public struct SandboxedUnzipReader: ArchiveReader {
         // On this thread (`runBlocking`): never a wait on the cooperative pool, which parallel readers could exhaust.
         let outcome = runner.runBlocking(command: command, cwd: outDir, environment: environment, timeout: Self.timeout,
                                          outputURL: dir.appending(path: "unzip.log"), policy: policy)
-        guard outcome.exitCode == 0 else { throw ArchiveReadError.unreadable }
+        // Round 3: a run that ran out of time or never ran says so (the gate does not cache those).
+        if outcome.timedOut { throw Self.tooLong }
+        guard let exit = outcome.exitCode else { throw Self.couldNotRun }
+        guard exit == 0 else { throw ArchiveReadError.unreadable }
         var result: [(name: String, data: Data)] = []
         var total = 0
         for (i, name) in names.enumerated() {
