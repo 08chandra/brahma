@@ -1593,6 +1593,26 @@ enum Migrations {
                 t.add(column: "smokeResults", .text).notNull().defaults(to: "[]")
             }
         }
+        m.registerMigration("v4a-artifacts") { db in
+            // Plan 4a Task 6: published artifacts, engine-owned copies under `<ws>/.brahma/artifacts/`. `title` and `sourcePath`
+            // are agent-controlled text; `storedPath` is relative to the workspace, `entryFile` to `storedPath`.
+            try db.create(table: "artifact") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("title", .text).notNull()
+                t.column("kind", .text).notNull()
+                t.column("storedPath", .text).notNull()
+                t.column("entryFile", .text).notNull()
+                t.column("sourcePath", .text).notNull()
+                t.column("publishedById", .text).notNull()
+                t.column("itemId", .text).references("workItem", onDelete: .setNull)
+                t.column("bytes", .integer).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.uniqueKey(["companyId", "number"])
+            }
+            try db.create(index: "artifact_publisher", on: "artifact", columns: ["companyId", "publishedById", "createdAt"])
+        }
     }
 }
 

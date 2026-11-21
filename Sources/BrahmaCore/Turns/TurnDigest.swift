@@ -71,6 +71,9 @@ public struct TurnContext: Sendable {
     public var newResources: [String] = []
     /// The item's merge request while it is open or did not land (Plan 4a); nil otherwise.
     public var merge: MergeOrientation? = nil
+    /// The company's latest published artifact (Plan 4a Task 6) and its entry file's absolute path, for the
+    /// `Latest artifact:` line.
+    public var latestArtifact: (artifact: Artifact, entryPath: String)? = nil
 
     public var scope: SessionScope { item.map { .item($0.id) } ?? .base }
 
@@ -119,6 +122,10 @@ public struct TurnContext: Sendable {
         let states = try store.previewStates(companyId: company.id)
         c.previews = try store.previewSurfaces(companyId: company.id).map { ($0, states[$0.id]) }
         c.newResources = try store.newResourceLines(agent: agent)
+        if let latest = try store.latestArtifact(companyId: company.id) {
+            let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+            c.latestArtifact = (latest, latest.entryURL(workspace: workspace).path)
+        }
         let notes = NotesFile.path(workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), team: agent.team)
         if FileManager.default.fileExists(atPath: notes.path) { c.notesPath = notes.path }
 
@@ -220,6 +227,13 @@ public enum TurnDigest {
         return ReviewDigest.flat("Previews: " + parts.joined(separator: " · "), max: maxPreviewLine - 1)
     }
 
+    public static let maxArtifactTitle = 80
+
+    /// `Latest artifact: AR-<n> <title…> (<absolute entry path>)`: the title (agent text) and the path flattened to one line.
+    public static func artifactLine(_ a: Artifact, entryPath: String) -> String {
+        "Latest artifact: \(a.ref) \(ReviewDigest.flat(a.title, max: maxArtifactTitle)) (\(ReviewDigest.flat(entryPath, max: 1024)))"
+    }
+
     public static func render(_ c: TurnContext, agent: Agent, company: Company) -> String {
         var out: [String] = ["# Orientation"]
         out.append("Role card (re-read from file every turn):")
@@ -236,6 +250,7 @@ public enum TurnDigest {
         out.append("Org: you report to @\(c.manager ?? "owner") · reports: \(c.reports.isEmpty ? "none" : reports + more)"
                    + " · team: \(c.team.map { ReviewDigest.flat($0, max: 60) } ?? "none")")
         if let previews = previewLine(c.previews) { out.append(previews) }
+        if let latest = c.latestArtifact { out.append(artifactLine(latest.artifact, entryPath: latest.entryPath)) }
         out.append("Team roster:")
         if c.roster.isEmpty { out.append("- (nobody else yet)") }
         for r in c.roster.prefix(maxRoster) {

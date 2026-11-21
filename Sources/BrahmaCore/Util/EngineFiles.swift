@@ -617,7 +617,7 @@ public enum EngineFiles {
     /// The directory, opened: the workspace resolved (it may sit behind a link the owner chose), then every part under it
     /// opened relative to the one before with `O_NOFOLLOW` (created with `mkdirat` when missing), so no link is ever
     /// followed on the way. The opened directory must still be where the walk put it, inside the resolved workspace.
-    private static func openDirectory(workspace: URL, _ relative: String) throws -> Int32 {
+    static func openDirectory(workspace: URL, _ relative: String) throws -> Int32 {
         let fm = FileManager.default
         if !fm.fileExists(atPath: workspace.path) { try fm.createDirectory(at: workspace, withIntermediateDirectories: true) }
         guard let root = resolved(workspace.path) else {

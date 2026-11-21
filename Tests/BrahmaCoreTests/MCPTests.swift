@@ -61,7 +61,7 @@ private struct MCPWorld {
         "release_lease", "submit_for_review", "confirm_spec", "plan_sprint", "close_sprint",
         "propose_decision", "request_from_owner", "escalate_decision", "decide", "request_mode", "write_handoff",
         "request_access", "request_secret", "use_secret", "readopt_branch", "propose_extension", "request_human_task", "set_preview_command", "set_smoke_check", "set_deploy_config", "propose_deploy", "set_main_check",
-        "search_memory", "recall", "remember", "search_kb", "kb_read", "kb_write"]
+        "publish_artifact", "search_memory", "recall", "remember", "search_kb", "kb_read", "kb_write"]
     #expect(Set(tools.compactMap { $0["name"] as? String }) == expected)
     #expect(tools.count == expected.count)
     for t in tools { #expect((t["inputSchema"] as? [String: Any])?["type"] as? String == "object") }
@@ -77,8 +77,7 @@ private struct MCPWorld {
     let line = try #require(w.server.handle(line: #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#))
     let r = try #require(try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
     let tools = try #require((r["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-    // (`publish_artifact` is in the executive's template but registered by Plan 4a Task 6.)
-    #expect(Set(tools.compactMap { $0["name"] as? String }) == Set(CompanyToolNames.all).subtracting(["review", "audit"]).subtracting(CompanyToolNames.design))
+    #expect(Set(tools.compactMap { $0["name"] as? String }) == Set(CompanyToolNames.all).subtracting(["review", "audit"]))
     // ...and may call each of them: none is refused for the role.
     let template = w.store.catalog.template(role: "ceo", pack: "software")
     #expect(Set(template.companyTools) == Set(CompanyToolNames.all).subtracting(["review", "audit"]))
