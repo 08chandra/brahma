@@ -168,7 +168,9 @@ struct UnverifiedPDFReader: ArchiveReader {
         let gzKey = Data([0x1F, 0x8B, 0x08, 0x00]) + Data(" key \(SecretGateTests.aws) ".utf8)
         #expect(outcome { try check(cf, gzKey, ext: "gz", canonical: "key.gz", archives: UnavailableArchiveReader()) }.hasPrefix("key.gz is compressed as gzip"))
         _ = try cf.store.vouchFile(companyId: cId, canonical: "key.gz", sha256: Self.full(gzKey), now: cf.now)
-        #expect(outcome { try check(cf, gzKey, ext: "gz", canonical: "key.gz", archives: UnavailableArchiveReader()) }.hasPrefix("pattern"))
+        // (C2b-carry fix round 1, F2: the serve-bytes API refuses a pattern in bytes that can't be redacted.)
+        #expect(outcome { try check(cf, gzKey, ext: "gz", canonical: "key.gz", archives: UnavailableArchiveReader()) }
+                    .contains("looks like it contains a secret"))
 
         // The stored member's bytes are a stand-in of the same length; the reader hands back what it would inflate.
         let zip = try SecretGateTests.zip {

@@ -36,7 +36,8 @@ extension Store {
     ///    nothing found in this company is `"that ref isn't available to you"`;
     /// 2. the bytes: a resource through ML's `purgeResource` (secure delete, FTS optimize, WAL checkpoint, vault and mirror
     ///    removal); a memory entry through ML's `ownerDeleteMemory` (`purgeMemoryDocs`); worktree-diff snapshots and the diff
-    ///    cache of a committed diff through `Vault` (their rows get `purgedAt`);
+    ///    cache of a committed diff through `Vault` (their rows get `purgedAt`); C2b-carry fix round 1 (F1): every flattened
+    ///    copy of a vouched PDF by the ref's name (or a resource's bytes), its vouch withdrawn first;
     /// 3. git, under the company's `GitLock` and never while a turn of the company runs (pruning while an agent writes the
     ///    object store can orphan its commit): `deleteShareRef` for every share, then `SafeGit.expireAndPrune` with the blobs
     ///    the engine itself wrote for `@worktree`/`.brahma` pins, each of which must be gone afterwards;
@@ -93,6 +94,13 @@ extension Store {
             }
             return found
         }
+        // C2b-carry fix round 1 (F1): the owner's vouches for files by this name (the ref's canonical form, pinned or not),
+        // whose flattened copies (`flattened/<row id>.pdf`, Ruling 42) are derived from its bytes.
+        let names = Array(Set([canonical, ref.canonical].map(Self.canonicalHash))).sorted()
+        var vouches = try writer.read { db in
+            try FileVouch.fetchAll(db, sql: "SELECT * FROM fileVouch WHERE companyId = ? AND canonicalHash IN (\(names.map { _ in "?" }.joined(separator: ", ")))",
+                                   arguments: StatementArguments([companyId]) + StatementArguments(names))
+        }
         var resource: Resource?
         var memoryNumber: Int?
         switch ref.kind {
@@ -107,10 +115,17 @@ extension Store {
             }) == true else { throw WorkError.notFound(Self.refUnavailable) }
             memoryNumber = n
         case .file, .diff, .commit:
-            guard !rows.isEmpty || !shares.isEmpty || !snapshots.isEmpty else { throw WorkError.notFound(Self.refUnavailable) }
+            guard !rows.isEmpty || !shares.isEmpty || !snapshots.isEmpty || !vouches.isEmpty else { throw WorkError.notFound(Self.refUnavailable) }
         default:
             throw WorkError.invalid("items, asks, kb pages, messages and the like are live records, not shared content: there are no "
                                     + "stored bytes to purge. Purge the file or resource they carry, or edit the record itself")
+        }
+        // A resource's bytes vouched under any name (by their hash) are its too.
+        if let sha = resource?.sha256 {
+            let known = Set(vouches.map(\.id))
+            vouches += try writer.read { db in
+                try FileVouch.fetchAll(db, sql: "SELECT * FROM fileVouch WHERE companyId = ? AND sha256 = ?", arguments: [companyId, sha])
+            }.filter { !known.contains($0.id) }
         }
         let stillInHistory = (ref.kind == .file && !blobPin) || ref.kind == .commit || (ref.kind == .diff && !ref.isWorktree)
 
@@ -158,6 +173,23 @@ extension Store {
                 }
                 do { try vault.remove(snapshot.vaultPath) } catch { problems.append("its vault copy \(snapshot.vaultPath) would not go (\(error))") }
                 report.vaultPaths.append(snapshot.vaultPath)
+            }
+            // C2b-carry fix round 1 (F1): the flattened copies. The database first: each vouch is withdrawn and its copy's
+            // hash cleared, so no copy is ever served or reused again (a later vouch makes a fresh one); then the files,
+            // which a purge run again (the rows are found by name again) removes if any is left.
+            if !vouches.isEmpty {
+                try writer.write { db in
+                    for v in vouches {
+                        try db.execute(sql: """
+                            UPDATE fileVouch SET copySha256 = NULL, vouchedAt = NULL, vouchedBy = NULL WHERE companyId = ? AND id = ?
+                            """, arguments: [companyId, v.id])
+                    }
+                }
+                for v in vouches {
+                    let path = "\(VaultArea.flattened.rawValue)/\(v.id).pdf"
+                    do { try vault.remove(path) } catch { problems.append("its flattened copy \(path) would not go (\(error))") }
+                    if v.copySha256 != nil { report.vaultPaths.append(path) }
+                }
             }
 
             // 3. Git: the share refs, then the objects the engine wrote for blob pins.

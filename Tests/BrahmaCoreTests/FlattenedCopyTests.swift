@@ -191,6 +191,75 @@ import Foundation
                 && !inner.contains("brahma vouch file"), "\(inner)")
     }
 
+    /// Fix round 1, F1: the owner's purge of a ref removes every flattened copy derived from it (`flattened/<row id>.pdf`
+    /// of each vouch row for its name), after the database retires those vouches (the copy's hash cleared, the vouch
+    /// withdrawn: never served or reused again; a later vouch makes a fresh copy). No byte of the copy stays in the vault;
+    /// the gate refuses the bytes again; a second purge is idempotent.
+    @Test func purgeRemovesTheFlattenedCopy() throws {
+        let cf = try CollabFixture()
+        let ref = try cf.fx.ref("docs/spec.pdf")
+        let canonical = ref.canonical
+        let pdf = Data("%PDF-1.7 a vouched spec".utf8)
+        let reader = UnverifiedPDFReader(parts: [])
+        #expect(outcome { try check(cf, pdf, canonical: canonical, archives: reader) }.hasPrefix("this PDF's structure couldn't be verified"))
+        let row = try cf.store.vouchFile(companyId: cf.c.id, canonical: canonical, sha256: SHA256.hex(pdf), now: cf.now)
+        let served = try serve(cf, pdf, canonical: canonical, archives: reader)
+        #expect(served.isFlattenedCopy)
+        let file = cf.vault.root.appending(path: "flattened/\(row.id).pdf")
+        #expect(FileManager.default.fileExists(atPath: file.path))
+        try PurgeTests.record(cf, ref, id: "mr-spec", at: cf.now)
+        let report = try cf.store.purge(companyId: cf.c.id, ref: ref, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: cf.now)
+        #expect(report.vaultPaths.contains("flattened/\(row.id).pdf"), "\(report.vaultPaths)")
+        #expect(!FileManager.default.fileExists(atPath: file.path), "the flattened copy is still in the vault")
+        #expect(try vaultHolds(cf, served.data) == false, "bytes of the copy remain in the vault")
+        let retired = try cf.store.writer.read { db in try FileVouch.fetchOne(db, key: row.id) }
+        #expect(retired?.copySha256 == nil && retired?.vouchedAt == nil, "\(String(describing: retired))")
+        let again = outcome { try serve(cf, pdf, canonical: canonical, archives: reader).verdict }
+        #expect(again.hasPrefix("this PDF's structure couldn't be verified"), "\(again)")
+        // Purged again: nothing left, nothing thrown.
+        _ = try cf.store.purge(companyId: cf.c.id, ref: ref, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: cf.now)
+        // A later vouch makes a fresh copy.
+        _ = try cf.store.vouchFile(companyId: cf.c.id, canonical: canonical, sha256: SHA256.hex(pdf), now: cf.now)
+        #expect(try serve(cf, pdf, canonical: canonical, archives: reader).isFlattenedCopy)
+        #expect(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    /// Fix round 1, F2: the serve-bytes API never hands out bytes with a secret-pattern hit that can't be redacted: a
+    /// flattened copy whose raw bytes hold a pattern, and a binary with one, are refused; text with one still comes back
+    /// as `.pattern` for the caller to redact (as `check` defines it).
+    @Test func gatedBytesRefusesUnredactablePatterns() throws {
+        let cf = try CollabFixture()
+        struct PatternCopy: ArchiveReader {
+            func members(of data: Data, wanted: @Sendable (String) -> Bool, limits: ArchiveLimits) throws -> [(name: String, data: Data)] { [] }
+            func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] {
+                if data.starts(with: Data("%PDF-1.3 copy".utf8)) { return [PDFPart(kind: .pageText, data: Data("hello".utf8))] }
+                throw UnverifiedPDF(parts: [])
+            }
+            func flattenPDF(of data: Data, maxBytes: Int, timeout: Duration) throws -> Data {
+                Data("%PDF-1.3 copy key \(SecretGateTests.aws) of \(SHA256.hex(data))".utf8)
+            }
+        }
+        let pdf = Data("%PDF-1.7 flagged with a pattern in its copy".utf8)
+        #expect(outcome { try check(cf, pdf, canonical: "pat.pdf", archives: PatternCopy()) }.hasPrefix("this PDF's structure couldn't be verified"))
+        _ = try cf.store.vouchFile(companyId: cf.c.id, canonical: "pat.pdf", sha256: SHA256.hex(pdf), now: cf.now)
+        let copy = outcome { try serve(cf, pdf, canonical: "pat.pdf", archives: PatternCopy()).verdict }
+        #expect(copy.contains("looks like it contains a secret"), "\(copy)")
+        let binary = Data([0, 1, 2]) + Data(" key \(SecretGateTests.aws) ".utf8)
+        let bin = outcome { try serve(cf, binary, ext: "bin", canonical: "blob.bin", archives: UnavailableArchiveReader()).verdict }
+        #expect(bin.contains("looks like it contains a secret"), "\(bin)")
+        let text = Data("key \(SecretGateTests.aws)\n".utf8)
+        #expect(outcome { try serve(cf, text, ext: "txt", canonical: "notes.txt", archives: UnavailableArchiveReader()).verdict }.hasPrefix("pattern"))
+    }
+
+    /// Whether any file under the company's vault holds `bytes`.
+    func vaultHolds(_ cf: CollabFixture, _ bytes: Data) throws -> Bool {
+        guard let walker = FileManager.default.enumerator(at: cf.vault.root, includingPropertiesForKeys: nil) else { return false }
+        for case let url as URL in walker {
+            if let data = try? Data(contentsOf: url), data.range(of: bytes) != nil { return true }
+        }
+        return false
+    }
+
     // MARK: Helpers
 
     func check(_ cf: CollabFixture, _ data: Data, ext: String = "pdf", canonical: String, archives: any ArchiveReader) throws -> ScanVerdict {

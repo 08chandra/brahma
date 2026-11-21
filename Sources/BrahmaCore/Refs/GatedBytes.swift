@@ -11,9 +11,9 @@ public struct GatedBytes: Equatable, Sendable {
     public let sha256: String
     /// `data`'s extension (`pdf` for a flattened copy).
     public let ext: String
-    /// The gate's verdict for `data`, as `SecretGate.check` gives it: `.clean`, or `.pattern` (a secret pattern in the raw
-    /// bytes), which the caller redacts (text only, `SecretGate.redactedCopy`) or refuses (a binary, a PDF). A stored value
-    /// never comes back: it throws.
+    /// The gate's verdict for `data`: `.clean`, or `.pattern` (a secret pattern in the raw bytes) only for text the caller
+    /// can redact (`SecretGate.isRedactable`; it redacts through `SecretGate.redactedCopy`). Fix round 1 (F2): a pattern in
+    /// bytes that can't be redacted (a flattened copy, any PDF, a binary, an archive) throws, and so does a stored value.
     public let verdict: ScanVerdict
     /// The SHA-256 of the bytes the caller passed in (the original's, for a flattened copy).
     public let originalSha256: String
@@ -32,14 +32,17 @@ extension Store {
     /// C2b-carry (c), Ruling 42: THE bytes to serve for `data` (the ref `canonical`'s bytes, of extension `ext`, in
     /// `companyId`) after the secret gate. Every caller that pins, shares, snapshots, copies, renders or serves bytes that
     /// may be a PDF calls this and serves `GatedBytes.data`, never `data`:
-    /// - Not a PDF the owner vouched for: `SecretGate.check` as usual (it throws every refusal); the bytes are `data`.
+    /// - Not a PDF the owner vouched for: `SecretGate.check` as usual (it throws every refusal; fix round 1, F2: a pattern
+    ///   too, unless `data` is text that can be redacted); the bytes are `data`.
+    /// - A purge of the ref (`Store.purge`) deletes its flattened copies and withdraws the vouch (fix round 1, F1).
     /// - A PDF the owner vouched for (`Store.vouchFile`; `SecretGate.isFlattenTarget`): the flattened copy the sandboxed
     ///   helper re-renders from CoreGraphics' view of the visible pages (`ArchiveReader.flattenPDF`), kept in the company's
     ///   vault keyed to the vouch row (`flattened/<row id>.pdf`, its SHA-256 in `fileVouch.copySha256`; made once, read back
     ///   checked against that hash, made again if it is missing or differs). The copy then passes the whole gate as an
     ///   ordinary file that can't be vouched (stored values in every encoded form, secret patterns, the helper's structure
     ///   check, archives and PDFs inside it): a stored value or a pattern seen only decoded refuses, and so does a copy whose
-    ///   structure couldn't be verified (it stays refused: no vouch applies to it). A file CoreGraphics can't open or
+    ///   structure couldn't be verified (it stays refused: no vouch applies to it), or whose raw bytes hold a pattern (a PDF
+    ///   can't be redacted; fix round 1, F2). A file CoreGraphics can't open or
     ///   draw can't be flattened: refused, telling the owner to convert it (print it to PDF) and add it again. The original
     ///   bytes are never returned.
     /// Taint is the caller's, as for any read of the ref (the copy is served under the same ref). `archives` must carry the
@@ -50,6 +53,9 @@ extension Store {
         guard SecretGate.isFlattenTarget(data, ext: ext), let row = vouchedRow(companyId: companyId, canonical: canonical, sha256: sha) else {
             let verdict = try SecretGate.check(data, ext: ext, canonical: canonical, archives: archives, knownValues: knownValues, store: self,
                                                companyId: companyId)
+            if case .pattern(let label, _) = verdict, !SecretGate.isRedactable(data, ext: ext) {
+                throw Self.unredactable(canonical, label: label, knownValues: knownValues)
+            }
             return GatedBytes(data: data, sha256: sha, ext: ext, verdict: verdict, originalSha256: sha, flattenedPath: nil)
         }
         let name = SecretGate.shown(canonical, knownValues: knownValues)
@@ -57,6 +63,8 @@ extension Store {
         let verdict = try SecretGate.verdict(copy.data, ext: "pdf", canonical: canonical, archives: archives, knownValues: knownValues,
                                              store: self, companyId: companyId, vouchable: false)
         if case .knownValue(let finding) = verdict { throw SecretGate.refusal(canonical, finding, knownValues: knownValues) }
+        // Fix round 1 (F2): a PDF is never redacted, so a pattern in the copy's own bytes refuses it.
+        if case .pattern(let label, _) = verdict { throw Self.unredactable(canonical, label: label, knownValues: knownValues) }
         return GatedBytes(data: copy.data, sha256: copy.sha256, ext: "pdf", verdict: verdict, originalSha256: sha, flattenedPath: copy.path)
     }
 
@@ -108,6 +116,11 @@ extension Store {
                            arguments: [written.sha256, row.id, row.companyId])
         }
         return (copy, written.sha256, path)
+    }
+
+    /// Fix round 1 (F2): a secret pattern in bytes that can't be redacted: nothing is served.
+    static func unredactable(_ canonical: String, label: String, knownValues: [(name: String, value: String)]) -> WorkError {
+        SecretGate.binaryRefusal(canonical, label: label, what: "shared, copied or shown", knownValues: knownValues)
     }
 
     /// A vouched PDF CoreGraphics can't open or draw: the vouch can't lift its refusal.
