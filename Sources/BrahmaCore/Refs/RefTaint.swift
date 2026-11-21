@@ -236,7 +236,7 @@ extension Store {
                 guard parts.count >= 4, parts[1] == "wt", let item = try writer.read({ db in try RefAccess.item(db, a.companyId, parts[2]) })
                 else { return unverified }
                 if let source = try itemTaintSource(item) { return (true, Self.sessionReason(source)) }
-                return try itemTaintAtPublish(item, publishedAt: a.createdAt)
+                return try itemTaintAtPublish(item, artifact: a)
             }
             return try mainSourceTaint(a, rel: rel, company: company)
         } catch {
@@ -252,37 +252,61 @@ extension Store {
         return try commitSource(WorkRef(kind: .diff, id: item.key), item: item)
     }
 
-    /// Ruling 17: whether `item` was tainted when an artifact of its worktree was published (`publishedAt`, the row's
-    /// `createdAt`), from what the store keeps: tainted-commit rows are never deleted, a clearing records `clearedAt`. Tainted
-    /// (with the row's source) when a row of the item was not cleared strictly before the publish: a row recorded later may
-    /// still name an earlier commit (taint is recorded at turn end and release), and equal times count as tainted.
-    /// Undeterminable, so tainted (`artifactSourceReason`):
-    /// - a row marked cleared without a time;
-    /// - a row of the company with no item (its item couldn't be recorded), not cleared before the publish;
-    /// - the item is done now, or its status changed since the publish (a `statusChanged` or `merged` event at or after it):
-    ///   5-lite's sticky mark has no history and may drop when an item reaches done, so a clear mark now says nothing then;
-    /// - any lookup fails (the caller's catch).
+    /// Ruling 17: whether `item` was tainted when `artifact` (published from its worktree) was published, from what the store
+    /// keeps. Tainted-commit rows are never deleted (a clearing sets `clearedBy`/`clearedAt`), and Ruling 19 orders the publish
+    /// against each clearing and each status change by the database's monotonic `taintOrder` sequence, written by triggers in
+    /// the same transaction as each; wall-clock times never order them. A row counts as cleared before the publish only when
+    /// it has `clearedBy`, `clearedAt` and a clearing sequence below the publish's; every other row was uncleared then.
+    /// - Tainted (with the row's source) by a row of the item uncleared then: a row recorded after the publish may still name
+    ///   an earlier commit (taint is recorded at turn end and release);
+    /// - tainted (R3-1) when any company row uncleared then names a commit the item's branch holds since it left `main`, or an
+    ///   orphaned item's commit on it: `commitSource` over those rows, as the current check does over today's;
+    /// - undeterminable, so tainted (`artifactSourceReason`): no publish sequence (published before the order was kept, or
+    ///   lost); a row marked cleared without a time; a company row with no item uncleared then; the item done now, or with a
+    ///   status change or merge after the publish (5-lite's sticky mark has no history and may drop when an item reaches done,
+    ///   so a clear mark now says nothing then); any lookup that fails (the caller's catch).
     /// Clean otherwise. No other clearing path exists (a content match against a reviewed blob is Plan S's).
-    private func itemTaintAtPublish(_ item: WorkItem, publishedAt: Date) throws -> (tainted: Bool, reason: String?) {
+    private func itemTaintAtPublish(_ item: WorkItem, artifact: Artifact) throws -> (tainted: Bool, reason: String?) {
         let unverified = (true, Optional(Self.artifactSourceReason))
-        return try writer.read { db in
+        let companyId = item.companyId
+        let read = try writer.read { db -> (rows: [TaintedCommit], current: WorkItem?, publish: Int64?, clears: [String: Int64],
+                                              statusAfter: Int) in
             let rows = try TaintedCommit.fetchAll(db, sql: """
-                SELECT * FROM taintedCommit WHERE companyId = ? AND (itemId = ? OR itemId IS NULL) ORDER BY createdAt DESC, rowid DESC
-                """, arguments: [item.companyId, item.id])
-            for row in rows {
-                guard let cleared = row.clearedAt else {
-                    if row.clearedBy != nil { return unverified }
-                    return row.itemId == nil ? unverified : (true, Self.sessionReason(row.source))
-                }
-                if cleared >= publishedAt { return row.itemId == nil ? unverified : (true, Self.sessionReason(row.source)) }
+                SELECT * FROM taintedCommit WHERE companyId = ? ORDER BY createdAt DESC, rowid DESC
+                """, arguments: [companyId])
+            let current = try WorkItem.fetchOne(db, sql: "SELECT * FROM workItem WHERE companyId = ? AND id = ?",
+                                                arguments: [companyId, item.id])
+            let publish = try Int64.fetchOne(db, sql: """
+                SELECT MIN(seq) FROM taintOrder WHERE companyId = ? AND kind = 'publish' AND subject = ?
+                """, arguments: [companyId, artifact.id])
+            var clears: [String: Int64] = [:]
+            for row in try Row.fetchAll(db, sql: """
+                SELECT subject, MAX(seq) AS seq FROM taintOrder WHERE companyId = ? AND kind = 'clear' GROUP BY subject
+                """, arguments: [companyId]) {
+                clears[row["subject"]] = row["seq"]
             }
-            guard let now = try WorkItem.fetchOne(db, sql: "SELECT * FROM workItem WHERE companyId = ? AND id = ?",
-                                                  arguments: [item.companyId, item.id]), now.status != .done else { return unverified }
-            let changed = try WorkItemEvent.filter(Column("companyId") == item.companyId && Column("itemId") == item.id
-                                                   && [WorkEventKind.statusChanged.rawValue, WorkEventKind.merged.rawValue].contains(Column("kind"))
-                                                   && Column("createdAt") >= publishedAt).fetchCount(db)
-            return changed > 0 ? unverified : (false, nil)
+            let statusAfter = try publish.map { seq in
+                try Int.fetchOne(db, sql: """
+                    SELECT COUNT(*) FROM taintOrder WHERE companyId = ? AND kind = 'status' AND subject = ? AND seq > ?
+                    """, arguments: [companyId, item.id, seq]) ?? 0
+            } ?? 0
+            return (rows, current, publish, clears, statusAfter)
         }
+        guard let publish = read.publish else { return unverified }
+        // The rows uncleared at the publish.
+        let atPublish = read.rows.filter { row in
+            guard row.clearedBy != nil, row.clearedAt != nil, let cleared = read.clears[row.sha] else { return true }
+            return cleared > publish
+        }
+        for row in atPublish where row.itemId == item.id || row.itemId == nil {
+            if row.itemId == nil || (row.clearedBy != nil && row.clearedAt == nil) { return unverified }
+            return (true, Self.sessionReason(row.source))
+        }
+        guard let current = read.current, current.status != .done, read.statusAfter == 0 else { return unverified }
+        if let source = try commitSource(WorkRef(kind: .diff, id: item.key), item: item, rows: atPublish) {
+            return (true, Self.sessionReason(source))
+        }
+        return (false, nil)
     }
 
     /// Ruling 16 for a source in the main checkout (`rel`, workspace-relative): see `artifactTaint`.
@@ -501,7 +525,12 @@ extension Store {
 
     /// The taint the item's commits give a committed diff or item-branch file ref (see `refTaint`).
     private func commitSource(_ ref: WorkRef, item: WorkItem) throws -> String? {
-        let rows = try unclearedCommits(companyId: item.companyId)
+        try commitSource(ref, item: item, rows: try unclearedCommits(companyId: item.companyId))
+    }
+
+    /// `commitSource` against a given set of the company's rows (newest first): the uncleared ones now, or (ruling 17) the ones
+    /// not cleared before an artifact was published.
+    private func commitSource(_ ref: WorkRef, item: WorkItem, rows: [TaintedCommit]) throws -> String? {
         guard !rows.isEmpty else { return nil }
         let bySha = Dictionary(rows.map { ($0.sha, $0.source) }, uniquingKeysWith: { first, _ in first })
         let itemRows = rows.filter { $0.itemId == item.id }
