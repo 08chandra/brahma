@@ -49,11 +49,25 @@ enum EmbeddedContent {
     static func inner(_ data: Data, ext: String, container: String, archives: any ArchiveReader, expanded: [(name: String, value: String)],
                       budget: ArchiveScanBudget, level: Int, chunk: Int) throws -> [ScanFinding] {
         if let format = ArchiveMemberScan.unscannableFormat(data) {
-            throw ArchiveReadError.refused("this \(container) holds \(format) data, which can't be scanned for secrets")
+            // Round 5 (ruling 38): in a file the owner vouched for, such a part's own bytes are still scanned; it can't be
+            // opened, so nothing below it is.
+            guard budget.vouched else { throw formatRefusal(container: container, format: format) }
+            return try ArchiveMemberScan.scanBytes(data, expanded: expanded, chunk: chunk)
         }
         var found = try ArchiveMemberScan.scanBytes(data, expanded: expanded, chunk: chunk)
         found += try scan(data, ext: ext, archives: archives, expanded: expanded, budget: budget, level: level + 1, chunk: chunk)
         return found
+    }
+
+    /// The refusal of a part compressed in a format the engine can't open (a structure refusal: the owner may vouch for
+    /// the file that holds it).
+    static func formatRefusal(container: String, format: String) -> ArchiveReadError {
+        .refused("this \(container) holds \(format) data, which can't be scanned for secrets")
+    }
+
+    /// Whether `message` is `formatRefusal`'s.
+    static func isFormatRefusal(_ message: String) -> Bool {
+        message.hasPrefix("this ") && message.hasSuffix(" data, which can't be scanned for secrets")
     }
 
     // MARK: PDF
@@ -78,7 +92,15 @@ enum EmbeddedContent {
         try budget.ensure(budget.bytes > 0)
         try budget.launch()
         guard let left = budget.remaining else { throw ArchiveMemberScan.outOfTime }
-        let parts = try archives.pdfParts(of: data, maxBytes: budget.bytes, timeout: left)
+        let parts: [PDFPart]
+        do {
+            parts = try archives.pdfParts(of: data, maxBytes: budget.bytes, timeout: left)
+        } catch let unverified as UnverifiedPDF {
+            // Round 5 (ruling 38): a structure the helper couldn't verify is refused, unless the owner vouched for the file;
+            // then every part it read is scanned below like any PDF's (a stored value or a secret pattern still refuses).
+            guard budget.vouched else { throw SandboxedPDFReader.unaccounted }
+            parts = unverified.parts
+        }
         var total = 0, streams = 0
         for part in parts {
             total += part.data.count

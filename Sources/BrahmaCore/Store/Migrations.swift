@@ -1784,6 +1784,24 @@ enum Migrations {
                 BEGIN INSERT INTO taintOrder (companyId, kind, subject) VALUES (NEW.companyId, 'clear', 'restore-epoch:' || NEW.id); END
                 """)
         }
+        m.registerMigration("vC-file-vouch") { db in
+            // Plan C Task C2b, fix round 5 (Ruling 38): the files the secret gate refused for their STRUCTURE (a PDF it couldn't
+            // verify, a format or archive method it can't open), per company, by the SHA-256 of the ref's name and of the
+            // bytes; the owner's vouch for exactly those bytes (`vouchedAt`). `shown` is the name as messages show it (stored
+            // values and secret patterns redacted); the name itself is never kept.
+            try db.create(table: "fileVouch") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("canonicalHash", .text).notNull()
+                t.column("shown", .text).notNull()
+                t.column("sha256", .text).notNull()
+                t.column("reason", .text).notNull()
+                t.column("refusedAt", .datetime).notNull()
+                t.column("vouchedBy", .text)                     // owner
+                t.column("vouchedAt", .datetime)
+                t.uniqueKey(["companyId", "canonicalHash", "sha256"])
+            }
+        }
     }
 }
 

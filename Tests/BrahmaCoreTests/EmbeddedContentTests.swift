@@ -245,8 +245,9 @@ struct SeededBytes {
 
     static let encrypted = WorkError.invalid("this PDF is encrypted, so it can't be scanned for secrets")
     static let undecodable = WorkError.invalid("this PDF has a stream that can't be decoded for scanning")
-    /// Round 4 (R4-6, ruling 35): every structural anomaly the helper finds is this one refusal.
-    static let unaccounted = WorkError.invalid("this PDF's structure couldn't be verified — ask the owner to vouch for or convert it")
+    /// Round 4 (R4-6, ruling 35): every structural anomaly the helper finds is this one refusal (round 5, ruling 38: the
+    /// gate ends it with the owner's vouch command, which `check` verifies and takes off).
+    static let unaccounted = WorkError.invalid("this PDF's structure couldn't be verified")
     static let unreadable = WorkError.invalid("this PDF can't be read, so it can't be scanned for secrets")
     static let unavailable = WorkError.invalid("PDFs can't be scanned on this machine")
     static let badPNG = WorkError.invalid("this PNG has a chunk that can't be checked for secrets")
@@ -268,9 +269,14 @@ struct SeededBytes {
         }, proxies: EgressProxyPool()), scratch: { try sbVault.makeTempDir() }, pdfHelper: helper)
     }
 
+    /// The gate's verdict; a structure refusal without the owner's vouch command when it names exactly the command for
+    /// `canonical` in the fixture's company (round 5, ruling 38: `FileVouchTests` checks the command itself).
     func check(_ cf: CollabFixture, _ data: Data, ext: String = "pdf", canonical: String = "doc.pdf",
                archives: any ArchiveReader, known: [(name: String, value: String)] = EmbeddedContentTests.known) throws -> ScanVerdict {
-        try SecretGate.check(data, ext: ext, canonical: canonical, archives: archives, knownValues: known, store: cf.store, companyId: cf.c.id)
+        do {
+            return try SecretGate.check(data, ext: ext, canonical: canonical, archives: archives, knownValues: known, store: cf.store,
+                                        companyId: cf.c.id)
+        } catch let e as WorkError { throw FileVouchTests.withoutCommand(e, cf.c, canonical) }
     }
 
     /// The helper is built with the package (SwiftPM builds every executable product for `swift test`).
@@ -903,7 +909,7 @@ struct SeededBytes {
     }
 
     /// R4-6 (ruling 35): any anomaly the exact-offset accounting finds is one refusal, "this PDF's structure couldn't be
-    /// verified — ask the owner to vouch for or convert it", with nothing modelled: more than 8 revisions; an object
+    /// verified" (round 5: then the owner's vouch command), with nothing modelled: more than 8 revisions; an object
     /// rewritten across revisions (clean or not); an object header no cross-reference entry names. Controls: 8 revisions
     /// that only add objects pass.
     @Test func structureAnomaliesRefused() throws {
@@ -927,7 +933,7 @@ struct SeededBytes {
         #expect(throws: Self.unaccounted) { try check(cf, rewritten, canonical: "rewritten.pdf", archives: reader) }
         let unknown = B.build(B.base(B.stream(4, clean)), unlisted: [B.obj(9, "<< /Note (nobody names me) >>")]).data
         #expect(throws: Self.unaccounted) { try check(cf, unknown, canonical: "unknown.pdf", archives: reader) }
-        #expect(SandboxedPDFReader.unaccounted.message == "this PDF's structure couldn't be verified — ask the owner to vouch for or convert it")
+        #expect(SandboxedPDFReader.unaccounted.message == "this PDF's structure couldn't be verified")
     }
 
     /// R4-4 (R3-7 and R3-3's escape): the helper runs as itself (no shell, no `head`), as the leader of its own session,

@@ -199,6 +199,13 @@ extension AppModel {
         }
     }
 
+    /// The action of the alert about a file the secret gate refused for its structure (C2b fix round 5, Ruling 38): the
+    /// owner vouches for exactly the bytes it refused (`Store.vouchFile(alertAskId:)`, the same path as `brahma vouch file`;
+    /// the alert is closed). Any other ask is refused.
+    public func vouchFile(askId: String) async {
+        _ = await ownerWrite("vouch for the file") { store in try store.vouchFile(alertAskId: askId, now: Date()) }
+    }
+
     @discardableResult
     public func rescind(askId: String, note: String = "") async -> Ask? {
         await ownerWrite("take it back") { store in try store.ownerRescind(askId: askId, note: note) }

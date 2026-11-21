@@ -23,6 +23,14 @@ public struct PDFPart: Equatable, Sendable {
     public init(kind: Kind, data: Data) { self.kind = kind; self.data = data }
 }
 
+/// C2b fix round 5 (controller ruling 38): the helper found a structural anomaly (exit 5) but read the rest of the file;
+/// `parts` is everything it read. The gate refuses it (`SandboxedPDFReader.unaccounted`, with the owner's vouch command)
+/// unless the owner vouched for these exact bytes, and then scans every part as it scans any PDF's.
+public struct UnverifiedPDF: Error, Sendable {
+    public let parts: [PDFPart]
+    public init(parts: [PDFPart]) { self.parts = parts }
+}
+
 /// C2b fix rounds 2 and 3 (controller ruling 33): the engine never parses a PDF. `brahma-pdf` (PDFKit and CoreGraphics; see
 /// its `main.swift`) runs under the engine's sandbox the way `SandboxedUnzipReader` runs unzip, on one private copy of the
 /// file in a vault temp directory (`scratch`), with:
@@ -46,8 +54,9 @@ public struct SandboxedPDFReader: Sendable {
     static let unreadable = ArchiveReadError.refused("this PDF can't be read, so it can't be scanned for secrets")
     static let encrypted = ArchiveReadError.refused("this PDF is encrypted, so it can't be scanned for secrets")
     static let undecodable = ArchiveReadError.refused("this PDF has a stream that can't be decoded for scanning")
-    /// Round 4 (R4-6, ruling 35): every structural anomaly the helper finds (exit 5) is this one refusal.
-    static let unaccounted = ArchiveReadError.refused("this PDF's structure couldn't be verified — ask the owner to vouch for or convert it")
+    /// Round 4 (R4-6, ruling 35): every structural anomaly the helper finds (exit 5) is this one refusal. Round 5 (ruling 38):
+    /// the gate adds the exact command by which the owner can vouch for the file (`SecretGate.vouchHint`).
+    static let unaccounted = ArchiveReadError.refused("this PDF's structure couldn't be verified")
     static let tooMany = ArchiveReadError.refused("this PDF has too many objects to scan for secrets")
     static let tooMuchMemory = ArchiveReadError.refused("this PDF needs too much memory to scan for secrets")
     /// The two that may pass on another try (not cached by the gate).
@@ -124,7 +133,13 @@ public struct SandboxedPDFReader: Sendable {
         case 0: break
         case 3: throw Self.encrypted
         case 4: throw Self.undecodable
-        case 5: throw Self.unaccounted
+        case 5:
+            // Round 5 (ruling 38): a structural anomaly, with everything the helper could read written out in full. The
+            // parts are handed up as `UnverifiedPDF`: refused unless the owner vouched for these exact bytes. Output that
+            // does not hold together is the plain refusal.
+            guard let output = EngineFiles.readNoFollow(outDir.appending(path: Self.partsName), under: outDir, limit: maxBytes + 1),
+                  let parts = try? Self.parse(output, maxBytes: maxBytes) else { throw Self.unaccounted }
+            throw UnverifiedPDF(parts: parts)
         case 6: throw ArchiveMemberScan.overBudget
         case 8: throw Self.tooMany
         case 9: throw Self.tooMuchMemory

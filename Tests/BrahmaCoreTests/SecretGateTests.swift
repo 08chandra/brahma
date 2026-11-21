@@ -56,11 +56,15 @@ struct StubArchiveReader: ArchiveReader {
         Data((String(repeating: "x", count: offset) + s + "tail!").utf8).base64EncodedString()
     }
 
+    /// The gate's verdict; a structure refusal without the owner's vouch command when it names exactly the command for
+    /// `canonical` in the fixture's company (round 5, ruling 38: `FileVouchTests` checks the command itself).
     func check(_ cf: CollabFixture, _ data: Data, ext: String = "txt", canonical: String = "src/x.txt",
                archives: any ArchiveReader = UnavailableArchiveReader(), known: [(name: String, value: String)] = Self.known,
                chunk: Int = ContentScan.chunkBytes) throws -> ScanVerdict {
-        try SecretGate.check(data, ext: ext, canonical: canonical, archives: archives, knownValues: known, store: cf.store,
-                             companyId: cf.c.id, chunk: chunk)
+        do {
+            return try SecretGate.check(data, ext: ext, canonical: canonical, archives: archives, knownValues: known, store: cf.store,
+                                        companyId: cf.c.id, chunk: chunk)
+        } catch let e as WorkError { throw FileVouchTests.withoutCommand(e, cf.c, canonical) }
     }
 
     @Test(arguments: ["raw", "percent", "percent-lower", "hex", "HEX", "base64-0", "base64-1", "base64-2"])
