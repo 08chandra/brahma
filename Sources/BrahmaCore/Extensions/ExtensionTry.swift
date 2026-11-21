@@ -208,6 +208,16 @@ extension Orchestrator {
                 TaintFlag.remove(home: paths.home, agentId: agent.id)
             }
         }
+        // R4-6 (ruling 35): the trial writes no turn row, so a purge's running-turn check can't see it; it holds the company's
+        // purge fence shared for its whole run instead (refused while a purge holds it).
+        let fence: PurgeFence.Hold?
+        do {
+            let store = self.store
+            fence = try await blocking.tryRun { try store.holdPurgeFence(companyId: company.id) }
+        } catch let e as WorkError {
+            throw ExtensionError.message("the trial did not run: \(e.message)")
+        }
+        defer { fence?.release() }
         do {
             let result = try await devRunTurn(agent: agent, company: company, prompt: prompt, devPlugin: devPlugin, devId: devId,
                                               trialRoot: trialRoot, settingsFile: settingsFile, mcpConfig: mcpConfig, places: places,

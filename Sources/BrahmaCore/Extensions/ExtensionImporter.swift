@@ -545,6 +545,9 @@ enum ZipInventory {
         var method: Int = 0
         var flags: Int = 0
         var localFlags: Int = 0
+        /// The central directory's CRC-32 of the entry's data (C2b fix round 4: the sandboxed unzip's output is checked
+        /// against it).
+        var crc: UInt32 = 0
     }
 
     static func entries(of data: Data) throws -> [Entry] {
@@ -622,7 +625,7 @@ enum ZipInventory {
             }
             let isDirectory = name.hasSuffix("/") || type == 0o040000 || (external & 0x10) != 0
             out.append(Entry(name: name, compressedSize: compressed, uncompressedSize: uncompressed, isSymlink: isSymlink, isDirectory: isDirectory,
-                             method: method, flags: flags, localFlags: localFlags))
+                             method: method, flags: flags, localFlags: localFlags, crc: UInt32(truncatingIfNeeded: crc)))
             p = nameStart + nameLength + extraLength + entryComment
         }
         guard p == cdOffset + cdSize else { throw refuse("the central directory holds more or fewer headers than the end record counts") }

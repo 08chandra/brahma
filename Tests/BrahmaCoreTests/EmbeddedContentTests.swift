@@ -245,7 +245,8 @@ struct SeededBytes {
 
     static let encrypted = WorkError.invalid("this PDF is encrypted, so it can't be scanned for secrets")
     static let undecodable = WorkError.invalid("this PDF has a stream that can't be decoded for scanning")
-    static let unaccounted = WorkError.invalid("this PDF holds data outside its objects (an earlier revision or a stray stream), so it can't be scanned for secrets")
+    /// Round 4 (R4-6, ruling 35): every structural anomaly the helper finds is this one refusal.
+    static let unaccounted = WorkError.invalid("this PDF's structure couldn't be verified — ask the owner to vouch for or convert it")
     static let unreadable = WorkError.invalid("this PDF can't be read, so it can't be scanned for secrets")
     static let unavailable = WorkError.invalid("PDFs can't be scanned on this machine")
     static let badPNG = WorkError.invalid("this PNG has a chunk that can't be checked for secrets")
@@ -405,7 +406,8 @@ struct SeededBytes {
         updated += Data("4 0 obj\n".utf8) + PDFBuild.stream("<< /Length \(plain.count) /Filter /FlateDecode >>", plain) + Data("\nendobj\n".utf8)
         let xref = updated.count
         updated += Data("xref\n4 1\n\(PDFBuild.pad10(at)) 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R /Prev \(previous) >>\nstartxref\n\(xref)\n%%EOF\n".utf8)
-        #expect(throws: Self.refusal("revised.pdf")) { try check(cf, updated, canonical: "revised.pdf", archives: reader) }
+        // Round 4 (R4-6): an object rewritten across revisions is an anomaly in itself.
+        #expect(throws: Self.unaccounted) { try check(cf, updated, canonical: "revised.pdf", archives: reader) }
         // A filter nobody knows, and a Flate stream that is not zlib.
         let unknown = PDFBuild.build(PDFBuild.page(PDFBuild.stream("<< /Length 6 /Filter /MadeUpDecode >>", Data("opaque".utf8))))
         #expect(throws: Self.undecodable) { try check(cf, unknown, canonical: "odd.pdf", archives: reader) }
@@ -690,17 +692,20 @@ struct SeededBytes {
         #expect(!String(decoding: aliased, as: UTF8.self).contains(Self.aws))
         // Two numbers naming one object: refused (the alias is what let one stream stand in for the hidden one).
         #expect(throws: Self.unaccounted) { try check(cf, aliased, canonical: "rev_dup.pdf", archives: reader) }
-        #expect(throws: SecretGateTests.decodedRefusal("rev_noalias.pdf", "aws-key")) { try check(cf, plain, canonical: "rev_noalias.pdf", archives: reader) }
+        // Round 4 (R4-6): object 4 rewritten by the update is an anomaly: refused whatever it holds.
+        #expect(throws: Self.unaccounted) { try check(cf, plain, canonical: "rev_noalias.pdf", archives: reader) }
         // A stored value in revision 1 of a three-revision file.
         let stored = PDFBuild.flate("key \(Self.value)")
         let three = PDFBuild.update(PDFBuild.update(stored, objects: [(4, newContent)]), objects: [(5, Data("<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".utf8))])
-        #expect(throws: Self.refusal("three.pdf")) { try check(cf, three, canonical: "three.pdf", archives: reader) }
+        #expect(throws: Self.unaccounted) { try check(cf, three, canonical: "three.pdf", archives: reader) }
         // Two bodies of object 4 in one revision; the cross-reference names the second.
         let twice = PDFBuild.build(PDFBuild.page(newContent),
                                    junk: (before: 4, data: Data("4 0 obj\n".utf8) + PDFBuild.stream("<< /Filter /FlateDecode /Length \(secret.count) >>", secret) + Data("\nendobj\n".utf8)))
         #expect(throws: Self.unaccounted) { try check(cf, twice, canonical: "twice.pdf", archives: reader) }
         // A clean multi-revision file passes.
-        #expect(try check(cf, PDFBuild.update(PDFBuild.flate("one"), objects: [(4, newContent)]), canonical: "edited.pdf", archives: reader) == .clean)
+        // Round 4 (R4-6): an update that only adds objects (no object rewritten) passes.
+        #expect(try check(cf, PDFBuild.update(PDFBuild.flate("one"), objects: [(6, Data("<< /Producer (edited) >>".utf8))]),
+                          canonical: "edited.pdf", archives: reader) == .clean)
     }
 
     /// R3-2 (C-2): strings drawn by content streams outside the page text (an annotation's appearance, every appearance
@@ -868,18 +873,15 @@ struct SeededBytes {
         #expect(noKey(v1))
         #expect(throws: Self.unaccounted) { try check(cf, v1, canonical: "v1_shift.pdf", archives: reader) }
         let control = B.update(a, objects: [B.stream(4, clean)], entries: [(4, 0, { $0[0] })], size: 6).data
-        #expect(throws: SecretGateTests.decodedRefusal("v1_control.pdf", "aws-key")) {
-            try check(cf, control, canonical: "v1_control.pdf", archives: reader)
-        }
+        // Round 4 (R4-6): object 4 rewritten by the update: refused as unverifiable (before R4-6 its key was caught).
+        #expect(throws: Self.unaccounted) { try check(cf, control, canonical: "v1_control.pdf", archives: reader) }
         for gen in [1, 0] {
             let nine = B.obj(9, Data("<< /Length 7 0 R >>\nstream\nABCDEFGH\nendstream".utf8), gen: gen)
             let b = B.update(a, objects: [B.stream(4, clean), nine, B.obj(7, "4")],
                              entries: [(4, 0, { $0[0] }), (9, gen, { $0[1] }), (7, 0, { $0[2] })], size: 10)
             let v2 = B.update(b, objects: [B.obj(7, "8")], entries: [(7, 0, { $0[0] })], size: 10).data
             #expect(noKey(v2))
-            #expect(throws: SecretGateTests.decodedRefusal("v2_gen\(gen).pdf", "aws-key")) {
-                try check(cf, v2, canonical: "v2_gen\(gen).pdf", archives: reader)
-            }
+            #expect(throws: Self.unaccounted) { try check(cf, v2, canonical: "v2_gen\(gen).pdf", archives: reader) }
         }
         // Revision A's body named by no entry anywhere: its stream is placed nowhere.
         let hidden = B.build(B.base(B.stream(4, clean)), unlisted: [B.stream(4, secret)], eof: true)
@@ -894,10 +896,38 @@ struct SeededBytes {
         #expect(throws: Self.unaccounted) { try check(cf, zero, canonical: "zero.pdf", archives: reader) }
         let wrongGeneration = B.update(base, objects: [B.stream(4, clean)], entries: [(4, 1, { $0[0] })], size: 6).data
         #expect(throws: Self.unaccounted) { try check(cf, wrongGeneration, canonical: "generation.pdf", archives: reader) }
-        // Controls: revision A clean and ending at `startxref` alone, then a clean update.
+        // Control: revision A clean and ending at `startxref` alone, then an update that adds an object.
         let fine = B.update(B.build(B.base(B.stream(4, clean)), eof: false),
-                            objects: [B.stream(4, PDFBuild.zlib(PDFBuild.text("hello again")))], entries: [(4, 0, { $0[0] })], size: 6).data
+                            objects: [B.obj(6, "<< /Producer (hello again) >>")], entries: [(6, 0, { $0[0] })], size: 7).data
         #expect(try check(cf, fine, canonical: "fine.pdf", archives: reader) == .clean)
+    }
+
+    /// R4-6 (ruling 35): any anomaly the exact-offset accounting finds is one refusal, "this PDF's structure couldn't be
+    /// verified — ask the owner to vouch for or convert it", with nothing modelled: more than 8 revisions; an object
+    /// rewritten across revisions (clean or not); an object header no cross-reference entry names. Controls: 8 revisions
+    /// that only add objects pass.
+    @Test func structureAnomaliesRefused() throws {
+        guard Self.helperReady else { return }
+        let cf = try CollabFixture()
+        let reader = try Self.reader(cf)
+        typealias B = RevisionBuild
+        let clean = PDFBuild.zlib(PDFBuild.text("hello"))
+        func additive(_ revisions: Int) -> Data {
+            var file = B.build(B.base(B.stream(4, clean)))
+            for k in 1..<revisions {
+                file = B.update(file, objects: [B.obj(5 + k, "<< /Note (revision \(k)) >>")], entries: [(5 + k, 0, { $0[0] })], size: 6 + k)
+            }
+            return file.data
+        }
+        #expect(try check(cf, additive(8), canonical: "eight.pdf", archives: reader) == .clean)
+        #expect(throws: Self.unaccounted) { try check(cf, additive(9), canonical: "nine.pdf", archives: reader) }
+        let base = B.build(B.base(B.stream(4, clean)))
+        let rewritten = B.update(base, objects: [B.obj(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>")],
+                                 entries: [(5, 0, { $0[0] })], size: 6).data
+        #expect(throws: Self.unaccounted) { try check(cf, rewritten, canonical: "rewritten.pdf", archives: reader) }
+        let unknown = B.build(B.base(B.stream(4, clean)), unlisted: [B.obj(9, "<< /Note (nobody names me) >>")]).data
+        #expect(throws: Self.unaccounted) { try check(cf, unknown, canonical: "unknown.pdf", archives: reader) }
+        #expect(SandboxedPDFReader.unaccounted.message == "this PDF's structure couldn't be verified — ask the owner to vouch for or convert it")
     }
 
     /// R4-4 (R3-7 and R3-3's escape): the helper runs as itself (no shell, no `head`), as the leader of its own session,
@@ -950,6 +980,103 @@ struct SeededBytes {
         #expect(throws: SandboxedPDFReader.tooLong) { try run("spin", timeout: .seconds(2)) }
         #expect(AwakeTime.uptime() - started < 25)
         #expect(try FileManager.default.contentsOfDirectory(atPath: sbPaths.tmpDir.path).isEmpty)
+    }
+
+    /// R4-6 (a), ruling 35: the sandboxed unzip runs as the PDF helper does: `/usr/bin/unzip -p` itself (no shell, no
+    /// `head`), the leader of its own session, under the same deny-default profile (nothing else runs, nothing forks, no
+    /// network, no file written, only the held copy read), a memory watchdog on its own pid, and its output read by the engine
+    /// up to the byte cap. All members come out of one run, in archive order, split by the sizes the central directory
+    /// declares and each checked against its CRC-32. A stand-in run under the reader's own policy shows each denial.
+    @Test func unzipRunsAloneInItsOwnSession() throws {
+        let cf = try CollabFixture()
+        let held = URL(fileURLWithPath: "/private/tmp/held"), out = URL(fileURLWithPath: "/private/tmp/out")
+        let unzip = URL(fileURLWithPath: SandboxedUnzipReader.unzip)
+        let policy = SandboxedUnzipReader.policy(unzip: unzip, held: held, out: out)
+        let profile = SeatbeltProfile.render(policy: policy, baseline: SandboxBaseline.current(paths: cf.paths, otherWorkspaces: [], backupTargets: []),
+                                             proxyPort: nil, marker: "dev.brahma.run.test")
+        #expect(profile.contains("(deny default)") && !profile.contains("(allow default)"))
+        #expect(profile.contains("(allow process-exec (literal \"/usr/bin/unzip\"))"))
+        #expect(!profile.contains("process-fork") && !profile.contains("/bin/sh") && !profile.contains("/usr/bin/head"))
+        #expect(!profile.contains("(allow file-write*") && !profile.contains("network-outbound"))
+        #expect(policy.memoryLimit == SandboxedUnzipReader.memoryLimit)
+        // One run: the argv, the cap, nothing through a shell; members split by size and checked by CRC.
+        let zip = try SecretGateTests.zip { z in z.add("a.txt", "alpha"); z.add("b/[c].txt", "bravo charlie") }
+        func scripted(_ parts: Data?, _ outcome: CheckOutcome, _ record: ScriptedRunner.Record? = nil) -> SandboxedUnzipReader {
+            SandboxedUnzipReader(runner: ScriptedRunner(parts: parts, outcome: outcome, record: record), scratch: { try cf.vault.makeTempDir() })
+        }
+        let ok = CheckOutcome(exitCode: 0, timedOut: false, tail: "")
+        let recorder = ScriptedRunner.Record()
+        let members = try scripted(Data("alphabravo charlie".utf8), ok, recorder).members(of: zip, wanted: { _ in true }, limits: .standard)
+        #expect(members.map(\.name) == ["a.txt", "b/[c].txt"] && members.map { String(decoding: $0.data, as: UTF8.self) } == ["alpha", "bravo charlie"])
+        let argv = recorder.arguments
+        #expect(argv.count == 5 && argv[0] == "/usr/bin/unzip" && argv[1] == "-p" && argv[2].hasSuffix("/held/archive.zip"))
+        #expect(argv.count == 5 && argv[3] == "a.txt" && argv[4] == "b/[[]c].txt")
+        #expect(recorder.stdoutCap == ArchiveLimits.standard.bytes && recorder.commands == 0)
+        // The members out of order (same total, the split lands elsewhere: CRC), short, long, a failed unzip: unreadable;
+        // past the cap: expands; out of time, no run.
+        for (name, parts, outcome) in [("out of order", "bravo charlie" + "alpha", ok), ("one byte changed", "alphAbravo charlie", ok), ("short", "alphabravo", ok), ("long", "alphabravo charlie!", ok),
+                                       ("failed", "alphabravo charlie", CheckOutcome(exitCode: 1, timedOut: false, tail: ""))] {
+            #expect(throws: ArchiveReadError.unreadable, "\(name)") {
+                try scripted(Data(parts.utf8), outcome).members(of: zip, wanted: { _ in true }, limits: .standard)
+            }
+        }
+        #expect(throws: ArchiveReadError.expands) {
+            try scripted(nil, CheckOutcome(exitCode: nil, timedOut: false, tail: GroupRun.outputExceeded)).members(of: zip, wanted: { _ in true }, limits: .standard)
+        }
+        #expect(throws: SandboxedUnzipReader.tooLong) {
+            try scripted(nil, CheckOutcome(exitCode: nil, timedOut: true, tail: "")).members(of: zip, wanted: { _ in true }, limits: .standard)
+        }
+        #expect(throws: SandboxedUnzipReader.couldNotRun) {
+            try scripted(nil, CheckOutcome(exitCode: nil, timedOut: false, tail: "")).members(of: zip, wanted: { _ in true }, limits: .standard)
+        }
+
+        guard Toolchain.seatbeltAvailable else { return }
+        // Real zips and Office files still read through the real reader.
+        let reader = try Self.reader(cf)
+        let real = try reader.members(of: zip, wanted: { _ in true }, limits: .standard)
+        #expect(real.map(\.name) == ["a.txt", "b/[c].txt"] && real.map { String(decoding: $0.data, as: UTF8.self) } == ["alpha", "bravo charlie"])
+        let docx = try SecretGateTests.zip { z in
+            z.add("[Content_Types].xml", "<Types/>")
+            z.add("word/document.xml", "<w:document><w:body><w:p><w:r><w:t>Hello docx</w:t></w:r></w:p></w:body></w:document>")
+        }
+        #expect(try TextExtract.extract(kind: nil, ext: "docx", data: docx, archives: reader).contains("Hello docx"))
+        if FileManager.default.isExecutableFile(atPath: "/usr/bin/zip") {
+            let dir = try tempDir()
+            for i in 0..<5 { try Data(String(repeating: "line \(i) of a deflated member\n", count: 40).utf8).write(to: dir.appending(path: "m\(i).txt")) }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+            p.currentDirectoryURL = dir
+            p.arguments = ["-q", "-X", "-9", "out.zip"] + (0..<5).map { "m\($0).txt" }
+            try p.run(); p.waitUntilExit()
+            let deflated = try reader.members(of: try Data(contentsOf: dir.appending(path: "out.zip")), wanted: { _ in true }, limits: .standard)
+            #expect(deflated.count == 5 && deflated.allSatisfy { $0.data.count == 40 * "line 0 of a deflated member\n".utf8.count })
+        }
+        // The reader's own policy with a stand-in in unzip's place: each of these is denied (the stand-in exits 0).
+        guard let probe = HelperProbe.binary() else { return }
+        let home = try Scratch.homeDir().resolvedForSandbox
+        let sbPaths = BrahmaPaths(home: home.appending(path: "home"), workspaces: home.appending(path: "ws"))
+        let sbVault = Vault(paths: sbPaths, companyId: cf.c.id, content: ContentVault(paths: sbPaths))
+        let runner = SeatbeltRunner(baseline: { SandboxBaseline.current(paths: sbPaths, otherWorkspaces: [], backupTargets: []) }, proxies: EgressProxyPool())
+        let outside = home.appending(path: "outside.txt")
+        try Data("not for unzip\n".utf8).write(to: outside)
+        func run(_ orders: String) throws -> CheckOutcome {
+            let dir = try sbVault.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let heldDir = dir.appending(path: "held", directoryHint: .isDirectory), outDir = dir.appending(path: "out", directoryHint: .isDirectory)
+            for d in [heldDir, outDir] { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: false) }
+            let ordersFile = heldDir.appending(path: "archive.zip")
+            try Data((orders + "\n").utf8).write(to: ordersFile)
+            let p = SandboxedUnzipReader.policy(unzip: probe, held: heldDir.resolvedForSandbox, out: outDir.resolvedForSandbox)
+            return runner.runProgramBlocking(arguments: [probe.path, ordersFile.resolvedForSandbox.path], cwd: outDir.resolvedForSandbox,
+                                             environment: [:], timeout: .seconds(30), outputURL: dir.appending(path: "log"),
+                                             stdoutURL: outDir.resolvedForSandbox.appending(path: "members"), stdoutCap: 10_000, policy: p)
+        }
+        #expect(try run("read /System/Library/CoreServices/SystemVersion.plist").exitCode == 1, "the stand-in sees what is allowed")
+        for orders in ["fork", "exec /bin/sh", "exec /usr/bin/unzip", "spawn /bin/sh", "setsid", "connect 22", "read \(outside.path)",
+                       "read /private/etc/hosts", "write \(home.appending(path: "unzip-wrote.txt").path)"] {
+            #expect(try run(orders).exitCode == 0, "\(orders) was not denied")
+        }
+        #expect(!FileManager.default.fileExists(atPath: home.appending(path: "unzip-wrote.txt").path))
     }
 
     /// R4-4 (R3-3): the memory watchdog follows the run's own process, not only its process group: a child that moved itself

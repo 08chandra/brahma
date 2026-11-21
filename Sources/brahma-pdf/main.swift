@@ -34,6 +34,10 @@
 //    generation, exactly what the body pinned at that offset decodes to in the same revision. Every in-use entry of every
 //    section must name exactly the offset of a header with its own number and generation (an offset one byte off, offset
 //    0, another number or generation: refused). Anything else is data no walk is known to reach: refused.
+//    Round 4 (R4-6, ruling 35): the rule is detection only, never a model of what a reader would do. Every anomaly refuses
+//    the same way (exit 5, which the engine reports as "this PDF's structure couldn't be verified — ask the owner to vouch
+//    for or convert it"): besides the above, more than 8 revisions, one object number with two bodies (an object rewritten
+//    across revisions, or twice in one), and any object header (stream or not) no in-use entry names exactly.
 // 6. Adds the page text of the last revision as PDFKit extracts it.
 // A thread checks the process's own memory footprint every 20 ms and exits (status 9) past the limit (default 1 GiB);
 // the engine's watchdog kills the whole run at its own limit too.
@@ -44,8 +48,8 @@
 // `T` the page text (each of the last four one record, entries separated by line feeds). The whole output, framing
 // included, stays within the byte cap, or the run fails.
 //
-// Exit status: 0 done; 2 usage; 3 encrypted; 4 a stream (or content stream) that can't be decoded; 5 data no walk
-// reaches; 6 the output cap; 7 not a PDF this reader can open; 8 too many objects or revisions; 9 the memory limit.
+// Exit status: 0 done; 2 usage; 3 encrypted; 4 a stream (or content stream) that can't be decoded; 5 a structural
+// anomaly (step 5); 6 the output cap; 7 not a PDF this reader can open; 8 too many objects; 9 the memory limit.
 // Anything but 0 is a refusal.
 import Foundation
 #if canImport(PDFKit) && canImport(CoreGraphics)
@@ -142,8 +146,8 @@ final class Extraction {
     static let maxObjects = 500_000
     /// At most this many objects are visited in one revision's walk.
     static let maxVisits = 5_000_000
-    /// At most this many revisions are read.
-    static let maxRevisions = 64
+    /// Round 4 (R4-6, ruling 35): more revisions than this is itself an anomaly (refused as unverifiable).
+    static let maxRevisions = 8
 
     let original: Data
     let bytes: [UInt8]
@@ -172,7 +176,11 @@ final class Extraction {
         guard highest < Self.maxObjects else { fail(.tooMany) }
         var ends = revisionEnds.sorted()
         if ends.last != bytes.count { ends.append(bytes.count) }
-        guard ends.count <= Self.maxRevisions else { fail(.tooMany) }
+        guard ends.count <= Self.maxRevisions else { fail(.unaccounted) }
+        // R4-6 (ruling 35): one object number with two bodies (an object rewritten across revisions, or twice in one) is
+        // an anomaly, refused without modelling which body a reader would take.
+        var numbers = Set<Int>()
+        guard headers.allSatisfy({ numbers.insert($0.key.number).inserted }) else { fail(.unaccounted) }
         let bodies = headers.filter { $0.streams == 1 }
         var placed = Set<Int>()   // the header offsets of the stream bodies some revision placed
         var opened = false
@@ -184,6 +192,8 @@ final class Extraction {
             // Every stream body wholly inside this revision, pinned at its offset (a generation a cross-reference row
             // can't carry is never pinned, so it is never placed).
             let pins = bodies.filter { ($0.end ?? bytes.count) <= end && $0.key.generation <= 65_535 }
+            // A revision the reader can't open (a linearized file's first part, ending `startxref 0`) adds nothing; its
+            // streams must still be placed by another revision's walk.
             guard let walked = Revision(of: self, prefix: prefix, pins: pins)?.read() else { continue }
             opened = true
             for pin in pins {
@@ -195,6 +205,8 @@ final class Extraction {
         // one per object; every stream body named exactly and placed by some revision's walk; every in-use entry exactly a
         // header.
         guard !stray, headers.allSatisfy({ $0.streams <= 1 }) else { fail(.unaccounted) }
+        // R4-6: every object header, stream or not, named exactly by an in-use entry (an unknown object is an anomaly).
+        for header in headers where !entries.contains(Entry(key: header.key, offset: header.offset)) { fail(.unaccounted) }
         for body in bodies {
             guard placed.contains(body.offset), entries.contains(Entry(key: body.key, offset: body.offset)) else { fail(.unaccounted) }
         }

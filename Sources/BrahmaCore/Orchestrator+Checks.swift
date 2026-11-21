@@ -89,6 +89,21 @@ extension Orchestrator {
             couldNotRun("could not verify the check snapshot: \(error)")
             return
         }
+        // R4-6 (ruling 35): the check reads the company's repository outside any recorded turn, so it holds the company's
+        // purge fence shared from its checkout to its end, as a turn start does: no purge prunes under it, and while a purge
+        // holds the fence the check does not run (recorded as not run, retried; never charged to the item).
+        let fence: PurgeFence.Hold?
+        do {
+            let (store, companyId) = (self.store, company.id)
+            fence = try await blocking.tryRun { try store.holdPurgeFence(companyId: companyId) }
+        } catch let e as WorkError {
+            couldNotRun("the check did not run: \(e.message)")
+            return
+        } catch {
+            couldNotRun("the check did not run: the company's purge fence is unavailable (\(error))")
+            return
+        }
+        defer { fence?.release() }
         let dir: URL
         do {
             // A merge check runs on a `.git`-free export made by the engine's own repository, under the data home

@@ -52,20 +52,28 @@ public struct UnavailableArchiveReader: ArchiveReader {
     }
 }
 
-/// `/usr/bin/unzip -p` under the engine's sandbox (`SandboxedRunner`): no network, read access to one private copy of the
-/// archive in a vault temp directory (`scratch`), write access to one output directory, each member's output cut by `head -c`.
-/// Before anything runs, ML's `ArchiveRatio.stats` reads the central directory (nothing inflated): a ratio, size or entry count
-/// over the limits, a symlink entry or an unsafe name refuses the read, as 4a's publish does. Only members whose names are
-/// plain (`[A-Za-z0-9._/-]` plus `[` and `]`, no `..`) are asked for; a `[` is passed as `[[]`, so `unzip`'s wildcard
-/// matching takes every name literally (Office's `[Content_Types].xml` included). An unzip failure is never masked by the
-/// pipe into `head` (it leaves a `.err` file), and every member must come out at exactly the size the central directory
-/// declares; either refuses the read. The temp directory is removed whatever happens. With `pdfHelper` (the `brahma-pdf`
-/// binary, `SandboxedPDFReader.locate`) it reads PDFs too, through the same runner; without it a PDF is refused.
+/// `/usr/bin/unzip -p` under the engine's sandbox (`SandboxedRunner`), read access to one private copy of the archive in a
+/// vault temp directory (`scratch`). C2b fix round 4 (R4-6, ruling 35): it runs as the PDF helper does (`policy`): unzip
+/// itself, no shell and no `head`, the leader of its own session, under the same deny-default profile (it may run nothing
+/// else and fork nothing, read only the system and that copy, write nothing, reach no network), with a memory watchdog on
+/// its own pid (`memoryLimit`) and its standard output read by the engine up to the byte cap (one byte more kills it).
+/// Before anything runs, ML's `ArchiveRatio.stats` reads the central directory (nothing inflated): a ratio, size or entry
+/// count over the limits, a symlink entry or an unsafe name refuses the read, as 4a's publish does. Only members whose
+/// names are plain (`[A-Za-z0-9._/-]` plus `[` and `]`, no `..`) are asked for; a `[` is passed as `[[]`, so `unzip`'s
+/// wildcard matching takes every name literally (Office's `[Content_Types].xml` included). All of them come out of one
+/// run, in archive order (`unzip -p` follows the central directory): the output is split by the sizes the central
+/// directory declares, and must be exactly their sum, each piece matching its entry's CRC-32; an unzip that did not exit
+/// 0, or anything else, refuses the read. The temp directory is removed whatever happens. With `pdfHelper` (the
+/// `brahma-pdf` binary, `SandboxedPDFReader.locate`) it reads PDFs too, through the same runner; without it a PDF is
+/// refused.
 public struct SandboxedUnzipReader: ArchiveReader {
     public static let unzip = "/usr/bin/unzip"
     public static let timeout: Duration = .seconds(60)
+    /// The most memory one read may use (the runner's watchdog: unzip's own pid and its group).
+    public static let memoryLimit = 1 << 30
     static let tooLong = ArchiveReadError.refused("this archive took too long to scan for secrets")
     static let couldNotRun = ArchiveReadError.refused("the archive reader could not run, so this archive can't be scanned for secrets")
+    static let membersName = "members"
 
     let runner: any SandboxedRunner
     let scratch: @Sendable () throws -> URL
@@ -74,6 +82,16 @@ public struct SandboxedUnzipReader: ArchiveReader {
     /// `scratch` makes a fresh private directory for one read (`Vault.makeTempDir`).
     public init(runner: any SandboxedRunner, scratch: @escaping @Sendable () throws -> URL, pdfHelper: URL? = nil) {
         self.runner = runner; self.scratch = scratch; self.pdfHelper = pdfHelper
+    }
+
+    /// The sandbox of one read (round 4): `held` (the copy) the only tree it reads besides the system; `unzip` the only
+    /// program (nothing else runs, nothing forks); no file it may write (`out` is the runner's own; the engine writes the
+    /// output there); no network; the memory limit.
+    static func policy(unzip: URL, held: URL, out: URL) -> SandboxPolicy {
+        var policy = SandboxPolicy(writable: [out], readable: [held], network: .none, toolchain: false)
+        policy.confined = SandboxConfinement(executables: [unzip], readableFiles: [], listableDirectories: [], writableFiles: [])
+        policy.memoryLimit = memoryLimit
+        return policy
     }
 
     public func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] {
@@ -105,40 +123,40 @@ public struct SandboxedUnzipReader: ArchiveReader {
         let entries: [ZipInventory.Entry]
         do { entries = try ZipInventory.entries(of: data) } catch { throw ArchiveReadError.unreadable }
         // C2b fix round 1 (ruling 30): a directory is a `/`-named entry holding nothing; any other entry is a file.
-        let chosen = entries.filter { !ArchiveMemberScan.isDirectoryEntry($0) && !$0.isSymlink && Self.isPlain($0.name) && wanted($0.name) }
-            .prefix(ArchiveLimits.maxMembers)
-        let names = chosen.map(\.name), sizes = chosen.map(\.uncompressedSize)
-        guard !names.isEmpty else { return [] }
+        let chosen = Array(entries.filter { !ArchiveMemberScan.isDirectoryEntry($0) && !$0.isSymlink && Self.isPlain($0.name) && wanted($0.name) }
+            .prefix(ArchiveLimits.maxMembers))
+        guard !chosen.isEmpty else { return [] }
+        let expected = chosen.reduce(0) { $0 + $1.uncompressedSize }
+        guard expected <= limits.bytes else { throw ArchiveReadError.expands }
 
-        let q = ExtensionValidator.shellQuote
         let (heldDir, outDir) = (held.resolvedForSandbox, out.resolvedForSandbox)
-        let copy = heldDir.appending(path: "archive.zip").path
-        // unzip's own failure is never masked by the pipe (whose status is head's): it leaves `m<i>.err` (C2b fix round 1).
-        let command = names.enumerated().map { i, name in
-            "{ \(q(Self.unzip)) -p \(q(copy)) \(q(Self.literal(name))) 2>/dev/null || echo failed > \(q(outDir.appending(path: "m\(i).err").path)); }"
-                + " | /usr/bin/head -c \(limits.bytes + 1) > \(q(outDir.appending(path: "m\(i)").path))"
-        }.joined(separator: " && ")
-        let policy = SandboxPolicy(writable: [outDir], readable: [heldDir], network: .none, toolchain: false)
+        let program = URL(fileURLWithPath: Self.unzip)
+        let policy = Self.policy(unzip: program, held: heldDir, out: outDir)
         let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
-        // On this thread (`runBlocking`): never a wait on the cooperative pool, which parallel readers could exhaust.
-        let outcome = runner.runBlocking(command: command, cwd: outDir, environment: environment, timeout: Self.timeout,
-                                         outputURL: dir.appending(path: "unzip.log"), policy: policy)
+        // One run, unzip itself, on this thread (`runProgramBlocking`: never a wait on the cooperative pool); the engine reads
+        // its output up to the cap.
+        let outcome = runner.runProgramBlocking(arguments: [program.path, "-p", heldDir.appending(path: "archive.zip").path]
+                                                    + chosen.map { Self.literal($0.name) },
+                                                cwd: outDir, environment: environment, timeout: Self.timeout,
+                                                outputURL: dir.appending(path: "unzip.log"), stdoutURL: outDir.appending(path: Self.membersName),
+                                                stdoutCap: limits.bytes, policy: policy)
+        if outcome.tail.hasSuffix(GroupRun.outputExceeded) || outcome.tail.hasSuffix(GroupRun.memoryExceeded) { throw ArchiveReadError.expands }
         // Round 3: a run that ran out of time or never ran says so (the gate does not cache those).
         if outcome.timedOut { throw Self.tooLong }
         guard let exit = outcome.exitCode else { throw Self.couldNotRun }
-        guard exit == 0 else { throw ArchiveReadError.unreadable }
+        guard exit == 0, let output = EngineFiles.readNoFollow(outDir.appending(path: Self.membersName), under: outDir, limit: limits.bytes + 1)
+        else { throw ArchiveReadError.unreadable }
+        guard output.count <= limits.bytes else { throw ArchiveReadError.expands }
+        // Exactly what the central directory declares, member by member: a member unzip could not fully decode, or bytes
+        // that belong to another member, never pass (sizes, then each piece's CRC-32).
+        guard output.count == expected else { throw ArchiveReadError.unreadable }
         var result: [(name: String, data: Data)] = []
-        var total = 0
-        for (i, name) in names.enumerated() {
-            guard !FileManager.default.fileExists(atPath: out.appending(path: "m\(i).err").path),
-                  let bytes = EngineFiles.readNoFollow(outDir.appending(path: "m\(i)"), under: outDir, limit: limits.bytes + 1) else {
-                throw ArchiveReadError.unreadable
-            }
-            total += bytes.count
-            guard bytes.count <= limits.bytes, total <= limits.bytes else { throw ArchiveReadError.expands }
-            // Exactly what the central directory declares: a member unzip could not fully decode is a failure, never short.
-            guard bytes.count == sizes[i] else { throw ArchiveReadError.unreadable }
-            result.append((name, bytes))
+        var at = output.startIndex
+        for entry in chosen {
+            let piece = output[at..<(at + entry.uncompressedSize)]
+            guard EmbeddedContent.crc32(ArraySlice(piece)) == entry.crc else { throw ArchiveReadError.unreadable }
+            result.append((entry.name, Data(piece)))
+            at += entry.uncompressedSize
         }
         return result
     }
