@@ -147,9 +147,11 @@ public struct TaintedCommit: Codable, Equatable, Sendable, FetchableRecord, Pers
 }
 
 /// Ruling 22 (P2 R5-1): a restore over a live database that could not be read, for one company. What the restored database
-/// can't place reads tainted until the owner vouches (`Store.vouchRestoredCommits`): when `listed`, the commits off
-/// `mainCommit` that every ref and worktree held at the restore, recorded as `taintedCommit` rows naming this epoch; otherwise
-/// every commit not in `mainCommit`'s history (no `mainCommit`: every commit).
+/// can't place reads tainted until the owner vouches (`Store.vouchRestoredCommits`; `brahma vouch restore <company>` or the
+/// restore alert's Inbox action): every commit not in `mainCommit`'s history (no `mainCommit`: every commit), and every file
+/// or diff whose range from `mainCommit` is not empty (Rulings 24 and 25), whether or not the epoch is `listed`. `listed`
+/// only says the restore also recorded the commits off `mainCommit` that every ref and worktree held then as `taintedCommit`
+/// rows naming this epoch (attribution to items; never a reason to read anything clean).
 public struct RestoreEpoch: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "restoreEpoch"
 

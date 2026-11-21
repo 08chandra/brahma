@@ -187,6 +187,18 @@ extension AppModel {
         await ownerWrite("acknowledge") { store in try store.acknowledge(askId: askId) }
     }
 
+    /// The restore alert's action (Plan C P2, Ruling 26): the owner vouches for the commits a restore over an unreadable
+    /// database could not place in the alert's company (`Store.vouchRestoredCommits`, the same path as
+    /// `brahma vouch restore`). Any other ask is refused.
+    public func vouchRestoredCommits(askId: String) async {
+        _ = await ownerWrite("vouch for the restored commits") { store in
+            guard let ask = try store.ask(id: askId), ask.kind == .engineAlert, ask.subjectId == Store.restoreAlertSubject else {
+                throw WorkError.invalid("only a restore alert can vouch for restored commits")
+            }
+            try store.vouchRestoredCommits(companyId: ask.companyId, now: Date())
+        }
+    }
+
     @discardableResult
     public func rescind(askId: String, note: String = "") async -> Ask? {
         await ownerWrite("take it back") { store in try store.ownerRescind(askId: askId, note: note) }

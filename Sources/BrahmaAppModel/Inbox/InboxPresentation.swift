@@ -44,6 +44,9 @@ public struct InboxRow: Equatable, Identifiable, Sendable {
     /// The approve button's title: "Merge into main" on Brahma's quarantine ask, whose approval is the owner's accept of
     /// exactly the recorded commit (`Store.ownerDecide`, A2).
     public var approveLabel: String = "Approve"
+    /// The restore alert of a company with a restore epoch the owner has not cleared (Plan C P2, Ruling 26): the owner can
+    /// vouch for the commits the restore could not place (`AppModel.vouchRestoredCommits`).
+    public var canVouchRestore: Bool = false
 }
 
 public enum InboxRows {
@@ -89,7 +92,8 @@ public enum InboxRows {
                 canAnswer: pending && a.kind == .info,
                 canAcknowledge: (pending && a.kind == .engineAlert) || section == .fyi,
                 decidedLine: decided,
-                approveLabel: quarantine ? "Merge into main" : "Approve")
+                approveLabel: quarantine ? "Merge into main" : "Approve",
+                canVouchRestore: pending && a.kind == .engineAlert && a.subjectId == Store.restoreAlertSubject && work.restoreVouchOpen)
         }
         return work.inbox.map { row($0, .pending) } + work.fyi.map { row($0, .fyi) } + work.recentDecided.map { row($0, .recent) }
     }
