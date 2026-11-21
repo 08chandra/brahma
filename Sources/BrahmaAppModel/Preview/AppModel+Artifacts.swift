@@ -3,46 +3,75 @@ import BrahmaCore
 
 /// The artifacts tab's model-side actions (Plan 4a Task 8b), and the backend OpenAPI parse the bodies wait on.
 extension AppModel {
+    public static let artifactDeletedTitle = "ARTIFACT DELETED"
+    public static let artifactDeletedNotice = "This artifact was deleted"
+
     /// The entry file's render mode and size, as the snapshot stat'd it (no view reads a file); a pinned older artifact's body
     /// was stat'd when it was looked up.
     public func fileBody(for a: Artifact) -> FileBody? {
         snapshot.preview.fileBodies[a.id] ?? (pinnedArtifact?.artifact.id == a.id ? pinnedArtifact?.body : nil)
     }
 
-    /// Shows this artifact in the ARTIFACTS tab.
+    /// Shows this artifact in the ARTIFACTS tab. An owner's pick supersedes any lookup still running (`openArtifact`).
     public func selectArtifact(_ a: Artifact) {
         selectedArtifactId = a.id
         selectedPreviewTab = PreviewTabID.artifacts
+        artifactNotice = nil
+        artifactSelectionGeneration += 1
     }
 
-    /// `artifact:AR-n`: the artifact among the newest ones the snapshot holds, else looked up in the Store (detached) and pinned
-    /// so the tab can show one older than the snapshot's list. "No artifact AR-n" only when the company has none by that number.
+    /// `artifact:AR-n`: the artifact among the newest ones the snapshot holds (when that snapshot is this company's), else
+    /// looked up in the Store (detached, with the company's workspace read in the same task) and pinned so the tab can show one
+    /// older than the snapshot's list. "No artifact AR-n" only when the company has none by that number. A result that lands
+    /// after the owner picked something else is dropped.
     public func openArtifact(number: Int) async {
         select(.missionControl)
-        if let a = snapshot.preview.artifacts.first(where: { $0.number == number }) {
+        guard let companyId = selectedCompanyId else { return }
+        if let a = snapshot.preview.artifacts.first(where: { $0.number == number && $0.companyId == companyId }) {
             selectArtifact(a)
             return
         }
-        guard let companyId = selectedCompanyId, let workspace = snapshot.preview.workspace else {
-            errorMessage = "No artifact AR-\(number)"
-            return
-        }
+        let generation = artifactSelectionGeneration
         let store = self.store
         do {
             let found = try await Task.detached { () -> PinnedArtifact? in
-                guard let a = try store.artifact(companyId: companyId, number: number) else { return nil }
+                guard let company = try store.company(id: companyId),
+                      let a = try store.artifact(companyId: companyId, number: number) else { return nil }
+                let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
                 return PinnedArtifact(artifact: a, body: PreviewBodies.fileBody(a, workspace: workspace))
             }.value
-            guard companyId == selectedCompanyId else { return }
-            guard let found else {
-                errorMessage = "No artifact AR-\(number)"
-                return
-            }
-            pinnedArtifact = found
-            selectArtifact(found.artifact)
+            applyLookup(found, number: number, companyId: companyId, generation: generation)
         } catch {
             report(error)
         }
+    }
+
+    /// The second half of `openArtifact`: pins and selects what the lookup found, unless the company changed or the owner
+    /// selected another artifact while it ran (`generation`).
+    func applyLookup(_ found: PinnedArtifact?, number: Int, companyId: String, generation: Int) {
+        guard companyId == selectedCompanyId, generation == artifactSelectionGeneration else { return }
+        guard let found else {
+            errorMessage = "No artifact AR-\(number)"
+            return
+        }
+        pinnedArtifact = found
+        selectArtifact(found.artifact)
+    }
+
+    /// After each snapshot refresh: a pinned artifact deleted outside the app (the CLI) is unpinned and the tab says so, rather
+    /// than keeping a body over a missing path. One indexed read, only while something is pinned.
+    func checkPinnedArtifact() async {
+        guard let pinned = pinnedArtifact, let companyId = selectedCompanyId else { return }
+        let store = self.store
+        let (number, id) = (pinned.artifact.number, pinned.artifact.id)
+        guard let stillThere = try? await Task.detached { try store.artifact(companyId: companyId, number: number) != nil }.value,
+              !stillThere, pinnedArtifact?.artifact.id == id, companyId == selectedCompanyId else { return }
+        pinnedArtifact = nil
+        if selectedArtifactId == id {
+            selectedArtifactId = nil
+            artifactNotice = Self.artifactDeletedNotice
+        }
+        phoneFrameOverride[id] = nil
     }
 
     /// Owner only: removes the artifact's row, memory doc and copy (`Store.deleteArtifact`). The selection and the phone-frame
@@ -55,6 +84,7 @@ extension AppModel {
         guard deleted == true else { return }
         if selectedArtifactId == a.id { selectedArtifactId = nil }
         if pinnedArtifact?.artifact.id == a.id { pinnedArtifact = nil }
+        artifactNotice = nil
         phoneFrameOverride[a.id] = nil
     }
 

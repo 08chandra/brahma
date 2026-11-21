@@ -94,7 +94,9 @@ public enum PreviewBody: Equatable, Sendable {
     /// A ran CLI demo (4a): its sealed output, agent-controlled (`AnsiText`), under "exit <n> · <sha7>".
     case terminal(lines: [String], footer: String)
     /// A running backend (4a): its smoke rows, log tail (agent-controlled) and the operations of the engine's OpenAPI copy.
-    case backend(smoke: [SmokeRow], logTail: [String], operations: [OpenAPIOperation])
+    /// `operationsNote` is the engine-written reason the operations section is empty (the copy could not be read as OpenAPI, or
+    /// its parse timed out); the engine-produced smoke rows and log stay whatever the agent-authored copy holds.
+    case backend(smoke: [SmokeRow], logTail: [String], operations: [OpenAPIOperation], operationsNote: String? = nil)
     /// A running iOS app (4a): the Simulator's frames (`SimulatorScreenshotSource`).
     case simulator(udid: String)
     /// A running macOS app (4a): its window, captured by pid.

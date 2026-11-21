@@ -42,9 +42,13 @@ public struct OpenAPICopy: Equatable, Sendable {
 extension PreviewBodies {
     /// The terminal keeps as many lines as `AnsiText` renders.
     public static let terminalLines = AnsiText.maxLines
+    /// What a file renderer (Task 9b: CSV, glTF, images) shows when its parse goes past `RendererCaps.parseTimeout`: the body is
+    /// the file itself there, so the status replaces it. The backend body never does (see `running`).
     public static let cantShowTitle = "CAN'T SHOW THIS FILE"
     public static let tookTooLong = "it took too long to read"
+    /// The operations section's engine-written reasons for being empty.
     public static let openAPIUnreadable = "the OpenAPI file couldn't be read"
+    public static let openAPITimedOut = "the OpenAPI summary timed out"
 
     public static func smokeRows(_ results: [SmokeResult]) -> [SmokeRow] {
         results.map { r in
@@ -75,14 +79,19 @@ extension PreviewBodies {
             guard let url = state?.resolvedURL.flatMap(URL.init(string:)) else { return starting }
             return .web(url: url, origin: url, builtBy: "@" + (p.setBy[sid] ?? surface.setById))
         case .backend:
-            let operations: [OpenAPIOperation]
+            // The smoke rows and the log are engine-produced and never hidden by anything agent-controlled: the OpenAPI copy
+            // (agent-authored) only ever empties the operations section, with the engine-written reason beside it. A copy that
+            // is not readable as OpenAPI (YAML, no `paths`, oversized, a link), or a pathological one that times the parser out,
+            // hides nothing.
+            var operations: [OpenAPIOperation] = [], note: String?
             switch p.openAPI[sid] {
-            case .timedOut?: return .status(title: cantShowTitle, detail: tookTooLong, logTail: [])
-            case .unreadable?: return .status(title: cantShowTitle, detail: openAPIUnreadable, logTail: [])
+            case .timedOut?: note = openAPITimedOut
+            case .unreadable?: note = openAPIUnreadable
             case .operations(let ops)?: operations = ops
-            case .loading?, nil: operations = []
+            case .loading?, nil: break
             }
-            return .backend(smoke: smokeRows(state?.smokeResults ?? []), logTail: tail(state?.logPath, logLines), operations: operations)
+            return .backend(smoke: smokeRows(state?.smokeResults ?? []), logTail: tail(state?.logPath, logLines), operations: operations,
+                            operationsNote: note)
         case .cli:
             // A demo never serves; it ends as `ran`.
             return starting

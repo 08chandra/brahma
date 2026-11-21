@@ -168,6 +168,11 @@ import GRDB
         return a
     }
 
+    /// Removes an artifact row the way the CLI would, behind the app's back (sync: GRDB's async `write` is not what a test wants).
+    static func deleteRow(_ w: WorkWorld, id: String) throws {
+        try w.store.writer.write { db in try db.execute(sql: "DELETE FROM artifact WHERE id = ?", arguments: [id]) }
+    }
+
     @Test func mergeHistoryIsBoundedAndOpenRowsNeverFallOut() async throws {
         let w = try await WorkWorld.make()
         let item = try w.item("Old but queued")
@@ -230,10 +235,10 @@ import GRDB
                                                    PreviewDraft(name: "api", kind: "backend", run: "node server", url: "http://127.0.0.1:{port}/"))
         try Data("listening\n".utf8).write(to: layout.previewLog(name: "api"))
         try Data(#"{"openapi":"3.0.0","paths":{"/health":{"get":{"summary":"Liveness"}}}}"#.utf8).write(to: layout.previewOpenAPI(name: "api"))
-        func running(commit: String) throws {
+        func running(commit: String, smoke: [SmokeResult] = []) throws {
             try w.store.savePreviewState(PreviewState(surfaceId: api.id, companyId: w.company.id, status: .running, commit: commit,
                                                       resolvedURL: "http://127.0.0.1:47100/", logPath: layout.previewLog(name: "api").path,
-                                                      startedAt: Date(), updatedAt: Date()))
+                                                      startedAt: Date(), updatedAt: Date(), smokeResults: smoke))
         }
         try running(commit: "1111111aaaaaaa")
         await w.refresh()
@@ -252,25 +257,31 @@ import GRDB
                                          operations: [OpenAPIOperation(method: "GET", path: "/health", summary: "Liveness")])
         await settle(apiTab, parsed)
 
-        // A copy that is not OpenAPI (a new start re-reads it): a distinct status, not an empty table.
+        // A copy that is not OpenAPI (a new start re-reads it): the live smoke rows and log stay, and only the operations
+        // section says why it is empty. An agent's bad `openapi_path` hides nothing.
+        let unreadable = PreviewBody.backend(smoke: [], logTail: ["listening"], operations: [], operationsNote: "the OpenAPI file couldn't be read")
         try Data("not json".utf8).write(to: layout.previewOpenAPI(name: "api"))
         try running(commit: "2222222bbbbbbb")
         await w.refresh()
-        await settle(apiTab, .status(title: "CAN'T SHOW THIS FILE", detail: "the OpenAPI file couldn't be read", logTail: []))
+        await settle(apiTab, unreadable)
 
-        // A link planted at the copy's name is not the engine's copy: not discovered (the snapshot lstat's for a regular file),
-        // never read, and the backend shows with no operations rather than what the link points at.
+        // A link planted at the copy's name is discovered but refused by the hardened walk: the same "couldn't be read" reason,
+        // never what the link points at.
         try FileManager.default.removeItem(at: layout.previewOpenAPI(name: "api"))
         let elsewhere = try tempDir().appending(path: "spec.json")
         try Data(#"{"paths":{"/x":{"get":{}}}}"#.utf8).write(to: elsewhere)
         try FileManager.default.createSymbolicLink(at: layout.previewOpenAPI(name: "api"), withDestinationURL: elsewhere)
         try running(commit: "3333333ccccccc")
         await w.refresh()
-        #expect(w.model.snapshot.preview.openAPICopies[api.id] == nil)
-        await settle(apiTab, .backend(smoke: [], logTail: ["listening"], operations: []))
-        #expect(w.model.openAPICache[api.id] == nil, "nothing to parse, nothing cached")
+        #expect(w.model.snapshot.preview.openAPICopies[api.id] == OpenAPICopy(layout: layout, name: "api"))
+        await settle(apiTab, unreadable)
+        #expect(w.model.openAPICache[api.id]?.result == .unreadable)
 
-        // The parse timeout, on a manual clock: `RendererCaps.parse(clock:)` times the body out, and the body says so.
+        // The parse timeout, on a manual clock: `RendererCaps.parse(clock:)` times the body out. A pathological spec must not
+        // hide the engine's smoke results: the failing row stays in view, and only the operations section says what happened.
+        let failing = [SmokeResult(url: "http://127.0.0.1:47100/health", method: "GET", status: 500, millis: 7, bodyPrefix: "", ok: false,
+                                   error: "expected 200, got 500")]
+        let failingRows = PreviewBodies.smokeRows(failing)
         try FileManager.default.removeItem(at: layout.previewOpenAPI(name: "api"))
         try Data(#"{"paths":{}}"#.utf8).write(to: layout.previewOpenAPI(name: "api"))
         let clock = ArtifactParsingTests.ManualClock()
@@ -284,12 +295,61 @@ import GRDB
                 return []
             }
         }
-        try running(commit: "4444444ddddddd")
+        try running(commit: "4444444ddddddd", smoke: failing)
         await w.refresh()
-        #expect(w.model.previewBody(forTab: apiTab) == .backend(smoke: [], logTail: ["listening"], operations: []), "loading shows the live state")
+        #expect(w.model.previewBody(forTab: apiTab) == .backend(smoke: failingRows, logTail: ["listening"], operations: []), "loading shows the live state")
         try await eventually { clock.sleepers == 1 }
         clock.advance(by: RendererCaps.parseTimeout)
-        await settle(apiTab, .status(title: "CAN'T SHOW THIS FILE", detail: "it took too long to read", logTail: []))
+        await settle(apiTab, .backend(smoke: failingRows, logTail: ["listening"], operations: [], operationsNote: "the OpenAPI summary timed out"))
+        #expect(failingRows == [SmokeRow(method: "GET", path: "/health", statusTitle: "500", millis: 7, ok: false, error: "expected 200, got 500")])
+    }
+
+    @Test func pinnedArtifactDeletedOutsideTheAppIsUnpinnedAndSaidSo() async throws {
+        let w = try await WorkWorld.make()
+        var all: [Artifact] = []
+        for n in 1...25 { all.append(try Self.insertArtifact(w, number: n)) }
+        await w.refresh()
+        await w.model.openArtifact(number: 3)
+        #expect(w.model.previewBody == .artifact(all[2], all: w.model.snapshot.preview.artifacts + [all[2]]))
+        #expect(w.model.fileBody(for: all[2]) != nil)
+        // The CLI (or anything but this app) removes the row: the next refresh unpins it and the tab says so, instead of a body
+        // over a path that is gone.
+        try Self.deleteRow(w, id: "ar3")
+        await w.refresh()
+        #expect(w.model.previewBody == .status(title: "ARTIFACT DELETED", detail: "This artifact was deleted", logTail: []))
+        #expect(w.model.pinnedArtifact == nil && w.model.selectedArtifactId == nil && w.model.fileBody(for: all[2]) == nil)
+        #expect(w.model.previewBody(forTab: PreviewTabID.artifacts) == .status(title: "ARTIFACT DELETED", detail: "This artifact was deleted", logTail: []))
+        #expect(w.model.snapshot.preview.artifacts.count == 20, "the list itself is untouched")
+        // The next pick clears the notice.
+        w.model.selectArtifact(all[24])
+        #expect(w.model.artifactNotice == nil && w.model.previewBody == .artifact(all[24], all: w.model.snapshot.preview.artifacts))
+        // A pinned artifact that still exists stays pinned across refreshes.
+        await w.model.openArtifact(number: 4)
+        await w.refresh()
+        #expect(w.model.selectedArtifactId == "ar4" && w.model.pinnedArtifact?.artifact.id == "ar4")
+    }
+
+    @Test func lateLookupNeverOverridesTheOwnersPick() async throws {
+        let w = try await WorkWorld.make()
+        var all: [Artifact] = []
+        for n in 1...25 { all.append(try Self.insertArtifact(w, number: n)) }
+        await w.refresh()
+        let ws = URL(fileURLWithPath: w.company.workspacePath, isDirectory: true)
+        let stale = PinnedArtifact(artifact: all[2], body: PreviewBodies.fileBody(all[2], workspace: ws))
+        // The owner picked AR-25 while the lookup for AR-3 ran: the generation moved on, so the result is dropped (no pin, no
+        // selection change, no error).
+        let generation = w.model.artifactSelectionGeneration
+        w.model.selectArtifact(all[24])
+        w.model.applyLookup(stale, number: 3, companyId: w.company.id, generation: generation)
+        #expect(w.model.selectedArtifactId == "ar25" && w.model.pinnedArtifact == nil && w.model.errorMessage == nil)
+        w.model.applyLookup(nil, number: 99, companyId: w.company.id, generation: generation)
+        #expect(w.model.errorMessage == nil, "a stale miss reports nothing")
+        // A result for another company is dropped too.
+        w.model.applyLookup(stale, number: 3, companyId: "other", generation: w.model.artifactSelectionGeneration)
+        #expect(w.model.selectedArtifactId == "ar25" && w.model.pinnedArtifact == nil)
+        // A current result lands.
+        w.model.applyLookup(stale, number: 3, companyId: w.company.id, generation: w.model.artifactSelectionGeneration)
+        #expect(w.model.selectedArtifactId == "ar3" && w.model.pinnedArtifact == stale)
     }
 
     @Test func phoneFrameOverrideToggles() async throws {

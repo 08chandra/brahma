@@ -9,6 +9,12 @@ extension PreviewSnapshot {
     /// How many sprints back the snapshot looks for a demo.
     static let demoSprintsSearched = 3
 
+    /// Whether anything (a file, a link, a directory) sits at `url`; nothing is followed or read.
+    static func entryExists(_ url: URL) -> Bool {
+        var st = stat()
+        return lstat(url.path, &st) == 0
+    }
+
     mutating func loadArtifacts(store: Store, company: Company, layout: EngineLayout) throws {
         workspace = layout.workspace
         artifacts = try store.artifacts(companyId: company.id)
@@ -27,8 +33,9 @@ extension PreviewSnapshot {
                 if let path = state.outputPath { logTails[path] = PreviewLog.outputTail(layout, name: s.name, lines: PreviewBodies.terminalLines) }
             case (.backend, .running):
                 if let path = state.logPath { logTails[path] = PreviewLog.tail(layout, name: s.name, lines: PreviewBodies.logLines) }
-                // Located here (an lstat by path); read by the model through `PreviewLog.openAPICopy`'s hardened walk.
-                if FileBody.regularFileSize(layout.previewOpenAPI(name: s.name)) > 0 {
+                // Located here (an lstat by path: any entry at the copy's name, a planted link included, so the hardened read
+                // can refuse it and the body can say the copy couldn't be read); read by the model through `PreviewLog.openAPICopy`.
+                if Self.entryExists(layout.previewOpenAPI(name: s.name)) {
                     openAPICopies[s.id] = OpenAPICopy(layout: layout, name: s.name)
                 }
             default:

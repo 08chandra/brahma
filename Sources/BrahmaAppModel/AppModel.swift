@@ -58,6 +58,11 @@ public final class AppModel {
     public var phoneFrameOverride: [String: Bool] = [:]
     /// An artifact older than the snapshot's newest ones, opened by `artifact:AR-n` (`openArtifact(number:)`); per company.
     var pinnedArtifact: PinnedArtifact?
+    /// Shown in the ARTIFACTS tab in place of a body: the pinned artifact was deleted outside the app (`checkPinnedArtifact`).
+    /// Cleared by the next selection.
+    public internal(set) var artifactNotice: String?
+    /// Bumped by every artifact selection, so a lookup result that lands after the owner picked something else is dropped.
+    @ObservationIgnored var artifactSelectionGeneration = 0
     /// Surface id → the parsed OpenAPI copy of a running backend (`refreshOpenAPI`, through `RendererCaps.parse`).
     var openAPICache: [String: OpenAPICacheEntry] = [:]
     /// How a running backend's OpenAPI copy is parsed: `defaultOpenAPIParser` (the hardened read under `RendererCaps.parse`);
@@ -357,6 +362,7 @@ public final class AppModel {
         selectedPreviewTab = nil
         selectedArtifactId = nil
         pinnedArtifact = nil
+        artifactNotice = nil
         phoneFrameOverride = [:]
         openAPICache = [:]
         stopObservingTurnStream()
@@ -605,6 +611,7 @@ public final class AppModel {
         guard id == selectedCompanyId else { return }  // selection changed mid-load: the stale snapshot is dropped
         if new != snapshot { snapshot = new }
         refreshOpenAPI()
+        await checkPinnedArtifact()
         if let c = mapController, c.companyId == id { c.sync(snapshot: snapshot) }
         ticksSinceSnapshot = 0
         // The Handbook follows the database only while it is shown (its lists are read on demand, never kept in the snapshot).

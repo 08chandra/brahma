@@ -193,14 +193,20 @@ import Testing
         let dir = try tempDir()
         let okFile = dir.appending(path: "openapi.json")
         try exact.write(to: okFile)
-        #expect(OpenAPISummary.load(okFile)?.count == 1)
+        #expect(Self.loadSpec(okFile)?.count == 1)
         let bigFile = dir.appending(path: "big.json")
         try (exact + Data([0x20])).write(to: bigFile)
-        #expect(OpenAPISummary.load(bigFile) == nil)
+        #expect(Self.loadSpec(bigFile) == nil)
         let link = dir.appending(path: "link.json")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: okFile)
-        #expect(OpenAPISummary.load(link) == nil)
-        #expect(OpenAPISummary.load(dir.appending(path: "missing.json")) == nil)
+        #expect(Self.loadSpec(link) == nil)
+        #expect(Self.loadSpec(dir.appending(path: "missing.json")) == nil)
+    }
+
+    /// The bounded plain-path read (`RendererCaps.readRegularFile`) then the summary: what a test of the reader's bounds needs.
+    /// The app itself reads the engine's copy through `PreviewLog.openAPICopy`.
+    static func loadSpec(_ url: URL) -> [OpenAPIOperation]? {
+        (try? RendererCaps.readRegularFile(url, maxBytes: OpenAPISummary.maxBytes)).flatMap(OpenAPISummary.parse)
     }
 
     // MARK: glTF
@@ -490,7 +496,7 @@ import Testing
         let began = SuspendingClock.now
         #expect(Self.gltfError(fifo) == .invalid("pipe.glb is not a regular file"))
         #expect(Self.gltfError(try asset.writeGLTF(to: dir, name: "f.gltf", uri: "pipe.glb")) == .invalid("buffer pipe.glb is not a regular file"))
-        #expect(OpenAPISummary.load(fifo) == nil)
+        #expect(Self.loadSpec(fifo) == nil)
         #expect(SuspendingClock.now - began < .seconds(2))
     }
 

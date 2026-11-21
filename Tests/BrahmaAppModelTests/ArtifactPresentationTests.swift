@@ -116,10 +116,12 @@ import BrahmaCore
                                     SmokeRow(method: "POST", path: "/items", statusTitle: "—", millis: 3000, ok: false, error: "timed out")],
                             logTail: log, operations: [op]))
         #expect(body(api, runningAPI) == .backend(smoke: PreviewBodies.smokeRows(smoke), logTail: log, operations: []))
+        // A parse past its timeout (an agent's pathological spec) hides nothing either: the failing smoke row stays in view.
         #expect(body(api, runningAPI, openAPI: ["b1": .timedOut])
-                == .status(title: "CAN'T SHOW THIS FILE", detail: "it took too long to read", logTail: []))
+                == .backend(smoke: PreviewBodies.smokeRows(smoke), logTail: log, operations: [], operationsNote: "the OpenAPI summary timed out"))
+        // Not readable as OpenAPI: the live smoke rows and log stay; only the operations section carries the reason.
         #expect(body(api, runningAPI, openAPI: ["b1": .unreadable])
-                == .status(title: "CAN'T SHOW THIS FILE", detail: "the OpenAPI file couldn't be read", logTail: []))
+                == .backend(smoke: PreviewBodies.smokeRows(smoke), logTail: log, operations: [], operationsNote: "the OpenAPI file couldn't be read"))
         #expect(body(api, runningAPI, openAPI: ["b1": .loading]) == .backend(smoke: PreviewBodies.smokeRows(smoke), logTail: log, operations: []))
         #expect(body(api, Self.state("b1", .unavailable, message: "no sandbox"))
                 == .status(title: "API UNAVAILABLE", detail: "no sandbox", logTail: []))

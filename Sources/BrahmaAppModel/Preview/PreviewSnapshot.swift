@@ -25,7 +25,7 @@ public struct PreviewSnapshot: Equatable, Sendable {
     public var fileBodies: [String: FileBody] = [:]
     /// Surface id → the engine's OpenAPI copy of a running backend (`EngineLayout.previewOpenAPI`), for the model to parse.
     public var openAPICopies: [String: OpenAPICopy] = [:]
-    /// Surface id → that copy parsed (laid over by `AppModel.previewWithOpenAPI`; empty straight from `load`).
+    /// Surface id → that copy parsed (laid over by `AppModel.previewForBodies`; empty straight from `load`).
     public var openAPI: [String: PreviewOpenAPI] = [:]
 
     public static let empty = PreviewSnapshot(surfaces: [], states: [:], live: nil, liveRef: nil)
