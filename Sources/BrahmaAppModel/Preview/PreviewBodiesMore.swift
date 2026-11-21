@@ -1,8 +1,9 @@
 import Foundation
 import BrahmaCore
 
-/// One backend smoke request's outcome, as the pane's table shows it (Plan 4a Task 8b). `path` and `error` are engine-composed
-/// from the surface's own smoke list; the body prefix stays out of the row.
+/// One backend smoke request's outcome, as the pane's table shows it (Plan 4a Task 8b). `method` and `path` come from the
+/// surface's smoke list, which an agent sets (`set_smoke_check`): agent-controlled text, `Text(verbatim:)` in the view. `error`
+/// is engine-composed; the body prefix stays out of the row.
 public struct SmokeRow: Equatable, Sendable {
     public var method: String
     public var path: String
@@ -18,11 +19,24 @@ public struct SmokeRow: Equatable, Sendable {
 }
 
 /// What the app knows about a running backend's OpenAPI copy (the engine's ≤ 2 MB file in `previewLogs`, the only one read):
-/// still loading, parsed (`OpenAPISummary` through `RendererCaps.parse`), or past the parse timeout.
+/// still loading, parsed (`OpenAPISummary` through `RendererCaps.parse`), past the parse timeout, or not readable as OpenAPI
+/// (missing, oversized, a link, or not a JSON document with `paths`).
 public enum PreviewOpenAPI: Equatable, Sendable {
     case loading
     case operations([OpenAPIOperation])
     case timedOut
+    case unreadable
+}
+
+/// Where a running backend's OpenAPI copy is: the engine's logs folder and the surface's name (`PreviewLog.openAPICopy` reads it
+/// through the hardened walk). `url` only identifies it.
+public struct OpenAPICopy: Equatable, Sendable {
+    public var layout: EngineLayout
+    public var name: String
+
+    public init(layout: EngineLayout, name: String) { self.layout = layout; self.name = name }
+
+    public var url: URL { layout.previewOpenAPI(name: name) }
 }
 
 extension PreviewBodies {
@@ -30,6 +44,7 @@ extension PreviewBodies {
     public static let terminalLines = AnsiText.maxLines
     public static let cantShowTitle = "CAN'T SHOW THIS FILE"
     public static let tookTooLong = "it took too long to read"
+    public static let openAPIUnreadable = "the OpenAPI file couldn't be read"
 
     public static func smokeRows(_ results: [SmokeResult]) -> [SmokeRow] {
         results.map { r in
@@ -63,6 +78,7 @@ extension PreviewBodies {
             let operations: [OpenAPIOperation]
             switch p.openAPI[sid] {
             case .timedOut?: return .status(title: cantShowTitle, detail: tookTooLong, logTail: [])
+            case .unreadable?: return .status(title: cantShowTitle, detail: openAPIUnreadable, logTail: [])
             case .operations(let ops)?: operations = ops
             case .loading?, nil: operations = []
             }

@@ -15,8 +15,8 @@ public struct MergeSnapshot: Equatable, Sendable {
     public var unfinishedBatch: MergeBatch?
 
     public static let recentShown = 20
-    /// How many requests are read for the history (newest first after the read).
-    static let readLimit = 10_000
+    /// The open set is small by design (one request per approved item); this only bounds a runaway read.
+    static let openLimit = 1000
 
     public static let empty = MergeSnapshot(open: [], recent: [], settings: MergeSettings(), mainCommit: nil, hold: nil, unfinishedBatch: nil)
 
@@ -29,9 +29,9 @@ public struct MergeSnapshot: Equatable, Sendable {
     public static func load(store: Store, companyId: String) throws -> MergeSnapshot {
         guard let company = try store.company(id: companyId) else { return .empty }
         var m = MergeSnapshot.empty
-        let all = try store.mergeRequests(companyId: companyId, limit: readLimit)
-        m.open = all.filter { $0.status.isOpen }
-        m.recent = Array(all.filter { !$0.status.isOpen }.reversed().prefix(recentShown))
+        // Two bounded reads: the open set in queue order (never dependent on the history window), and the newest closed ones.
+        m.open = try store.mergeRequests(companyId: companyId, statuses: MergeRequestStatus.allCases.filter(\.isOpen), limit: openLimit)
+        m.recent = try store.recentMergeRequests(companyId: companyId, limit: recentShown)
         m.settings = MergeSettings(mainCheck: company.mainCheck, batchSize: company.mergeBatchSize, strategy: company.mergeStrategy)
         m.mainCommit = company.mainCommit
         m.hold = company.mergeHold

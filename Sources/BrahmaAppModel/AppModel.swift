@@ -56,8 +56,13 @@ public final class AppModel {
     public var selectedArtifactId: String?
     /// Artifact id → the owner's "PHONE FRAME" choice for a video (Plan 4a); unset keeps `VideoLayout`'s detection. Per company.
     public var phoneFrameOverride: [String: Bool] = [:]
+    /// An artifact older than the snapshot's newest ones, opened by `artifact:AR-n` (`openArtifact(number:)`); per company.
+    var pinnedArtifact: PinnedArtifact?
     /// Surface id → the parsed OpenAPI copy of a running backend (`refreshOpenAPI`, through `RendererCaps.parse`).
     var openAPICache: [String: OpenAPICacheEntry] = [:]
+    /// How a running backend's OpenAPI copy is parsed: `defaultOpenAPIParser` (the hardened read under `RendererCaps.parse`);
+    /// tests inject one on a manual clock.
+    @ObservationIgnored var openAPIParser: @Sendable (OpenAPICopy) async throws -> [OpenAPIOperation]? = AppModel.defaultOpenAPIParser
     /// The agent whose turn stream some view observes (`observeTurnStream`); loaded off-main per tick only while set.
     public internal(set) var turnStreamAgentId: String?
     var turnStreamCache: TurnStreamCache?
@@ -351,6 +356,7 @@ public final class AppModel {
         selectedItemKey = nil
         selectedPreviewTab = nil
         selectedArtifactId = nil
+        pinnedArtifact = nil
         phoneFrameOverride = [:]
         openAPICache = [:]
         stopObservingTurnStream()
@@ -428,11 +434,12 @@ public final class AppModel {
                 errorMessage = "No preview \(name)"
             }
         case .artifact(let number):
+            // In the snapshot: shown at once. Older than its newest ones: looked up and pinned (`openArtifact`), off-main.
             select(.missionControl)
             if let a = snapshot.preview.artifacts.first(where: { $0.number == number }) {
                 selectArtifact(a)
             } else {
-                errorMessage = "No artifact AR-\(number)"
+                Task { await openArtifact(number: number) }
             }
         case .ask(let id):
             select(.inbox)

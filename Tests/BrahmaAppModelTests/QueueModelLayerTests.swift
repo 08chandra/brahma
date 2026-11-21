@@ -145,8 +145,9 @@ import GRDB
         #expect(w.model.sidebarSelection == .missionControl)
         #expect(w.model.selectedPreviewTab == PreviewTabID.artifacts && w.model.selectedArtifactId == a.id)
         #expect(w.model.previewBody == .artifact(a, all: [a]))
-        w.model.apply(.artifact(number: 9))
+        await w.model.openArtifact(number: 9)
         #expect(w.model.errorMessage == "No artifact AR-9")
+        #expect(w.model.selectedArtifactId == a.id, "a miss keeps the selection")
         w.model.errorMessage = nil
         w.model.selectedPreviewTab = nil
         w.model.apply(.preview(name: "artifacts"))
@@ -155,6 +156,140 @@ import GRDB
         w.model.presentedSheet = .mergeSettings
         await w.model.selectCompany(w.company.id)
         #expect(w.model.presentedSheet == nil)
+    }
+
+    /// An artifact row without a copy on disk (the publish rate would stop 25 real publishes in one test).
+    @discardableResult
+    static func insertArtifact(_ w: WorkWorld, number: Int) throws -> Artifact {
+        let a = Artifact(id: "ar\(number)", companyId: w.company.id, number: number, title: "Thing \(number)", kind: .html,
+                         storedPath: ".brahma/artifacts/\(number)-thing", entryFile: "thing.html", sourcePath: "x", publishedById: "owner",
+                         itemId: nil, bytes: 11, createdAt: Date(timeIntervalSince1970: 1_800_000_000 + Double(number)))
+        try w.store.writer.write { db in try a.insert(db) }
+        return a
+    }
+
+    @Test func mergeHistoryIsBoundedAndOpenRowsNeverFallOut() async throws {
+        let w = try await WorkWorld.make()
+        let item = try w.item("Old but queued")
+        // The oldest request is still open; two dozen newer ones closed since.
+        let old = try Self.request(w, item, number: 1, status: .queued)
+        for n in 2...25 { try Self.request(w, item, number: n, status: .merged) }
+        await w.refresh()
+        #expect(w.model.snapshot.merge.open.map(\.number) == [1])
+        #expect(w.model.snapshot.merge.recent.map(\.number) == Array((6...25).reversed()))
+        #expect(w.model.snapshot.merge.recent.count == MergeSnapshot.recentShown)
+        #expect(w.model.openMergeCount == 1 && w.model.mergeHeader.title == "1 IN QUEUE")
+        let rows = w.model.mergeRows
+        #expect(rows.count == 21 && rows.first?.id == old.id && rows.first?.position == 1)
+        #expect(rows.dropFirst().map(\.ref) == (6...25).reversed().map { "M-\($0)" })
+    }
+
+    @Test func artifactOlderThanTheNewestTwentyIsLookedUpAndPinned() async throws {
+        let w = try await WorkWorld.make()
+        var all: [Artifact] = []
+        for n in 1...25 { all.append(try Self.insertArtifact(w, number: n)) }
+        await w.refresh()
+        let newest = w.model.snapshot.preview.artifacts
+        #expect(newest.map(\.number) == Array((6...25).reversed()))
+        #expect(w.model.previewTabs.map(\.title) == ["ARTIFACTS"])
+        // In the snapshot: shown at once, synchronously.
+        w.model.apply(.artifact(number: 25))
+        #expect(w.model.selectedArtifactId == "ar25")
+        // Older than the newest 20: found in the Store and pinned; the body shows it and the list carries it.
+        await w.model.openArtifact(number: 3)
+        #expect(w.model.errorMessage == nil)
+        #expect(w.model.selectedArtifactId == "ar3" && w.model.selectedPreviewTab == PreviewTabID.artifacts)
+        #expect(w.model.previewBody == .artifact(all[2], all: newest + [all[2]]))
+        let ws = URL(fileURLWithPath: w.company.workspacePath, isDirectory: true)
+        let body = try #require(w.model.fileBody(for: all[2]))
+        #expect(body.root == ws.appending(path: ".brahma/artifacts/3-thing", directoryHint: .isDirectory) && body.mode == .web && body.bytes == 0)
+        #expect(w.model.previewTabs.count == 1, "the pin adds no tab")
+        // Only a number the company never used is "No artifact"; the pin stays.
+        await w.model.openArtifact(number: 99)
+        #expect(w.model.errorMessage == "No artifact AR-99")
+        #expect(w.model.selectedArtifactId == "ar3" && w.model.previewBody == .artifact(all[2], all: newest + [all[2]]))
+        // The pin is per company.
+        await w.model.selectCompany(w.company.id)
+        #expect(w.model.previewBody == .artifact(all[24], all: newest))
+    }
+
+    @Test func openAPIAndDemoOutputReachTheBodiesEndToEnd() async throws {
+        let w = try await WorkWorld.make()
+        let layout = EngineLayout(workspace: URL(fileURLWithPath: w.company.workspacePath, isDirectory: true))
+        try FileManager.default.createDirectory(at: layout.previewLogs, withIntermediateDirectories: true)
+
+        // A ran CLI demo: its sealed output reaches `.terminal` through the core's hardened reader.
+        let demo = try w.store.upsertPreviewSurface(companyId: w.company.id, by: .owner,
+                                                    PreviewDraft(name: "demo", kind: "cli", run: nil, url: nil, demo: "./demo"))
+        try Data("hello\n\u{1B}[32mworld\u{1B}[0m\n".utf8).write(to: layout.previewOutput(name: "demo"))
+        try w.store.savePreviewState(PreviewState(surfaceId: demo.id, companyId: w.company.id, status: .ran, commit: "abcdef1234567",
+                                                  message: "exit 0", updatedAt: Date(), outputPath: layout.previewOutput(name: "demo").path))
+
+        // A running backend: its log tail and the engine's OpenAPI copy, parsed by the model after the refresh.
+        let api = try w.store.upsertPreviewSurface(companyId: w.company.id, by: .owner,
+                                                   PreviewDraft(name: "api", kind: "backend", run: "node server", url: "http://127.0.0.1:{port}/"))
+        try Data("listening\n".utf8).write(to: layout.previewLog(name: "api"))
+        try Data(#"{"openapi":"3.0.0","paths":{"/health":{"get":{"summary":"Liveness"}}}}"#.utf8).write(to: layout.previewOpenAPI(name: "api"))
+        func running(commit: String) throws {
+            try w.store.savePreviewState(PreviewState(surfaceId: api.id, companyId: w.company.id, status: .running, commit: commit,
+                                                      resolvedURL: "http://127.0.0.1:47100/", logPath: layout.previewLog(name: "api").path,
+                                                      startedAt: Date(), updatedAt: Date()))
+        }
+        try running(commit: "1111111aaaaaaa")
+        await w.refresh()
+        let demoTab = PreviewTabID.surface(demo.id), apiTab = PreviewTabID.surface(api.id)
+        /// Waits for the parse to land (up to 20 s), then asserts, so a failure names the body shown.
+        func settle(_ tab: String, _ expected: PreviewBody) async {
+            let deadline = SuspendingClock.now + .seconds(20)
+            while w.model.previewBody(forTab: tab) != expected, SuspendingClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(w.model.previewBody(forTab: tab) == expected)
+        }
+        #expect(w.model.previewBody(forTab: demoTab) == .terminal(lines: ["hello", "\u{1B}[32mworld\u{1B}[0m"], footer: "exit 0 · abcdef1"))
+        #expect(w.model.snapshot.preview.openAPICopies[api.id] == OpenAPICopy(layout: layout, name: "api"))
+        let parsed = PreviewBody.backend(smoke: [], logTail: ["listening"],
+                                         operations: [OpenAPIOperation(method: "GET", path: "/health", summary: "Liveness")])
+        await settle(apiTab, parsed)
+
+        // A copy that is not OpenAPI (a new start re-reads it): a distinct status, not an empty table.
+        try Data("not json".utf8).write(to: layout.previewOpenAPI(name: "api"))
+        try running(commit: "2222222bbbbbbb")
+        await w.refresh()
+        await settle(apiTab, .status(title: "CAN'T SHOW THIS FILE", detail: "the OpenAPI file couldn't be read", logTail: []))
+
+        // A link planted at the copy's name is not the engine's copy: not discovered (the snapshot lstat's for a regular file),
+        // never read, and the backend shows with no operations rather than what the link points at.
+        try FileManager.default.removeItem(at: layout.previewOpenAPI(name: "api"))
+        let elsewhere = try tempDir().appending(path: "spec.json")
+        try Data(#"{"paths":{"/x":{"get":{}}}}"#.utf8).write(to: elsewhere)
+        try FileManager.default.createSymbolicLink(at: layout.previewOpenAPI(name: "api"), withDestinationURL: elsewhere)
+        try running(commit: "3333333ccccccc")
+        await w.refresh()
+        #expect(w.model.snapshot.preview.openAPICopies[api.id] == nil)
+        await settle(apiTab, .backend(smoke: [], logTail: ["listening"], operations: []))
+        #expect(w.model.openAPICache[api.id] == nil, "nothing to parse, nothing cached")
+
+        // The parse timeout, on a manual clock: `RendererCaps.parse(clock:)` times the body out, and the body says so.
+        try FileManager.default.removeItem(at: layout.previewOpenAPI(name: "api"))
+        try Data(#"{"paths":{}}"#.utf8).write(to: layout.previewOpenAPI(name: "api"))
+        let clock = ArtifactParsingTests.ManualClock()
+        w.model.openAPIParser = { _ in
+            try await RendererCaps.parse(clock: clock) { () -> [OpenAPIOperation]? in
+                let deadline = Date().addingTimeInterval(10)
+                while Date() < deadline {
+                    if Task.isCancelled { return nil }
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                return []
+            }
+        }
+        try running(commit: "4444444ddddddd")
+        await w.refresh()
+        #expect(w.model.previewBody(forTab: apiTab) == .backend(smoke: [], logTail: ["listening"], operations: []), "loading shows the live state")
+        try await eventually { clock.sleepers == 1 }
+        clock.advance(by: RendererCaps.parseTimeout)
+        await settle(apiTab, .status(title: "CAN'T SHOW THIS FILE", detail: "it took too long to read", logTail: []))
     }
 
     @Test func phoneFrameOverrideToggles() async throws {

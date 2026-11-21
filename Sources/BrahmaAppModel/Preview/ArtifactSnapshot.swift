@@ -27,8 +27,10 @@ extension PreviewSnapshot {
                 if let path = state.outputPath { logTails[path] = PreviewLog.outputTail(layout, name: s.name, lines: PreviewBodies.terminalLines) }
             case (.backend, .running):
                 if let path = state.logPath { logTails[path] = PreviewLog.tail(layout, name: s.name, lines: PreviewBodies.logLines) }
-                let copy = layout.previewOpenAPI(name: s.name)
-                if FileBody.regularFileSize(copy) > 0 { openAPIFiles[s.id] = copy }
+                // Located here (an lstat by path); read by the model through `PreviewLog.openAPICopy`'s hardened walk.
+                if FileBody.regularFileSize(layout.previewOpenAPI(name: s.name)) > 0 {
+                    openAPICopies[s.id] = OpenAPICopy(layout: layout, name: s.name)
+                }
             default:
                 continue
             }

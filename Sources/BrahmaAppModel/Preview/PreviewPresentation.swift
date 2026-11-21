@@ -58,7 +58,8 @@ public enum PreviewTabs {
                               tone: PreviewTone(status), surfaceId: s.id)
         }
         if let latest = p.artifacts.first {
-            tabs.append(PreviewTab(id: PreviewTabID.artifacts, title: "ARTIFACTS", statusTitle: latest.ref, tone: .good, surfaceId: nil))
+            // Not a health state: the chip stays neutral.
+            tabs.append(PreviewTab(id: PreviewTabID.artifacts, title: "ARTIFACTS", statusTitle: latest.ref, tone: .idle, surfaceId: nil))
         }
         if p.live != nil {
             tabs.append(PreviewTab(id: PreviewTabID.live, title: "LIVE", statusTitle: p.liveRef ?? "LIVE", tone: .good, surfaceId: nil))

@@ -30,6 +30,14 @@ extension Store {
         }
     }
 
+    /// The company's newest closed requests (merged, bounced, failed, cancelled), newest first, at most `limit` (the app's history).
+    public func recentMergeRequests(companyId: String, limit: Int) throws -> [MergeRequest] {
+        try writer.read { db in
+            try MergeRequest.filter(Column("companyId") == companyId && !MergeRequestStatus.openRaw.contains(Column("status")))
+                .order(Column("number").desc).limit(max(0, limit)).fetchAll(db)
+        }
+    }
+
     /// The item's newest merge request.
     public func latestMergeRequest(itemId: String) throws -> MergeRequest? {
         try writer.read { db in

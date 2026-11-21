@@ -51,6 +51,7 @@ import BrahmaCore
         #expect(tabs.map(\.title) == ["WEB", "API", "ARTIFACTS", "LIVE"])
         #expect(tabs.map(\.id) == ["surface:s1", "surface:s2", PreviewTabID.artifacts, PreviewTabID.live])
         #expect(tabs[2].statusTitle == "AR-2" && tabs[2].surfaceId == nil)
+        #expect(tabs[2].tone == .idle, "not a health state: a neutral chip")
         // No artifact: no ARTIFACTS tab.
         var none = p
         none.artifacts = []
@@ -117,6 +118,9 @@ import BrahmaCore
         #expect(body(api, runningAPI) == .backend(smoke: PreviewBodies.smokeRows(smoke), logTail: log, operations: []))
         #expect(body(api, runningAPI, openAPI: ["b1": .timedOut])
                 == .status(title: "CAN'T SHOW THIS FILE", detail: "it took too long to read", logTail: []))
+        #expect(body(api, runningAPI, openAPI: ["b1": .unreadable])
+                == .status(title: "CAN'T SHOW THIS FILE", detail: "the OpenAPI file couldn't be read", logTail: []))
+        #expect(body(api, runningAPI, openAPI: ["b1": .loading]) == .backend(smoke: PreviewBodies.smokeRows(smoke), logTail: log, operations: []))
         #expect(body(api, Self.state("b1", .unavailable, message: "no sandbox"))
                 == .status(title: "API UNAVAILABLE", detail: "no sandbox", logTail: []))
 

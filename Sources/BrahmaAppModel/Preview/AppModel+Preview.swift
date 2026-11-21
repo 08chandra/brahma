@@ -9,9 +9,9 @@ extension AppModel {
     public var previewBody: PreviewBody { previewBody(forTab: selectedPreviewTab) }
 
     /// The body of any tab id, for surfaces other than the pane (chat's inspector split, Collab). The ARTIFACTS tab shows the
-    /// selected artifact; a backend body carries the parsed OpenAPI copy (`previewWithOpenAPI`).
+    /// selected (possibly pinned) artifact; a backend body carries the parsed OpenAPI copy (`previewForBodies`).
     public func previewBody(forTab tabId: String?) -> PreviewBody {
-        let p = previewWithOpenAPI
+        let p = previewForBodies
         let tails = p.logTails
         return PreviewBodies.body(for: tabId, snapshot: p, logTail: { tails[$0.path] ?? [] }, selectedArtifactId: selectedArtifactId)
     }

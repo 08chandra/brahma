@@ -24,7 +24,7 @@ public struct PreviewSnapshot: Equatable, Sendable {
     /// Artifact id → its entry file's body, stat'd here so no view reads a file.
     public var fileBodies: [String: FileBody] = [:]
     /// Surface id → the engine's OpenAPI copy of a running backend (`EngineLayout.previewOpenAPI`), for the model to parse.
-    public var openAPIFiles: [String: URL] = [:]
+    public var openAPICopies: [String: OpenAPICopy] = [:]
     /// Surface id → that copy parsed (laid over by `AppModel.previewWithOpenAPI`; empty straight from `load`).
     public var openAPI: [String: PreviewOpenAPI] = [:]
 
