@@ -188,9 +188,17 @@ extension Store {
     /// executive or the owner can re-adopt it), not adopted. An item already flagged keeps its flag and its flagged holder.
     func recordClaimHead(itemId: String, head: String, now: Date) throws {
         try writer.write { db in
-            // Plan C2a: where a tainted turn that claimed it starts recording (whatever the recorded-head checks decide below).
-            try db.execute(sql: "UPDATE workLease SET claimHead = ? WHERE itemId = ?", arguments: [head, itemId])
             guard let item = try WorkItem.fetchOne(db, key: itemId) else { return }
+            // Plan C2a: where a tainted turn that claimed it starts recording. Only a head the engine recorded and the branch still
+            // is (an agent may have moved an unheld branch) is trusted, once per lease and claim; else the record starts at the
+            // merge base with `main`.
+            if !item.branchMoved, item.leaseHeadCommit == head {
+                try db.execute(sql: "UPDATE workLease SET claimHead = ? WHERE itemId = ? AND claimHead IS NULL", arguments: [head, itemId])
+                try db.execute(sql: """
+                    UPDATE leaseClaim SET claimHead = ? WHERE id = (SELECT id FROM leaseClaim WHERE itemId = ? ORDER BY id DESC LIMIT 1)
+                      AND claimHead IS NULL
+                    """, arguments: [head, itemId])
+            }
             if !item.branchMoved, let recorded = item.leaseHeadCommit, recorded != head,
                let claimantId = try Self.leaseHolderId(db: db, itemId: itemId), let claimant = try Agent.fetchOne(db, key: claimantId) {
                 try flagBranchMoved(db: db, item: item, agent: claimant, holderId: nil,
