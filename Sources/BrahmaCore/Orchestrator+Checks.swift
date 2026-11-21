@@ -95,7 +95,7 @@ extension Orchestrator {
         let fence: PurgeFence.Hold?
         do {
             let (store, companyId) = (self.store, company.id)
-            fence = try await blocking.tryRun { try store.holdPurgeFence(companyId: companyId) }
+            fence = try await blocking.tryRun { try store.holdPurgeFence(companyId: companyId, kind: .check) }
         } catch let e as WorkError {
             couldNotRun("the check did not run: \(e.message)")
             return
