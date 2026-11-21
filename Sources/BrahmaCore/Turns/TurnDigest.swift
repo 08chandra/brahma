@@ -202,12 +202,17 @@ public enum TurnDigest {
         return out.joined(separator: "\n")
     }
 
-    /// `Previews: <name> <status>[ <url>] @<sha7> · …` (the URL while running), one flattened line of at most
-    /// `maxPreviewLine` characters (a cut line ends in …); nil without surfaces.
+    /// `Previews: <name>[ (<Kind>)] <status>[: <reason>][ <url>] @<sha7> · …` (the kind for every kind but web; the
+    /// engine's message when it ran or is unavailable — e.g. waiting for the owner's Simulator approval; the URL while
+    /// running), one flattened line of at most `maxPreviewLine` characters (a cut line ends in …); nil without surfaces.
     public static func previewLine(_ previews: [(surface: PreviewSurface, state: PreviewState?)]) -> String? {
         guard !previews.isEmpty else { return nil }
         let parts = previews.map { surface, state -> String in
-            var part = "\(surface.name) \((state?.status ?? .idle).title)"
+            let kind = surface.previewKind.flatMap { $0 == .web ? nil : " (\($0.title))" } ?? ""
+            var part = "\(surface.name)\(kind) \((state?.status ?? .idle).title)"
+            if [.ran, .unavailable].contains(state?.status), let message = state?.message, !message.isEmpty {
+                part += ": " + ReviewDigest.flat(message, max: 120)
+            }
             if state?.status == .running, let url = state?.resolvedURL { part += " " + url }
             if let commit = state?.commit { part += " @" + commit.prefix(7) }
             return part

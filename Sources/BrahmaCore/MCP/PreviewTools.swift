@@ -9,16 +9,24 @@ extension CompanyTools {
                                           "description": .string("Up to 10 smoke requests, e.g. \"GET /health 200\" or \"POST /items {json} 201\"")])
         return [
             ToolSpec(name: "set_preview_command", description: """
-                Set (or remove) one of the company's previews: a web server the engine builds from main in a fresh sandboxed \
-                export and keeps running on a loopback port, restarted when main moves. run and url are required; write {port} \
-                where the engine's port goes (e.g. "PORT={port} npm start" and "http://127.0.0.1:{port}/"). The engine builds it \
-                from main; nothing starts in this turn. At most 8 previews per company.
+                Set (or remove) one of the company's previews, which the engine builds from main in a fresh sandboxed export \
+                and runs again when main moves. Kinds: web and backend (a server on a loopback port: run and url are required; \
+                write {port} where the engine's port goes, e.g. "PORT={port} npm start" and "http://127.0.0.1:{port}/"; a \
+                backend's smoke requests are its demo), cli (demo is required: a command whose output is shown), ios (build, \
+                app_path and bundle_id are required; it runs only after the owner allows the Simulator, which runs outside \
+                the sandbox) and macos (build and app_path are required). Paths are relative to the repo root. Nothing starts \
+                in this turn. At most 8 previews per company.
                 """, inputSchema: schema([
                     "name": prop("string", "Preview name: lowercase letters, digits and dashes (max 24), e.g. web"),
-                    "kind": prop("string", "web (the only kind yet)"),
-                    "run": prop("string", "Shell command that starts the server, listening on {port} (1–2000 characters)"),
-                    "url": prop("string", "Where it answers: http://127.0.0.1:{port}/ (or localhost, [::1]; a literal port is allowed but not shared)"),
-                    "build": prop("string", "Optional shell command run first, e.g. npm ci && npm run build"),
+                    "kind": prop("string", "web, backend, cli, ios or macos"),
+                    "run": prop("string", "web/backend: shell command that starts the server, listening on {port} (1–2000 characters)"),
+                    "url": prop("string", "web/backend: where it answers, http://127.0.0.1:{port}/ (or localhost, [::1]; a literal port is allowed but not shared)"),
+                    "build": prop("string", "Shell command run first, e.g. npm ci && npm run build (required for ios and macos)"),
+                    "demo": prop("string", "cli: the shell command whose output is the preview (1–2000 characters)"),
+                    "openapi_path": prop("string", "backend: its OpenAPI file, relative to the repo root (at most 2 MB)"),
+                    "app_path": prop("string", "ios/macos: the built .app, relative to the repo root, e.g. build/Build/Products/Debug/App.app"),
+                    "bundle_id": prop("string", "ios: the app's bundle id (letters, digits, '.' and '-')"),
+                    "device": prop("string", "ios: the Simulator device type, e.g. iPhone 15 Pro (optional)"),
                     "smoke": strings,
                     "remove": prop("boolean", "true removes the preview named name instead"),
                 ], required: ["name", "kind"])),
@@ -50,7 +58,10 @@ extension CompanyTools {
         }
         let kind = try string(args, "kind").trimmingCharacters(in: .whitespaces).lowercased()
         let draft = PreviewDraft(name: name, kind: kind, run: try optionalString(args, "run"), url: try optionalString(args, "url"),
-                                 build: try optionalString(args, "build"), smoke: try optionalStringArray(args, "smoke"))
+                                 build: try optionalString(args, "build"), smoke: try optionalStringArray(args, "smoke"),
+                                 demo: try optionalString(args, "demo"), openapiPath: try optionalString(args, "openapi_path"),
+                                 appPath: try optionalString(args, "app_path"), bundleId: try optionalString(args, "bundle_id"),
+                                 device: try optionalString(args, "device"))
         let surface = try store.upsertPreviewSurface(companyId: companyId, by: .agent(agentId), draft)
         return "Preview \(surface.name) (\(surface.kind)) set; the engine builds it from main."
     }

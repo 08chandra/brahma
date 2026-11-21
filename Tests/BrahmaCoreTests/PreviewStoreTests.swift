@@ -86,7 +86,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         // Validation messages come straight from the model.
         #expect(t.set(t.devops, "Web").text == "preview names are lowercase letters, digits and dashes (max 24)")
         #expect(t.set(t.devops, "api", url: "https://example.com").text == "preview URLs must be http://127.0.0.1, localhost or [::1] with a port")
-        #expect(t.set(t.devops, "api", extra: ["kind": .string("cli")]).text == "only web previews are available yet")
+        #expect(t.set(t.devops, "api", extra: ["kind": .string("cli")]).text == "a cli preview needs demo")
         #expect(t.set(t.devops, "api", extra: ["smoke": .array([.string("FETCH /x")])]).text
                 == "smoke requests look like \"GET /health 200\" or \"POST /items {json} 201\"")
         // The cap: 8 per company (the first is `web`); the CTO (an executive) may set them too.
@@ -355,9 +355,11 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
             (try String.fetchAll(db, sql: "SELECT name FROM pragma_table_info('previewSurface')"),
              try String.fetchAll(db, sql: "SELECT name FROM pragma_table_info('previewState')"))
         }
-        #expect(Set(columns.0) == ["id", "companyId", "name", "kind", "position", "build", "run", "url", "smoke", "setById", "createdAt", "updatedAt"])
+        // L's columns, plus Plan 4a's ("v4a-preview-kinds").
+        #expect(Set(columns.0) == ["id", "companyId", "name", "kind", "position", "build", "run", "url", "smoke", "setById", "createdAt", "updatedAt",
+                                   "demo", "openapiPath", "appPath", "bundleId", "device", "outsideSandboxAskId", "outsideSandboxApprovedAt"])
         #expect(Set(columns.1) == ["surfaceId", "companyId", "status", "commit", "port", "resolvedURL", "pid", "message", "logPath", "exits",
-                                   "restartRequestedAt", "startedAt", "updatedAt"])
+                                   "restartRequestedAt", "startedAt", "updatedAt", "simulatorId", "outputPath", "smokeResults"])
         // UNIQUE(companyId, name): the same name in two companies is fine; in one it is an upsert, never a second row.
         let draft = PreviewDraft(name: "web", kind: "web", run: "npm start", url: "http://127.0.0.1:{port}/")
         _ = try t.store.upsertPreviewSurface(companyId: t.acme.id, by: .owner, draft)

@@ -2,13 +2,13 @@ import Foundation
 import BrahmaCore
 
 /// A preview chip's color (Global Constraints "Color tokens"): running `success`, building/starting `running` (pulse),
-/// failed `danger`, idle/stopped `text2`, unavailable `warning`.
+/// failed `danger`, idle/stopped `text2`, unavailable `warning`; 4a's `ran` `success`.
 public enum PreviewTone: Sendable {
     case good, busy, bad, idle, warn
 
     public init(_ status: PreviewStatus) {
         switch status {
-        case .running: self = .good
+        case .running, .ran: self = .good
         case .building, .starting: self = .busy
         case .failed: self = .bad
         case .idle, .stopped: self = .idle
@@ -111,6 +111,8 @@ public enum PreviewBodies {
             return .status(title: "\(name) STOPPED", detail: state?.message, logTail: [])
         case .unavailable:
             return .status(title: "\(name) UNAVAILABLE", detail: state?.message, logTail: [])
+        case .ran:
+            return .status(title: "\(name) RAN", detail: state?.message, logTail: tail())
         case .running:
             guard let url = state?.resolvedURL.flatMap(URL.init(string:)) else {
                 return .status(title: "\(name) STARTING", detail: state?.message, logTail: [])

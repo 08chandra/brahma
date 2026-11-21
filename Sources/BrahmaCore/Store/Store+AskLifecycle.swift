@@ -261,6 +261,9 @@ extension Store {
         case .grant:
             // The access it granted is gone from the next turn.
             try revokeGrants(db, askId: ask.id, now: now)
+        case .other:
+            // The engine's Simulator ask (Plan 4a): the iOS preview loses the owner's approval.
+            try reverseSimulatorApproval(db, ask: ask, now: now)
         default:
             break
         }

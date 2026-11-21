@@ -34,19 +34,27 @@ struct PreviewGroup: ParsableCommand {
 
     struct Set: ParsableCommand {
         static let configuration = CommandConfiguration(
-            abstract: "Set (create or replace) a web preview the engine builds from main and keeps running (owner only).")
+            abstract: "Set (create or replace) a preview the engine builds from main: web, backend, cli, ios or macos (owner only).")
         @Argument(help: "Company name or slug.") var company: String
         @Argument(help: "Preview name: lowercase letters, digits and dashes (max 24).") var name: String
-        @Option(name: .customLong("run"), help: "Shell command that starts the server; write {port} where the engine's port goes.") var runCommand: String
-        @Option(help: "Where it answers, e.g. http://127.0.0.1:{port}/.") var url: String
-        @Option(help: "Shell command run first, e.g. \"npm ci && npm run build\".") var build: String?
+        @Option(help: "web (default), backend, cli, ios or macos.") var kind: String = PreviewKind.web.rawValue
+        @Option(name: .customLong("run"), help: "web/backend: shell command that starts the server; write {port} where the engine's port goes.") var runCommand: String?
+        @Option(help: "web/backend: where it answers, e.g. http://127.0.0.1:{port}/.") var url: String?
+        @Option(help: "Shell command run first, e.g. \"npm ci && npm run build\" (required for ios and macos).") var build: String?
         @Option(help: "A smoke request, e.g. \"GET / 200\" (repeatable, up to 10).") var smoke: [String] = []
+        @Option(help: "cli: the shell command whose output is the preview.") var demo: String?
+        @Option(help: "backend: its OpenAPI file, relative to the repo root.") var openapi: String?
+        @Option(name: .customLong("app-path"), help: "ios/macos: the built .app, relative to the repo root.") var appPath: String?
+        @Option(name: .customLong("bundle-id"), help: "ios: the app's bundle id.") var bundleId: String?
+        @Option(help: "ios: the Simulator device type, e.g. \"iPhone 15 Pro\".") var device: String?
 
         func run() throws {
             try requireOwnerShell()
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
-            let draft = PreviewDraft(name: name, kind: PreviewKind.web.rawValue, run: runCommand, url: url, build: build, smoke: smoke)
+            let draft = PreviewDraft(name: name, kind: kind.trimmingCharacters(in: .whitespaces).lowercased(), run: runCommand, url: url,
+                                     build: build, smoke: smoke, demo: demo, openapiPath: openapi, appPath: appPath, bundleId: bundleId,
+                                     device: device)
             let surface: PreviewSurface
             do { surface = try store.upsertPreviewSurface(companyId: c.id, by: .owner, draft) } catch let e as WorkError { throw fail(e.message) }
             print(safe("Preview \(surface.name) (\(surface.kind)) set; the engine builds it from main."))

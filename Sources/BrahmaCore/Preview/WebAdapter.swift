@@ -17,7 +17,25 @@ public struct WebAdapter: PreviewAdapter {
 
     public var kind: PreviewKind { .web }
     public func availability() -> String? { nil }
-    public func start(_ c: PreviewContext) async -> PreviewUpdate { await Self.startServer(c, deps: deps) }
+    /// Through the runner `deps.runner(for: c)` picks (PR-5), telling `c.onSpawn` the server's pid.
+    public func start(_ c: PreviewContext) async -> PreviewUpdate {
+        var routed = deps
+        routed.sandbox = deps.runner(for: c)
+        return await Self.startServer(c, deps: routed, onSpawn: c.onSpawn)
+    }
+
+    /// One request's own timeout for a demo.
+    static let demoTimeout: Duration = .seconds(10)
+
+    /// One GET of the running preview's URL: ok when it answers below 400, `"<name>: HTTP <status>"`; no answer is
+    /// `"<name>: not reachable"`, no URL `"<name>: not running"`. Never the body.
+    public func demo(_ c: PreviewContext, state: PreviewState) async -> DemoCapture {
+        let name = c.surface.name
+        guard let text = state.resolvedURL, let url = URL(string: text) else { return DemoCapture(ok: false, line: "\(name): not running") }
+        let answer = await deps.http.send(method: "GET", url: url, body: nil, timeout: Self.demoTimeout)
+        guard let status = answer.status else { return DemoCapture(ok: false, line: "\(name): not reachable") }
+        return DemoCapture(ok: status < 400, line: "\(name): HTTP \(status)")
+    }
 
     public func stop(_ c: PreviewContext, state: PreviewState) async {
         guard let pid = state.pid, let process = deps.processes.process(pid) else { return }

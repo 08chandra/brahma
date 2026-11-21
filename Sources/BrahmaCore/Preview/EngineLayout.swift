@@ -19,6 +19,9 @@ public struct EngineLayout: Equatable, Sendable {
     public var previewLogs: URL { previewDir.appending(path: "logs", directoryHint: .isDirectory) }
     /// `.brahma/preview/logs/<name>.log` (a surface name is one safe path component, `PreviewSurface.validate`).
     public func previewLog(name: String) -> URL { previewLogs.appending(path: "\(name).log", directoryHint: .notDirectory) }
+    /// `.brahma/preview/logs/<name>.out`: a one-shot preview's captured output (Plan 4a), written only by the engine (a name
+    /// has no dot, so it never meets another surface's log).
+    public func previewOutput(name: String) -> URL { previewLogs.appending(path: "\(name).out", directoryHint: .notDirectory) }
     /// `.brahma/releases`: read-only to every turn and in no build, preview or check writable list. It holds only what the
     /// owner and agents may read (the redacted deploy logs and release metadata); every deploy runs under the data home
     /// (`ReleaseLayout`), outside the workspace and its repository.

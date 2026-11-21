@@ -1575,6 +1575,24 @@ enum Migrations {
             }
             try db.create(index: "mergeBatch_company", on: "mergeBatch", columns: ["companyId", "step", "number"])
         }
+        m.registerMigration("v4a-preview-kinds") { db in
+            // Plan 4a Task 4: non-web preview kinds. The agent-written fields of a surface, the engine's record of the owner's
+            // Simulator approval, and what a start left (`smokeResults`: a JSON array of `SmokeResult`).
+            try db.alter(table: "previewSurface") { t in
+                t.add(column: "demo", .text)
+                t.add(column: "openapiPath", .text)
+                t.add(column: "appPath", .text)
+                t.add(column: "bundleId", .text)
+                t.add(column: "device", .text)
+                t.add(column: "outsideSandboxAskId", .text)
+                t.add(column: "outsideSandboxApprovedAt", .datetime)
+            }
+            try db.alter(table: "previewState") { t in
+                t.add(column: "simulatorId", .text)
+                t.add(column: "outputPath", .text)
+                t.add(column: "smokeResults", .text).notNull().defaults(to: "[]")
+            }
+        }
     }
 }
 

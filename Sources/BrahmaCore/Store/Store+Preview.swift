@@ -10,9 +10,17 @@ public struct PreviewDraft: Equatable, Sendable {
     public var url: String?
     public var build: String?
     public var smoke: [String]
+    /// Plan 4a's fields (agent-written; validated with the surface).
+    public var demo: String?
+    public var openapiPath: String?
+    public var appPath: String?
+    public var bundleId: String?
+    public var device: String?
 
-    public init(name: String, kind: String = PreviewKind.web.rawValue, run: String?, url: String?, build: String? = nil, smoke: [String] = []) {
+    public init(name: String, kind: String = PreviewKind.web.rawValue, run: String?, url: String?, build: String? = nil, smoke: [String] = [],
+                demo: String? = nil, openapiPath: String? = nil, appPath: String? = nil, bundleId: String? = nil, device: String? = nil) {
         self.name = name; self.kind = kind; self.run = run; self.url = url; self.build = build; self.smoke = smoke
+        self.demo = demo; self.openapiPath = openapiPath; self.appPath = appPath; self.bundleId = bundleId; self.device = device
     }
 }
 
@@ -50,18 +58,34 @@ extension Store {
     /// one takes the next position and an idle state row; an existing one (changed only by the owner or its setter,
     /// `checkMayChange`) keeps its id and position, takes the new fields and setter, and is asked to restart (`restartRequestedAt`). The draft is validated as a `PreviewSurface` (its messages) after
     /// each smoke line is parsed. The ninth surface is refused with `"a company can have at most 8 previews"`. Every command,
-    /// URL and smoke line is agent text: redacted before it is stored. Returns the stored surface.
+    /// URL, smoke line, path, bundle id and device is agent text: redacted before it is stored. Returns the stored surface.
+    ///
+    /// The owner's Simulator approval (Plan 4a fix 4) belongs to the exact iOS build it was asked for: a change of the kind,
+    /// `build`, `appPath` or `bundleId` clears `outsideSandboxApprovedAt` and `outsideSandboxAskId` (a still-open ask for the
+    /// old build is `superseded`), so the engine asks again. Nothing here ever sets either field.
     public func upsertPreviewSurface(companyId: String, by: Sender, _ draft: PreviewDraft, now: Date = Store.now()) throws -> PreviewSurface {
         let smoke = try draft.smoke.map { try SmokeRequest.parse(try redact($0)) }
-        let build = try redact(draft.build?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        func field(_ s: String?) throws -> String? {
+            try redact(s?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        }
+        let build = try field(draft.build)
         let run = try redact(draft.run), url = try redact(draft.url?.trimmingCharacters(in: .whitespaces))
+        let demo = try field(draft.demo), openapiPath = try field(draft.openapiPath), appPath = try field(draft.appPath)
+        let bundleId = try field(draft.bundleId), device = try field(draft.device)
         return try writer.write { db in
             let actor = try Self.previewActor(db, companyId: companyId, by: by)
             let existing = try PreviewSurface.filter(Column("companyId") == companyId && Column("name") == draft.name).fetchOne(db)
             var surface: PreviewSurface
             if var current = existing {
                 try Self.checkMayChange(db, current, actor: actor)
+                if current.kind != draft.kind || current.build != build || current.appPath != appPath || current.bundleId != bundleId {
+                    try Self.supersedeSimulatorAsk(db, surface: current, now: now)
+                    current.outsideSandboxAskId = nil
+                    current.outsideSandboxApprovedAt = nil
+                }
                 current.kind = draft.kind; current.build = build; current.run = run; current.url = url; current.smoke = smoke
+                current.demo = demo; current.openapiPath = openapiPath; current.appPath = appPath; current.bundleId = bundleId
+                current.device = device
                 current.setById = actor; current.updatedAt = now
                 surface = current
             } else {
@@ -70,7 +94,8 @@ extension Store {
                 // Lowercase ids: run ids carry them, and APFS is case-insensitive (two ids differing in case would collide).
                 surface = PreviewSurface(id: UUID().uuidString.lowercased(), companyId: companyId, name: draft.name, kind: draft.kind,
                                          position: (positions.max() ?? -1) + 1, build: build, run: run, url: url, smoke: smoke,
-                                         setById: actor, createdAt: now, updatedAt: now)
+                                         setById: actor, createdAt: now, updatedAt: now, demo: demo, openapiPath: openapiPath,
+                                         appPath: appPath, bundleId: bundleId, device: device)
             }
             try surface.validate()
             if existing == nil {
@@ -100,6 +125,7 @@ extension Store {
                 throw WorkError.notFound("no preview named \(Self.flat(name, max: 40))")
             }
             try Self.checkMayChange(db, surface, actor: actor)
+            try Self.supersedeSimulatorAsk(db, surface: surface, now: now)
             try surface.delete(db)
             try Self.recordPreviewEvent(db, companyId: companyId, actor: actor, text: "removed preview \(surface.name)", now: now)
             return surface
@@ -184,6 +210,79 @@ extension Store {
             try state.save(db)
             try Self.recordPreviewEvent(db, companyId: surface.companyId, actor: actor, text: "requested a restart of preview \(surface.name)", now: now)
         }
+    }
+
+    // MARK: The iOS owner gate (Plan 4a fix 4)
+
+    /// The engine's owner ask for an iOS surface without the owner's approval: the one it filed (whatever its status now),
+    /// or, the first time, a new one filed by the system straight to the owner (`other`, `permissions` — a reserved matter
+    /// no preset approves — risk high, `SimulatorApproval`'s title and summary), recorded on the surface in the same
+    /// transaction. Nil when the surface is gone, not iOS, or already approved. Called only by the engine's runner.
+    @discardableResult
+    func requestSimulatorApproval(surfaceId: String, now: Date) throws -> Ask? {
+        try writer.write { db in
+            guard var surface = try PreviewSurface.fetchOne(db, key: surfaceId), surface.previewKind == .ios,
+                  surface.outsideSandboxApprovedAt == nil else { return nil }
+            if let id = surface.outsideSandboxAskId, let ask = try Ask.fetchOne(db, key: id), ask.companyId == surface.companyId { return ask }
+            let ask = try propose(db: db, companyId: surface.companyId, by: .system, kind: .other, risk: .high,
+                                  category: SimulatorApproval.category, title: SimulatorApproval.title(surface.name),
+                                  summary: SimulatorApproval.summary, payload: nil, document: nil, itemId: nil,
+                                  subjectId: SimulatorApproval.subjectPrefix + surface.id, supersedes: nil, requestId: nil,
+                                  decisionClass: .taste, viaOwner: true, now: now)
+            surface.outsideSandboxAskId = ask.id
+            try surface.update(db)
+            return ask
+        }
+    }
+
+    /// The engine's Simulator ask for `ask`, when it is one: filed by the system, `other`/`permissions`, and recorded on an
+    /// iOS surface of the same company as that surface's ask. An agent's look-alike ask is never one.
+    static func simulatorSurface(_ db: Database, ask: Ask) throws -> PreviewSurface? {
+        guard ask.kind == .other, ask.requesterId == "system", ask.category == SimulatorApproval.category,
+              ask.subjectId?.hasPrefix(SimulatorApproval.subjectPrefix) == true,
+              let surface = try PreviewSurface.filter(Column("companyId") == ask.companyId && Column("outsideSandboxAskId") == ask.id).fetchOne(db),
+              surface.previewKind == .ios else { return nil }
+        return surface
+    }
+
+    /// `applyAskEffects` of the engine's Simulator ask: approved by the owner (`decidedBy == "owner"`, never a policy or a
+    /// preset) sets `outsideSandboxApprovedAt` and flags a restart, so the runner's next pass starts it. Any other outcome
+    /// changes nothing (the runner reports a declined ask).
+    func applySimulatorApprovalEffects(_ db: Database, ask: Ask, now: Date) throws {
+        guard ask.status == .approved, ask.decidedBy == "owner", var surface = try Self.simulatorSurface(db, ask: ask),
+              surface.outsideSandboxApprovedAt == nil else { return }
+        surface.outsideSandboxApprovedAt = now
+        try surface.update(db)
+        try Self.flagPreviewRestart(db, surface: surface, now: now)
+        try ActivityEvent(companyId: surface.companyId, agentId: nil, turnId: nil, kind: .preview,
+                          text: "owner allowed the iOS Simulator preview \(surface.name) (\(ask.ref))", createdAt: now).insert(db)
+    }
+
+    /// `reverseAskEffects` of the engine's Simulator ask (the owner rescinded it): the approval is gone; the runner stops it.
+    func reverseSimulatorApproval(_ db: Database, ask: Ask, now: Date) throws {
+        guard var surface = try Self.simulatorSurface(db, ask: ask), surface.outsideSandboxApprovedAt != nil else { return }
+        surface.outsideSandboxApprovedAt = nil
+        try surface.update(db)
+        try Self.flagPreviewRestart(db, surface: surface, now: now)
+        try ActivityEvent(companyId: surface.companyId, agentId: nil, turnId: nil, kind: .preview,
+                          text: "owner withdrew the iOS Simulator preview \(surface.name) (\(ask.ref))", createdAt: now).insert(db)
+    }
+
+    /// The surface's still-open Simulator ask, `superseded` (its build changed or the surface is removed).
+    static func supersedeSimulatorAsk(_ db: Database, surface: PreviewSurface, now: Date) throws {
+        guard let id = surface.outsideSandboxAskId, var ask = try Ask.fetchOne(db, key: id), ask.companyId == surface.companyId,
+              ask.status.isPending else { return }
+        ask.status = .superseded
+        ask.statusSinceActive = try Store.activeNow(db: db, companyId: ask.companyId)
+        ask.updatedAt = now
+        try ask.update(db)
+    }
+
+    static func flagPreviewRestart(_ db: Database, surface: PreviewSurface, now: Date) throws {
+        var state = try PreviewState.fetchOne(db, key: surface.id)
+            ?? PreviewState(surfaceId: surface.id, companyId: surface.companyId, status: .idle, updatedAt: now)
+        state.restartRequestedAt = now; state.updatedAt = now
+        try state.save(db)
     }
 
     /// One `preview` activity line (`@handle <text>`, or `owner <text>`); the surface name is a validated safe token.
