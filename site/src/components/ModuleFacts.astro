@@ -1,0 +1,147 @@
+---
+/**
+ * "Public API" facts for one module (or one BrahmaCore area), from src/generated/modules.json
+ * (written by scripts/site-api-docs.sh via scripts/gen-module-facts.mjs; gitignored).
+ *
+ *   <ModuleFacts module="BrahmaCore" area="Work" />
+ *   <ModuleFacts module="BrahmaKeychain" />          (single-area modules need no area)
+ *
+ * Renders an existing <Panel>: the public symbol count (mono), the top-level types linked to
+ * their DocC page under `apiBase`, and the source files. Without `area`, every area of the
+ * module is merged. When modules.json is absent (generators skipped) or has no entry, the
+ * panel says the reference was not generated instead of failing the build.
+ */
+import Panel from './Panel.astro';
+import Label from './Label.astro';
+import { site } from '../../site.config';
+
+interface Type {
+  name: string;
+  kind: string;
+  path: string;
+}
+interface Area {
+  symbols: number;
+  files: string[];
+  types: Type[];
+}
+interface Module {
+  symbols: number;
+  byArea: Record<string, Area>;
+}
+
+interface Props {
+  module: string;
+  area?: string;
+}
+const { module, area } = Astro.props;
+
+// import.meta.glob tolerates the file being absent (no generator run): it yields {}.
+const generated = import.meta.glob<Record<string, Module>>('../generated/modules.json', {
+  eager: true,
+  import: 'default',
+});
+const facts = Object.values(generated)[0];
+const mod = facts?.[module];
+
+let entry: Area | undefined;
+if (mod && area) {
+  entry = mod.byArea[area];
+} else if (mod) {
+  const areas = Object.values(mod.byArea);
+  entry = {
+    symbols: mod.symbols,
+    files: areas.flatMap((a) => a.files).sort(),
+    types: areas.flatMap((a) => a.types).sort((x, y) => x.name.localeCompare(y.name)),
+  };
+}
+
+const API = '/api';
+const href = (path: string) =>
+  path.startsWith(`${API}/`) ? `${site.apiBase.replace(/\/$/, '')}${path.slice(API.length)}` : path;
+const scope = area ? `${module} · ${area}` : module;
+---
+
+<Panel title="Public API">
+  {
+    entry ? (
+      <div class="facts">
+        <p class="facts__count">
+          <span class="facts__num">{entry.symbols.toLocaleString('en-US')}</span> public symbols in{' '}
+          <code>{scope}</code>
+        </p>
+        {entry.types.length > 0 && (
+          <div class="facts__group">
+            <Label as="p">Types</Label>
+            <ul class="facts__list">
+              {entry.types.map((t) => (
+                <li>
+                  <a href={href(t.path)}>
+                    <code>{t.name}</code>
+                  </a>{' '}
+                  <span class="facts__kind">{t.kind}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {entry.files.length > 0 && (
+          <div class="facts__group">
+            <Label as="p">Files</Label>
+            <ul class="facts__list">
+              {entry.files.map((f) => (
+                <li>
+                  <code>Sources/{f}</code>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    ) : (
+      <p class="facts__none">
+        The API reference for <code>{scope}</code> was not generated in this build.
+      </p>
+    )
+  }
+</Panel>
+
+<style>
+  .facts__count,
+  .facts__none {
+    margin: 0;
+    color: var(--text1);
+  }
+  .facts__num {
+    font-family: var(--font-mono);
+    color: var(--text0);
+  }
+  .facts__group {
+    margin-top: var(--s-4);
+  }
+  .facts__group :global(.label) {
+    margin: 0 0 var(--s-2);
+  }
+  .facts__list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--text0);
+  }
+  .facts__list li {
+    margin: 0;
+    padding: var(--s-1) 0;
+    border-top: var(--hairline);
+  }
+  .facts__list li:first-child {
+    border-top: 0;
+  }
+  .facts__list a {
+    color: var(--text-link);
+  }
+  .facts__kind {
+    color: var(--text1);
+  }
+</style>

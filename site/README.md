@@ -66,11 +66,28 @@ commit them:
 | `src/content/docs/docs/cli/` | `scripts/site-cli-docs.sh` | CLI reference from `brahma --help` |
 | `public/api/` | `scripts/site-api-docs.sh` | DocC API reference, served at `/api/` |
 | `public/screenshots/` | `scripts/site-screenshots.sh` | app screenshots |
-| `public/og/`, `src/generated/` | build-time generators | social images and generated data |
+| `src/generated/modules.json` | `scripts/site-api-docs.sh` | module facts for `ModuleFacts.astro` |
+| `public/og/` | build-time generators | social images |
 
 `npm run check:links` is strict about every root-relative link except links into `/api/`: when
 `dist/api/index.html` is absent (the API generator did not run) it prints
 `SKIP /api/ (generator output absent)` instead of counting them as broken.
+
+### API reference
+
+`scripts/site-api-docs.sh` builds every target (debug)
+with swiftc symbol-graph emission into `.build/symbol-graphs`, then runs `docc convert` once per
+module (`BrahmaCore BrahmaAppModel BrahmaApp BrahmaMapKit BrahmaKeychain CSandboxCheck brahma`)
+into `public/api/<module-lowercase>/` for static hosting, so a module's reference is at
+`/api/<module>/documentation/<module>/`. A module with no Swift symbol graph (a C target, or an
+executable with no public API) is skipped with a message. Each output gets
+`api-theme/theme-settings.json` (the site's dark tokens and font stacks), `public/api/index.html`
+lists the modules, and `scripts/gen-module-facts.mjs` writes `src/generated/modules.json`:
+per module, the public-symbol count and, per area (BrahmaCore: the first directory under
+`Sources/BrahmaCore/`, top-level files → `Orchestrator`; other modules: one area), the source files
+and top-level types with their `/api` links. `<ModuleFacts module="BrahmaCore" area="Work" />`
+renders that as a "Public API" panel, and says the reference was not generated when the file is
+absent. Only repo-relative paths are written; the script fails if any output contains `/Users/`.
 
 ## Deploy (owner only)
 
@@ -90,8 +107,13 @@ wrangler pages deploy site/dist --project-name brahma
 ### `/api` and the 20,000-file limit
 
 Cloudflare Pages caps a deployment at 20,000 files. The DocC API reference under `public/api/`
-is large. If `site/dist/` exceeds the cap, deploy the API reference as a second project and point
-the site at it:
+is large: DocC writes two files per documented symbol (a page shell and its JSON). Measured on
+2026-11-20: `scripts/site-api-docs.sh` printed `api files: 15977`, and the whole `site/dist/` held
+16,342 files. That figure depends on `-symbol-graph-skip-synthesized-members`; with synthesized
+members (inherited `Equatable`/`Codable`/collection defaults) the same sources gave 39,879 files.
+The generator fails when `public/api/` holds more than 19,000 files, leaving headroom for the rest
+of the site. If that happens, deploy the API reference as a second project, point the site at it
+and rerun the generator with `BRAHMA_API_SPLIT=1`, which lifts the check:
 
 ```
 wrangler pages project create brahma-api --production-branch main  # once
