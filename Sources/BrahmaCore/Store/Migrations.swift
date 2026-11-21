@@ -1633,6 +1633,111 @@ enum Migrations {
             }
             try db.create(index: "previewDemo_sprint", on: "previewDemo", columns: ["sprintId"])
         }
+        m.registerMigration("vC-refs") { db in
+            // Plan C Task C2a: refs as data. A message's kind and the taint of the session that wrote it; the refs a message
+            // carries; every read of shared content; vault snapshots and the diff cache; commits made by a tainted session
+            // (keyed per company: the same commit in two companies' repositories is two rows, ruling P1); and purges (C2b).
+            try db.alter(table: "message") { t in
+                t.add(column: "kind", .text).notNull().defaults(to: "text")   // text|share|showRequest|showAnswer|fileAsk|system
+                t.add(column: "fromTaintedSession", .boolean).notNull().defaults(to: false)
+                t.add(column: "taintSource", .text)
+            }
+            try backfillMessageTaint(db)
+            try db.create(table: "messageRef") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("messageId", .text).notNull().references("message", onDelete: .cascade)
+                t.column("position", .integer).notNull()
+                t.column("canonical", .text).notNull()
+                t.column("kind", .text).notNull()
+                t.column("refId", .text).notNull()
+                t.column("branch", .text)
+                t.column("rev", .text)
+                t.column("rangeStart", .integer)
+                t.column("rangeEnd", .integer)
+                t.column("params", .text).notNull().defaults(to: "{}")
+                t.column("accessKind", .text).notNull()          // ML's AccessClass.kind
+                t.column("accessId", .text)                      // and its id
+                t.column("sensitivity", .text).notNull().defaults(to: "normal")   // ML's Sensitivity
+                t.column("restrictions", .text).notNull().defaults(to: "[]")
+                t.column("readerSet", .text)
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
+                t.column("state", .text).notNull().defaults(to: "ok")             // ok|redacted|purged
+                t.column("inline", .boolean).notNull().defaults(to: false)
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "messageRef_backlinks", on: "messageRef", columns: ["companyId", "kind", "refId"])
+            try db.create(index: "messageRef_message", on: "messageRef", columns: ["messageId"])
+            try db.create(table: "refRead") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("readerKind", .text).notNull()          // owner|agent|concierge
+                t.column("readerId", .text)
+                t.column("canonical", .text).notNull()
+                t.column("rev", .text)
+                t.column("bytes", .integer)
+                t.column("tainted", .boolean).notNull()
+                t.column("via", .text).notNull()                 // open_ref|show|tab|export|viewOriginal|materialize
+                t.column("turnId", .text)
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "refRead_canonical", on: "refRead", columns: ["companyId", "canonical"])
+            try db.create(table: "refSnapshot") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("kind", .text).notNull()                // worktreeDiff|diffCache
+                t.column("cacheKey", .text).notNull()
+                t.column("vaultPath", .text).notNull()
+                t.column("sha256", .text).notNull()
+                t.column("bytes", .integer).notNull()
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("purgedAt", .datetime)
+                t.uniqueKey(["companyId", "kind", "cacheKey"])
+            }
+            try db.create(table: "taintedCommit") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("sha", .text).notNull()
+                t.column("itemId", .text)
+                t.column("agentId", .text)
+                t.column("turnId", .text)
+                t.column("source", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.column("clearedBy", .text)                     // review|owner
+                t.column("clearedAt", .datetime)
+                t.primaryKey(["companyId", "sha"])
+            }
+            try db.create(index: "taintedCommit_item", on: "taintedCommit", columns: ["companyId", "itemId"])
+            try db.create(table: "purgeLog") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("canonical", .text).notNull()
+                t.column("vaultPaths", .text).notNull()
+                t.column("gitRefs", .text).notNull()
+                t.column("backupsFlagged", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+            }
+        }
+    }
+}
+
+extension Migrations {
+    /// `vC-refs`: messages written before it get the taint of the session that wrote them at the time (ML's `taintAt`), and
+    /// the write-time mark (`taintedOrigin`) for any the history no longer explains.
+    static func backfillMessageTaint(_ db: Database) throws {
+        try db.execute(sql: "UPDATE message SET fromTaintedSession = taintedOrigin")
+        let senders = try String.fetchAll(db, sql: "SELECT DISTINCT senderId FROM message WHERE senderId NOT IN ('owner', 'system')")
+        for sender in senders {
+            let history = try TaintHistory.load(db: db, agentId: sender)
+            guard !history.marks.isEmpty else { continue }
+            for row in try Row.fetchAll(db, sql: "SELECT id, createdAt FROM message WHERE senderId = ?", arguments: [sender]) {
+                guard let source = history.taint(at: row["createdAt"]) else { continue }
+                try db.execute(sql: "UPDATE message SET fromTaintedSession = 1, taintSource = ? WHERE id = ?",
+                               arguments: [source, row["id"] as String])
+            }
+        }
     }
 }
 
