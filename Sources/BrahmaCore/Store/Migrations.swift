@@ -1609,6 +1609,9 @@ enum Migrations {
                 t.column("itemId", .text).references("workItem", onDelete: .setNull)
                 t.column("bytes", .integer).notNull()
                 t.column("createdAt", .datetime).notNull()
+                // Task 6 fix round 1: published by a tainted session (its title stays out of agents' prompts).
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
                 t.uniqueKey(["companyId", "number"])
             }
             try db.create(index: "artifact_publisher", on: "artifact", columns: ["companyId", "publishedById", "createdAt"])

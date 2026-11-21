@@ -30,6 +30,7 @@ public struct BackendAdapter: PreviewAdapter {
     static let openapiWithheld = "openapi_path was not copied: secrets could not be loaded to scrub it"
     static let offOrigin = "the smoke path does not stay on the preview's origin"
     static let ownPortOnly = "smoke requests run only against the preview's own port"
+    static let foreignPort = "a backend preview must serve on its own port ($PORT)"
 
     public let deps: PreviewDependencies
 
@@ -40,6 +41,12 @@ public struct BackendAdapter: PreviewAdapter {
 
     /// Through the runner `deps.runner(for: c)` picks (PR-5), telling `c.onSpawn` the server's pid, as the web adapter.
     public func start(_ c: PreviewContext) async -> PreviewUpdate {
+        // Task 6 fix round 1 (controller ruling): a URL off the engine's own port fails before L's start runs, so not even its
+        // readiness GET (unsandboxed, from the engine) is ever pointed at another local service.
+        if !Self.servesOwnPort(c) {
+            Self.removeOpenAPICopy(c)
+            return PreviewUpdate(status: .failed, message: Self.foreignPort)
+        }
         var routed = deps
         routed.sandbox = deps.runner(for: c)
         var update = await WebAdapter.startServer(c, deps: routed, onSpawn: c.onSpawn)
@@ -91,6 +98,15 @@ public struct BackendAdapter: PreviewAdapter {
     /// The smoke origin of a started preview: `http://127.0.0.1:<port>`, `port` being the engine's (`c.port`), never one the
     /// agent wrote. Nil (no smoke request is sent) when the resolved URL is not a loopback URL on that same port, or the port
     /// is not one the engine allocates.
+    /// Whether the surface's URL (with `{port}` filled in) names exactly the engine's port. A URL with no port, or none, is
+    /// left to L's start (which refuses a missing one).
+    static func servesOwnPort(_ c: PreviewContext) -> Bool {
+        guard let raw = c.surface.url else { return true }
+        let text = raw.replacingOccurrences(of: LoopbackURL.placeholder, with: String(c.port))
+        guard let parts = URLComponents(string: text) else { return false }
+        return parts.port == c.port
+    }
+
     static func origin(resolvedURL: String, port: Int) -> URL? {
         guard let parts = URLComponents(string: resolvedURL), let host = parts.host, LoopbackURL.isLoopback(host: host),
               parts.port == port, (1024...65535).contains(port) else { return nil }

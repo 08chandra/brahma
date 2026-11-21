@@ -147,17 +147,35 @@ import Glibc
         let l = try Self.setup(smoke: [SmokeRequest(method: "POST", path: "/admin/delete", body: "{\"all\":true}"),
                                        SmokeRequest(method: "GET", path: "/health")],
                                url: "http://127.0.0.1:47199/", http: literal)
+        // Task 6 fix round 1 (controller ruling): the start fails before anything runs, so not even L's readiness GET goes to
+        // the literal port.
         let lu = await l.adapter.start(l.context)
-        #expect(lu.status == .running && lu.smokeResults.isEmpty, "\(lu)")
-        #expect(lu.message == "smoke requests run only against the preview's own port", "\(lu)")
-        // Only L's readiness GET reached the URL; no smoke request went anywhere.
-        #expect(literal.requests.allSatisfy { $0.method == "GET" && $0.url.path == "/" && $0.body == nil }, "\(literal.requests)")
-        #expect(!literal.requests.contains { $0.url.path == "/health" || $0.url.path.hasPrefix("/admin") })
-        let before = literal.requests.count
-        let ld = await l.adapter.demo(l.context, state: Self.running(lu))
+        #expect(lu.status == .failed && lu.smokeResults.isEmpty && lu.process == nil, "\(lu)")
+        #expect(lu.message == "a backend preview must serve on its own port ($PORT)", "\(lu)")
+        #expect(literal.requests.isEmpty, "\(literal.requests)")
+        // A state that claims to run there (an earlier engine's record) still sends no smoke request on demo.
+        let forged = PreviewState(surfaceId: "s1", companyId: "c1", status: .running, resolvedURL: "http://127.0.0.1:47199/", pid: nil,
+                                  updatedAt: Date())
+        let ld = await l.adapter.demo(l.context, state: forged)
         #expect(!ld.ok && ld.line == "api: smoke requests run only against the preview's own port", "\(ld)")
-        #expect(literal.requests.count == before)
-        await l.stop(lu)
+        #expect(literal.requests.isEmpty)
+    }
+
+    /// Task 6 fix round 1 (controller ruling): a backend URL that is not on the engine's own port fails the start before L's
+    /// start runs (no build, no server, no readiness GET), with or without smoke requests and with no port at all.
+    @Test func foreignPortFailsBeforeStart() async throws {
+        for url in ["http://127.0.0.1:47199/", "http://127.0.0.1/", "http://localhost:8080/health"] {
+            let http = FakeHTTPProbe([FakeHTTPProbe.ok()])
+            let s = try Self.setup(url: url, http: http)
+            let update = await s.adapter.start(s.context)
+            #expect(update.status == .failed && update.message == "a backend preview must serve on its own port ($PORT)", "\(url): \(update)")
+            #expect(http.requests.isEmpty && update.process == nil, "\(url)")
+        }
+        // The engine's own port still starts.
+        let ok = try Self.setup(url: "http://127.0.0.1:{port}/", http: FakeHTTPProbe([FakeHTTPProbe.ok()]))
+        let started = await ok.adapter.start(ok.context)
+        #expect(started.status == .running, "\(started)")
+        await ok.stop(started)
     }
 
     @Test func unreachableRequestRecordsError() async throws {

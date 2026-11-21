@@ -22,9 +22,14 @@ public struct ArtifactAdapter: PreviewAdapter {
         Self.latestDemo(store: store, companyId: c.company.id) ?? DemoCapture(ok: false, line: "artifacts: none published")
     }
 
-    /// `ok`, `"artifacts: latest AR-<n>"`; nil when the company has published none (or they can't be read).
+    /// `ok`, `"artifacts: latest AR-<n>"`; nil when the company has published none. A store that can't be read is not ok:
+    /// `"artifacts: could not be read: <error>"`.
     public static func latestDemo(store: Store, companyId: String) -> DemoCapture? {
-        guard let latest = try? store.latestArtifact(companyId: companyId) else { return nil }
-        return DemoCapture(ok: true, line: "artifacts: latest \(latest.ref)")
+        do {
+            guard let latest = try store.latestArtifact(companyId: companyId) else { return nil }
+            return DemoCapture(ok: true, line: "artifacts: latest \(latest.ref)")
+        } catch {
+            return DemoCapture(ok: false, line: "artifacts: could not be read: \(Store.flat("\(error)", max: 200))")
+        }
     }
 }

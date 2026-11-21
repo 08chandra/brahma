@@ -230,8 +230,12 @@ public enum TurnDigest {
     public static let maxArtifactTitle = 80
 
     /// `Latest artifact: AR-<n> <title…> (<absolute entry path>)`: the title (agent text) and the path flattened to one line.
+    /// An artifact a tainted session published shows no title (`Latest artifact: AR-<n> (<path>)`); its path holds no agent
+    /// text either (`publishArtifact` names it `<n>-artifact/artifact.<ext>`).
     public static func artifactLine(_ a: Artifact, entryPath: String) -> String {
-        "Latest artifact: \(a.ref) \(ReviewDigest.flat(a.title, max: maxArtifactTitle)) (\(ReviewDigest.flat(entryPath, max: 1024)))"
+        let path = ReviewDigest.flat(entryPath, max: 1024)
+        if a.tainted { return "Latest artifact: \(a.ref) (\(path))" }
+        return "Latest artifact: \(a.ref) \(ReviewDigest.flat(a.title, max: maxArtifactTitle)) (\(path))"
     }
 
     public static func render(_ c: TurnContext, agent: Agent, company: Company) -> String {

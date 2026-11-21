@@ -31,6 +31,7 @@ public enum ArtifactMessages {
     public static let notYourRole = "publish_artifact is not available to your role"
     public static let ownerDeletes = "only the owner can delete artifacts"
     public static let refShape = "artifact keys look like AR-<n>"
+    public static let largeGLTF = "a .gltf over 20 MB can't be published; publish a .glb"
     public static let emptyTitle = "the title is empty"
     public static let longTitle = "the title is longer than \(ArtifactPolicy.titleMax) characters"
 
@@ -149,9 +150,11 @@ extension Store {
         guard fstat(opened.fd, &st) == 0 else { throw WorkError.invalid(ArtifactMessages.notRegular) }
         // The quota, before a byte is copied (checked again, with the bytes copied, when the artifact is recorded).
         let usedBefore = try artifactBytes(companyId: companyId)
-        if st.st_mode & S_IFMT == S_IFREG, usedBefore + Int64(st.st_size) > ArtifactPolicy.companyQuotaBytes {
+        let pending = st.st_mode & S_IFMT == S_IFREG ? Int64(st.st_size) : 0
+        if usedBefore + pending > ArtifactPolicy.companyQuotaBytes || usedBefore >= ArtifactPolicy.companyQuotaBytes {
             throw WorkError.conflict(ArtifactMessages.quota(usedBytes: usedBefore))
         }
+        let quota = ArtifactBudget.Quota(used: usedBefore)
 
         // The copy, made in a fresh staging folder of the engine's artifacts folder.
         let artifactsFd: Int32
@@ -172,14 +175,15 @@ extension Store {
             switch st.st_mode & S_IFMT {
             case S_IFREG:
                 copied = try Self.copyArtifactFile(fd: opened.fd, st: st, name: source.parts.last ?? "", parentFd: opened.parent,
-                                                   into: stagingFd, hooks: hooks)
+                                                   into: stagingFd, neutralName: caller.taint != nil, quota: quota, hooks: hooks)
             case S_IFDIR:
-                copied = try Self.copyArtifactFolder(fd: opened.fd, into: stagingFd, hooks: hooks)
+                copied = try Self.copyArtifactFolder(fd: opened.fd, into: stagingFd, quota: quota, hooks: hooks)
             default:
                 throw WorkError.invalid(ArtifactMessages.notRegular)
             }
 
-            let slug = String(Store.slug(for: cleanTitle).prefix(60))
+            // A tainted session's words name nothing an agent's prompt shows (the digest's path).
+            let slug = caller.taint != nil ? "artifact" : String(Store.slug(for: cleanTitle).prefix(60))
             return try writer.write { db in
                 if caller.isAgent { try Self.checkArtifactRate(db, companyId: companyId, publisherId: caller.id, now: now) }
                 let used = try Int64.fetchOne(db, sql: "SELECT COALESCE(SUM(bytes), 0) FROM artifact WHERE companyId = ?",
@@ -201,13 +205,14 @@ extension Store {
                 let artifact = Artifact(id: UUID().uuidString, companyId: companyId, number: number, title: cleanTitle, kind: copied.kind,
                                         storedPath: ".brahma/artifacts/\(folder)", entryFile: copied.entryFile,
                                         sourcePath: source.resolved, publishedById: caller.id, itemId: caller.itemId,
-                                        bytes: copied.bytes, createdAt: now)
+                                        bytes: copied.bytes, createdAt: now, tainted: caller.taint != nil,
+                                        taintReason: caller.taint.map { "written by a session that read \($0)" })
                 try artifact.insert(db)
                 try ingest(db: db, MemoryIngestDoc(
                     companyId: companyId, source: .artifact, sourceId: artifact.id, ref: artifact.ref, title: artifact.title,
                     body: "\(artifact.kind.rawValue) artifact: \(artifact.title)", access: .company, readerSet: nil,
                     futureHolders: false, sensitivity: .normal, provenance: artifact.provenance,
-                    tainted: caller.taint != nil, taintReason: caller.taint.map { "written by a session that read \($0)" },
+                    tainted: artifact.tainted, taintReason: artifact.taintReason,
                     authorId: artifact.publishedById,
                     itemId: artifact.itemId, createdAt: now), now: now)
                 try ActivityEvent(companyId: companyId, agentId: caller.isAgent ? caller.id : nil, turnId: nil, kind: .preview,
@@ -273,6 +278,8 @@ extension Store {
     // MARK: Rules
 
     static let stagingPrefix = ".staging-"
+    /// The most of a .gltf the engine reads to find its siblings (the app's in-process glTF cap, `RendererCaps`).
+    static let maxGLTFJSONBytes = 20_971_520
     /// A staging folder older than this was left by a publish that never finished (the engine stopped mid-copy).
     static let staleStaging: TimeInterval = 3600
 
@@ -387,12 +394,19 @@ extension Store {
 
     /// What is left of a folder's (or a glTF set's) caps.
     struct ArtifactBudget {
+        /// What the company's artifacts already hold: a set is refused before a file would take it past the quota.
+        struct Quota { var used: Int64 }
+
         var files = 0
         var bytes: Int64 = 0
+        var quota: Quota?
         mutating func take(file size: Int64) throws {
             files += 1
             if files > ArtifactPolicy.maxFiles || bytes + size > Int64(ArtifactPolicy.maxFolderBytes) {
                 throw WorkError.invalid(ArtifactMessages.folderCap)
+            }
+            if let quota, quota.used + bytes + size > ArtifactPolicy.companyQuotaBytes {
+                throw WorkError.conflict(ArtifactMessages.quota(usedBytes: quota.used))
             }
         }
         var remaining: Int64 { Int64(ArtifactPolicy.maxFolderBytes) - bytes }
@@ -400,19 +414,21 @@ extension Store {
 
     /// One file at `fd`: its kind by extension (playlists and unknown kinds refused), the size cap, the counted copy, the
     /// content checks on the copy, and for glTF the bare-name siblings it names (from `parentFd`).
-    static func copyArtifactFile(fd: Int32, st: stat, name: String, parentFd: Int32, into dir: Int32,
-                                 hooks: ArtifactPublishHooks) throws -> CopiedArtifact {
+    /// `neutralName`: the copy is named `artifact.<ext>`, not from the agent's file name (a tainted publisher).
+    static func copyArtifactFile(fd: Int32, st: stat, name: String, parentFd: Int32, into dir: Int32, neutralName: Bool = false,
+                                 quota: ArtifactBudget.Quota? = nil, hooks: ArtifactPublishHooks) throws -> CopiedArtifact {
         let ext = ArtifactKind.ext(of: name)
         if ArtifactKind.playlistExtensions.contains(ext) { throw WorkError.invalid(ArtifactMessages.playlist) }
         guard let kind = ArtifactKind.from(ext: ext) else { throw WorkError.invalid(ArtifactMessages.unsupported(ext: ext)) }
         if EngineFiles.copyProblem(st) != nil { throw WorkError.invalid(ArtifactMessages.notRegular) }
         let (cap, capMessage) = fileCap(kind)
         if Int64(st.st_size) > cap { throw WorkError.invalid(capMessage) }
-        let entry = ResourceIntake.sanitizeName(name)
+        if ext == "gltf", st.st_size > maxGLTFJSONBytes { throw WorkError.invalid(ArtifactMessages.largeGLTF) }
+        let entry = neutralName ? "artifact.\(ext)" : ResourceIntake.sanitizeName(name)
         var total = try copyCounting(from: fd, into: dir, name: entry, cap: cap, capMessage: capMessage, hooks: hooks)
         try checkContent(dir: dir, name: entry, kind: kind, ext: ext)
         if ext == "gltf" {
-            var budget = ArtifactBudget()
+            var budget = ArtifactBudget(quota: quota)
             try budget.take(file: total)
             budget.bytes = total
             total += try copyGLTFSiblings(gltf: entry, into: dir, from: parentFd, budget: &budget, hooks: hooks)
@@ -422,12 +438,13 @@ extension Store {
 
     /// A folder at `fd`: `index.html` at its top, no link anywhere in it, every regular file copied under the folder caps
     /// (and its own per-file cap), its content checked when its kind is known. `.git` and `.DS_Store` are left out.
-    static func copyArtifactFolder(fd: Int32, into dir: Int32, hooks: ArtifactPublishHooks) throws -> CopiedArtifact {
+    static func copyArtifactFolder(fd: Int32, into dir: Int32, quota: ArtifactBudget.Quota? = nil,
+                                   hooks: ArtifactPublishHooks) throws -> CopiedArtifact {
         var index = stat()
         guard fstatat(fd, "index.html", &index, AT_SYMLINK_NOFOLLOW) == 0, index.st_mode & S_IFMT == S_IFREG else {
             throw WorkError.invalid(ArtifactMessages.needsIndex)
         }
-        var budget = ArtifactBudget()
+        var budget = ArtifactBudget(quota: quota)
         var visited = 0
         func walk(_ src: Int32, _ dst: Int32, depth: Int) throws {
             guard let names = DirectoryListing.names(fd: src, limit: artifactWalkEntries - visited + 1) else {
@@ -502,8 +519,11 @@ extension Store {
                                  hooks: ArtifactPublishHooks) throws -> Int64 {
         let copy = openat(dir, gltf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard copy >= 0 else { throw WorkError.invalid("the artifact could not be stored") }
-        let data = (try? readAll(fd: copy, limit: ArtifactPolicy.maxFileBytes)) ?? Data()
+        // The copy is at most `maxGLTFJSONBytes` (checked before it was made); a longer read is refused, never parsed.
+        let data = (try? readAll(fd: copy, limit: maxGLTFJSONBytes)) ?? Data()
         closeFD(copy)
+        guard data.count <= maxGLTFJSONBytes else { throw WorkError.invalid(ArtifactMessages.largeGLTF) }
+        // JSON that does not parse names no siblings: the .gltf alone is published (the app's bounded loader refuses it).
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return 0 }
         var uris: [String] = []
         for key in ["buffers", "images"] {

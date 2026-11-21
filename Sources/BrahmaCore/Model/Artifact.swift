@@ -27,12 +27,18 @@ public struct Artifact: Codable, Equatable, Sendable, Identifiable, FetchableRec
     /// Bytes copied (every file of a folder or glTF set).
     public var bytes: Int64
     public var createdAt: Date
+    /// Published by a session that read outside content (ML's rule for agent-written text): its title is never put in another
+    /// agent's prompt (`TurnDigest.artifactLine`), and its folder and entry file are not named from agent text.
+    public var tainted: Bool = false
+    /// `written by a session that read <source>`, with `tainted`.
+    public var taintReason: String? = nil
 
     public init(id: String, companyId: String, number: Int, title: String, kind: ArtifactKind, storedPath: String, entryFile: String,
-                sourcePath: String, publishedById: String, itemId: String?, bytes: Int64, createdAt: Date) {
+                sourcePath: String, publishedById: String, itemId: String?, bytes: Int64, createdAt: Date, tainted: Bool = false,
+                taintReason: String? = nil) {
         self.id = id; self.companyId = companyId; self.number = number; self.title = title; self.kind = kind
         self.storedPath = storedPath; self.entryFile = entryFile; self.sourcePath = sourcePath; self.publishedById = publishedById
-        self.itemId = itemId; self.bytes = bytes; self.createdAt = createdAt
+        self.itemId = itemId; self.bytes = bytes; self.createdAt = createdAt; self.tainted = tainted; self.taintReason = taintReason
     }
 
     /// `AR-<n>` (asks own `A-<n>`).
