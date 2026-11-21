@@ -367,7 +367,7 @@ Nothing is built for Gemini in Plan X. X2's acceptance includes **a written adap
 
 `brahma` gains an engine-side **model proxy**: one loopback HTTP listener per engine, bound to `127.0.0.1` on an ephemeral port. Under decision 20 the proxy is the **provider gateway** (§8.2.5). This section describes its Anthropic route, which is also the route `api-key` and `fallback` billing use. Every rule here applies to every provider route.
 
-- **Per turn,** the engine mints a random token bound to that turn: its company, runtime, vendor host, caps and expiry at turn end. The runtime gets `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/t/` (or the Codex equivalent) and the per-turn token as its "API key". **The real key never enters the turn's process tree.**
+- **Per turn,** the engine mints a random token bound to that turn: its company, runtime, vendor host and caps. The token refuses new requests the moment the turn ends; a response already streaming may finish within a short grace. The runtime gets `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/t/` (or the Codex equivalent) and the per-turn token as its "API key". **The real key never enters the turn's process tree.**
 - **The proxy:**
   - accepts only requests carrying a live turn token, and only on the vendor's model endpoints (Anthropic `/v1/messages` and `/v1/messages/count_tokens`; OpenAI's model endpoint for Codex *(probe)*). Files, batches, admin and anything else are refused;
   - swaps in the real key from the vault and forwards over TLS to the pinned vendor host, through the egress policy;
@@ -411,7 +411,7 @@ An owner-wide ceiling, `brahma settings pacing conservative|standard|full` (new;
 
 **Providers and keys.**
 - A provider is an owner-wide record: an id, its adapter, a base URL and the pinned host it may reach. It is added with `brahma providers add <id> --adapter <a> --base-url <url>` (new; Mac only). The four built-ins `anthropic`, `openai`, `openrouter` and `groq` exist without setup.
-- Keys are per company, stored with the existing flow: `brahma secret set <co> <NAME>`, engine-held, never a test key. The provider record names the secret (`--key-secret OPENROUTER_API_KEY`). `SecretName.isInjectable` refuses every name a provider record uses, so no key can be handed to a check as a test key.
+- Keys are per company, stored with the existing flow: `brahma secret set <co> <NAME>`, engine-held, never a test key. The provider record names the secret. **Key names are `ANTHROPIC_API_KEY` for Anthropic and `BRAHMA_KEY_<PROVIDER>` for every other provider (`--key-secret BRAHMA_KEY_OPENROUTER`) (controller's call, from the X1 plan review).** Both families are already refused as test keys by `SecretName.isInjectable`, so no provider key can be handed to an agent or a check by construction, and existing test keys such as `OPENAI_API_KEY` keep working unchanged. The secret store accepts these two families as engine-held names; every other reserved name stays refused.
 - **Host pinning.** A remote provider's base URL must be `https` with a host name, and the gateway reaches only that host, through the egress policy (public addresses only). A `local` provider must be `http://127.0.0.1:<port>` or `http://localhost:<port>`. A LAN host needs an explicit owner flag, `--lan`, and is never a public address. The agent sandbox never reaches any provider host or port: the canary gains a probe for each configured local port.
 
 **Routes: who uses which model.**
