@@ -743,13 +743,11 @@ import GRDB
         #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:src/a.ts"), companyId: cf.c.id).tainted)
     }
 
-    /// R4-1: another item's branch reset onto an unrelated root (no merge base with `main`, so the orphan check throws) does
-    /// not skip the checks of a row-less item that holds a recorded tainted commit.
-    @Test func unrelatedRootOnAnotherBranchFailsClosed() throws {
-        let cf = try CollabFixture()
+    /// The R4-1 setup: ENG-1 has a recorded tainted commit, row-less ENG-2's branch holds it, and ENG-3 (with a tainted commit
+    /// of its own, returned) has its branch reset onto an unrelated root, so listing it throws (no merge base with `main`).
+    static func unrelatedRootOnENG3(_ cf: CollabFixture) throws -> (third: WorkItem, own: String) {
         let sha = try Self.taintItemCommit(cf)
         try Self.rowlessItem(cf, at: sha)                                   // ENG-2: row-less, holds ENG-1's tainted commit
-        // ENG-3: a tainted commit of its own, then its branch is reset onto an unrelated root.
         let third = try Self.rowlessItem(cf, at: try cf.fx.head(), title: "Third")
         #expect(third.key == "ENG-3")
         let own = try cf.commit(["src/e.ts": Data("e\n".utf8)], on: "item/ENG-3", message: "third")
@@ -759,9 +757,59 @@ import GRDB
         let root = try cf.fx.git.git(["commit-tree", try cf.fx.git.git(["mktree"]), "-m", "unrelated root"])
         try cf.fx.git.git(["update-ref", "refs/heads/item/ENG-3", root])
         #expect(throws: (any Error).self) { try SafeGit(workspace: cf.workspace).mergeBase("main", root) }
+        return (third, own)
+    }
+
+    /// R4-1: another item's branch reset onto an unrelated root (no merge base with `main`, so the orphan check throws) does
+    /// not skip the checks of a row-less item that holds a recorded tainted commit.
+    @Test func unrelatedRootOnAnotherBranchFailsClosed() throws {
+        let cf = try CollabFixture()
+        try Self.unrelatedRootOnENG3(cf)
         #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cf.c.id).tainted)
         #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:src/a.ts"), companyId: cf.c.id).tainted)
         #expect(try cf.fx.resolve(.qa2, try cf.fx.ref("ENG-2:src/a.ts")).tainted)
+    }
+
+    /// Ruling 12: a branch that can't be read (so every item ref in the company reads tainted) raises one owner alert naming
+    /// it, not one per resolve; once it reads again the alert answers itself, and a later break alerts again.
+    @Test func unreadableBranchAlertsOncePerBreak() throws {
+        let cf = try CollabFixture()
+        let (_, own) = try Self.unrelatedRootOnENG3(cf)
+        let cId = cf.c.id
+        func alerts() throws -> [Ask] {
+            try cf.store.writer.read { db in
+                try Ask.filter(Column("companyId") == cId && Column("kind") == AskKind.engineAlert).fetchAll(db)
+                    .filter { $0.title.contains("item/ENG-3") }
+            }
+        }
+        func events() throws -> Int {
+            try cf.store.writer.read { db in
+                try ActivityEvent.filter(Column("companyId") == cId).fetchAll(db).filter { $0.text.contains("item/ENG-3") }.count
+            }
+        }
+        var logged: [Int] = []
+        for _ in 0..<3 {
+            #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cId).tainted)
+            #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:src/a.ts"), companyId: cId).tainted)
+            #expect(try cf.fx.resolve(.qa2, try cf.fx.ref("ENG-2:src/a.ts")).tainted)
+            logged.append(try events())
+        }
+        let first = try alerts()
+        #expect(first.count == 1 && first.first?.status == .pendingOwner)
+        #expect(logged.first ?? 0 > 0 && Set(logged).count == 1)       // logged by the first resolve, never again
+        // Readable again: the alert answers itself; resolves add nothing.
+        try cf.fx.git.git(["update-ref", "refs/heads/item/ENG-3", own])
+        _ = try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cId)
+        _ = try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cId)
+        let healed = try alerts()
+        #expect(healed.count == 1 && healed.first?.status == .answered && healed.first?.ownerAnswer == "resolved")
+        // Broken again: one new alert.
+        let root = try cf.fx.git.git(["commit-tree", try cf.fx.git.git(["mktree"]), "-m", "unrelated root, again"])
+        try cf.fx.git.git(["update-ref", "refs/heads/item/ENG-3", root])
+        _ = try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cId)
+        _ = try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cId)
+        #expect(try alerts().filter { $0.status == .pendingOwner }.count == 1)
+        #expect(try alerts().count == 2)
     }
 
     /// R4-2: when the engine's auto-commit can't be recorded as it should (here the claim log can't be read), it fails closed:
@@ -777,6 +825,8 @@ import GRDB
             try db.execute(sql: "CREATE TEMP TABLE leaseClaim (broken INTEGER)")
         }
         defer { try? cf.store.writer.write { db in try db.execute(sql: "DROP TABLE IF EXISTS temp.leaseClaim") } }
+        // R5-3: a turn-record alert already open for the item neither absorbs nor suppresses the auto-commit's.
+        try EngineAlerts.raise(store: cf.store, text: "a turn's taint record failed", now: now, reason: "taint-record:\(itemId)", companyId: cId)
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         try cf.fx.git.write("src/leftover.ts", "left\n", in: wt)
         let git = cf.store.gitWorkspace(root: cf.workspace, companyId: cId)
@@ -790,10 +840,40 @@ import GRDB
         #expect(try cf.store.workItem(id: itemId)?.taintedOrigin == true)
         #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:src/leftover.ts"), companyId: cId).tainted)
         let alerts = try cf.store.writer.read { db in
-            try Ask.filter(Column("kind") == AskKind.engineAlert && Column("subjectId") == EngineAlerts.askSubject(reason: "taint-record:\(itemId)"))
-                .fetchCount(db)
+            try Ask.filter(Column("companyId") == cId && Column("kind") == AskKind.engineAlert
+                           && Column("status") == AskStatus.pendingOwner.rawValue).fetchAll(db)
         }
-        #expect(alerts == 1)
+        #expect(alerts.count == 2)
+        #expect(alerts.filter { $0.subjectId == EngineAlerts.askSubject(reason: "taint-record:\(itemId)") }.count == 1)
+        let autoCommit = alerts.first { $0.subjectId != EngineAlerts.askSubject(reason: "taint-record:\(itemId)") }
+        let text = autoCommit?.summary ?? ""
+        #expect(text.contains("ENG-1") && text.contains(String(made.prefix(7))) && text.contains("treated as tainted"))
+        #expect(!text.contains("read outside content"))
+    }
+
+    /// R5-2: when even the item can't be looked up on the fail-closed path, the auto-commit's sha-keyed row is still written,
+    /// so it reads tainted by its sha (and through the item's history once the item reads again).
+    @Test func engineAutoCommitRowWithoutItemId() throws {
+        let cf = try CollabFixture()
+        let cId = cf.c.id
+        let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
+        try cf.fx.git.write("src/leftover.ts", "left\n", in: wt)
+        let git = cf.store.gitWorkspace(root: cf.workspace, companyId: cId)
+        // `removeItemWorktree` in two steps, the items shadowed between them on the writer's connection: the record's update
+        // and the fail-closed id lookup both throw.
+        let auto = try #require(try git.removeWorktree(key: "ENG-1", keepIf: { false }))
+        try cf.store.writer.write { db in try db.execute(sql: "CREATE TEMP TABLE workItem (broken INTEGER)") }
+        defer { try? cf.store.writer.write { db in try db.execute(sql: "DROP TABLE IF EXISTS temp.workItem") } }
+        #expect(throws: (any Error).self) { try cf.store.recordEngineAutoCommit(companyId: cId, key: "ENG-1", auto) }
+        try cf.store.writer.write { db in try db.execute(sql: "DROP TABLE IF EXISTS temp.workItem") }
+        let made = auto.commit
+        #expect(made == (try cf.fx.head("item/ENG-1")))
+        let rows = try cf.store.writer.read { db in
+            try Row.fetchAll(db, sql: "SELECT itemId FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [cId, made])
+        }
+        #expect(rows.count == 1)
+        #expect(try cf.store.refTaint(try cf.fx.ref("commit:\(made)"), companyId: cId).tainted)
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:src/leftover.ts"), companyId: cId).tainted)
     }
 
 }
