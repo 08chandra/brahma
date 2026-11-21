@@ -145,12 +145,26 @@ struct RefFixture {
 }
 
 extension RefFixture {
-    /// 4a's `AR-<number>` row, inserted as is (C's tests need titles no publish accepts); its folder is not on disk.
+    /// 4a's `AR-<number>` row, inserted as is (C's tests need titles no publish accepts). In C its source checks out clean
+    /// (ruling 16): `art/<number>/index.html` committed on `main` at the recorded head, and a copy of the same 12 bytes in its
+    /// folder. In another company it is a row only.
     @discardableResult
     func seedArtifact(_ number: Int, title: String, companyId: String? = nil, tainted: Bool = false, taintReason: String? = nil,
                       publishedById: String = "owner") throws -> Artifact {
-        let a = Artifact(id: UUID().uuidString, companyId: companyId ?? c.id, number: number, title: title, kind: .html,
-                         storedPath: ".brahma/artifacts/\(number)-seeded", entryFile: "index.html", sourcePath: "/seeded/index.html",
+        let company = companyId ?? c.id
+        let body = String(format: "<p>%06d</p>", number)
+        var source = "/seeded/index.html"
+        if company == c.id {
+            try git.write("art/\(number)/index.html", body)
+            try git.git(["add", "--", "art/\(number)/index.html"])
+            try git.git(["commit", "-q", "-m", "art \(number)"])
+            let main = try head()
+            try store.writer.write { db in try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [main, company]) }
+            try git.write(".brahma/artifacts/\(number)-seeded/index.html", body)
+            source = (Store.realPath(c.workspacePath) ?? c.workspacePath) + "/art/\(number)"
+        }
+        let a = Artifact(id: UUID().uuidString, companyId: company, number: number, title: title, kind: .html,
+                         storedPath: ".brahma/artifacts/\(number)-seeded", entryFile: "index.html", sourcePath: source,
                          publishedById: publishedById, itemId: nil, bytes: 12, createdAt: now, tainted: tainted, taintReason: taintReason)
         try store.writer.write { db in try a.insert(db) }
         return a

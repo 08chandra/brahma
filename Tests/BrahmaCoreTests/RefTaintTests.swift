@@ -884,7 +884,7 @@ import GRDB
         let cf = try CollabFixture()
         let cId = cf.c.id
         let reason = "written by a session that read docs.swift.org"
-        let a = try cf.publish("page.html", "<p>x</p>\n", title: "Clean page")
+        let a = try cf.publishCommitted("page.html", "<p>x</p>\n", title: "Clean page")
         let entry = try cf.fx.ref(a.storedPath + "/" + a.entryFile)
         #expect(try cf.store.refTaint(entry, companyId: cId) == (false, nil))
         let clean = try cf.open(.qa2, a.storedPath + "/" + a.entryFile)
@@ -945,9 +945,19 @@ import GRDB
         _ = try cf.store.acknowledge(askId: first.id)
         try resolve()
         #expect(try alerts().count == 1)
-        // The branch reads cleanly: nothing new, and the answered alert is re-armed.
+        func markers() throws -> Int {
+            try cf.store.writer.read { db in
+                try ActivityEvent.filter(Column("companyId") == cId && Column("kind") == ActivityKind.access.rawValue).fetchAll(db)
+                    .filter { $0.text.hasPrefix("item/ENG-3 can be read again") }.count
+            }
+        }
+        #expect(try markers() == 0)
+        // The branch reads cleanly: nothing new, and the answered alert is re-armed, once (heal resolves twice).
         try heal()
         #expect(try alerts().count == 1)
+        #expect(try markers() == 1)
+        _ = try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cId)
+        #expect(try markers() == 1)
         #expect(try alerts().first?.ownerAnswer == "acknowledged" && alerts().first?.decidedBy == "owner")
         // Broken again: exactly one new pending alert.
         try breakAgain(2)
@@ -958,11 +968,197 @@ import GRDB
         try resolve()
         #expect(try alerts().count == 2)
         try heal()
+        #expect(try markers() == 2)
         try breakAgain(3)
         try resolve()
         #expect(try alerts().count == 3 && alerts().filter { $0.status == .pendingOwner }.count == 1)
+        #expect(try markers() == 2)
     }
 
+    // MARK: P2 fix round 1 (Ruling 16: artifact source provenance)
+
+    /// A designer of C (its role has `publish_artifact`).
+    static func designer(_ cf: CollabFixture) throws -> Agent {
+        try cf.store.hire(companyId: cf.c.id, name: "design-1", role: "designer", model: "sonnet")
+    }
+
+    /// A ready item leased by `agent`, with its worktree folder (a real directory, as 4a's publish needs).
+    static func leased(_ cf: CollabFixture, _ agent: Agent, title: String = "Landing") throws -> (item: WorkItem, worktree: URL) {
+        let item = try cf.store.createWorkItem(companyId: cf.c.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: title, checkSpec: CheckSpec(command: "true", paths: ["src/\(UUID().uuidString.prefix(8))"]),
+            status: .ready))
+        // The lease row as `claimLease` writes it (its path-overlap rule would refuse a second item beside the fixture's ENG-1).
+        let lease = WorkLease(itemId: item.id, companyId: cf.c.id, agentId: agent.id, acquiredAt: cf.now, expiresActive: 1e9)
+        try cf.store.writer.write { db in
+            try lease.insert(db)
+            try db.execute(sql: "UPDATE workItem SET status = 'inProgress', ownerId = ? WHERE id = ?", arguments: [agent.id, item.id])
+        }
+        let wt = cf.workspace.appending(path: ".brahma/wt/\(item.key)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: wt, withIntermediateDirectories: true)
+        return (item, wt)
+    }
+
+    /// `AR-<n>`, and each file of its folder as a key-less `.brahma/artifacts/…` ref, read tainted (or not).
+    static func expectArtifact(_ cf: CollabFixture, _ a: Artifact, tainted: Bool, sourceLocation: SourceLocation = #_sourceLocation) throws {
+        #expect(try cf.store.refTaint(try cf.fx.ref(a.ref), companyId: cf.c.id).tainted == tainted, sourceLocation: sourceLocation)
+        #expect(try cf.store.refTaint(try cf.fx.ref(a.storedPath + "/" + a.entryFile), companyId: cf.c.id).tainted == tainted,
+                sourceLocation: sourceLocation)
+        let r = try cf.fx.resolve(.qa2, try cf.fx.ref(a.ref))
+        #expect(r.tainted == tainted, sourceLocation: sourceLocation)
+        #expect((r.title == "\(a.ref) (untrusted)") == tainted, "\(r.title)", sourceLocation: sourceLocation)
+    }
+
+    /// Ruling 16: a clean session publishing from its worktree takes the worktree's item taint: a tainted commit on the
+    /// item's branch, or 5-lite's sticky mark. The row says clean (4a's flag is the publisher's session only); the ref does not.
+    @Test func cleanPublisherOfTaintedWorktreeIsTainted() throws {
+        let cf = try CollabFixture()
+        let cId = cf.c.id
+        let designer = try Self.designer(cf)
+        // A tainted commit on the leased item's branch.
+        let (item, wt) = try Self.leased(cf, designer)
+        try cf.fx.git.git(["branch", "item/\(item.key)", "main"])
+        let tainted = try cf.commit(["src/landing.html": Data("<p>evil</p>\n".utf8)], on: "item/\(item.key)", message: "landing")
+        try cf.store.recordTaintedCommits(companyId: cId, itemId: item.id, agentId: cf.fx.eng3.id, turnId: nil,
+                                          headBefore: try cf.fx.head(), headAfter: tainted, source: "docs.swift.org",
+                                          git: SafeGit(workspace: cf.workspace), now: cf.now)
+        try Data("<p>evil</p>\n".utf8).write(to: wt.appending(path: "landing.html"))
+        let a = try cf.store.publishArtifact(companyId: cId, by: .agent(designer.id), sourcePath: "landing.html", title: "Landing",
+                                             itemKey: nil, baseDirectory: wt)
+        #expect(!a.tainted && a.itemId == nil)
+        try Self.expectArtifact(cf, a, tainted: true)
+        #expect(try cf.store.refTaint(try cf.fx.ref(a.ref), companyId: cId) == (true, Store.sessionReason("docs.swift.org")))
+        let out = try cf.open(.qa2, a.ref)
+        #expect(out.tainted && out.text.hasPrefix("Untrusted content from"))
+        #expect(try cf.agent(cf.fx.qa2).sessionTainted)
+        // The sticky mark alone (no commit): a second item, released by a tainted session, now leased by the clean designer.
+        try cf.store.writer.write { db in try db.execute(sql: "DELETE FROM workLease WHERE agentId = ?", arguments: [designer.id]) }
+        let (other, wt2) = try Self.leased(cf, designer, title: "Other")
+        try cf.store.writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE companyId = ? AND id = ?", arguments: [cId, other.id])
+        }
+        try Data("<p>x</p>\n".utf8).write(to: wt2.appending(path: "x.html"))
+        let b = try cf.store.publishArtifact(companyId: cId, by: .agent(designer.id), sourcePath: "x.html", title: "X",
+                                             itemKey: nil, baseDirectory: wt2)
+        #expect(!b.tainted)
+        try Self.expectArtifact(cf, b, tainted: true)
+        // A clean item's worktree: clean (its branch reads, with nothing tainted on it; with no branch while the company has
+        // uncleared rows, `commitSource` fails closed, ruling 11). The sticky mark can't be cleared, so it is a third item.
+        try cf.store.writer.write { db in try db.execute(sql: "DELETE FROM workLease WHERE agentId = ?", arguments: [designer.id]) }
+        let (third, wt3) = try Self.leased(cf, designer, title: "Third")
+        try cf.fx.git.git(["branch", "item/\(third.key)", "main"])
+        try Data("<p>ok</p>\n".utf8).write(to: wt3.appending(path: "ok.html"))
+        let c = try cf.store.publishArtifact(companyId: cId, by: .agent(designer.id), sourcePath: "ok.html", title: "Ok",
+                                             itemKey: nil, baseDirectory: wt3)
+        try Self.expectArtifact(cf, c, tainted: false)
+    }
+
+    /// Ruling 16: a source in the main checkout is clean only when the copy's bytes are main's committed bytes at the recorded
+    /// head (and that history is clean); a copy of a modified or untracked file, a changed copy, an extra file in the copy, or
+    /// no recorded head is tainted.
+    @Test func mainSourceMustMatchMainsCommittedBytes() throws {
+        let cf = try CollabFixture()
+        let cId = cf.c.id
+        let clean = try cf.publishCommitted("page.html", "<p>v1</p>\n")
+        try Self.expectArtifact(cf, clean, tainted: false)
+        #expect(try !cf.open(.qa2, clean.ref).tainted)
+        #expect(try !cf.agent(cf.fx.qa2).sessionTainted)
+        // A folder committed on main: clean; a file added to its copy, or a copy changed, is not.
+        let site = try cf.publishCommitted("site/index.html", "<h1>Site</h1>\n", title: "Site")
+        try Self.expectArtifact(cf, site, tainted: false)
+        let siteDir = site.directory(workspace: cf.workspace)
+        try Data("<script>evil()</script>\n".utf8).write(to: siteDir.appending(path: "extra.js"))
+        try Self.expectArtifact(cf, site, tainted: true)
+        try FileManager.default.removeItem(at: siteDir.appending(path: "extra.js"))
+        try Self.expectArtifact(cf, site, tainted: false)
+        try Data("<h1>Changed</h1>\n".utf8).write(to: siteDir.appending(path: "index.html"))
+        try Self.expectArtifact(cf, site, tainted: true)
+        // Published from a working copy that differs from main (uncommitted bytes), or from an untracked file.
+        try Data("<p>v2, not committed</p>\n".utf8).write(to: cf.workspace.appending(path: "page.html"))
+        let modified = try cf.store.publishArtifact(companyId: cId, by: .owner, sourcePath: "page.html", title: "Modified",
+                                                    itemKey: nil, baseDirectory: cf.workspace)
+        try Self.expectArtifact(cf, modified, tainted: true)
+        #expect(try cf.store.refTaint(try cf.fx.ref(modified.ref), companyId: cId) == (true, Store.artifactSourceReason))
+        let untracked = try cf.publish("loose.html", "<p>loose</p>\n")
+        try Self.expectArtifact(cf, untracked, tainted: true)
+        // No recorded main head: nothing to compare with.
+        try cf.recordMain(nil)
+        try Self.expectArtifact(cf, clean, tainted: true)
+    }
+
+    /// Ruling 16: a row without usable provenance (`sourcePath` empty, relative, outside the workspace, the workspace itself, in
+    /// `.git`, or in `.brahma` outside a worktree) is tainted.
+    @Test func artifactWithoutUsableProvenanceIsTainted() throws {
+        let cf = try CollabFixture()
+        let cId = cf.c.id
+        let a = try cf.publishCommitted("page.html", "<p>x</p>\n")
+        try Self.expectArtifact(cf, a, tainted: false)
+        let root = cf.workspaceRealPath
+        for bad in ["", "page.html", "/tmp/elsewhere/page.html", root, root + "/", root + "/.git/page.html", root + "/./page.html",
+                    root + "/x/../page.html", root + "/.brahma/progress/page.html", root + "/.brahma/wt/ENG-99/page.html",
+                    root + "-evil/page.html"] {
+            try cf.store.writer.write { db in
+                try db.execute(sql: "UPDATE artifact SET sourcePath = ? WHERE companyId = ? AND id = ?", arguments: [bad, cId, a.id])
+            }
+            #expect(try cf.store.refTaint(try cf.fx.ref(a.ref), companyId: cId) == (true, Store.artifactSourceReason), "\(bad)")
+            #expect(try cf.store.refTaint(try cf.fx.ref(a.storedPath + "/" + a.entryFile), companyId: cId).tainted, "\(bad)")
+        }
+    }
+
+    /// Ruling 16: `itemId` is the publisher's word: a tainted item adds taint; a clean one never clears any.
+    @Test func publisherNamedItemOnlyAddsTaint() throws {
+        let cf = try CollabFixture()
+        let (cId, itemId) = (cf.c.id, cf.fx.item.id)
+        let a = try cf.publishCommitted("page.html", "<p>x</p>\n", itemKey: "ENG-1")
+        #expect(a.itemId == itemId)
+        try Self.expectArtifact(cf, a, tainted: false)
+        // A clean item named on an unverifiable source clears nothing.
+        let loose = try cf.publish("loose.html", "<p>loose</p>\n", itemKey: "ENG-1")
+        try Self.expectArtifact(cf, loose, tainted: true)
+        // The named item turns tainted (5-lite's sticky mark): so does the artifact whose source is otherwise clean.
+        try cf.store.writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE companyId = ? AND id = ?", arguments: [cId, itemId])
+        }
+        try Self.expectArtifact(cf, a, tainted: true)
+        #expect(try cf.store.refTaint(try cf.fx.ref(a.ref), companyId: cId) == (true, Store.sessionReason("outside content")))
+    }
+
+    /// Ruling 16: a check that fails (git) reads tainted.
+    @Test func artifactSourceCheckFailureIsTainted() throws {
+        let cf = try CollabFixture()
+        let a = try cf.publishCommitted("page.html", "<p>x</p>\n")
+        try Self.expectArtifact(cf, a, tainted: false)
+        cf.store.refHooks.setGitRunner(FailingGitRunner())
+        defer { cf.store.refHooks.setGitRunner(nil) }
+        #expect(try cf.store.refTaint(try cf.fx.ref(a.ref), companyId: cf.c.id) == (true, Store.artifactSourceReason))
+        #expect(try cf.store.refTaint(try cf.fx.ref(a.storedPath + "/" + a.entryFile), companyId: cf.c.id).tainted)
+    }
+
+    /// R1-5: a tainted session publishing through 4a's real path: the row is tainted, and so is every read of it.
+    @Test func taintedSessionPublishReadsTainted() throws {
+        let cf = try CollabFixture()
+        let designer = try Self.designer(cf)
+        let (_, wt) = try Self.leased(cf, designer)
+        try Data("<p>from the web</p>\n".utf8).write(to: wt.appending(path: "web.html"))
+        try cf.store.markTainted(agentId: designer.id, source: "WebFetch")
+        let a = try cf.store.publishArtifact(companyId: cf.c.id, by: .agent(designer.id), sourcePath: "web.html", title: "From the web",
+                                             itemKey: nil, baseDirectory: wt)
+        #expect(a.tainted && a.taintReason == "written by a session that read WebFetch", "\(a)")
+        #expect(try cf.store.refTaint(try cf.fx.ref(a.ref), companyId: cf.c.id) == (true, a.taintReason))
+        try Self.expectArtifact(cf, a, tainted: true)
+        #expect(try cf.open(.qa2, a.ref).tainted)
+        #expect(try cf.agent(cf.fx.qa2).sessionTainted)
+    }
+
+}
+
+/// A git runner that fails every call (status 128, as a broken repository does).
+struct FailingGitRunner: GitProcessRunning {
+    func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int) throws -> (status: Int32, stdout: Data, stderr: Data) {
+        (128, Data(), Data("fatal: injected failure\n".utf8))
+    }
+    func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int, workTreeDescriptor: Int32?) throws -> (status: Int32, stdout: Data, stderr: Data) {
+        (128, Data(), Data("fatal: injected failure\n".utf8))
+    }
 }
 
 /// A git runner that fails (status 128, as a broken repository does) every call naming an item branch.

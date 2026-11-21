@@ -1,5 +1,10 @@
 import Foundation
 import GRDB
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// Taint as data (design §4.3). A session that read outside content stamps what it produces — the commits of its holder turn,
 /// the files it snapshots, the refs it pins, the messages it posts — and every reader of those is tainted in turn when it
@@ -11,6 +16,9 @@ extension Store {
 
     /// The reason a `.brahma/…` file on disk that no item or hand-off accounts for is tainted (ruling 9).
     static let unplacedBrahmaReason = "a .brahma file no item accounts for"
+
+    /// The reason an artifact whose source can't be shown to be clean is tainted (ruling 16).
+    static let artifactSourceReason = "an artifact whose source can't be shown to be clean"
 
     /// The source recorded when a taint check or record could not be made and nothing better is known (fail closed, ruling 11).
     static let taintCheckFailedSource = "a taint check that failed"
@@ -97,10 +105,8 @@ extension Store {
             if m.fromTaintedSession || m.taintedOrigin { return (true, Self.sessionReason(m.taintSource ?? "outside content")) }
             return (false, nil)
         case .artifact:
-            guard let n = Int(ref.id), let a = try writer.read({ db in
-                try Artifact.fetchOne(db, sql: "SELECT * FROM artifact WHERE companyId = ? AND number = ?", arguments: [companyId, n])
-            }) else { return (false, nil) }
-            return a.tainted ? (true, a.taintReason ?? "outside content") : (false, nil)
+            guard let n = Int(ref.id), let a = try artifact(companyId: companyId, number: n) else { return (false, nil) }
+            return artifactTaint(a)
         case .item:
             guard let item = try writer.read({ db in try RefAccess.item(db, companyId, ref.id) }) else { return (false, nil) }
             return item.taintedOrigin ? (true, "outside content") : (false, nil)
@@ -150,9 +156,10 @@ extension Store {
     /// - `handoffs/<KEY>/…`: the hand-off row's own mark (its writer's session when it was written), or the item's as above;
     ///   a file no hand-off row names can't be attributed: tainted;
     /// - `resources/company/…`: clean (the engine mirrors only untainted, unflagged owner resources there);
-    /// - `artifacts/<number>-<slug>/…`: the taint of this company's artifact row whose `storedPath` is that folder (4a's
-    ///   `tainted`/`taintReason`; the folder is engine-written, write-denied to every turn); a folder no row names (a
-    ///   leftover, a staging copy, another company's), a file beside the folders, or a lookup that fails: tainted;
+    /// - `artifacts/<number>-<slug>/…`: the taint of this company's artifact row whose `storedPath` is that folder
+    ///   (`artifactTaint`: the row's flag and its source's provenance; the folder is engine-written, write-denied to every
+    ///   turn); a folder no row names (a leftover, a staging copy, another company's), a file beside the folders, or a lookup
+    ///   that fails: tainted;
     /// - an agent's lab or notes (private: only it and the owner read them): its own place, not judged here;
     /// - anything else (an unknown item): it can't be determined, so tainted (fail closed).
     private func onDiskBrahmaTaint(_ ref: WorkRef, companyId: String) throws -> (tainted: Bool, reason: String?) {
@@ -180,7 +187,7 @@ extension Store {
                 return unknown
             }
             guard let row else { return unknown }
-            return row.tainted ? (true, row.taintReason ?? "outside content") : (false, nil)
+            return artifactTaint(row)
         case "progress" where parts.count == 3 && parts[2].hasSuffix(".md"):
             guard let item = try item(String(parts[2].dropLast(3))) else { return unknown }
             return try itemSource(item).map { (true, Self.sessionReason($0)) } ?? (false, nil)
@@ -193,6 +200,98 @@ extension Store {
         default:
             return unknown
         }
+    }
+
+    // MARK: Artifacts (ruling 16)
+
+    /// Ruling 16: an artifact's taint, read now. 4a's `tainted` records only the publishing session, so a clean session could
+    /// otherwise publish bytes a tainted one wrote. It is tainted when any of these holds:
+    /// - its row is tainted (4a's flag and reason);
+    /// - `itemId` names an item of this company that is tainted (its holder's session now, 5-lite's sticky mark, or an
+    ///   uncleared tainted commit on its branch). `itemId` is the publisher's word: it only ever adds taint;
+    /// - `sourcePath` (4a's `realpath` at publish) is not a clean path under the workspace's real path (empty, relative,
+    ///   outside, the workspace itself, in `.git`, in `.brahma` outside a worktree): no usable provenance;
+    /// - it is under `.brahma/wt/<KEY>/`: that item's taint, as above (an unknown item: tainted);
+    /// - it is in the main checkout: unless main's engine-recorded head (`company.mainCommit`) holds it (a file, or a folder),
+    ///   its key-less history there is clean (ruling 1), and every file of the copy is main's committed blob at the matching
+    ///   path (git's blob id of the copy's bytes, read through SafeFS, at most `SafeGit.maxBinaryBytes` in all);
+    /// - any lookup or check fails.
+    /// The copy's bytes are hashed here, never shown: the reader is marked (`openRef`) before any byte reaches it. Never throws.
+    func artifactTaint(_ a: Artifact) -> (tainted: Bool, reason: String?) {
+        if a.tainted { return (true, a.taintReason ?? "outside content") }
+        let unverified = (true, Optional(Self.artifactSourceReason))
+        do {
+            if let itemId = a.itemId, let item = try writer.read({ db in
+                try WorkItem.fetchOne(db, sql: "SELECT * FROM workItem WHERE companyId = ? AND id = ?", arguments: [a.companyId, itemId])
+            }), let source = try itemTaintSource(item) {
+                return (true, Self.sessionReason(source))
+            }
+            guard let company = try company(id: a.companyId), let root = Self.realPath(company.workspacePath),
+                  a.sourcePath.hasPrefix(root + "/") else { return unverified }
+            let rel = String(a.sourcePath.dropFirst(root.count + 1))
+            let parts = rel.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+            guard parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && $0.lowercased() != ".git" }) else { return unverified }
+            if parts[0].lowercased() == ".brahma" {
+                guard parts.count >= 4, parts[1] == "wt", let item = try writer.read({ db in try RefAccess.item(db, a.companyId, parts[2]) })
+                else { return unverified }
+                return try itemTaintSource(item).map { (true, Self.sessionReason($0)) } ?? (false, nil)
+            }
+            return try mainSourceTaint(a, rel: rel, company: company)
+        } catch {
+            return unverified
+        }
+    }
+
+    /// The source of an item's taint: its lease holder's session now, 5-lite's sticky mark, or an uncleared tainted commit on its
+    /// branch (or none of its commits provably clean); nil when clean.
+    private func itemTaintSource(_ item: WorkItem) throws -> String? {
+        if let source = try holderSource(item: item) { return source }
+        if item.taintedOrigin { return "outside content" }
+        return try commitSource(WorkRef(kind: .diff, id: item.key), item: item)
+    }
+
+    /// Ruling 16 for a source in the main checkout (`rel`, workspace-relative): see `artifactTaint`.
+    private func mainSourceTaint(_ a: Artifact, rel: String, company: Company) throws -> (tainted: Bool, reason: String?) {
+        let unverified = (true, Optional(Self.artifactSourceReason))
+        guard let main = company.mainCommit, let folder = RefAccess.artifactFolder(a) else { return unverified }
+        func history(_ path: String) throws -> String? {
+            try keylessSource(WorkRef(kind: .file, id: path, rev: main), rev: main, companyId: company.id)
+        }
+        if let source = try history(rel) { return (true, Self.sessionReason(source)) }
+        let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+        let git = try refGit(workspace)
+        let listed = try git.lsTree(rev: main, path: rel, cap: ArtifactPolicy.maxFiles)
+        guard !listed.truncated, !listed.entries.isEmpty else { return unverified }
+        var expected = Dictionary(listed.entries.map { ($0.path, $0.sha) }, uniquingKeysWith: { first, _ in first })
+        // A file is copied under its own name (with, for glTF, bare-name siblings from its folder); a folder as it is.
+        let isFile = listed.entries.count == 1 && listed.entries[0].path == rel
+        if isFile {
+            guard a.entryFile == (rel as NSString).lastPathComponent else { return unverified }
+        } else {
+            guard listed.entries.allSatisfy({ $0.path.hasPrefix(rel + "/") }) else { return unverified }
+        }
+        let base = isFile ? (rel as NSString).deletingLastPathComponent : rel
+        let stored = try ArtifactCopyListing.files(workspace: workspace, folder: folder)
+        guard !stored.isEmpty else { return unverified }
+        let fs = try SafeFS(workspace: workspace, ownHandle: nil)
+        let sha256 = main.utf8.count == 64
+        var budget = SafeGit.maxBinaryBytes
+        for name in stored {
+            let path = base.isEmpty ? name : "\(base)/\(name)"
+            if expected[path] == nil {
+                // A glTF sibling beside a file: it must be on main too, with clean history. A folder's copy holds nothing else.
+                guard isFile, !name.contains("/") else { return unverified }
+                let one = try git.lsTree(rev: main, path: path, cap: 1)
+                guard !one.truncated, one.entries.count == 1, one.entries[0].path == path else { return unverified }
+                if let source = try history(path) { return (true, Self.sessionReason(source)) }
+                expected[path] = one.entries[0].sha
+            }
+            guard budget > 0 else { return unverified }
+            let file = try fs.open(workspacePath: "\(a.storedPath)/\(name)", maxBytes: budget)
+            budget -= file.size
+            guard try SafeGit.blobId(of: file, sha256: sha256) == expected[path] else { return unverified }
+        }
+        return (false, nil)
     }
 
     /// The source of the taint of an item-branch file or diff (committed or `@worktree`), or nil when it is clean.
@@ -651,5 +750,47 @@ struct TaintedCommitObserver: WorkItemObserver {
     func itemCompleted(_ item: WorkItem, db: Database) throws {
         guard item.mergedCommit != nil else { return }
         try Store.clearTaintedCommits(db: db, item: item, by: "review", now: item.doneAt ?? Store.now())
+    }
+}
+
+/// The files of an artifact's copy (`.brahma/artifacts/<folder>/…`), folder-relative and sorted, listed on descriptors that
+/// follow no link. Anything but regular files and directories, more than `ArtifactPolicy.maxFiles` files, or more than 16
+/// levels throws (ruling 16's check then reads the artifact tainted).
+enum ArtifactCopyListing {
+    static let maxDepth = 16
+
+    static func files(workspace: URL, folder: String) throws -> [String] {
+        let top = try EngineFiles.openDirectory(workspace: workspace, ".brahma/artifacts")
+        defer { close(top) }
+        let fd = openat(top, folder, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw VaultError.missing }
+        var out: [String] = []
+        try walk(fd, prefix: "", depth: 0, into: &out)
+        return out.sorted()
+    }
+
+    /// Lists `fd` (and closes it).
+    private static func walk(_ fd: Int32, prefix: String, depth: Int, into out: inout [String]) throws {
+        defer { close(fd) }
+        guard depth <= maxDepth, let names = DirectoryListing.names(fd: fd, limit: ArtifactPolicy.maxFiles + 1) else {
+            throw VaultError.missing
+        }
+        for name in names {
+            guard !name.isEmpty, !name.contains("/") else { throw VaultError.missing }
+            var st = stat()
+            guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { throw VaultError.missing }
+            let path = prefix.isEmpty ? name : "\(prefix)/\(name)"
+            switch st.st_mode & S_IFMT {
+            case S_IFREG:
+                out.append(path)
+                if out.count > ArtifactPolicy.maxFiles { throw VaultError.missing }
+            case S_IFDIR:
+                let child = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                guard child >= 0 else { throw VaultError.missing }
+                try walk(child, prefix: path, depth: depth + 1, into: &out)
+            default:
+                throw VaultError.missing
+            }
+        }
     }
 }
