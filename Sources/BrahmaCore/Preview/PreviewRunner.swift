@@ -301,7 +301,7 @@ public actor PreviewRunner: EmergencyStopObserver {
         restartAt[surface.id] = nil
         pending.insert(surface.id)
         starts[surface.id] = Task {
-            await self.perform(company: company, surface: surface, commit: commit, fresh: fresh, start: n, now: now)
+            await self.perform(company: company, surface: surface, commit: commit, fresh: fresh, start: n, epoch: epoch, now: now)
             self.startEnded(surface.id)
         }
     }
@@ -311,12 +311,23 @@ public actor PreviewRunner: EmergencyStopObserver {
         pending.remove(id)
     }
 
-    /// Waits for every start in flight (tests; and `stopAll`, after cancelling them).
+    /// Waits for every start in flight (tests; the sprint demo; and `stopAll`, after cancelling them). Returns as soon as the
+    /// caller is cancelled (fix round 2, N1: the owner's stop cancels the demo waiting here and the starts it waits for; a
+    /// cancelled waiter never cancels the starts itself).
     public func waitForStarts() async {
-        while let task = starts.values.first { await task.value }
+        while !Task.isCancelled, let task = starts.values.first {
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { _ = await task.value }
+                group.addTask { try? await Task.sleep(for: .seconds(86_400)) }   // ends at once when the waiter is cancelled
+                await group.next()
+                group.cancelAll()
+            }
+        }
     }
 
-    private func perform(company: Company, surface: PreviewSurface, commit: String, fresh: Bool, start n: Int, now: Date) async {
+    /// `epoch`: the stop epoch the start was launched in. A start that ends after a `stopAll` (cancelled, or the epoch moved)
+    /// is torn down, never recorded running (fix round 2, N1).
+    private func perform(company: Company, surface: PreviewSurface, commit: String, fresh: Bool, start n: Int, epoch: Int, now: Date) async {
         await stopRun(surface.id)
         let id = surface.id
         let sandbox = sandboxLayout(company)
@@ -422,8 +433,11 @@ public actor PreviewRunner: EmergencyStopObserver {
                                      onSpawn: { pid in await self.spawned(id, pid: pid) }, redactor: engineStore.redactor)
         runs[id]?.context = context
         let update = await adapter.start(context)
-        if Task.isCancelled || update.status == .stopped {
-            runs[id]?.pid = update.process ?? runs[id]?.pid
+        if Task.isCancelled || epoch != stopEpoch || update.status == .stopped {
+            // What the start left (a pid, a device) is recorded on the run so `stopRun` reaches it. (O1: the fallback is read
+            // before the run is modified; an optional-chained assignment would read `runs` inside its own modify access.)
+            let pid = update.process ?? runs[id]?.pid
+            runs[id]?.pid = pid
             runs[id]?.simulatorId = update.simulatorId
             await stopRun(id)
             return
@@ -533,7 +547,10 @@ public actor PreviewRunner: EmergencyStopObserver {
         stopping += 1
         stopEpoch += 1
         defer { stopping -= 1 }
-        // A sprint demo in flight (its reconcile passes, a running demo command) is cancelled first (fix round 1, I1).
+        // The starts and a sprint demo in flight (its reconcile passes, a running demo command) are cancelled together, then
+        // awaited: the demo returns as soon as it is cancelled (`waitForStarts`), and no start is waited out (fix round 1 I1,
+        // fix round 2 N1).
+        for task in starts.values { task.cancel() }
         if let demo = demoTask {
             demo.cancel()
             _ = await demo.value

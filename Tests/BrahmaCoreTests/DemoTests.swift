@@ -188,6 +188,46 @@ import GRDB
         #expect(try f.store.resumeAfterStop(now: f.x.now))
     }
 
+    /// Fix round 2, N1: the owner's stop during a demo's start phase cancels the in-flight start (not waits for it): the stop
+    /// returns promptly, the demo returns nil, and no surface is recorded running.
+    @Test func stopDuringDemoStartPhase() async throws {
+        let f = try Fx()
+        try f.cli("slow", demo: "sleep 20")
+        let sprint = try f.reviewSprint()
+        let runner = f.x.runner
+        let demo = Task { await runner.demo(sprint: sprint) }
+        await f.x.sandbox.waitForRun { $0.command == "sleep 20" }
+        let stopped = Date()
+        _ = try f.store.emergencyStop(note: "test", by: "owner", now: f.x.now)
+        await runner.stopAll(reason: "stopped by the owner")
+        let latency = Date().timeIntervalSince(stopped)
+        #expect(latency < 10, "the stop waited \(latency) s for the start")
+        let outcome = await demo.value
+        #expect(outcome == nil)
+        let state = try f.x.state("slow")
+        #expect(state.status == .stopped && state.message == PreviewRunner.ownerStopMessage && state.pid == nil, "\(state)")
+        let rows = try f.rows(sprint), posts = try f.posts().filter { $0.senderId == "system" }
+        #expect(rows.isEmpty && posts.isEmpty)
+        #expect(try f.events().filter { $0.hasPrefix("Preview slow running") || $0.hasPrefix("Preview slow ran") }.isEmpty)
+        #expect(try f.store.resumeAfterStop(now: f.x.now))
+    }
+
+    /// Fix round 2, O1: the owner's stop while a CLI start is in flight (its update has no process) cancels it without a trap,
+    /// promptly, and records it stopped.
+    @Test func stopCancelsCLIStartInFlight() async throws {
+        let f = try Fx()
+        try f.cli("slow", demo: "sleep 20")
+        await f.x.runner.reconcile(now: f.x.now)
+        await f.x.sandbox.waitForRun { $0.command == "sleep 20" }
+        let stopped = Date()
+        await f.x.runner.stopAll(reason: "stopped by the owner")
+        let latency = Date().timeIntervalSince(stopped)
+        #expect(latency < 10, "the stop waited \(latency) s for the start")
+        let state = try f.x.state("slow")
+        #expect(state.status == .stopped && state.message == PreviewRunner.ownerStopMessage && state.pid == nil, "\(state)")
+        #expect(try f.events().filter { $0.hasPrefix("Preview slow ran") }.isEmpty)
+    }
+
     /// Fix round 1, M3: the demo's debounce bypass applies to the sprint's company only; another company's moved `main` keeps
     /// its debounce.
     @Test func settledOnlyForSprintCompany() async throws {

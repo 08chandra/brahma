@@ -171,7 +171,7 @@ enum AppleBuild {
 /// An iOS Simulator preview. `start` needs the owner's approval on the surface (`outsideSandboxApprovedAt`, Task 4's gate),
 /// else it is `unavailable` with the waiting message and nothing is asked of the Simulator. Then: the build (`AppleBuild`),
 /// `app_path` resolved inside the run (`AppBundle.locate`: a `.app` directory), the surface's own device
-/// (`Brahma <company slug>-<surface name>`, created with the surface's `device` type when listed, else the first iPhone),
+/// (`Brahma <company slug> <surface name>`, created with the surface's `device` type when listed, else the first iPhone),
 /// `boot` (an already booted device is fine),
 /// `install`, `launch(bundle_id)`: `running` with `simulatorId`. `stop` terminates the app and shuts the device down. `demo`
 /// saves a screenshot to `previewLogs/<name>-demo-<sprint>.png` (`"<name>: screenshot saved"`). Every Simulator failure is
@@ -366,9 +366,11 @@ public struct SimctlController: SimulatorControlling {
     init(exec: @escaping Exec, available: @escaping @Sendable () -> Bool) { self.exec = exec; self.available = available }
 
     public static func deviceName(slug: String) -> String { devicePrefix + slug }
-    /// `Brahma <company slug>-<surface name>`: one device per iOS surface (fix round 1, I2), so each surface's `device` type is
-    /// honoured and one surface's stop never shuts down a sibling's device. Both parts are engine-validated slugs.
-    public static func deviceName(slug: String, surface: String) -> String { devicePrefix + slug + "-" + surface }
+    /// `Brahma <company slug> <surface name>`: one device per iOS surface (fix round 1, I2), so each surface's `device` type is
+    /// honoured and one surface's stop never shuts down a sibling's device. Both parts are engine-validated slugs
+    /// (`[a-z0-9-]`), so the space separator cannot occur in either and no two companies' surfaces share a name (fix round 2,
+    /// N2); the `Brahma ` prefix still bounds the leftovers sweep.
+    public static func deviceName(slug: String, surface: String) -> String { devicePrefix + slug + " " + surface }
     public static func isBrahmaDevice(_ name: String) -> Bool { name.hasPrefix(devicePrefix) }
 
     struct Device: Equatable, Sendable {

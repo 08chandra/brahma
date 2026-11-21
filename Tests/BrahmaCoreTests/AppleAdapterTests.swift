@@ -140,7 +140,7 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
         #expect(calls.first?.policy.toolchain == true)
         // Then the simctl sequence on the surface's own device (`Brahma <company slug>-<surface name>`).
         let app = s.run.appending(path: "build/App.app")
-        #expect(s.simulator.calls == [.ensureDevice("Brahma acme-phone", "iPhone 15 Pro"), .boot("SIM-1"),
+        #expect(s.simulator.calls == [.ensureDevice("Brahma acme phone", "iPhone 15 Pro"), .boot("SIM-1"),
                                       .install("SIM-1", app.resolvedForSandbox), .launch("SIM-1", "com.acme.app")], "\(s.simulator.calls)")
         // The demo: a screenshot in the engine's logs directory, named for the surface and the sprint.
         let state = PreviewState(surfaceId: "s1", companyId: "c1", status: .running, updatedAt: Date(), simulatorId: "SIM-1")
@@ -162,15 +162,15 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
     /// shuts down a sibling's device.
     @Test func iosDevicePerSurface() async throws {
         let sim = FakeSimulator()
-        sim.udids = ["Brahma acme-phone": "SIM-P", "Brahma acme-pad": "SIM-T"]
+        sim.udids = ["Brahma acme phone": "SIM-P", "Brahma acme pad": "SIM-T"]
         let phone = try Self.setup(kind: .ios, simulator: sim)
         let pad = try Self.setup(kind: .ios, device: "iPad Pro 13-inch (M5)", name: "pad", simulator: sim)
         let p = await IOSAdapter(deps: phone.deps).start(phone.context)
         let t = await IOSAdapter(deps: pad.deps).start(pad.context)
         #expect(p.status == .running && p.simulatorId == "SIM-P", "\(p)")
         #expect(t.status == .running && t.simulatorId == "SIM-T", "\(t)")
-        #expect(sim.calls.contains(.ensureDevice("Brahma acme-phone", "iPhone 15 Pro")) && sim.calls.contains(.ensureDevice("Brahma acme-pad", "iPad Pro 13-inch (M5)")))
-        #expect(SimctlController.deviceName(slug: "acme", surface: "phone") == "Brahma acme-phone" && SimctlController.isBrahmaDevice("Brahma acme-phone"))
+        #expect(sim.calls.contains(.ensureDevice("Brahma acme phone", "iPhone 15 Pro")) && sim.calls.contains(.ensureDevice("Brahma acme pad", "iPad Pro 13-inch (M5)")))
+        #expect(SimctlController.deviceName(slug: "acme", surface: "phone") == "Brahma acme phone" && SimctlController.isBrahmaDevice("Brahma acme phone"))
         // Stopping the phone leaves the pad's device alone.
         await IOSAdapter(deps: phone.deps).stop(phone.context, state: PreviewState(surfaceId: "s1", companyId: "c1", status: .running, updatedAt: Date(), simulatorId: "SIM-P"))
         #expect(sim.calls.contains(.shutdown("SIM-P")) && !sim.calls.contains(.shutdown("SIM-T")), "\(sim.calls)")
@@ -179,7 +179,7 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
         let script = SimctlScript(devices: try Self.fixture("simctl-devices"), types: try Self.fixture("simctl-devicetypes"))
         let ctl = SimctlController(exec: script.exec, available: { true })
         #expect(try ctl.ensureDevice(name: SimctlController.deviceName(slug: "acme", surface: "phone"), deviceType: "iPhone 15 Pro") == "NEW-UDID-1")
-        #expect(script.argvs.last == ["create", "Brahma acme-phone", "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro"], "\(script.argvs)")
+        #expect(script.argvs.last == ["create", "Brahma acme phone", "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro"], "\(script.argvs)")
     }
 
     /// Fix round 1, M1: a start that fails after `boot` (install, launch) shuts the device down again; nothing stays booted.
