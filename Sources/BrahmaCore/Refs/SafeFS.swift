@@ -23,6 +23,8 @@ public enum SafeFSError: Error, Equatable, Sendable {
     case privateTo(String)
     /// A path outside `.brahma/` named through `open(workspacePath:)`: tracked files go through git.
     case notInPlace
+    /// `createExclusive` found the name taken (by anything: a file, a link, a directory).
+    case exists
     /// Anything else (does not exist, cannot be opened or read, cannot be created), with the reason.
     case io(String)
 }
@@ -185,9 +187,7 @@ public final class SafeFS: @unchecked Sendable {
         let dir = ".brahma/labs/\(ownHandle)/\(subParts.joined(separator: "/"))"
         do {
             try EngineFiles.directory(workspace: workspace, dir)
-            guard try EngineFiles.create(data, workspace: workspace, dir: dir, name: name, mode: 0o444) else {
-                throw SafeFSError.io("\(sub)/\(name) exists")
-            }
+            guard try EngineFiles.create(data, workspace: workspace, dir: dir, name: name, mode: 0o444) else { throw SafeFSError.exists }
         } catch let e as UnsafeEngineFile {
             throw Self.map(e)
         }

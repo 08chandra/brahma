@@ -276,6 +276,8 @@ extension Store {
             if triggerAfterLanding { try MergeSafety(store: self).afterLanding(companyId: company.id, mergedKey: item.key) }
 
         case .rebased(let head):
+            // Plan C2a (ruling 5): the rewritten commits are as tainted as the ones they replay.
+            carryTaintThroughRebase(item: item, rebased: head, now: now)
             let base = try? git.mergeBase(GitWorkspace.mainRef, head)
             try writer.write { db in
                 // The engine moved the branch: the rebased head is the recorded head the next submit (and the next holder

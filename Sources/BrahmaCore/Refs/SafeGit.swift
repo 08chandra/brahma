@@ -310,6 +310,11 @@ public struct SafeGit: Sendable {
     public func hashObject(from file: SafeFile) throws -> String {
         let data: Data
         do { data = try file.readAll() } catch { throw SafeGitError.io("\(error)") }
+        return try hashObject(data: data)
+    }
+
+    /// Writes exactly `data` (bytes the caller already read from a `SafeFS` descriptor and checked) as a blob and returns its id.
+    public func hashObject(data: Data) throws -> String {
         guard let sha = Self.fullSha(try output(["hash-object", "-w", "--stdin", "--no-filters"], stdin: data)) else {
             throw SafeGitError.git("hash-object gave no id")
         }

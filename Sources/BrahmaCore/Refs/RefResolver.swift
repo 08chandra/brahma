@@ -22,11 +22,13 @@ extension Store {
     ///   `params["snapshot"]` its id), which needs the data home (`paths`); a committed diff's patch goes into the diff cache.
     /// - A private lab or notes file is never pinned (git is company-readable): it is shared as a snapshot
     ///   (`snapshotPrivateFile`, `WorkError.invalid`).
-    /// - Taint at pin time: a pin made by a session that read outside content (ML's `currentTaint`), or of `@worktree`
-    ///   content whose holder's session is tainted now, carries `params["taint"] = <source>` (`refTaint`: tainted;
-    ///   provenance `.external("tainted-session:<source>")`).
+    /// - Taint at pin time: a pin made by a session that read outside content (ML's `currentTaint`), or of tainted `@worktree`
+    ///   content (`refTaint`'s rules), carries `params["taint"] = <source>` (`refTaint`: tainted; provenance
+    ///   `.external("tainted-session:<source>")`).
+    /// - The secret gate (`secretGate`, with `knownValues`) runs before git or the vault sees a byte: a file with a stored
+    ///   secret's value or a secret pattern is not pinned (`WorkError.forbidden`); a diff keeps only its redacted text.
     public func pinRef(_ ref: WorkRef, for reader: Reader, companyId: String, messageRefId: String,
-                       paths: BrahmaPaths? = nil) throws -> WorkRef {
+                       knownValues: [(name: String, value: String)], paths: BrahmaPaths? = nil) throws -> WorkRef {
         let r = try resolveDetailed(ref, reader: reader, companyId: companyId, messageRefId: messageRefId)
         guard r.resolved.visibility == .full, let company = r.company, let subject = r.subject else {
             throw WorkError.forbidden("there is no such ref you can read")
@@ -52,13 +54,22 @@ extension Store {
             } catch is SafeFSError {
                 throw WorkError.forbidden("there is no such ref you can read")
             }
+            // The secret gate before git sees a byte: the company-readable object store never holds a secret. These exact bytes
+            // are scanned and hashed (never read again from the file).
+            let data = try file.readAll()
+            let scan = try Self.secretGate(data, shown: ref.canonical, knownValues: knownValues)
+            if let finding = scan.findings.first {
+                throw WorkError.forbidden("\(ref.canonical) looks like it contains a secret (\(finding.label)"
+                                          + (finding.line > 0 ? ", line \(finding.line)" : "") + "); remove it before sharing")
+            }
             let git = try refGit(workspace)
-            let blob = try git.hashObject(from: file)
+            let blob = try git.hashObject(data: data)
             try git.updateShareRef(messageRefId, to: blob)
             pinned.rev = blob
             pinned.params["share"] = messageRefId
+            // `@worktree` content keeps the taint it has now (the holder's session, the item's mark, the branch's commits).
             if ref.isWorktree, source == nil, let item = try writer.read({ db in try RefAccess.item(db, companyId, ref.itemKey ?? "") }) {
-                source = try holderSource(item: item)
+                source = try contentSource(ref, item: item)
             }
         case .diff(let item) where ref.isWorktree && ref.params["snapshot"] == nil:
             guard let paths else { throw WorkError.invalid("an uncommitted diff is kept as a vault snapshot; it needs the data home") }
@@ -67,11 +78,11 @@ extension Store {
             defer { try? FileManager.default.removeItem(at: temp) }
             let worktree = workspace.appending(path: ".brahma/wt/\(item.key)", directoryHint: .isDirectory)
             let diff = try refGit(workspace).worktreeDiff(key: item.key, worktree: worktree, tempDir: temp, fs: fs)
-            let holder = try holderSource(item: item)
-            let taint = source ?? holder
+            let taint = try source ?? contentSource(ref, item: item)
             let id = UUID().uuidString
             let vault = Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths))
-            let data = Data(diff.patch.utf8)
+            // Only the redacted text is kept (secret patterns and stored secrets' values).
+            let data = Data(ContentScan.redact(text: diff.patch, findings: [], knownValues: knownValues).utf8)
             let written = try vault.write(data, area: .snapshots, name: "\(id).patch")
             do {
                 try writer.write { db in
@@ -90,7 +101,7 @@ extension Store {
                 let git = try refGit(workspace)
                 _ = try cachedDiff(companyId: companyId, git: git, base: try git.mergeBase("main", head), head: head,
                                    file: ref.params["file"], vault: Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths)),
-                                   taint: try refTaint(pinned, companyId: companyId))
+                                   taint: try refTaint(pinned, companyId: companyId), knownValues: knownValues)
             }
         default:
             break
@@ -163,10 +174,10 @@ extension Store {
         } catch is Outcome, is SafeGitError, is SafeFSError, is VaultError {
             return blank(.missing)
         }
-        // Plan C2a: git-backed and live content carries the taint of the session that made it (`refTaint`).
-        if ref.kind == .file || ref.kind == .diff {
-            let taint = try refTaint(ref, companyId: companyId)
-            details.tainted = taint.tainted
+        // Plan C2a: every kind carries the taint of the session that made it (`refTaint`), OR-ed into what the row says.
+        let taint = try refTaint(ref, companyId: companyId)
+        if taint.tainted {
+            details.tainted = true
             details.taintReason = taint.reason
         }
         if let source = ref.params["taint"] { details.provenance = .external("tainted-session:\(source)") }
@@ -234,8 +245,9 @@ extension Store {
             let place = channel.kind == .dm ? "DM" : "#\(channel.name)"
             let provenance: Provenance = m.senderId == "owner" ? .owner : m.senderId == "system" ? .engine : .agent(m.senderId)
             return Details(title: (ref.kind == .thread ? "Thread in " : "Message in ") + place, subtitle: Self.safe(m.text),
-                           bytes: m.text.utf8.count, provenance: provenance, tainted: m.taintedOrigin,
-                           taintReason: m.taintedOrigin ? "from a session that read outside content" : nil, pinned: ref)
+                           bytes: m.text.utf8.count, provenance: provenance, tainted: m.taintedOrigin || m.fromTaintedSession,
+                           taintReason: m.taintedOrigin || m.fromTaintedSession
+                               ? Self.sessionReason(m.taintSource ?? "outside content") : nil, pinned: ref)
         case .agent(let agent):
             var pinned = ref
             pinned.params["was"] = agent.state.rawValue
