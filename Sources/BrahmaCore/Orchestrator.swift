@@ -821,6 +821,9 @@ public actor Orchestrator {
         var leaseHead: (git: GitWorkspace, item: WorkItem, held: Bool)?
         // Plan C2a: the head of every item branch the agent holds as the turn starts (where its turn-end taint record starts).
         var heldAtStart: [String: String] = [:]
+        // P2 R4-3: every item the agent holds as the turn starts, from its leases (not git: an item whose branch head can't
+        // be read then is held all the same) and the turn's own lease; the turn-end mark and record take each of them.
+        var heldItemsAtStart: Set<String> = []
         // Task 10: the turn's taint (marked once, from the stream's backup path) and the workspace whose lab is recorded at the end.
         var taintMarked = false
         var recordedSources: Set<String> = []
@@ -937,6 +940,11 @@ public actor Orchestrator {
                     }
                 }
                 heldAtStart = await blocking.run { store.leaseHeads(agentId: agent.id, workspace: workspace) }
+                heldItemsAtStart = Set(heldAtStart.keys)
+                if let lease = c.lease, lease.agentId == agent.id { heldItemsAtStart.insert(lease.itemId) }
+                do { heldItemsAtStart.formUnion(try store.leases(agentId: agent.id).map(\.itemId)) } catch {
+                    self.log("could not read the leases \(agent.name) holds at turn start: \(error)")
+                }
                 // Only work updates to read and nothing to answer: a notice-only turn (cheapest model for `auto` agents). A
                 // leaseholder's updates are its work, so its turns stay work turns.
                 if c.onlyNotices, c.lease == nil { kind = .notice }
@@ -1496,12 +1504,13 @@ public actor Orchestrator {
         // cooperative pool.
         if launched {
             let (store, paths, turnId, started, leasedItem) = (self.store, self.paths, turn.id, heldAtStart, leaseHead?.item.id)
+            let held = Array(heldItemsAtStart)
             await blocking.run {
                 let source: String?
                 do { source = try store.currentTaint(agentId: agent.id, paths: paths) } catch { source = "session" }
                 guard let source else { return }
                 store.recordTurnTaints(companyId: agent.companyId, agentId: agent.id, turnId: turnId, heldAtStart: started,
-                                       leasedItemId: leasedItem, source: source, now: now)
+                                       heldItemsAtStart: held, leasedItemId: leasedItem, source: source, now: now)
             }
         }
 
@@ -1539,10 +1548,11 @@ public actor Orchestrator {
         // Task 10: the lab's new commits are recorded with the session's taint state, then a fresh session a refused high-risk
         // call asked for is applied (both flags and the flag file cleared). Git, off the cooperative pool.
         // A tainted session marks every item it holds at turn end, leases taken mid-turn included (S21), and (Plan C Ruling 20)
-        // every item the turn touched and released: held as it started, or in its claim log. The hook flag is read under `paths`.
+        // every item the turn touched and released: held as it started (R4-3: from its leases, whether or not git could read
+        // the branch head then, and its own lease), or in its claim log. The hook flag is read under `paths`.
         if launched, !isReview {
             attempt {
-                try store.markHeldItemsIfTainted(agentId: agent.id, turnId: turn.id, heldAtStart: Array(heldAtStart.keys), home: paths.home)
+                try store.markHeldItemsIfTainted(agentId: agent.id, turnId: turn.id, heldAtStart: Array(heldItemsAtStart), home: paths.home)
             }
         }
         if launched, let labWorkspace {
