@@ -158,8 +158,7 @@ public enum RefAccess {
             return s
         case .artifact:
             // 4a's published artifact (company class, like the preview pane that shows it). Its taint is its row's.
-            guard let n = Int(ref.id), let artifact = try Artifact.fetchOne(db, sql: "SELECT * FROM artifact WHERE companyId = ? AND number = ?",
-                                                                            arguments: [companyId, n]) else { return nil }
+            guard let n = Int(ref.id), let artifact = try artifact(db, companyId, number: n) else { return nil }
             return Subject(record: .artifact(artifact))
         case .resource:
             guard let n = Int(ref.id), let r = try Store.resource(db: db, companyId: companyId, number: n), r.removedAt == nil
@@ -241,6 +240,21 @@ public enum RefAccess {
 
     static func item(_ db: Database, _ companyId: String, _ key: String) throws -> WorkItem? {
         try WorkItem.fetchOne(db, sql: "SELECT * FROM workItem WHERE companyId = ? AND key = ?", arguments: [companyId, key])
+    }
+
+    /// 4a's `Store.artifact(companyId:number:)` inside a read the caller holds.
+    static func artifact(_ db: Database, _ companyId: String, number: Int) throws -> Artifact? {
+        try Artifact.filter(Column("companyId") == companyId && Column("number") == number).fetchOne(db)
+    }
+
+    /// The folder name of an artifact whose row has 4a's shape (`storedPath` exactly `.brahma/artifacts/<folder>`, not a dot
+    /// folder; `entryFile` a relative path with no empty, `.` or `..` part), else nil: nothing else is ever opened for it.
+    static func artifactFolder(_ a: Artifact) -> String? {
+        let folder = (a.storedPath as NSString).lastPathComponent
+        let entry = a.entryFile.split(separator: "/", omittingEmptySubsequences: false)
+        guard a.storedPath == ".brahma/artifacts/\(folder)", !folder.isEmpty, !folder.hasPrefix("."), !entry.isEmpty,
+              entry.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { return nil }
+        return folder
     }
 
     static func handle(_ db: Database, _ companyId: String, _ agentId: String) throws -> String? {

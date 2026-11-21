@@ -82,16 +82,34 @@ struct CollabFixture {
 
     /// `name` written to the workspace of `company` (C by default) with `body`, and published there by the owner (4a's
     /// `publishArtifact`): its `AR-<n>`.
+    /// Unless it is committed on `main` at the recorded head (`publishCommitted`), it reads tainted (ruling 16).
     @discardableResult
-    func publish(_ name: String, _ body: String, title: String = "Page", in company: Company? = nil) throws -> Artifact {
+    func publish(_ name: String, _ body: String, title: String = "Page", in company: Company? = nil, itemKey: String? = nil) throws -> Artifact {
         let co = company ?? c
         let ws = URL(fileURLWithPath: co.workspacePath, isDirectory: true)
         let url = ws.appending(path: name)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(body.utf8).write(to: url)
         return try store.publishArtifact(companyId: co.id, by: .owner, sourcePath: name.split(separator: "/").first.map(String.init) ?? name,
-                                         title: title, itemKey: nil, baseDirectory: ws)
+                                         title: title, itemKey: itemKey, baseDirectory: ws)
     }
+
+    /// `name` committed on C's `main` with `body`, that commit recorded as main's head (`company.mainCommit`), then published
+    /// by the owner: an artifact whose source provenance checks out clean (ruling 16).
+    @discardableResult
+    func publishCommitted(_ name: String, _ body: String, title: String = "Page", itemKey: String? = nil) throws -> Artifact {
+        try recordMain(try commit([name: Data(body.utf8)], message: "add \(name)"))
+        return try publish(name, body, title: title, itemKey: itemKey)
+    }
+
+    /// Records `sha` (or nil) as C's engine-recorded main head.
+    func recordMain(_ sha: String?) throws {
+        let cId = c.id
+        try store.writer.write { db in try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [sha, cId]) }
+    }
+
+    /// The workspace's real path (4a records `sourcePath` under it).
+    var workspaceRealPath: String { Store.realPath(workspace.path) ?? workspace.path }
 
     /// Marks `AR-<number>` of C tainted (as a publish by a tainted session records it).
     func taintArtifact(_ number: Int, reason: String = "written by a session that read docs.swift.org") throws {
@@ -336,7 +354,7 @@ struct CollabFixture {
     @Test func artifactOpensAndMaterializes() throws {
         let cf = try CollabFixture()
         let body = "<html><body>\n<p>Hello</p>\n</body></html>\n"
-        let a = try cf.publish("page.html", body, title: "Landing")
+        let a = try cf.publishCommitted("page.html", body, title: "Landing")
         #expect(a.ref == "AR-1")
         let out = try cf.open(.qa2, "AR-1")
         let lines = out.text.components(separatedBy: "\n")
@@ -353,7 +371,7 @@ struct CollabFixture {
         #expect(cf.failure { try cf.open(.concierge, "AR-1", copy: true) } == Store.copyUnavailable)
         #expect(cf.failure { try cf.open(.qa2, "AR-9") } == Store.refUnavailable)
         // A folder opens (and copies) its entry file.
-        try cf.publish("site/index.html", "<h1>Site</h1>\n", title: "Site")
+        try cf.publishCommitted("site/index.html", "<h1>Site</h1>\n", title: "Site")
         #expect(try cf.open(.qa2, "AR-2").text.contains("    | <h1>Site</h1>"))
         #expect(try cf.open(.qa2, "AR-2", copy: true).materializedPath == ".brahma/labs/qa-2/in/AR-2-1.html")
         // Its copy gone from disk: the generic answer, nothing thrown past it.
@@ -374,7 +392,7 @@ struct CollabFixture {
         }
         #expect(cf.failure { try cf.open(.qa2, "AR-1", copy: true) } == Store.refUnavailable)
         #expect(try cf.store.refTaint(try cf.fx.ref("AR-1"), companyId: cf.c.id) == (false, nil))
-        try cf.publish("c.html", "<p>C page</p>\n", title: "C page")
+        try cf.publishCommitted("c.html", "<p>C page</p>\n", title: "C page")
         let mine = try cf.open(.qa2, "AR-1").text
         #expect(mine.contains("    | <p>C page</p>") && !mine.contains("D only"))
         // An agent of D gets the generic answer for C's AR-1.
