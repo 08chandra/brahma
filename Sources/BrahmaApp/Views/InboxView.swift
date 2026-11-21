@@ -251,6 +251,12 @@ private struct InboxCard: View {
                     Button("Vouch for restored commits") { run { await model.vouchRestoredCommits(askId: row.id) } }
                         .buttonStyle(.brahma).disabled(busy)
                 }
+                if row.canVouchFile {
+                    // C2b fix round 5 (Ruling 38): the owner vouches for exactly the bytes the secret gate refused for
+                    // their structure.
+                    Button("Vouch for this file") { run { await model.vouchFile(askId: row.id) } }
+                        .buttonStyle(.brahma).disabled(busy)
+                }
                 if row.canRescind {
                     Button("Rescind…") { showRescind = true }.buttonStyle(.brahma)
                         .popover(isPresented: $showRescind, arrowEdge: .bottom) { rescindPopover }

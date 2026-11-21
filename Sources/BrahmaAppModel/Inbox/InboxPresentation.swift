@@ -47,6 +47,9 @@ public struct InboxRow: Equatable, Identifiable, Sendable {
     /// The restore alert of a company with a restore epoch the owner has not cleared (Plan C P2, Ruling 26): the owner can
     /// vouch for the commits the restore could not place (`AppModel.vouchRestoredCommits`).
     public var canVouchRestore: Bool = false
+    /// The alert about a file the secret gate refused for its structure (C2b fix round 5, Ruling 38): the owner can vouch
+    /// for exactly those bytes (`AppModel.vouchFile`).
+    public var canVouchFile: Bool = false
 }
 
 public enum InboxRows {
@@ -93,7 +96,8 @@ public enum InboxRows {
                 canAcknowledge: (pending && a.kind == .engineAlert) || section == .fyi,
                 decidedLine: decided,
                 approveLabel: quarantine ? "Merge into main" : "Approve",
-                canVouchRestore: pending && a.kind == .engineAlert && a.subjectId == Store.restoreAlertSubject && work.restoreVouchOpen)
+                canVouchRestore: pending && a.kind == .engineAlert && a.subjectId == Store.restoreAlertSubject && work.restoreVouchOpen,
+                canVouchFile: pending && Store.isFileVouchAlert(a))
         }
         return work.inbox.map { row($0, .pending) } + work.fyi.map { row($0, .fyi) } + work.recentDecided.map { row($0, .recent) }
     }

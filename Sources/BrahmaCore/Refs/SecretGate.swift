@@ -211,18 +211,26 @@ public enum ArchiveMemberScan {
         try budget.ensure(level < budget.depth)
         let entries: [ZipInventory.Entry]
         do { entries = try ZipInventory.entries(of: data) } catch { throw ArchiveReadError.unreadable }
-        let files = entries.filter { !isDirectoryEntry($0) }
+        var files = entries.filter { !isDirectoryEntry($0) }
         if files.contains(where: \.isSymlink) { throw ArchiveReadError.unsafe }
         guard files.count <= ArchiveLimits.maxMembers else { throw tooMany }
         // m-1: the local header's encryption bit must agree with the central directory's.
-        if files.contains(where: { ($0.method != 0 && $0.method != 8) || $0.flags & 0x1 != 0 || $0.localFlags & 0x1 != $0.flags & 0x1 }) {
-            throw unscannableMethod
+        func unscannable(_ e: ZipInventory.Entry) -> Bool {
+            (e.method != 0 && e.method != 8) || e.flags & 0x1 != 0 || e.localFlags & 0x1 != e.flags & 0x1
+        }
+        if files.contains(where: unscannable) {
+            // Round 5 (ruling 38): in a file the owner vouched for, the members that can be read still are (and scanned);
+            // only those that can't are left out.
+            guard budget.vouched else { throw unscannableMethod }
+            files = files.filter { !unscannable($0) }
         }
         budget.entries -= files.count
         guard budget.entries >= 0, files.reduce(0, { $0 + $1.uncompressedSize }) <= budget.bytes else { throw overBudget }
         guard !files.isEmpty else { return [] }
         try budget.launch()
-        let members = try archives.members(of: data, wanted: { _ in true },
+        // (A vouched archive with members left out asks only for the rest.)
+        let wanted = Set(files.map(\.name)), every = !budget.vouched
+        let members = try archives.members(of: data, wanted: { every || wanted.contains($0) },
                                            limits: ArchiveLimits(bytes: budget.bytes, ratio: ArchiveLimits.maxRatio))
         // Every file entry exactly once, each with the length the directory declares: nothing the reader skipped or could
         // not decode goes unscanned (a failed inflate is short, never empty-and-clean).
@@ -274,10 +282,14 @@ final class ArchiveScanBudget {
     var launches: Int
     let depth: Int
     let deadline: TimeInterval
+    /// Round 5 (ruling 38): the owner vouched for the exact bytes being checked: their structure refusals (a PDF whose
+    /// structure couldn't be verified, a part in a format the engine can't open, archive members it can't decode) give way
+    /// to scanning everything that can be read, at every level.
+    let vouched: Bool
 
     init(bytes: Int = ArchiveLimits.maxBytes, entries: Int = ArchiveScanBudget.maxEntries, depth: Int = ArchiveMemberScan.maxDepth,
-         seconds: TimeInterval = 120, launches: Int = ArchiveScanBudget.maxLaunches) {
-        self.bytes = bytes; self.entries = entries; self.launches = launches; self.depth = depth
+         seconds: TimeInterval = 120, launches: Int = ArchiveScanBudget.maxLaunches, vouched: Bool = false) {
+        self.bytes = bytes; self.entries = entries; self.launches = launches; self.depth = depth; self.vouched = vouched
         deadline = AwakeTime.uptime() + seconds
     }
 
@@ -372,15 +384,29 @@ public enum SecretGate {
     }
 
     /// `check` without the throw for a stored value (the app's render point blanks instead); the alert is raised the same.
+    /// Round 5 (ruling 38): a STRUCTURE refusal (`StructureRefusal`: a PDF whose structure couldn't be verified, bytes or a
+    /// part compressed in a format the engine can't open, archive members it can't decode) names the exact command by which
+    /// the owner can vouch for the file (`vouchHint`), records the refused bytes and alerts the owner
+    /// (`Store.recordStructureRefusal`); once the owner vouched for these exact bytes under this name in this company
+    /// (`Store.isFileVouched`), those refusals give way and everything readable is scanned as usual.
     static func verdict(_ data: Data, ext: String, canonical: String, archives: any ArchiveReader,
                         knownValues: [(name: String, value: String)], store: Store, companyId: String,
                         chunk: Int = ContentScan.chunkBytes) throws -> ScanVerdict {
         let sha = SHA256.hex(data)
+        let vouched = store.isFileVouched(companyId: companyId, canonical: canonical, sha256: sha)
+        // A vouched file's verdict is its own: the same bytes under another name, or in another company, are not vouched.
         let version = chunk == ContentScan.chunkBytes
-            ? cacheVersion(store: store, companyId: companyId, ext: ext, knownValues: knownValues) : nil
+            ? cacheVersion(store: store, companyId: companyId, ext: ext, knownValues: knownValues).map { vouched ? $0 + "|vouched" : $0 } : nil
         let result: ScanVerdict
         let name = shown(canonical, knownValues: knownValues)
+        func structural(_ reason: String) -> WorkError {
+            store.recordStructureRefusal(companyId: companyId, canonical: canonical, shown: name, sha256: sha, reason: reason, now: Store.now())
+            return WorkError.invalid(reason + vouchHint(store: store, companyId: companyId, shown: name))
+        }
         if let version, let refused = ScanCache.shared.refusal(sha256: sha, version: version) {
+            if refused.hasPrefix(structureMark) {
+                throw structural(String(refused.dropFirst(structureMark.count)).replacingOccurrences(of: refToken, with: name))
+            }
             throw WorkError.invalid(refused.replacingOccurrences(of: refToken, with: name))
         }
         if let version, let cached = ScanCache.shared.result(sha256: sha, version: version) {
@@ -389,7 +415,11 @@ public enum SecretGate {
             // Round 3 (m-A): a refusal is cached like a verdict, its ref's name left out (a token stands for it), unless it
             // may pass on another try (no reader, a reader that could not run or ran out of time).
             do {
-                result = try compute(data, ext: ext, archives: archives, knownValues: knownValues, chunk: chunk, shown: refToken)
+                result = try compute(data, ext: ext, archives: archives, knownValues: knownValues, chunk: chunk, shown: refToken,
+                                     vouched: vouched)
+            } catch let refusal as StructureRefusal {
+                if let version { ScanCache.shared.storeRefusal(sha256: sha, version: version, message: structureMark + refusal.message) }
+                throw structural(refusal.message.replacingOccurrences(of: refToken, with: name))
             } catch let error as WorkError {
                 if let version, case .invalid(let message) = error, !transientRefusals.contains(message) {
                     ScanCache.shared.storeRefusal(sha256: sha, version: version, message: message)
@@ -404,6 +434,38 @@ public enum SecretGate {
                                     label: finding.label, now: Store.now())
         }
         return result
+    }
+
+    /// Round 5 (ruling 38): a refusal of the bytes' STRUCTURE, not of anything found in them; the owner may vouch for the
+    /// exact file. `message` names the ref as `refToken`, if at all.
+    struct StructureRefusal: Error {
+        let message: String
+    }
+
+    /// What marks a cached structure refusal.
+    static let structureMark = "\u{2}structure\u{2}"
+
+    /// The refusals of the reader that are about structure (`StructureRefusal`).
+    static func isStructural(_ e: ArchiveReadError) -> Bool {
+        e == SandboxedPDFReader.unaccounted || e == ArchiveMemberScan.unscannableMethod || EmbeddedContent.isFormatRefusal(e.message)
+    }
+
+    /// The end of a structure refusal: the exact command by which the owner can vouch for the file (`brahma vouch file
+    /// <company slug> <name as shown>`, the name quoted for the shell when it needs it); the Inbox when the name is withheld.
+    static func vouchHint(store: Store, companyId: String, shown: String) -> String {
+        guard shown != withheldName, let company = try? store.company(id: companyId) else {
+            return " — the owner can vouch for this exact file from the Inbox"
+        }
+        return " — the owner can vouch for this exact file: brahma vouch file \(company.slug) \(shellQuoted(shown))"
+    }
+
+    /// `text` as one shell word for the vouch command's last argument: as is when it holds only characters no shell treats
+    /// specially, else in single quotes; after `--` when it starts with `-` (so it is never read as an option).
+    static func shellQuoted(_ text: String) -> String {
+        let plain = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@_+:,./-")
+        let word = !text.isEmpty && text.unicodeScalars.allSatisfy({ plain.contains($0) })
+            ? text : "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        return text.hasPrefix("-") ? "-- " + word : word
     }
 
     /// What stands for the ref's name in a cached refusal.
@@ -426,21 +488,23 @@ public enum SecretGate {
     }
 
     static func compute(_ data: Data, ext: String, archives: any ArchiveReader, knownValues: [(name: String, value: String)],
-                        chunk: Int, shown: String) throws -> ScanVerdict {
+                        chunk: Int, shown: String, vouched: Bool = false) throws -> ScanVerdict {
         let expanded = EncodedForms.expand(knownValues)
         let raw = try ArchiveMemberScan.scanBytes(data, expanded: expanded, chunk: chunk)
         if let known = raw.first(where: \.isKnownValue) { return .knownValue(known) }
-        // Ruling 29: compressed data the engine can't open is never passed as clean.
-        if let format = ArchiveMemberScan.unscannableFormat(data) {
-            throw WorkError.invalid("\(shown) is compressed as \(format), which can't be scanned for secrets; share the files inside instead")
+        // Ruling 29: compressed data the engine can't open is never passed as clean (round 5, ruling 38: unless the owner
+        // vouched for these exact bytes; their own bytes were scanned just above).
+        if let format = ArchiveMemberScan.unscannableFormat(data), !vouched {
+            throw StructureRefusal(message: "\(shown) is compressed as \(format), which can't be scanned for secrets; share the files inside instead")
         }
         // One budget for everything decoded from these bytes: archive members, PDF parts and PNG text at every level
         // (R1-6, ruling 33).
         let decoded: [ScanFinding]
         do {
-            decoded = try EmbeddedContent.scan(data, ext: ext, archives: archives, expanded: expanded, budget: ArchiveScanBudget(),
-                                               level: 0, chunk: chunk)
+            decoded = try EmbeddedContent.scan(data, ext: ext, archives: archives, expanded: expanded,
+                                               budget: ArchiveScanBudget(vouched: vouched), level: 0, chunk: chunk)
         } catch let e as ArchiveReadError {
+            if isStructural(e) { throw StructureRefusal(message: e.message) }
             throw WorkError.invalid(e == .unavailable ? "archives can't be scanned on this machine" : e.message)
         }
         if let known = decoded.first(where: \.isKnownValue) { return .knownValue(known) }
@@ -513,6 +577,8 @@ public enum SecretGate {
                 throw WorkError.invalid("\(label) still looks like it holds a secret after redaction, so no copy of it is made")
             }
             throw WorkError.invalid("no redacted copy of \(label) is made: the copy couldn't be checked again (\(error.message))")
+        } catch let refusal as StructureRefusal {
+            throw WorkError.invalid("no redacted copy of \(label) is made: the copy couldn't be checked again (\(refusal.message))")
         }
         guard again == .clean else {
             throw WorkError.invalid("\(label) still looks like it holds a secret after redaction, so no copy of it is made")

@@ -113,6 +113,41 @@ import GRDB
         #expect(!after.canVouchRestore, "the vouch is still offered with nothing left to clear")
     }
 
+    /// C2b fix round 5 (Ruling 38, R5-3): the alert the gate raises for a file it refused for its structure offers the
+    /// owner's vouch for that exact file (`AppModel.vouchFile`, the same path as `brahma vouch file`): the refused bytes are
+    /// vouched, an owner activity line is written, the alert is closed, and the gate then passes the same bytes. No other
+    /// alert offers it, and the action refuses any other ask.
+    @Test func fileRefusalAlertOffersTheFileVouch() async throws {
+        let w = try await WorkWorld.make()
+        let store = w.store, company = w.company
+        let pdf = Data("%PDF-1.7 flagged in the app".utf8)
+        func check() throws -> ScanVerdict {
+            try SecretGate.check(pdf, ext: "pdf", canonical: "docs/app.pdf", archives: FlaggedPDFReader(), knownValues: [], store: store,
+                                 companyId: company.id)
+        }
+        #expect(throws: WorkError.self) { try check() }
+        try await w.store.writer.write { db in
+            try Store.fileEngineAlert(db, company: company, reason: "other-alert", text: "something else", now: Date())
+        }
+        await w.refresh()
+        let alert = try #require(w.model.inboxRows.first { $0.kind == .engineAlert && $0.title.contains("docs/app.pdf") })
+        let other = try #require(w.model.inboxRows.first { $0.kind == .engineAlert && $0.title.contains("something else") })
+        #expect(alert.canVouchFile, "the structure refusal alert does not offer the vouch")
+        #expect(!other.canVouchFile)
+        await w.model.vouchFile(askId: other.id)
+        #expect(w.model.errorMessage != nil)
+        #expect(throws: WorkError.self) { try check() }
+        w.model.errorMessage = nil
+        await w.model.vouchFile(askId: alert.id)
+        #expect(w.model.errorMessage == nil, "\(w.model.errorMessage ?? "")")
+        #expect(try check() == .clean)
+        let lines = try await w.store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT text FROM activityEvent WHERE companyId = ? AND kind = 'access'", arguments: [company.id])
+        }
+        #expect(lines.contains { $0.contains("Owner vouched for docs/app.pdf") }, "\(lines)")
+        #expect(!(w.model.inboxRows.first { $0.id == alert.id }?.canVouchFile ?? false), "the vouch is still offered once done")
+    }
+
     @Test func changedDocumentRequiresAck() async throws {
         let w = try await WorkWorld.make()
         try w.writeDoc("docs/prd.md", "# Plan\n\nOriginal.")
@@ -246,4 +281,13 @@ import GRDB
         #expect(summary.inboxCount == 2)
         #expect(summary.badge == summary.unread + summary.waitingOnOwner + 2)
     }
+}
+
+/// A PDF reader whose helper found a structural anomaly and read nothing more (`UnverifiedPDF` with no parts).
+struct FlaggedPDFReader: ArchiveReader {
+    func members(of data: Data, wanted: @Sendable (String) -> Bool, limits: ArchiveLimits) throws -> [(name: String, data: Data)] {
+        throw ArchiveReadError.refused("no archives here")
+    }
+
+    func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] { throw UnverifiedPDF(parts: []) }
 }
