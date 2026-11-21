@@ -1,9 +1,10 @@
 import Foundation
 
 /// The vault's areas under `<home>/vault/<companyId>/`: ML's owner resources (`resources`, `ContentVault`'s), C's snapshots
-/// (worktree diffs as shared), the diff cache and temp copies.
+/// (worktree diffs as shared), the diff cache and temp copies; C2b-carry (c), Ruling 42: the flattened copies of PDFs the
+/// owner vouched for (`flattened/<vouch row id>.pdf`, `Store.gatedBytes`).
 public enum VaultArea: String, Sendable, CaseIterable {
-    case resources, snapshots, diffcache, tmp
+    case resources, snapshots, diffcache, tmp, flattened
 }
 
 public enum VaultError: Error, Equatable, Sendable {

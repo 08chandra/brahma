@@ -37,10 +37,15 @@ public protocol ArchiveReader: Sendable {
     /// Every decoded part of the PDF `data` (`SandboxedPDFReader`), at most `maxBytes` in all, within `timeout`. Throws
     /// `ArchiveReadError`; a reader without the PDF helper refuses (`"PDFs can't be scanned on this machine"`).
     func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart]
+    /// C2b-carry (c), Ruling 42: the flattened copy of the PDF `data` (`SandboxedPDFReader.flatten`: the visible pages
+    /// re-rendered, nothing else), at most `maxBytes`, within `timeout`. Throws `ArchiveReadError`; a reader without the PDF
+    /// helper refuses (`"PDFs can't be scanned on this machine"`).
+    func flattenPDF(of data: Data, maxBytes: Int, timeout: Duration) throws -> Data
 }
 
 extension ArchiveReader {
     public func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] { throw SandboxedPDFReader.unavailable }
+    public func flattenPDF(of data: Data, maxBytes: Int, timeout: Duration) throws -> Data { throw SandboxedPDFReader.unavailable }
 }
 
 /// Where no sandbox exists: nothing is unpacked.
@@ -97,6 +102,11 @@ public struct SandboxedUnzipReader: ArchiveReader {
     public func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] {
         guard let pdfHelper else { throw SandboxedPDFReader.unavailable }
         return try SandboxedPDFReader(runner: runner, helper: pdfHelper, scratch: scratch).parts(of: data, maxBytes: maxBytes, timeout: timeout)
+    }
+
+    public func flattenPDF(of data: Data, maxBytes: Int, timeout: Duration) throws -> Data {
+        guard let pdfHelper else { throw SandboxedPDFReader.unavailable }
+        return try SandboxedPDFReader(runner: runner, helper: pdfHelper, scratch: scratch).flatten(of: data, maxBytes: maxBytes, timeout: timeout)
     }
 
     public func members(of data: Data, wanted: @Sendable (String) -> Bool, limits: ArchiveLimits) throws -> [(name: String, data: Data)] {

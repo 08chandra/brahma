@@ -140,7 +140,11 @@ import GRDB
         w.model.errorMessage = nil
         await w.model.vouchFile(askId: alert.id)
         #expect(w.model.errorMessage == nil, "\(w.model.errorMessage ?? "")")
-        #expect(try check() == .clean)
+        // C2b-carry (c): the vouched PDF is served as its flattened copy (the original never passes as it is).
+        #expect(throws: WorkError.self) { try check() }
+        let served = try store.gatedBytes(pdf, ext: "pdf", canonical: "docs/app.pdf", companyId: company.id, archives: FlaggedPDFReader(),
+                                          knownValues: [], paths: w.paths)
+        #expect(served.isFlattenedCopy && served.verdict == .clean && served.data.starts(with: FlaggedPDFReader.copyMark))
         let lines = try await w.store.writer.read { db in
             try String.fetchAll(db, sql: "SELECT text FROM activityEvent WHERE companyId = ? AND kind = 'access'", arguments: [company.id])
         }
@@ -334,5 +338,13 @@ struct FlaggedPDFReader: ArchiveReader {
         throw ArchiveReadError.refused("no archives here")
     }
 
-    func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] { throw UnverifiedPDF(parts: []) }
+    static let copyMark = Data("%PDF-1.3 flattened in the app ".utf8)
+
+    func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] {
+        if data.starts(with: Self.copyMark) { return [PDFPart(kind: .pageText, data: Data("hello".utf8))] }
+        throw UnverifiedPDF(parts: [])
+    }
+
+    /// C2b-carry (c): a stand-in flattened copy, which it then reads as a verified PDF.
+    func flattenPDF(of data: Data, maxBytes: Int, timeout: Duration) throws -> Data { Self.copyMark + Data(SHA256.hex(data).utf8) }
 }

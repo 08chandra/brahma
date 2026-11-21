@@ -7,6 +7,7 @@
 // the engine up to a byte cap, past which it is killed) and scans what it hands back under the gate's one budget.
 //
 //     brahma-pdf <input.pdf> <max output bytes> [<memory limit in bytes>]
+//     brahma-pdf --flatten <input.pdf> <max output bytes> [<memory limit in bytes>]   (C2b-carry (c), Ruling 42: `Flatten`)
 //
 // What it does, with Apple's own reader (CoreGraphics, PDFKit):
 // 1. Lexes the file: every `<n> <g> obj` header (its exact byte offset) and the `endobj` that closes it, every `stream`
@@ -45,7 +46,8 @@
 //    index; a number that has a header and a type-2 row, rows that name two places, a row whose object stream is no
 //    stream object, and a member no revision's reader resolved are anomalies too. An anomaly no longer stops the read:
 //    everything readable is still read and written out in full, and the exit status is 5 (the engine refuses it unless
-//    the owner vouched for these exact bytes, ruling 38, and then scans every part as usual).
+//    the owner vouched for these exact bytes, ruling 38; C2b-carry (c), ruling 42: and then only as this helper's
+//    flattened copy, `Flatten`, which is checked again like any PDF).
 //    Breaker (B-1; Ruling 35 b, the class of Ruling 37): no view may mix revisions, since a reader that meets a gap in its
 //    view rebuilds it by scanning the whole file (poppler) and so takes objects from other revisions. Detected, never
 //    modelled, each an anomaly: (a) a cross-reference section (a table with a row or a trailer; a cross-reference stream a
@@ -442,7 +444,7 @@ final class Extraction {
     /// Every `startxref` value, in file order (the last one names the whole file's newest section).
     var startxrefs: [Int] = []
     /// Round 5: a structural anomaly was found. The helper still reads everything it can and writes it out in full, then
-    /// exits 5 (`unaccounted`): the engine refuses it, unless the owner vouched for these exact bytes (ruling 38).
+    /// exits 5 (`unaccounted`): the engine refuses it; a vouched one is served only as its flattened copy (ruling 42).
     var anomalous = false
     /// Every number some cross-reference section marks free (classic `f`, type-0 rows).
     var freed = Set<Int>()
@@ -1475,7 +1477,97 @@ final class Revision {
     }
 }
 
-let arguments = CommandLine.arguments
+/// C2b-carry (c), controller Ruling 42: `brahma-pdf --flatten <input.pdf> <max output bytes> [<memory limit>]`. A PDF the
+/// owner vouched for although its structure couldn't be verified is never shared as it is: what is shared is this copy.
+/// CoreGraphics opens the file (its own view of it, the one any Apple reader shows) and draws each page, vector, into a fresh
+/// PDF context (`drawPDFPage`, its crop box, its rotation applied): only the page content survives. Hidden revisions,
+/// objects nothing on a page draws, annotations (CoreGraphics draws none), form fields, attachments and embedded files,
+/// JavaScript and actions, the document's metadata and XMP, outlines and the page's own dictionaries are not carried over.
+/// The copy is then checked by the engine like any PDF (this helper's ordinary read included). No file is written: the copy
+/// goes to standard output as `BRAHMA-PDF-FLAT/1\n`, its length (8 bytes, big-endian), the PDF; all of it within the byte
+/// cap. An encrypted file (3), a file CoreGraphics can't open or draw, or with no page (7), more than `maxPages` pages
+/// (8) or a copy past the cap (6) is refused: the engine then says the file must be converted (printed to PDF) and added
+/// again.
+enum Flatten {
+    static let maxPages = 2000
+
+    static func run(_ original: Data, cap: Int) -> Never {
+        guard let provider = CGDataProvider(data: original as CFData), let document = CGPDFDocument(provider) else { fail(.unreadable) }
+        if document.isEncrypted || !document.isUnlocked { fail(.encrypted) }
+        let pages = document.numberOfPages
+        guard pages >= 1 else { fail(.unreadable) }
+        guard pages <= maxPages else { fail(.tooMany) }
+        let copy = NSMutableData()
+        // No auxiliary information: the copy names no title, author, subject, keywords or creator of the original.
+        guard let consumer = CGDataConsumer(data: copy as CFMutableData),
+              let context = CGContext(consumer: consumer, mediaBox: nil, nil) else { fail(.unreadable) }
+        for number in 1...pages {
+            guard let page = document.page(at: number) else { fail(.unreadable) }
+            let crop = page.getBoxRect(.cropBox)
+            let quarter = ((Int(page.rotationAngle) % 360) + 360) % 360
+            guard crop.width.isFinite, crop.height.isFinite, crop.width >= 1, crop.height >= 1, crop.width <= 200 * 72, crop.height <= 200 * 72,
+                  quarter % 90 == 0 else { fail(.unreadable) }
+            var box = quarter % 180 == 0 ? CGRect(x: 0, y: 0, width: crop.width, height: crop.height)
+                                         : CGRect(x: 0, y: 0, width: crop.height, height: crop.width)
+            let boxData = withUnsafeBytes(of: &box) { Data($0) } as CFData
+            context.beginPDFPage([kCGPDFContextMediaBox as String: boxData] as CFDictionary)
+            context.saveGState()
+            // The page's own rotation and crop box mapped onto the new page; nothing outside the crop box is drawn.
+            context.concatenate(page.getDrawingTransform(.cropBox, rect: box, rotate: 0, preserveAspectRatio: true))
+            context.clip(to: crop)
+            context.drawPDFPage(page)
+            context.restoreGState()
+            context.endPDFPage()
+            if copy.length > cap { fail(.cap) }
+        }
+        context.closePDF()
+        guard let written = freeingUnwritten(copy as Data) else { fail(.unreadable) }
+        let header = Data("BRAHMA-PDF-FLAT/1\n".utf8)
+        let length = UInt64(written.count)
+        let framed = header + Data((0..<8).reversed().map { UInt8((length >> (8 * UInt64($0))) & 0xFF) }) + written
+        guard framed.count <= cap else { fail(.cap) }
+        FileHandle.standardOutput.write(framed)
+        exit(0)
+    }
+
+    /// CoreGraphics' PDF context lists every object number it reserved, also those it never wrote, as an in-use row at
+    /// offset 0 (`0000000000 00000 n`), which the structure check rightly refuses (an in-use entry that is no header). In
+    /// the copy it just wrote, and only in its exact layout (one classic table, `xref`, one subsection `0 <count>`, rows
+    /// of 20 bytes, then `trailer`, named by the file's one `startxref`), each such row becomes a free row of the same length
+    /// (`0000000000 00001 f`); nothing else is touched. Nil (refused) for anything else.
+    static func freeingUnwritten(_ pdf: Data) -> Data? {
+        var b = [UInt8](pdf)
+        let tail = Array(b.suffix(64))
+        let key = Array("startxref".utf8)
+        var at = tail.count - key.count
+        while at >= 0, !matches(key, at: at, in: tail) { at -= 1 }
+        guard at >= 0 else { return nil }
+        var j = at + key.count
+        while j < tail.count, isWhite(tail[j]) { j += 1 }
+        var offset = 0, digits = 0
+        while j < tail.count, isDigit(tail[j]), digits < 12 { offset = offset * 10 + Int(tail[j] - 0x30); j += 1; digits += 1 }
+        guard digits > 0, offset < b.count else { return nil }
+        let head = Array("xref\n0 ".utf8)
+        guard matches(head, at: offset, in: b) else { return nil }
+        var i = offset + head.count, count = 0, countDigits = 0
+        while i < b.count, isDigit(b[i]), countDigits < 9 { count = count * 10 + Int(b[i] - 0x30); i += 1; countDigits += 1 }
+        guard countDigits > 0, i < b.count, b[i] == 0x0A, count >= 1 else { return nil }
+        i += 1
+        let (end, overflow) = i.addingReportingOverflow(count * 20)
+        guard !overflow, end <= b.count, matches(Array("trailer".utf8), at: end, in: b) else { return nil }
+        let unwritten = Array("0000000000 00000 n \n".utf8), free = Array("0000000000 00001 f \n".utf8)
+        for row in 0..<count {
+            let r = i + 20 * row
+            guard b[r + 10] == 0x20, b[r + 16] == 0x20, b[r + 17] == 0x6E || b[r + 17] == 0x66, b[r + 18] == 0x20, b[r + 19] == 0x0A else { return nil }
+            if row > 0, matches(unwritten, at: r, in: b) { b.replaceSubrange(r..<(r + 20), with: free) }
+        }
+        return Data(b)
+    }
+}
+
+var arguments = CommandLine.arguments
+let flattening = arguments.count >= 2 && arguments[1] == "--flatten"
+if flattening { arguments.remove(at: 1) }
 guard arguments.count == 3 || arguments.count == 4, let cap = Int(arguments[2]), cap > 0 else { fail(.usage) }
 /// The memory self-check: past `limit` the process exits at once (a decompression bomb needs no exploit to get there).
 func watchMemory(limit: Int) {
@@ -1489,6 +1581,7 @@ func watchMemory(limit: Int) {
 guard let limit = arguments.count == 4 ? Int(arguments[3]) : 1 << 30, limit > 0 else { fail(.usage) }
 watchMemory(limit: limit)
 guard let original = FileManager.default.contents(atPath: arguments[1]), !original.isEmpty else { fail(.unreadable) }
+if flattening { Flatten.run(original, cap: cap) }
 Extraction(original: original, cap: cap).run()
 #else
 // No PDFKit (Linux): nothing can be read here.

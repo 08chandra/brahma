@@ -22,11 +22,15 @@ public struct FileVouch: Codable, Equatable, Sendable, FetchableRecord, Persista
     public var refusedAt: Date
     public var vouchedBy: String?
     public var vouchedAt: Date?
+    /// C2b-carry (c), Ruling 42: for a vouched PDF, the SHA-256 of its flattened copy in the vault (`flattened/<id>.pdf`),
+    /// once made (`Store.gatedBytes`).
+    public var copySha256: String?
 
     public init(id: String = UUID().uuidString, companyId: String, canonicalHash: String, shown: String, sha256: String, reason: String,
-                refusedAt: Date, vouchedBy: String? = nil, vouchedAt: Date? = nil) {
+                refusedAt: Date, vouchedBy: String? = nil, vouchedAt: Date? = nil, copySha256: String? = nil) {
         self.id = id; self.companyId = companyId; self.canonicalHash = canonicalHash; self.shown = shown; self.sha256 = sha256
         self.reason = reason; self.refusedAt = refusedAt; self.vouchedBy = vouchedBy; self.vouchedAt = vouchedAt
+        self.copySha256 = copySha256
     }
 }
 
@@ -91,8 +95,9 @@ extension Store {
                 let how = "run \(SecretGate.vouchCommand(slug: company.slug, id: hash, sha256: sha256, shown: shown)), or use Vouch for "
                     + "this file here"
                 let text = "\(shown) was refused: \(reason). If you trust this exact file (sha256 \(sha256)), \(how). "
-                    + "A vouch skips only this check: Brahma still scans what it can read of the file and refuses a stored secret "
-                    + "or a secret pattern in it, and any change to the file ends the vouch."
+                    + "A vouch skips only this check. For a PDF, what Brahma then shares is a flattened re-render of its visible "
+                    + "pages, checked again like any file (the original is never shared); for other files Brahma still scans what "
+                    + "it can read and refuses a stored secret or a secret pattern in it. Any change to the file ends the vouch."
                 try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: reasonKey, companyId: companyId)
             }
         } catch {
@@ -249,8 +254,9 @@ extension Store {
         row.vouchedAt = now
         try row.update(db)
         try ActivityEvent(companyId: row.companyId, agentId: nil, turnId: nil, kind: .access,
-                          text: "Owner vouched for \(row.shown) (sha256 \(row.sha256.prefix(12))…): \(row.reason); Brahma now scans "
-                              + "what it can read of exactly these bytes", createdAt: now).insert(db)
+                          text: "Owner vouched for \(row.shown) (sha256 \(row.sha256.prefix(12))…): \(row.reason); a PDF is shared only "
+                              + "as a flattened re-render of its visible pages, other files pass with what Brahma can read of exactly "
+                              + "these bytes scanned", createdAt: now).insert(db)
         let key = Store.engineAlertKey(Self.fileVouchReasonPrefix + row.id)
         let alerts = try Ask.filter(Column("companyId") == row.companyId && Column("kind") == AskKind.engineAlert
                                     && Column("status") == AskStatus.pendingOwner.rawValue && Column("subjectId") == key).fetchAll(db)

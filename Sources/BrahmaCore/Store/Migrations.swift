@@ -1804,6 +1804,11 @@ enum Migrations {
                 t.uniqueKey(["companyId", "canonicalHash", "sha256"])
             }
         }
+        m.registerMigration("vC-file-flatten") { db in
+            // C2b-carry (c), Ruling 42: a vouched PDF is served only as its flattened copy, kept in the company's vault
+            // (`flattened/<row id>.pdf`); the copy's own SHA-256, which every read of it must match.
+            try db.alter(table: "fileVouch") { t in t.add(column: "copySha256", .text) }
+        }
     }
 }
 

@@ -25,7 +25,8 @@ public struct PDFPart: Equatable, Sendable {
 
 /// C2b fix round 5 (controller ruling 38): the helper found a structural anomaly (exit 5) but read the rest of the file;
 /// `parts` is everything it read. The gate refuses it (`SandboxedPDFReader.unaccounted`, with the owner's vouch command)
-/// unless the owner vouched for these exact bytes, and then scans every part as it scans any PDF's.
+/// at every level (C2b-carry (c), Ruling 42: a vouch no longer lifts it; a vouched PDF is served only as its flattened copy,
+/// `flatten`, `Store.gatedBytes`).
 public struct UnverifiedPDF: Error, Sendable {
     public let parts: [PDFPart]
     public init(parts: [PDFPart]) { self.parts = parts }
@@ -141,7 +142,7 @@ public struct SandboxedPDFReader: Sendable {
         case 4: throw Self.undecodable
         case 5:
             // Round 5 (ruling 38): a structural anomaly, with everything the helper could read written out in full. The
-            // parts are handed up as `UnverifiedPDF`: refused unless the owner vouched for these exact bytes. Output that
+            // parts are handed up as `UnverifiedPDF`, which the gate refuses (C2b-carry (c)). Output that
             // does not hold together can't be vouched for (breaker B-3: it says so, and names no vouch).
             guard let output = EngineFiles.readNoFollow(outDir.appending(path: Self.partsName), under: outDir, limit: maxBytes + 1),
                   let parts = try? Self.parse(output, maxBytes: maxBytes) else { throw Self.unverifiedUnread }
@@ -156,6 +157,60 @@ public struct SandboxedPDFReader: Sendable {
             throw Self.unreadable
         }
         return try Self.parse(output, maxBytes: maxBytes)
+    }
+
+    // MARK: C2b-carry (c), Ruling 42: the flattened copy
+
+    static let flatHeader = Data("BRAHMA-PDF-FLAT/1\n".utf8)
+    /// The helper could not make the copy (CoreGraphics can't open or draw the file, it has no page, it is encrypted, too
+    /// many pages, a copy past the cap, a crash, a kill, output that does not hold together).
+    public static let flattenFailed = ArchiveReadError.refused("this PDF can't be flattened")
+
+    /// The flattened copy of the PDF `data` (`brahma-pdf --flatten`): CoreGraphics' view of each page, drawn (vector) into a
+    /// fresh PDF; only the page content survives. Run like `parts` (the same sandbox: deny-default, nothing else run, no
+    /// fork, no file written, no network; the leader of its own session; the time and memory limits; standard output read
+    /// up to the byte cap, `maxBytes`, one byte more and the run is killed). Throws `ArchiveReadError`: `flattenFailed`
+    /// for anything but a copy that holds together; `tooLong` and `couldNotRun`, which may pass on another try.
+    public func flatten(of data: Data, maxBytes: Int, timeout: Duration = SandboxedPDFReader.timeout) throws -> Data {
+        guard maxBytes > Self.flatHeader.count + 8 else { throw ArchiveMemberScan.overBudget }
+        let dir = try scratch()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let held = dir.appending(path: "held", directoryHint: .isDirectory)
+        let out = dir.appending(path: "out", directoryHint: .isDirectory)
+        for d in [held, out] {
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        }
+        guard FileManager.default.createFile(atPath: held.appending(path: "input.pdf").path, contents: data,
+                                             attributes: [.posixPermissions: 0o400]) else { throw Self.flattenFailed }
+        let (heldDir, outDir) = (held.resolvedForSandbox, out.resolvedForSandbox)
+        let program = helper.resolvedForSandbox
+        let input = heldDir.appending(path: "input.pdf").path
+        let policy = Self.policy(helper: program, held: heldDir, out: outDir, memoryLimit: memoryLimit)
+        let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
+        let outcome = runner.runProgramBlocking(arguments: [program.path, "--flatten", input, String(maxBytes), String(helperMemoryLimit)],
+                                                cwd: outDir, environment: environment, timeout: min(timeout, Self.timeout),
+                                                outputURL: dir.appending(path: "helper.log"),
+                                                stdoutURL: outDir.appending(path: Self.partsName), stdoutCap: maxBytes, policy: policy)
+        if outcome.tail.hasSuffix(GroupRun.memoryExceeded) || outcome.tail.hasSuffix(GroupRun.outputExceeded) { throw Self.flattenFailed }
+        if outcome.timedOut { throw Self.tooLong }
+        guard let code = outcome.exitCode else { throw Self.couldNotRun }
+        guard code == 0, let output = EngineFiles.readNoFollow(outDir.appending(path: Self.partsName), under: outDir, limit: maxBytes + 1)
+        else { throw Self.flattenFailed }
+        return try Self.parseFlat(output, maxBytes: maxBytes)
+    }
+
+    /// The flatten output: `BRAHMA-PDF-FLAT/1\n`, an 8-byte big-endian length, exactly that many bytes, which start with
+    /// `%PDF-`. Anything else is `flattenFailed`.
+    static func parseFlat(_ output: Data, maxBytes: Int) throws -> Data {
+        let b = [UInt8](output)
+        let h = flatHeader.count
+        guard b.count <= maxBytes, b.count >= h + 8, Data(b[0..<h]) == flatHeader else { throw flattenFailed }
+        var length: UInt64 = 0
+        for k in 0..<8 { length = length << 8 | UInt64(b[h + k]) }
+        guard length == UInt64(b.count - h - 8) else { throw flattenFailed }
+        let pdf = Data(b[(h + 8)...])
+        guard pdf.starts(with: EmbeddedContent.pdfMagic) else { throw flattenFailed }
+        return pdf
     }
 
     /// The helper's output: `BRAHMA-PDF/1\n`, records (a kind byte, a 4-byte big-endian length, the payload), and an `E`

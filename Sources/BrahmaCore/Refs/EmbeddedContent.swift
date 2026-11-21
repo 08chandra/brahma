@@ -95,11 +95,12 @@ enum EmbeddedContent {
         let parts: [PDFPart]
         do {
             parts = try archives.pdfParts(of: data, maxBytes: budget.bytes, timeout: left)
-        } catch let unverified as UnverifiedPDF {
-            // Round 5 (ruling 38): a structure the helper couldn't verify is refused, unless the owner vouched for the file;
-            // then every part it read is scanned below like any PDF's (a stored value or a secret pattern still refuses).
-            guard budget.vouched else { throw SandboxedPDFReader.unaccounted }
-            parts = unverified.parts
+        } catch is UnverifiedPDF {
+            // A structure the helper couldn't verify is refused, at every level, vouched or not. C2b-carry (c), Ruling 42:
+            // scanning what the helper read and then serving the bytes as they are would let out what another reader
+            // recovers (a hidden revision, an object no page draws); a vouched PDF is served only as its flattened copy
+            // (`Store.gatedBytes`), which is checked here like any PDF, never vouched.
+            throw SandboxedPDFReader.unaccounted
         }
         var total = 0, streams = 0
         for part in parts {

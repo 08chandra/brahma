@@ -4,14 +4,26 @@ import GRDB
 @testable import BrahmaCore
 
 /// A PDF reader whose helper found a structural anomaly but read everything it could (`UnverifiedPDF`): the parts it read.
+/// C2b-carry (c): it flattens too (`copyParts` nil: it can't), into a stand-in copy (`copyMark` and the original's hash)
+/// that it then reads as a verified PDF holding `copyParts`.
 struct UnverifiedPDFReader: ArchiveReader {
     var parts: [PDFPart]
+    var copyParts: [PDFPart]? = [PDFPart(kind: .pageText, data: Data("hello".utf8))]
+    static let copyMark = Data("%PDF-1.3 the flattened copy of ".utf8)
 
     func members(of data: Data, wanted: @Sendable (String) -> Bool, limits: ArchiveLimits) throws -> [(name: String, data: Data)] {
         throw ArchiveReadError.unavailable
     }
 
-    func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] { throw UnverifiedPDF(parts: parts) }
+    func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] {
+        if data.starts(with: Self.copyMark), let copyParts { return copyParts }
+        throw UnverifiedPDF(parts: parts)
+    }
+
+    func flattenPDF(of data: Data, maxBytes: Int, timeout: Duration) throws -> Data {
+        guard copyParts != nil else { throw SandboxedPDFReader.flattenFailed }
+        return Self.copyMark + Data(SHA256.hex(data).utf8)
+    }
 }
 
 /// C2b fix round 5 (controller Ruling 38, R5-3): the owner's path for a file the gate refuses for its STRUCTURE (a PDF whose
@@ -39,10 +51,15 @@ struct UnverifiedPDFReader: ArchiveReader {
         return .invalid(String(message.dropLast(suffix.count)))
     }
 
+    /// The gate's verdict for what is served for `data` (C2b-carry (c): `Store.gatedBytes`, which serves a vouched PDF as its
+    /// flattened copy and never the original).
     func check(_ cf: CollabFixture, _ data: Data, ext: String = "pdf", canonical: String = "doc.pdf", companyId: String? = nil,
                archives: any ArchiveReader) throws -> ScanVerdict {
-        try SecretGate.check(data, ext: ext, canonical: canonical, archives: archives, knownValues: Self.known, store: cf.store,
-                             companyId: companyId ?? cf.c.id)
+        let served = try cf.store.gatedBytes(data, ext: ext, canonical: canonical, companyId: companyId ?? cf.c.id, archives: archives,
+                                             knownValues: Self.known, paths: cf.paths)
+        #expect(served.data != data || !served.isFlattenedCopy, "a flattened copy is the original")
+        if served.isFlattenedCopy { #expect(!served.data.contains(data), "the original went out inside the copy") }
+        return served.verdict
     }
 
     func outcome(_ body: () throws -> ScanVerdict) -> String {
@@ -106,14 +123,20 @@ struct UnverifiedPDFReader: ArchiveReader {
         let other = outcome { try check(cf, file, companyId: cf.fx.d.id, archives: reader) }
         #expect(other == "this PDF's structure couldn't be verified" + Self.command(cf.fx.d, "doc.pdf", file), "\(other)")
 
-        // What the gate can read is still scanned: a stored value, and a secret pattern, seen only decoded.
+        // C2b-carry (c), Ruling 42: what is served is the flattened copy of the visible pages. A stored value or a secret
+        // pattern in an object no page draws is not in it (and the original, which holds it, is never served).
         for (name, hidden) in [("value.pdf", "key \(Self.value)"), ("pattern.pdf", "key \(SecretGateTests.aws)")] {
             let pdf = Self.anomalous(hidden: hidden)
             #expect(!String(decoding: pdf, as: UTF8.self).contains(hidden))
             #expect(outcome { try check(cf, pdf, canonical: name, archives: reader) }.hasPrefix("this PDF's structure couldn't be verified"))
             _ = try cf.store.vouchFile(companyId: cId, canonical: name, sha256: Self.full(pdf), now: cf.now)
-            let after = outcome { try check(cf, pdf, canonical: name, archives: reader) }
-            #expect(after.contains("contains a stored secret") || after.contains("looks like it contains a secret"), "\(name): \(after)")
+            let served = try cf.store.gatedBytes(pdf, ext: "pdf", canonical: name, companyId: cId, archives: reader, knownValues: Self.known,
+                                                 paths: cf.paths)
+            #expect(served.isFlattenedCopy && served.data != pdf && served.verdict == .clean, "\(name)")
+            let parts = try reader.pdfParts(of: served.data, maxBytes: 16_000_000, timeout: .seconds(60))
+            #expect(!parts.contains { String(decoding: $0.data, as: UTF8.self).contains(hidden) }, "\(name): the hidden object is in the copy")
+            #expect(outcome { try SecretGate.check(pdf, ext: "pdf", canonical: name, archives: reader, knownValues: Self.known, store: cf.store,
+                                                   companyId: cId) }.contains("only its flattened copy"))
         }
     }
 
@@ -130,7 +153,8 @@ struct UnverifiedPDFReader: ArchiveReader {
         #expect(outcome { try check(cf, pdf, archives: clean) } == "clean")
         // (Other bytes: verdicts are cached by the bytes, and a real reader reads the same bytes the same way.)
         let held = Data("%PDF-1.7 another flagged file".utf8)
-        let holding = UnverifiedPDFReader(parts: [PDFPart(kind: .decodedStream, data: Data("key \(Self.value)".utf8))])
+        let holding = UnverifiedPDFReader(parts: [PDFPart(kind: .decodedStream, data: Data("key \(Self.value)".utf8))],
+                                          copyParts: [PDFPart(kind: .pageText, data: Data("key \(Self.value)".utf8))])
         #expect(outcome { try check(cf, held, canonical: "held.pdf", archives: holding) }.hasPrefix("this PDF's structure couldn't be verified"))
         _ = try cf.store.vouchFile(companyId: cId, canonical: "held.pdf", sha256: Self.full(held), now: cf.now)
         #expect(outcome { try check(cf, held, canonical: "held.pdf", archives: holding) }.contains("contains a stored secret"))
@@ -326,7 +350,12 @@ struct UnverifiedPDFReader: ArchiveReader {
             SandboxedUnzipReader(runner: ScriptedRunner(parts: output, outcome: CheckOutcome(exitCode: code, timedOut: false, tail: "")),
                                  scratch: { try cf.vault.makeTempDir() }, pdfHelper: URL(fileURLWithPath: "/usr/bin/true"))
         }
-        let garbled = outcome { try check(cf, pdf, archives: scripted(5, Data("BRAHMA-PDF/1\n".utf8))) }
+        // (C2b-carry (c): the vouched file is served only as its flattened copy; a scripted helper that makes none refuses it,
+        // saying the vouch can't lift that.)
+        let unflattened = outcome { try check(cf, pdf, archives: scripted(5, Data("BRAHMA-PDF/1\n".utf8))) }
+        #expect(unflattened.contains("can't be flattened") && unflattened.contains("print it to PDF") && !unflattened.contains("brahma vouch file"),
+                "\(unflattened)")
+        let garbled = outcome { try check(cf, pdf + Data(" garbled".utf8), archives: scripted(5, Data("BRAHMA-PDF/1\n".utf8))) }
         #expect(garbled == SandboxedPDFReader.unverifiedUnread.message, "\(garbled)")
         #expect(garbled.contains("can't be vouched for") && !garbled.contains("brahma vouch file"))
         // (Other bytes: the refusal above is cached by the bytes.)
@@ -374,8 +403,8 @@ struct UnverifiedPDFReader: ArchiveReader {
             let at = try store.writer.read { db in
                 try Date.fetchOne(db, sql: "SELECT vouchedAt FROM fileVouch WHERE companyId = ?", arguments: [h.company.id])
             }
-            let passes = (try? SecretGate.check(h.pdf, ext: "pdf", canonical: "docs/spec.pdf", archives: UnverifiedPDFReader(parts: []),
-                                                knownValues: [], store: store, companyId: h.company.id)) == .clean
+            let passes = (try? store.gatedBytes(h.pdf, ext: "pdf", canonical: "docs/spec.pdf", companyId: h.company.id,
+                                                archives: UnverifiedPDFReader(parts: []), knownValues: [], paths: paths))?.verdict == .clean
             return (at != nil, passes, try store.events(afterId: 0, companyId: h.company.id).map(\.text))
         }
         let noKey = try home(initOwner: false)

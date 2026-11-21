@@ -282,9 +282,10 @@ final class ArchiveScanBudget {
     var launches: Int
     let depth: Int
     let deadline: TimeInterval
-    /// Round 5 (ruling 38): the owner vouched for the exact bytes being checked: their structure refusals (a PDF whose
-    /// structure couldn't be verified, a part in a format the engine can't open, archive members it can't decode) give way
-    /// to scanning everything that can be read, at every level.
+    /// Round 5 (ruling 38): the owner vouched for the exact bytes being checked: their structure refusals (a part in a
+    /// format the engine can't open, archive members it can't decode) give way to scanning everything that can be read, at
+    /// every level. C2b-carry (c), Ruling 42: never a PDF the helper couldn't verify (a vouched PDF is served only as its
+    /// flattened copy, `Store.gatedBytes`; one inside a vouched archive stays refused).
     let vouched: Bool
 
     init(bytes: Int = ArchiveLimits.maxBytes, entries: Int = ArchiveScanBudget.maxEntries, depth: Int = ArchiveMemberScan.maxDepth,
@@ -388,18 +389,34 @@ public enum SecretGate {
     /// part compressed in a format the engine can't open, archive members it can't decode) names the exact command by which
     /// the owner can vouch for the file (`vouchHint`), records the refused bytes and alerts the owner
     /// (`Store.recordStructureRefusal`); once the owner vouched for these exact bytes under this name in this company
-    /// (`Store.isFileVouched`), those refusals give way and everything readable is scanned as usual.
+    /// (`Store.isFileVouched`), those refusals give way and everything readable is scanned as usual, except for a PDF
+    /// (C2b-carry (c), Ruling 42), which only `Store.gatedBytes` serves, as its flattened copy.
+    /// C2b-carry (c), Ruling 42: a PDF the owner vouched for (`isFlattenTarget`) is never passed as it is: this refuses it
+    /// (`flattenedOnly`), and only `Store.gatedBytes` serves it, as its flattened copy. `vouchable: false` checks bytes as
+    /// an ordinary file that can't be vouched (the flattened copy): no vouch applies, no refusal is recorded or alerted,
+    /// and a structure refusal says the copy stays refused (no loop).
     static func verdict(_ data: Data, ext: String, canonical: String, archives: any ArchiveReader,
                         knownValues: [(name: String, value: String)], store: Store, companyId: String,
-                        chunk: Int = ContentScan.chunkBytes) throws -> ScanVerdict {
+                        chunk: Int = ContentScan.chunkBytes, vouchable: Bool = true) throws -> ScanVerdict {
         let sha = SHA256.hex(data)
-        let vouched = store.isFileVouched(companyId: companyId, canonical: canonical, sha256: sha)
+        let vouched = vouchable && store.isFileVouched(companyId: companyId, canonical: canonical, sha256: sha)
+        let name = shown(canonical, knownValues: knownValues)
+        if vouched && isFlattenTarget(data, ext: ext) { throw flattenedOnly(name) }
         // A vouched file's verdict is its own: the same bytes under another name, or in another company, are not vouched.
         let version = chunk == ContentScan.chunkBytes
             ? cacheVersion(store: store, companyId: companyId, ext: ext, knownValues: knownValues).map { vouched ? $0 + "|vouched" : $0 } : nil
         let result: ScanVerdict
-        let name = shown(canonical, knownValues: knownValues)
         func structural(_ reason: String) -> WorkError {
+            guard vouchable else {
+                return WorkError.invalid("the flattened copy of \(name) couldn't be verified either (\(reason)), so it stays refused, and "
+                                         + "no vouch lifts that: convert the file (print it to PDF) and add it again")
+            }
+            if vouched {
+                // C2b-carry (c): what a vouch can't lift says so (and records no refusal to vouch for again).
+                return WorkError.invalid(reason + " — the owner vouched for this exact file, but a vouch can't lift this for a PDF "
+                                         + "Brahma can't flatten on its own (one inside another file, or a file that is also an "
+                                         + "archive): share that PDF on its own")
+            }
             store.recordStructureRefusal(companyId: companyId, canonical: canonical, shown: name, sha256: sha, reason: reason, now: Store.now())
             return WorkError.invalid(reason + vouchHint(store: store, companyId: companyId, canonical: canonical, shown: name, sha256: sha))
         }
@@ -434,6 +451,20 @@ public enum SecretGate {
                                     label: finding.label, now: Store.now())
         }
         return result
+    }
+
+    /// C2b-carry (c), Ruling 42: the bytes a vouch serves only as a flattened copy: a PDF (by its name or its `%PDF-`
+    /// header, `EmbeddedContent.isPDF`) that is not also an archive and not compressed in a format the engine can't open
+    /// (those keep Ruling 38's vouch: their structure refusals give way, everything readable scanned, and a PDF inside
+    /// them that can't be verified stays refused).
+    static func isFlattenTarget(_ data: Data, ext: String) -> Bool {
+        EmbeddedContent.isPDF(data, ext: ext) && ArchiveMemberScan.unscannableFormat(data) == nil && !ArchiveMemberScan.isArchive(data, ext: ext)
+    }
+
+    /// The refusal of a vouched PDF's original bytes at any read point but `Store.gatedBytes`.
+    static func flattenedOnly(_ name: String) -> WorkError {
+        WorkError.invalid("\(name) is a PDF the owner vouched for: Brahma shares or shows only its flattened copy (a re-render of its "
+                          + "visible pages), never the file as it is")
     }
 
     /// Round 5 (ruling 38): a refusal of the bytes' STRUCTURE, not of anything found in them; the owner may vouch for the
