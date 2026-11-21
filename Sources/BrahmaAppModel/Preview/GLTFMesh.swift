@@ -180,19 +180,24 @@ public struct GLTFMesh: Equatable, Sendable {
             loadedBytes += count
         }
 
-        /// The `byteLength` bytes of buffer `index`, loaded once. The declared length is checked against the remaining
-        /// budget before anything is read, the bytes actually loaded are counted, and a sibling file is read at most once
-        /// and only when its size (on the open descriptor) is exactly what the buffer declares.
+        /// The `byteLength` bytes of buffer `index`, loaded once. Where bytes are about to be loaded, the declared length is
+        /// checked against the remaining budget first, then the bytes actually loaded are counted; a sibling file is read
+        /// at most once (a second buffer naming it adds nothing and is never refused for it) and only when its size (on
+        /// the open descriptor) is exactly what the buffer declares.
         mutating func buffer(_ index: Int) throws -> Data {
             if let data = buffers[index] { return data }
             let all = array("buffers")
             guard all.indices.contains(index) else { throw GLTFError.invalid("buffer \(index) does not exist") }
             let what = "buffer \(index)"
             let byteLength = try Self.int(all[index], "byteLength", in: what)
-            guard byteLength <= GLTFMesh.maxBufferBytes - loadedBytes else { throw GLTFError.tooLarge }
+            /// Before loading: the declared length must fit what is left of the cap.
+            func affordable() throws {
+                guard byteLength <= GLTFMesh.maxBufferBytes - loadedBytes else { throw GLTFError.tooLarge }
+            }
             var data: Data
             if let uri = all[index]["uri"] as? String {
                 if uri.hasPrefix("data:") {
+                    try affordable()
                     guard let marker = uri.range(of: ";base64,"),
                           let decoded = Data(base64Encoded: String(uri[marker.upperBound...])) else {
                         throw GLTFError.unsupported("\(what) data URI must be base64")
@@ -206,6 +211,7 @@ public struct GLTFMesh: Equatable, Sendable {
                     if let cached = siblings[name] {
                         data = cached
                     } else {
+                        try affordable()
                         do {
                             data = try RendererCaps.readRegularFile(directory.appending(path: name), maxBytes: byteLength)
                         } catch RendererCaps.FileReadFailure.tooLarge {
@@ -221,6 +227,7 @@ public struct GLTFMesh: Equatable, Sendable {
                 }
             } else {
                 guard index == 0, let bin else { throw GLTFError.invalid("\(what) has no uri and no glb BIN chunk") }
+                try affordable()
                 data = bin
                 try hold(data.count)
             }

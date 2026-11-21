@@ -27,6 +27,9 @@ public struct CSVTable: Equatable, Sendable {
         var record: [String] = []
         var field = String.UnicodeScalarView()
         var fieldScalars = 0
+        /// Whether anything has been consumed into the current field, kept or not: a `"` opens a quoted field only at
+        /// the very start of a field, before and after the line cut alike.
+        var fieldStarted = false
         var inQuotes = false
         var truncated = false
         var lineBytes = 0
@@ -34,6 +37,7 @@ public struct CSVTable: Equatable, Sendable {
         var lineCut = false
 
         func append(_ c: Unicode.Scalar) {
+            fieldStarted = true
             if lineCut {
                 truncated = true
             } else if fieldScalars < maxCellChars {
@@ -47,6 +51,7 @@ public struct CSVTable: Equatable, Sendable {
             if record.count < maxColumns { record.append(String(field)) } else { truncated = true }
             field = String.UnicodeScalarView()
             fieldScalars = 0
+            fieldStarted = false
         }
         func endRecord() {
             if field.last == "\r", !inQuotes {
@@ -90,8 +95,9 @@ public struct CSVTable: Equatable, Sendable {
                 } else {
                     append(c)
                 }
-            } else if c == "\"", fieldScalars == 0 {
+            } else if c == "\"", !fieldStarted {
                 inQuotes = true
+                fieldStarted = true
             } else if c == sep {
                 endField()
             } else if c == "\n" {
@@ -101,7 +107,7 @@ public struct CSVTable: Equatable, Sendable {
             }
             i = scalars.index(after: i)
         }
-        if inQuotes || fieldScalars > 0 || !record.isEmpty { endRecord() }
+        if inQuotes || fieldStarted || !record.isEmpty { endRecord() }
         return CSVTable(header: records.first ?? [], rows: Array(records.dropFirst()), truncated: truncated)
     }
 }

@@ -48,6 +48,13 @@ import Testing
         #expect(quoted.rows[0].count == 2 && quoted.rows[0][0].count == CSVTable.maxCellChars && quoted.rows[0][1] == "")
         #expect(quoted.rows[1] == ["r2a", "r2b"] && quoted.rows[2] == ["r3a", "r3b"])
         #expect(quoted.truncated)
+        // A field that starts past the cut and holds a stray `"` stays an unquoted field (as it does before the cut), so
+        // the records after it still parse (fix round 2 regression: the reviewer's probe).
+        let stray = CSVTable.parse("h1,h2\n" + String(repeating: "x", count: 4200) + ",ab\"cd\nr2a,r2b\nr3a,r3b\n")
+        #expect(stray.rows.count == 3)
+        #expect(stray.rows[0] == [String(repeating: "x", count: CSVTable.maxCellChars), ""])
+        #expect(stray.rows[1] == ["r2a", "r2b"] && stray.rows[2] == ["r3a", "r3b"])
+        #expect(CSVTable.parse("h\nab\"cd,e\n").rows == [["ab\"cd", "e"]])   // the same field before the cut
         // The same with the cell's closing quote escaped inside the cut region, and a newline inside the quotes.
         let tricky = CSVTable.parse("h\n\"" + String(repeating: "y", count: 4500) + "\"\"q\"\"\nz\",after\nnext,row\n")
         #expect(tricky.rows == [[String(repeating: "y", count: CSVTable.maxCellChars), "after"], ["next", "row"]])
@@ -91,8 +98,12 @@ import Testing
             }
         }
         await running.wait()
+        // The timer's deadline is taken when it goes to sleep, so the clock moves only once it is asleep.
+        let registered = SuspendingClock.now + .seconds(10)
+        while clock.sleepers < 1, SuspendingClock.now < registered { try await Task.sleep(for: .milliseconds(5)) }
+        #expect(clock.sleepers == 1, "the timer is asleep before the clock moves")
         clock.advance(by: RendererCaps.parseTimeout - .milliseconds(1))
-        #expect(!flag.cancelled, "short of the timeout nothing fires")
+        #expect(clock.sleepers == 1, "short of the timeout the timer still sleeps")
         clock.advance(by: .milliseconds(1))
         await #expect(throws: RendererError.timedOut) { try await waiting.value }
         let settle = SuspendingClock.now + .seconds(10)
@@ -430,6 +441,19 @@ import Testing
         for i in 0..<50 { #expect(try document.buffer(i).count == binSize) }
         #expect(document.loadedBytes == binSize)
         #expect(document.siblings.count == 1)
+        // A buffer on an already-cached sibling adds no bytes, so it is not refused even when its declared length no
+        // longer fits the remaining budget (fix round 2); a buffer that would load bytes past the budget still is.
+        var tight = GLTFMesh.Document(root: doc, bin: nil, directory: dir)
+        tight.loadedBytes = GLTFMesh.maxBufferBytes - binSize
+        #expect(try tight.buffer(0).count == binSize)
+        #expect(try tight.buffer(1).count == binSize)
+        #expect(tight.loadedBytes == GLTFMesh.maxBufferBytes)
+        var otherDoc = doc
+        otherDoc["buffers"] = [["byteLength": binSize, "uri": "tri.bin"], ["byteLength": binSize, "uri": "big.bin"]]
+        var full = GLTFMesh.Document(root: otherDoc, bin: nil, directory: dir)
+        full.loadedBytes = GLTFMesh.maxBufferBytes - binSize
+        #expect(try full.buffer(0).count == binSize)
+        #expect(throws: GLTFError.tooLarge) { try full.buffer(1) }
 
         // Total indices are capped across primitives sharing one accessor: 3 × 3 000 000 u8 indices > maxIndices.
         let indexCount = 3_000_000
