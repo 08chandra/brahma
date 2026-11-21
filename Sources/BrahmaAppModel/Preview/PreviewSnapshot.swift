@@ -12,8 +12,21 @@ public struct PreviewSnapshot: Equatable, Sendable {
     public var liveRef: String?
     /// Surface id → the handle of whoever set it ("owner" for the owner).
     public var setBy: [String: String] = [:]
-    /// A state's `logPath` → the last `PreviewBodies.logLines` lines of that surface's log (agent-controlled text).
+    /// A state's `logPath` → the last `PreviewBodies.logLines` lines of that surface's log (agent-controlled text). 4a adds a
+    /// ran CLI demo's `outputPath` → the last `PreviewBodies.terminalLines` lines of its sealed output.
     public var logTails: [String: [String]] = [:]
+    /// The company's workspace (`Company.workspacePath`): an artifact's `storedPath` is relative to it.
+    public var workspace: URL?
+    /// Published artifacts, newest first (Plan 4a Task 8b).
+    public var artifacts: [Artifact] = []
+    /// The latest sprint demo's rows (the newest sprint that has any).
+    public var demos: [PreviewDemo] = []
+    /// Artifact id → its entry file's body, stat'd here so no view reads a file.
+    public var fileBodies: [String: FileBody] = [:]
+    /// Surface id → the engine's OpenAPI copy of a running backend (`EngineLayout.previewOpenAPI`), for the model to parse.
+    public var openAPIFiles: [String: URL] = [:]
+    /// Surface id → that copy parsed (laid over by `AppModel.previewWithOpenAPI`; empty straight from `load`).
+    public var openAPI: [String: PreviewOpenAPI] = [:]
 
     public static let empty = PreviewSnapshot(surfaces: [], states: [:], live: nil, liveRef: nil)
 
@@ -34,6 +47,7 @@ public struct PreviewSnapshot: Equatable, Sendable {
             guard let state = p.states[s.id], [.building, .starting, .failed].contains(state.status), let path = state.logPath else { continue }
             p.logTails[path] = PreviewLog.tail(layout, name: s.name, lines: PreviewBodies.logLines)
         }
+        try p.loadArtifacts(store: store, company: company, layout: layout)
         return p
     }
 }

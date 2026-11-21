@@ -19,6 +19,7 @@ struct Sidebar: View {
                 NavRow(title: "Backlog", icon: "list.bullet.indent", item: .backlog, model: model)
                 NavRow(title: "Board", icon: "rectangle.split.3x1", item: .board, model: model)
                 NavRow(title: "Releases", icon: "shippingbox", item: .releases, model: model, count: model.openReleaseCount)
+                NavRow(title: "Merge queue", icon: "arrow.triangle.merge", item: .mergeQueue, model: model, count: model.openMergeCount)
                 NavRow(title: "Handbook", icon: "book.closed", item: .handbook, model: model)
                 NavRow(title: "Resources", icon: "paperclip", item: .resources, model: model)
                 NavRow(title: "Budget", icon: "gauge", item: .budget, model: model)

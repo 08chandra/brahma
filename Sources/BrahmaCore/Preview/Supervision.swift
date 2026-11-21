@@ -50,13 +50,22 @@ public enum PreviewLog {
     /// The last `lines` lines of surface `name`'s log (from its last 64 KB), without their newlines; empty when it is
     /// missing or refused (a link on the way, a hard-linked or foreign file). Agent-controlled text: quote or flatten it.
     public static func tail(_ l: EngineLayout, name: String, lines: Int) -> [String] {
-        guard lines > 0, let fd = try? EngineFiles.openFileNoFollow(under: l.workspace, relative(name), flags: O_RDONLY) else { return [] }
+        tail(l, relative: relative(name), shown: l.previewLog(name: name).path, lines: lines)
+    }
+
+    /// The same for a one-shot preview's sealed output (`EngineLayout.previewOutput`, the CLI demo; Plan 4a Task 8b).
+    public static func outputTail(_ l: EngineLayout, name: String, lines: Int) -> [String] {
+        tail(l, relative: ".brahma/preview/logs/\(name).out", shown: l.previewOutput(name: name).path, lines: lines)
+    }
+
+    private static func tail(_ l: EngineLayout, relative: String, shown: String, lines: Int) -> [String] {
+        guard lines > 0, let fd = try? EngineFiles.openFileNoFollow(under: l.workspace, relative, flags: O_RDONLY) else { return [] }
         defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0 else { return [] }
         let size = Int(st.st_size)
         let start = max(0, size - tailWindow)
-        guard var data = try? read(fd, offset: start, count: size - start, path: l.previewLog(name: name).path) else { return [] }
+        guard var data = try? read(fd, offset: start, count: size - start, path: shown) else { return [] }
         if start > 0, let newline = data.firstIndex(of: 10) { data = data[data.index(after: newline)...] }
         var all = String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         if all.last == "" { all.removeLast() }

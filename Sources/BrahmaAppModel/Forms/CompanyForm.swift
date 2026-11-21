@@ -10,6 +10,8 @@ public enum AppSheet: Identifiable, Hashable, Sendable {
     case vacancy(managerHandle: String?)
     /// The owner fills the open seat `handle` (the map's cleaned vacancy id), after the paid-agent preview.
     case fillVacancy(handle: String)
+    /// Work › Merge queue › Settings (Plan 4a): batch size, strategy and the main check.
+    case mergeSettings
 
     public var id: String {
         switch self {
@@ -18,13 +20,14 @@ public enum AppSheet: Identifiable, Hashable, Sendable {
         case .newItem: "newItem"
         case .vacancy(let managerHandle): "vacancy:\(managerHandle ?? "board")"
         case .fillVacancy(let handle): "fill:\(handle)"
+        case .mergeSettings: "mergeSettings"
         }
     }
 
     /// Bound to the company (and map) it was opened for: dismissed when the selected company changes.
     var isCompanyBound: Bool {
         switch self {
-        case .vacancy, .fillVacancy: true
+        case .vacancy, .fillVacancy, .mergeSettings: true
         case .newCompany, .hire, .newItem: false
         }
     }

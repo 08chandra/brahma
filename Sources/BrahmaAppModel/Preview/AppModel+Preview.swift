@@ -8,10 +8,12 @@ extension AppModel {
     /// The body of the selected tab (an unknown or reserved selection is the default one).
     public var previewBody: PreviewBody { previewBody(forTab: selectedPreviewTab) }
 
-    /// The body of any tab id, for surfaces other than the pane (chat's inspector split, Collab).
+    /// The body of any tab id, for surfaces other than the pane (chat's inspector split, Collab). The ARTIFACTS tab shows the
+    /// selected artifact; a backend body carries the parsed OpenAPI copy (`previewWithOpenAPI`).
     public func previewBody(forTab tabId: String?) -> PreviewBody {
-        let tails = snapshot.preview.logTails
-        return PreviewBodies.body(for: tabId, snapshot: snapshot.preview, logTail: { tails[$0.path] ?? [] })
+        let p = previewWithOpenAPI
+        let tails = p.logTails
+        return PreviewBodies.body(for: tabId, snapshot: p, logTail: { tails[$0.path] ?? [] }, selectedArtifactId: selectedArtifactId)
     }
 
     /// Asks the engine to restart a surface (owner).
