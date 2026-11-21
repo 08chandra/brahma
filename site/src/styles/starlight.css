@@ -774,10 +774,43 @@ footer .meta {
     width: 2.5rem;
     height: 2.5rem;
   }
-  /* The always-visible 40 px button would sit on the first lines of code (and stay there while
-   * the block scrolls sideways); give it a strip of its own above the code instead. */
-  .expressive-code pre > code {
-    padding-block-start: calc(var(--ec-codePadBlk) + 2.5rem + var(--s-1));
+  /* The always-visible 40 px button gets a header of its own instead of sitting on the code
+   * (where it would also stay while a wide block scrolls sideways). Titled frames: the tab bar
+   * / terminal bar grows to 44 px and the button is centred in it. Untitled frames: a 48 px
+   * bg3 band drawn as the <pre>'s top border (so it never scrolls), hairlines above and
+   * below — the Panel header idiom. */
+  .expressive-code .frame.has-title:not(.is-terminal) {
+    --ec-uiPadBlk: 0.6rem; /* tab bar: 1 px + 2 × (0.6 rem + 2 px) + 12 px × 1.65 ≈ 44 px */
+    --button-spacing: 0.125rem;
+  }
+  .expressive-code .frame.is-terminal {
+    --button-spacing: 0.125rem;
+  }
+  .expressive-code .frame.is-terminal .header {
+    box-sizing: border-box;
+    min-height: 2.75rem;
+  }
+  .expressive-code .frame:is(.has-title, .is-terminal) .header {
+    padding-inline-end: 3rem; /* a long title never runs under the button */
+  }
+  .expressive-code .frame:not(.has-title):not(.is-terminal) > pre {
+    border-block-start: calc(2.5rem + var(--s-2)) solid var(--bg3);
+    box-shadow:
+      inset 0 1px 0 var(--line),
+      0 -1px 0 var(--line);
+  }
+  .expressive-code .frame:not(.has-title):not(.is-terminal) .copy {
+    inset-block-start: calc(var(--ec-brdWd) + var(--s-1));
+  }
+}
+
+/* ---- Narrow viewports: tables scroll inside their box instead of squeezing ------------- */
+/* Below 50 rem a reference table with three nowrap mono columns left its one text column
+ * ~17 ch wide; a floor on the last column lets the table outgrow its box and scroll
+ * (Starlight sets display: block; overflow: auto on tables). */
+@media (max-width: 50rem) {
+  .sl-markdown-content :is(th, td):last-child:not(:where(.not-content *)) {
+    min-width: 26ch;
   }
 }
 

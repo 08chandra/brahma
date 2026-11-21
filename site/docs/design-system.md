@@ -69,7 +69,8 @@ Rules that follow: `text0`/`text1` are fine everywhere at any size. `text2` is b
 4.5:1 AA threshold on every surface, so **it is never a text colour**: use it only for
 non-text marks (ticks, glyphs, icon strokes, separators, the `aria-hidden` `$` prompt, the
 docs' heading-anchor icon), disabled states, and large text ≥ 24 px regular / 18.66 px bold
-(the 3:1 threshold, met on bg0–bg3). `accent` is a UI colour (≥ 3:1 for focus rings, borders,
+(the 3:1 threshold, met on bg0–bg3). Marks on bg2 clear 3:1 only just (3.79) — a heading
+that ever sits on a panel keeps its anchor icon a mark, never text. `accent` is a UI colour (≥ 3:1 for focus rings, borders,
 fills), never a text colour; text on accent is white.
 
 ## Motion

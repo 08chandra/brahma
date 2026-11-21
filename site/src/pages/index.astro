@@ -41,10 +41,10 @@ import { site } from '../../site.config.ts';
 
         <div class="home__intro">
           <p class="home__lede reveal" style="--i: 1">
-            Brahma is the governed local AI org: a company of AI agents on your Mac, each turn a headless run of the{' '}
-            <code>claude</code> CLI you already use, on your plan. The engine schedules every turn inside your usage
-            limits, runs it under the company’s safety profile and its checks, and is the only thing that merges into
-            main. What only you can decide waits in your Inbox.
+            Brahma is the governed local AI org: agents on your Mac, each turn a headless run of the{' '}
+            <code>claude</code> CLI you already use. The engine schedules every turn inside your usage limits, runs it
+            under the company’s safety profile, and alone merges into main. What only you can decide waits in your
+            Inbox.
           </p>
           <div class="home__actions reveal" style="--i: 2">
             <Button variant="primary" href="/start/" trailing="→">Get started</Button>
@@ -199,6 +199,16 @@ import { site } from '../../site.config.ts';
     .home__title {
       grid-column: 1 / span 12;
     }
+    /* 64–80 em: four columns are too narrow for the lede (it ran far below the console), so
+     * the words take five and the console seven; the 4 / 8 split returns from 80 em. */
+    .home__intro {
+      grid-column: 1 / span 5;
+    }
+    .home__console {
+      grid-column: 6 / span 7;
+    }
+  }
+  @media (min-width: 80em) {
     .home__intro {
       grid-column: 1 / span 4;
     }

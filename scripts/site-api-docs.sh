@@ -196,6 +196,7 @@ find "$OUT" -name '*.html' -print0 | xargs -0 sed -i '' 's#</head>#<link rel="st
   .colophon { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #2F3A45; font-family: 'JetBrains Mono Variable', 'JetBrains Mono Fallback', 'Courier New', monospace; font-size: 0.75rem; color: #A7B3BF; }
   .colophon .brand { font-family: 'Inter Variable', 'Inter Fallback', Arial, sans-serif; font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
   .colophon .sep { color: #6E7C89; }
+  .colophon .pair { display: inline-flex; gap: 0.5rem; align-items: baseline; white-space: nowrap; } /* a separator never orphans at a line end */
   .colophon a { color: #A7B3BF; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; text-decoration-color: #3D4A57; }
   .colophon a:hover { color: #E6EBF0; text-decoration-color: #4C90F0; }
   a:focus-visible { outline: 2px solid #2D72D2; outline-offset: 2px; border-radius: 2px; }
@@ -215,12 +216,12 @@ HTML
     printf '<li><a href="/api/%s/documentation/%s/"><span class="name">%s</span><span class="count">%s public symbols</span></a></li>\n' "$lc" "$lc" "$module" "${symbols[$i]}"
   done
   echo '</ul>'
-  echo '<footer class="colophon"><span class="brand">Brahma</span><span class="sep" aria-hidden="true">·</span>'
+  echo '<footer class="colophon"><span class="brand">Brahma</span>'
   if [ "$SPLIT" = "1" ]; then
     # Its own origin: no site-relative links.
-    echo '<span>Apache-2.0</span>'
+    echo '<span class="pair"><span class="sep" aria-hidden="true">·</span><span>Apache-2.0</span></span>'
   else
-    echo '<a href="/license/">Apache-2.0</a><span class="sep" aria-hidden="true">·</span><a href="/">Back to the site</a><span class="sep" aria-hidden="true">·</span><a href="/internals/">Inside Brahma</a>'
+    echo '<span class="pair"><span class="sep" aria-hidden="true">·</span><a href="/license/">Apache-2.0</a></span><span class="pair"><span class="sep" aria-hidden="true">·</span><a href="/">Back to the site</a></span><span class="pair"><span class="sep" aria-hidden="true">·</span><a href="/internals/">Inside Brahma</a></span>'
   fi
   cat <<'HTML'
 </footer>

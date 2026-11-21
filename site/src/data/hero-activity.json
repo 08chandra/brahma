@@ -3,9 +3,9 @@
   "company": "Initech",
   "initial": {
     "running": 2,
-    "ready": 2,
+    "ready": 3,
     "blocked": 1,
-    "sleeping": 7
+    "sleeping": 6
   },
   "lines": [
     {
@@ -93,14 +93,14 @@
       "text": "#general The timer was registered on every launch; registering it once fixes the duplicate."
     },
     {
-      "at": 400,
+      "at": 0,
       "time": "09:41:21",
       "kind": "work",
       "handle": "eng-1",
       "text": "INITE-3 submitted for review, check passed"
     },
     {
-      "at": 1100,
+      "at": 0,
       "time": "09:41:22",
       "kind": "state",
       "handle": "cto",
