@@ -199,7 +199,7 @@ extension Store {
 
     private func diffDetails(_ ref: WorkRef, item: WorkItem, workspace: URL) throws -> Details {
         let file = ref.params["file"]
-        let title = "\(item.key) diff" + (file.map { " · \($0)" } ?? "")
+        let title = Self.safe("\(item.key) diff" + (file.map { " · \($0)" } ?? ""))
         if ref.isWorktree {
             let fs = try SafeFS(workspace: workspace, ownHandle: nil)
             let temp = try refTempDirectory()
@@ -208,7 +208,7 @@ extension Store {
             let diff = try refGit(workspace).worktreeDiff(key: item.key, worktree: worktree, tempDir: temp, fs: fs)
             let files = diff.files.filter { file == nil || $0.path == file }
             let summary = Self.diffStat(files.map { (path: $0.path, added: $0.added, removed: $0.removed) })
-            return Details(title: title + " (uncommitted)", subtitle: summary, state: diff.truncated ? .tooLarge : .ok, pinned: ref)
+            return Details(title: Self.safe(title + " (uncommitted)"), subtitle: summary, state: diff.truncated ? .tooLarge : .ok, pinned: ref)
         }
         let git = try refGit(workspace)
         let branch = "item/\(item.key)"

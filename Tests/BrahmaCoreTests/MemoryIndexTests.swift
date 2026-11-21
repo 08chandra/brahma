@@ -232,7 +232,8 @@ import GRDB
 
     @Test func refsResolveByImpliedSource() throws {
         let w = try W(name: "F")
-        #expect(Store.keyPrefix(slug: w.company.slug) == "F")
+        // New items of company "F" are FX-<n> (Plan C C1b); an item stored before that rule keeps its colliding key F-<n>.
+        #expect(Store.keyPrefix(slug: w.company.slug) == "FX")
         // A colliding item is stored (as Task 2 stores it) under its canonical `item:<KEY>` ref; others under the bare key.
         let item = try w.ingest(w.doc("item-1", title: "Item F-1", body: "an item", source: .item, ref: "item:F-1"))
         let eng = try w.ingest(w.doc("item-7", title: "Item ENG-7", body: "another item", source: .item, ref: "ENG-7"))
