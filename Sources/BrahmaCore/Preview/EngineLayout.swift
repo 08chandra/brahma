@@ -22,6 +22,9 @@ public struct EngineLayout: Equatable, Sendable {
     /// `.brahma/preview/logs/<name>.out`: a one-shot preview's captured output (Plan 4a), written only by the engine (a name
     /// has no dot, so it never meets another surface's log).
     public func previewOutput(name: String) -> URL { previewLogs.appending(path: "\(name).out", directoryHint: .notDirectory) }
+    /// `.brahma/preview/logs/<name>-openapi.json`: the engine's confined copy of a backend preview's OpenAPI file (Plan 4a
+    /// Task 5), the only copy the app reads (a `.json` name never meets another surface's `.log` or `.out`).
+    public func previewOpenAPI(name: String) -> URL { previewLogs.appending(path: "\(name)-openapi.json", directoryHint: .notDirectory) }
     /// `.brahma/releases`: read-only to every turn and in no build, preview or check writable list. It holds only what the
     /// owner and agents may read (the redacted deploy logs and release metadata); every deploy runs under the data home
     /// (`ReleaseLayout`), outside the workspace and its repository.

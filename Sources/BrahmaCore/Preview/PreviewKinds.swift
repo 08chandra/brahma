@@ -201,11 +201,11 @@ public struct UnavailableMacApps: MacAppLaunching {
 
 // MARK: Adapters
 
-/// The adapters a `PreviewRunner` uses by default, by kind. Plan L's web adapter; Tasks 5 (cli, backend) and 7 (ios, macos)
-/// add theirs here. A kind with no adapter is `unavailable` (`PreviewRunner.noAdapterMessage`).
+/// The adapters a `PreviewRunner` uses by default, by kind. Plan L's web adapter, Task 5's backend and CLI adapters; Task 7
+/// (ios, macos) adds its own here. A kind with no adapter is `unavailable` (`PreviewRunner.noAdapterMessage`).
 public enum PreviewAdapters {
     public static func defaults(_ deps: PreviewDependencies) -> [PreviewKind: any PreviewAdapter] {
-        [.web: WebAdapter(deps: deps)]
+        [.web: WebAdapter(deps: deps), .backend: BackendAdapter(deps: deps), .cli: CLIAdapter(deps: deps)]
     }
 }
 

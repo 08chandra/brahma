@@ -292,19 +292,28 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
     // MARK: Runner
 
     @Test func injectedAdaptersUsed() async throws {
+        // Task 5 registers the backend and CLI adapters next to L's web one.
         let defaults = PreviewAdapters.defaults(PreviewDependencies.fake())
-        #expect(Set(defaults.keys) == [.web] && defaults[.web] is WebAdapter)
+        #expect(Set(defaults.keys) == [.web, .backend, .cli] && defaults[.web] is WebAdapter)
+        #expect(defaults[.backend] is BackendAdapter && defaults[.cli] is CLIAdapter)
         // An injected web adapter replaces L's: no server is spawned.
         let x = try Fx(kinds: [.web])
         #expect(x.set(["name": .string("web"), "kind": .string("web"), "run": .string("npm start"), "url": .string("http://127.0.0.1:{port}/")]).ok)
-        // A kind with no adapter is unavailable, without an export or a start.
-        try x.cli()
         await x.settle()
         let web = try #require(x.adapters[.web])
         #expect(web.starts.count == 1 && web.starts.first?.surface.name == "web")
         #expect(x.sandbox.calls.isEmpty)
         #expect(try x.state("web").status == .running)
-        let tool = try x.state("tool")
+        // A kind with no adapter is unavailable, without an export or a start.
+        let z = try Fx(kinds: [.cli])
+        let zPaths = z.w.paths
+        let bare = PreviewRunner(store: z.store, paths: zPaths, deps: z.deps,
+                                 sandboxLayout: { SandboxLayout(paths: zPaths, company: $0, agentHandle: "preview") },
+                                 timeouts: Fx.fast, memory: { false }, clock: z.w.clock.function, adapters: [.web: RecordingAdapter(.web)])
+        try z.cli()
+        await bare.reconcile(now: z.now); await bare.waitForStarts()
+        #expect(z.sandbox.calls.isEmpty)
+        let tool = try z.state("tool")
         #expect(tool.status == .unavailable && tool.message == "CLI previews are not available on this engine yet", "\(tool)")
         // An adapter that is not available here says why.
         let y = try Fx(kinds: [.cli])

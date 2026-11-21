@@ -405,7 +405,7 @@ public actor PreviewRunner: EmergencyStopObserver {
                                      policy: policies.policy, environment: environment, logURL: logURL, timeouts: timeouts,
                                      outputURL: layout.previewOutput(name: surface.name), appPolicy: policies.appPolicy,
                                      unsandboxed: Self.unsandboxed(store: engineStore, company: company, surface: surface),
-                                     onSpawn: { pid in await self.spawned(id, pid: pid) })
+                                     onSpawn: { pid in await self.spawned(id, pid: pid) }, redactor: engineStore.redactor)
         runs[id]?.context = context
         let update = await adapter.start(context)
         if Task.isCancelled || update.status == .stopped {
