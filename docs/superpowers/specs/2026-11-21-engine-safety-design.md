@@ -944,3 +944,141 @@ Results are recorded in the final task report. A canary failure blocks the merge
   Plan S adds a regression test for each:
   - A workspace or worktree with planted `core.fsmonitor`, `core.sshCommand`, `core.pager`, `diff.external`, `filter.*.process` and `includeIf` keys must run nothing under any engine git call or helper path.
   - Planted config must be refused by the allowlist check on adopt and import.
+
+### Owner decision, 2026-11-21: the sandbox canary runs itself (Tasks S7b, S7c)
+
+**Binding.** Owners no longer have to write canary probes. This reverses one rule of 5-lite Task 3 fix 1 ("the engine never writes a probe line; no probe line anywhere in Sources"). Everything else of today's canary stays: the four planted places, the two layers, the leak matcher, the planted-place snapshot, the init-list checks, the per-key gate and back-off, and the sandbox-check alert. What exists today (`main` 632ae1b):
+- `CanaryProbes` loads `<data home>/canary/probes.txt` (0600, one link, owner-owned, never through a link). A missing file, or one with no blocking line, gives no pass, so sandboxed agents wait until the owner writes probes.
+- The key is `CanaryProbes.keyFingerprint(cli:probes:)` (the CLI `stat` fingerprint plus the file's SHA-256), the settings shape, and `ProcessInfo.operatingSystemVersionString`. On macOS that string already reads "Version 26.2 (Build 25C56)", so the build is in today's key only through the string's format. Nothing pins that.
+- The canary runs only when a sandboxed agent asks (`requireSandboxVerified`), or when the owner runs `brahma canary run` or `brahma doctor`. Each new key appends the activity line "sandbox not verified …; checking".
+
+**1. Probe set: `CanaryProbeSet` (BrahmaCore `Safety/`).** One ordered list, merged from three origins:
+- `.builtIn(id)`, from `BuiltinCanaryProbes`;
+- `.generated(rule)`, from `GeneratedCanaryProbes`;
+- `.owner(line)`, from `probes.txt`.
+
+Each probe carries:
+- `text`: the command, a fixed template;
+- `variables`: name to value, never spliced into `text`;
+- `layers`: `.both` or `.localOnly`;
+- `expect`: one of
+  - `.denied`: today's rule. Non-zero exit or a kill, no token, nothing planted changed, and an exit 127 counts only if `execRefused`;
+  - `.execRefused`: only the shell's own exec-refusal line counts;
+  - `.noResultLine`: non-zero exit, and no stream-json `result` line in the output (V-9, nested `claude`).
+
+Owner lines keep `.denied` and their `# helper` mark. Duplicates collapse by `(text, variables)`, and the first origin wins in the order built-in, generated, owner. Every deny rule still points at the probe that covers it.
+
+**2. Built-in probes** (`BuiltinCanaryProbes`, `version` 1, in code). Each one is a thing the Sandboxed profile promises to block. Each is written so that no `claude` permission rule matches it: an absolute executable path, or `/bin/sh -c '…'`. The test is "the canary's compiled `permissions.deny` `Bash(<prefix> *)` rules match no built-in under the CLI's prefix semantics". Each probe names its targets only through variables. Each must also be **harmless if the sandbox fails to stop it**:
+- unique `dev.brahma.canary.<run>` labels for launchd and `at` jobs, removed by the engine afterwards;
+- no write outside the planted places;
+- no Keychain item read, only `security default-keychain`, which needs SecurityServer;
+- no request body sent anywhere.
+
+The set (S7b's probe-first step may change a form, never drop a category):
+
+| Category | Probes (all `.both` unless marked) |
+|---|---|
+| Credential reads | `/bin/ls -A "$CANARY_OWNER_HOME/<d>"` for each present `<d>` of `.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker`, `.config/gcloud`, `.config/gh`, `Library/Keychains`; `/bin/cat "$CANARY_OWNER_HOME/.netrc"` when present; `/bin/cat "$CANARY_HOME_FILE"`. |
+| Keychain | `/usr/bin/security default-keychain`. |
+| Data home | `/bin/cat "$CANARY_DATA_FILE"`; `/usr/bin/head -c 16 "$CANARY_DATA_HOME/brahma.db"`. |
+| Other agents | `/bin/cat "$OTHER_AGENT_LAB/token"`; `/bin/cat "$CANARY_OTHER_WORKTREE/token"`; `/bin/cat "$CANARY_OTHER_HOME/transcript.jsonl"`. |
+| Writes outside the workspace | `/usr/bin/touch "$CANARY_OUTSIDE_DIR/written"`; `/bin/sh -c 'echo x > "$CANARY_HOME_DIR/written"'`; `/bin/mkdir "$OTHER_AGENT_LAB/written"`. |
+| Egress | `/usr/bin/curl --noproxy '*' -sS -m 5 -o /dev/null https://1.1.1.1/`, which bypasses the proxy; `/usr/bin/curl -sS -m 5 -o /dev/null "$CANARY_UNLISTED_URL"`, which goes through the proxy to the first of `example.com`, `example.org`, `example.net` that the shape does not allow; `/usr/bin/nc -z -w 3 1.1.1.1 443`. |
+| Persistence and launch | `/bin/launchctl submit -l "$CANARY_JOB_LABEL" -- /usr/bin/true`; `/usr/bin/crontab -l` (`.execRefused`); `/bin/sh -c 'echo /usr/bin/true \| /usr/bin/at now + 1 year'`; `/bin/sh -c 'echo x > "$CANARY_OWNER_HOME/Library/LaunchAgents/$CANARY_JOB_LABEL.plist"'`; `/usr/bin/osascript -e 'tell application id "com.apple.systemevents" to count processes'`; `/usr/bin/open -g -a TextEdit`. |
+| Spawning `claude` | `/bin/sh -c '"$CANARY_CLAUDE" -p --model haiku --max-budget-usd 0.001 x'` (`.noResultLine`). |
+
+Rules for targets:
+- A target the engine cannot see unsandboxed (an absent `~/.aws`) gives no probe. The run lists it under `sandbox-rules` as "not applicable on this Mac", never silently.
+- The LaunchAgents probe never creates the folder.
+- The engine removes the job label, any `at` job it finds by its marker, and the plist (`launchctl remove`, `atrm`, a descriptor-safe unlink), whether or not the probe succeeded.
+
+New variables join `CanaryProbes.variables`, which `ChildEnvironment` admits only on the canary's own request: `CANARY_OWNER_HOME`, `CANARY_HOME_DIR`, `CANARY_DATA_HOME`, `CANARY_OTHER_WORKTREE`, `CANARY_OTHER_HOME`, `CANARY_UNLISTED_URL`, `CANARY_JOB_LABEL` and `CANARY_CLAUDE`.
+
+**3. Generated probes** (`GeneratedCanaryProbes`). There is one atom per deny rule, and each atom maps to a probe, `coveredBy(check)` or `untested(reason)`.
+- **Seatbelt** (**architect's call:** parse the text that actually runs, not a second model of the renderer). `SeatbeltDenyRules.parse(_ profile: String) -> [DenyAtom]` reads the profile rendered for the canary's own model-free policy (`Purpose.canary`, `localBaseline`).
+  - An atom is one operation × one filter of a top-level `(deny …)` form. A `require-not` form is one atom: "outside the allowed set".
+  - Probes from these atoms are `.localOnly`, because the turn's sandbox is the CLI's own and does not have to share Brahma's rules.
+  - Mapping:
+    - `file-read*`/`file-read-data` (subpath P) → read a token the engine plants under P, else `ls` P. P must exist; otherwise the atom is untested.
+    - the write complement → `touch` in a planted place.
+    - `file-link` → `ln` of a readable, non-writable file into the cwd.
+    - `file-clone` → `cp -c` of the same file.
+    - `file-mount` → `/sbin/mount -t devfs devfs ./m`.
+    - `process-exec` (literal X) → X with a harmless argument (`.execRefused`).
+    - `mach-lookup` (name) → a fixed client table: pasteboard → `/usr/bin/pbpaste`; DiskArbitration → `/usr/sbin/diskutil list`; cfprefsd → `/usr/bin/defaults write dev.brahma.canary k v`, checked unchanged by the engine and then deleted; LaunchServices → `/usr/bin/lsappinfo front`.
+    - `signal`/`process-info*` (target others) → `/bin/kill -0` and `/bin/ps -p` on the engine's pid (`CANARY_ENGINE_PID`).
+    - `network*` → the direct-egress probe.
+    - Anything else, or a client S7b's probe-first step finds vacuous → `untested`.
+- **Claude settings** (`ClaudeSettings`, the input to the CLI's sandbox; the CLI's own generated SBPL is not readable by Brahma). Probes from these atoms run in `.both` layers.
+  - `sandbox.filesystem.denyRead` P → a read of a planted token, else `ls`.
+  - `denyWrite` P → `touch`.
+  - The `allowedDomains` complement → the two egress probes.
+  - `allowLocalBinding: false` → `/usr/bin/nc -l 127.0.0.1 0` under a 3 s cap (`.denied`).
+  - `permissions.deny` `Bash(<cmd> *)` → `<cmd>` by absolute path.
+  - `Read`/`Edit`/`Write(//p)` → the shell read or `touch` of p.
+  - `Skill(…)`, `mcp__…` and `allowUnsandboxedCommands: false` → `coveredBy` the turn judge's init-list and unsandboxed-use checks.
+  - Anything else → `untested`.
+- **Reporting.** A new warn-only doctor item `sandbox-rules` lists every `untested` atom as `untested rule: <atom> (<reason>)`, plus the "not applicable" built-ins. It passes when the list is empty. It never blocks `CanaryRun.passes`, and nothing is dropped from it.
+- **Turn size.** The turn layer runs at most `SandboxCanary.maxProbesPerTurn` = 40 probes per turn. Beyond that it runs consecutive turns, each with the positive control, each within `turnBudgetUSD`.
+
+**4. Owner probes become optional extras.**
+- `CanaryProbeError.noProbes` is deleted.
+- A missing file means no extras, and the engine no longer creates the template; `brahma canary edit` still does.
+- A file that exists but is refused (ownership, mode, link, size, encoding, control characters) still fails the canary. Every one of those checks stays.
+- The template text says the built-ins run automatically and that these lines are extras.
+
+**5. The key.** `SandboxCanaryKey` gains `macOSBuild`, read once per engine process from `sysctlbyname("kern.osversion")`. That equals `sw_vers -buildVersion`, and needs no spawn. It is part of `==`, `hash` and `text`.
+
+The probe part of the fingerprint becomes `CanaryProbeSet.digest`: `StableHash` of
+- `BuiltinCanaryProbes.digest` (version plus every template);
+- `GeneratedCanaryProbes.version`;
+- `SeatbeltProfile` profile shape (the canary policy's rendering with every quoted string replaced by "s");
+- the owner file's SHA-256, or `"none"`.
+
+So a new claude build, macOS build, turn shape, profile rule or probe template each needs a new pass.
+
+Migration `vS-canary-auto`:
+- It recreates `sandboxCanary` with two new columns: `macOSBuild`, and `cliKey` (`CLIFingerprint.key` alone, for "tested"). The primary key becomes `(cliFingerprint, settingsShape, osVersion, macOSBuild)`.
+- It drops the old rows. They can never match again, because the probe part of every key changed.
+- It adds `ownerSettings.holdClaudeUpdates` (default 0).
+
+**6. Automatic runs.**
+- At engine start (after `sweepStale`), the engine schedules a canary for every distinct shape key of the running sandboxed companies' standard work turns, the same set `brahma canary run` uses, and for the default shape when there is none. Only keys not yet verified are scheduled.
+- A watch on the tick, every `canaryWatchSeconds` = 60 awake seconds, re-computes those keys. The fingerprint is a cached `stat` and the owner file digest is cached. Any change schedules a run before an agent asks.
+- Runs stay one at a time, with today's back-off, and nothing starts under the owner's stop.
+- **The owner sees nothing unless a probe fails.** The "sandbox not verified …; checking" activity line moves to the engine log. On failure, today's pinned sandbox-check alert is raised (`.allCompanies(.sandboxCheck)` after S4), and agents wait as today.
+
+**7. Hold claude updates.**
+- **Tested build.** The tested build is the `cliKey` and `cliVersion` of the newest `sandboxCanary` row. `brahma doctor` gains an item `claude-build`, `tested <version> (<cliKey prefix>), installed <version> (<cliKey prefix>); updates held|allowed`. It passes when they are equal, and warns ("waiting for the automatic canary") when they differ.
+- **Setting.**
+  - The new CLI subcommand is `brahma settings claude-updates [hold|allow]` (shows the value when no argument is given; owner shell to set). Existing commands are unchanged.
+  - The app toggle is "Hold claude updates for agents" in the menu bar menu, beside "Prevent sleep while agents run", with the tested/installed line under it.
+- **Mechanism (verified 2026-11-21).** The CLI docs' env-var reference says: `DISABLE_AUTOUPDATER` "Set to `1` to disable automatic background updates. Manual `claude update` still works". `DISABLE_UPDATES` also blocks manual `claude update`/`claude install`. Both strings are present in the installed 2.1.325 binary.
+  - **Architect's call:** use `DISABLE_AUTOUPDATER`, so the owner can still update on purpose.
+  - It goes in the process environment, not the settings `env` block, so the settings shape and canary key do not move with the toggle.
+  - With the hold on, every `claude` the engine starts carries `DISABLE_AUTOUPDATER=1`: turns of every profile, the canary turn, the mode-canary and control probes. `ChildEnvironment.engineClaudeVars` admits it only from the compiler and never inherits it.
+  - Today `ChildEnvironment` drops an owner-exported `DISABLE_AUTOUPDATER`, so Brahma's turns can self-update now.
+  - **Residual:** the owner's own interactive `claude` still updates the shared install. The hold only stops Brahma's processes from being the updater.
+- **Untested builds.** Turns never run on an untested build.
+  - Sandboxed turns already wait, because the CLI fingerprint is in their key.
+  - **Architect's call (controller to confirm):** with the hold on, the rule extends to Workspace and Full turns. They wait, through the same `canaryWaiting` path, until the current `cliKey` has any canary pass, and the engine schedules the standard-shape canary for it.
+  - With the hold off, Workspace and Full turns are not gated, as today.
+
+**Behaviour changes (extend §8):**
+
+| # | Change | Who sees it | Surfaced by |
+|---|---|---|---|
+| B13 | Sandboxed companies no longer wait for owner-written probes. The built-in and generated probes run by themselves. A missing or comment-only `probes.txt` no longer blocks; a refused one still does. | Every owner with a sandboxed company | Release note; template text; `brahma canary edit` messages. |
+| B14 | The canary runs at engine start and whenever its key changes, spending one small haiku turn per new key (more when the set exceeds 40 probes). The "checking" activity line is gone. Only a failure is shown. | Everyone, only on failure | sandbox-check alert; engine log. |
+| B15 | Every existing canary pass is invalidated once by the upgrade (new key parts), and the automatic run re-verifies. | Everyone, once | Engine log. |
+| B16 | `brahma doctor` gains `sandbox-rules` (warn-only, untested rules) and `claude-build` (tested vs installed). | Doctor readers | The items. |
+| B17 | With "hold claude updates" on, Brahma's `claude` processes never self-update, and every turn profile waits on a build without a canary pass. | Owners who switch it on | The toggle's tested/installed line; `claude-build`. |
+
+**Order.** S7b and S7c come after S7 and before S8. They need S4 (`AlertScope`), S5 (`ToolPaths.claude` for `CANARY_CLAUDE`) and S7 (`ValidatedPolicy`, `Purpose.canary`). They touch no helper file, so the controller may run them as a lane beside S8–S12. S16 starts only after S7c: its re-run covers the built-in and generated probes, and its helper probes join `CanaryProbeSet` as a fourth origin, `.helper(op)`. If S13 has merged first, S7b builds the canary prompt's new lines with `Trusted` literals (engine-authored templates). Otherwise S13 migrates them.
+
+**Docs follow-up (F8, do not edit the site in Plan S).** When S7b and S7c ship, update:
+- `site/src/content/docs/docs/safety/canary.md`: built-in, generated and owner probes; untested rules; automatic runs; macOS build in the key; hold updates. "What it does not do" changes: it is no longer "only what your probe lines ask".
+- `site/src/pages/start.astro` step 3: the `canarySh` block and the copy at the Sandbox doctor row and the profile paragraph. Owners no longer write probes, and the canary items no longer warn until step 3.
+- `site/src/content/docs/docs/troubleshooting.md` `#sandbox-denial`: the reasons "missing probe file" and "no probes" are gone, and `sandbox-rules` and `claude-build` are new.
+- `site/src/content/docs/docs/safety/sandbox.md` and the CLI reference pages for `canary edit`, `doctor` and the new `settings claude-updates`, via `internals/modules/brahma-cli.mdx`.
+- `internals/modules/brahmacore/safety.mdx`.
