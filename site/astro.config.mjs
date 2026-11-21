@@ -28,8 +28,8 @@ export default defineConfig({
         { label: 'Inside Brahma', items: [{ autogenerate: { directory: 'internals' } }] },
         { label: 'API reference', link: `${site.apiBase}/` },
       ],
-      // The 404 page is src/content/docs/404.md, rendered by the regular docs
-      // route; Starlight's built-in /404 route would conflict with it.
+      // The 404 page is src/pages/404.astro (a designed page); Starlight's built-in
+      // /404 route would conflict with it.
       disable404Route: true,
       routeMiddleware: './src/route-data.mjs',
       pagefind: true,
@@ -40,6 +40,8 @@ export default defineConfig({
       components: {
         Head: './src/components/SiteHead.astro',
         Footer: './src/components/SiteFooter.astro',
+        // Home and 404 draw their own hero; see the component.
+        Hero: './src/components/SiteHero.astro',
         // Dark only: no theme toggle, and no inline script flipping `data-theme`
         // to the OS preference.
         ThemeSelect: './src/components/Empty.astro',

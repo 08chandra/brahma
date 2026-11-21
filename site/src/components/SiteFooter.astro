@@ -59,4 +59,12 @@ import { site } from '../../site.config.ts';
     color: var(--text0);
     text-decoration-color: var(--text-link);
   }
+  /* ≥ 40 px tap target on touch. */
+  @media (pointer: coarse) {
+    .colophon__link {
+      display: inline-flex;
+      align-items: center;
+      min-height: 2.5rem;
+    }
+  }
 </style>

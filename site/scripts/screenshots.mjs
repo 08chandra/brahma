@@ -59,6 +59,16 @@ async function main() {
           process.exitCode = 1;
         }
         await page.evaluate(() => document.fonts.ready);
+        // A full-page capture does not scroll, so `loading="lazy"` images below the fold
+        // would come out blank: walk the page once so they load, then return to the top.
+        await page.evaluate(async () => {
+          for (let y = 0; y < document.documentElement.scrollHeight; y += window.innerHeight) {
+            window.scrollTo(0, y);
+            await new Promise((r) => setTimeout(r, 50));
+          }
+          window.scrollTo(0, 0);
+        });
+        await page.waitForLoadState('networkidle');
         const file = join(out, `${slugFor(path)}-${name}.png`);
         await page.screenshot({ path: file, fullPage: true, animations: 'disabled' });
         // Overflow check. The site clips the root (`overflow-x: clip`), which can hide a

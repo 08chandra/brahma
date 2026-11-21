@@ -44,7 +44,7 @@ else
 fi
 
 cd site
-for step in "npm ci" "npm run build" "npm run check"; do
+for step in "npm ci" "npm run og" "npm run build" "npm run check"; do
   echo "== $step"
   if ! $step; then
     echo "site-build: step failed: $step" >&2

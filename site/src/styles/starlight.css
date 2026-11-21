@@ -593,8 +593,8 @@ footer .meta {
   color: var(--on-accent);
 }
 .sl-link-button.primary:hover {
-  background: color-mix(in srgb, var(--accent) 86%, white);
-  border-color: color-mix(in srgb, var(--accent) 86%, white);
+  background: color-mix(in srgb, var(--accent) 85%, var(--bg0));
+  border-color: color-mix(in srgb, var(--accent) 85%, var(--bg0));
 }
 .sl-link-button.secondary:hover,
 .sl-link-button.minimal:hover {

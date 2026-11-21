@@ -13,6 +13,7 @@
   --bg3: #212a33; /* panel headers, table headers, hover */
   --bg4: #2a3540; /* selected */
   --zebra: #1d252e;
+  --grid-line: #18202a; /* the agent-map grid (visual spec: bg0 with #18202A lines every 24 pt) */
 
   /* Hairlines */
   --line: #2f3a45;
@@ -36,6 +37,7 @@
   --warn: #ec9a3c;
   --sleep: #6e7c89;
   --killed: #404854;
+  --series-violet: #c774e8; /* charts/series 4; the app's state-change glyph (non-text mark) */
 
   /* Shape */
   --radius: 2px;
@@ -67,6 +69,7 @@
   --step-3: clamp(1.5rem, 1.3rem + 1vw, 2rem); /* 24 → 32 */
   --step-4: clamp(2rem, 1.6rem + 2vw, 3rem); /* 32 → 48 */
   --step-5: clamp(2.75rem, 2rem + 3.75vw, 5rem); /* 44 → 80 */
+  --text-ui: 0.8125rem; /* 13: controls and dense feeds (Button, console hero) */
   --text-label: 0.6875rem; /* 11 */
   --text-chip: 0.625rem; /* 10 */
   --tracking-label: 0.08em;

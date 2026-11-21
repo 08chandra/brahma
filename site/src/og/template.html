@@ -1,0 +1,173 @@
+<!doctype html>
+<!--
+  Open Graph card, 1200 × 630. Rendered by scripts/gen-og.mjs in Playwright Chromium as
+  template.html?kicker=…&title=…; the generator serves this file, tokens.css and the three
+  font files from one local origin. Same system as the site: bg0 on the agent-map grid,
+  Instrument Serif title, uppercase tracked kicker, a thin row of status chips.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Brahma OG card</title>
+    <link rel="stylesheet" href="/tokens.css" />
+    <style>
+      @font-face {
+        font-family: 'Instrument Serif';
+        src: url('/fonts/display.woff2') format('woff2');
+      }
+      @font-face {
+        font-family: 'Inter Variable';
+        font-weight: 100 900;
+        src: url('/fonts/sans.woff2') format('woff2-variations');
+      }
+      @font-face {
+        font-family: 'JetBrains Mono Variable';
+        font-weight: 100 800;
+        src: url('/fonts/mono.woff2') format('woff2-variations');
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+      }
+      html,
+      body {
+        width: 1200px;
+        height: 630px;
+        overflow: hidden;
+        background: var(--bg0);
+        color: var(--text0);
+        -webkit-font-smoothing: antialiased;
+      }
+      .card {
+        position: relative;
+        width: 1200px;
+        height: 630px;
+        padding: 64px 72px 56px;
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        background-color: var(--bg0);
+        /* Two 1 px line patterns: the app's agent-map grid, as on the Home hero. */
+        background-image:
+          linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+          linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+        background-size: 24px 24px;
+        background-position: -1px -1px;
+      }
+      .top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-family: var(--font-sans);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--text1);
+      }
+      .mark {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        color: var(--text0);
+      }
+      .mark svg {
+        width: 28px;
+        height: 28px;
+      }
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+      .kicker::before {
+        content: '';
+        width: 40px;
+        height: 1px;
+        background: var(--text2);
+      }
+      h1 {
+        align-self: center;
+        max-width: 20ch;
+        font-family: var(--font-display);
+        font-weight: 400;
+        font-size: 96px;
+        line-height: 1.02;
+        letter-spacing: -0.018em;
+        color: var(--text0);
+        text-wrap: balance;
+      }
+      .foot {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding-top: 24px;
+        border-top: 1px solid var(--line);
+      }
+      .chips {
+        display: flex;
+        gap: 12px;
+      }
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        height: 32px;
+        padding: 0 14px 0 12px;
+        border: 1px solid var(--chip);
+        border-radius: 3px;
+        background: color-mix(in srgb, var(--chip) 15%, transparent);
+        font-family: var(--font-sans);
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--text0);
+      }
+      .chip::before {
+        content: '';
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: var(--chip);
+      }
+      .chip--sleeping::before {
+        background: transparent;
+        border: 1.5px solid var(--text2);
+      }
+      .meta {
+        font-family: var(--font-mono);
+        font-size: 18px;
+        color: var(--text1);
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <div class="top">
+        <span class="mark">
+          <svg viewBox="0 0 32 32" aria-hidden="true">
+            <circle cx="16" cy="16" r="11" fill="none" stroke="currentColor" stroke-width="2.5"></circle>
+            <circle cx="16" cy="16" r="3.4" fill="currentColor"></circle>
+          </svg>
+          Brahma
+        </span>
+        <span class="kicker" id="kicker"></span>
+      </div>
+      <h1 id="title"></h1>
+      <div class="foot">
+        <div class="chips">
+          <span class="chip" style="--chip: var(--ok)">Running</span>
+          <span class="chip" style="--chip: var(--ready)">Ready</span>
+          <span class="chip" style="--chip: var(--danger)">Blocked</span>
+          <span class="chip chip--sleeping" style="--chip: var(--sleep)">Sleeping</span>
+        </div>
+        <span class="meta">macOS · claude CLI · Apache-2.0</span>
+      </div>
+    </main>
+    <script>
+      const params = new URLSearchParams(location.search);
+      document.getElementById('kicker').textContent = params.get('kicker') ?? '';
+      document.getElementById('title').textContent = params.get('title') ?? '';
+    </script>
+  </body>
+</html>

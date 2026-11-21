@@ -23,7 +23,7 @@ no layout (CLS 0). The three above-the-fold woff2 files are preloaded in `SiteHe
 ## Type scale (`--step--1 … --step-5`, ratio ≈ 1.25, fluid at the top)
 
 Base `--step-0` is 14 px on docs, 16 px on hero pages (`[data-has-hero]`). `--step--1` 12 px · `--step-0` base · `--step-1` 1.2 × base · `--step-2` 20→24 px ·
-`--step-3` 24→32 px · `--step-4` 32→48 px · `--step-5` 44→80 px. Labels use `--text-label`
+`--step-3` 24→32 px · `--step-4` 32→48 px · `--step-5` 44→80 px. Dense UI text (buttons, the console feed, card bodies) uses `--text-ui` (13 px). Labels use `--text-label`
 (11 px, uppercase, tracking 0.08em, weight 600) and chips `--text-chip` (10 px).
 Line heights: display 1.02–1.1, headings 1.2, docs body 1.6, Home body 1.55. Numbers are
 always `font-variant-numeric: tabular-nums`.
@@ -44,9 +44,14 @@ a 48 px header. Titles sit on the left column; nothing is centred.
 
 Tokens are verbatim from the visual-design spec (`tokens.css`). Chrome is grey; `--accent`
 marks selection, focus and the primary button only; status colours mark status only.
-No shadows. No gradients except one radial `bg1 → bg0` behind the Home hero. Links are
+No shadows. No gradients except one radial `bg1 → bg0` behind the Home hero. The Home hero,
+the 404 and the OG cards sit on the agent-map grid from the visual spec (`--grid-line`
+#18202A, 1 px lines every 24 px; a 1.14:1 texture — text crossing a line keeps AA: text1
+7.70:1, link 5.13:1, text2 3.84:1 for its large-text use). `--series-violet` (#C774E8, charts/series 4) colours only the console's state-change
+glyph, as in the app. Links are
 `--text-link` (#4C90F0, the one blue that passes AA on every surface) with a 1 px underline
-offset 3 px. Primary buttons use white text on `--accent` (4.72:1).
+offset 3 px. Primary buttons use white text on `--accent` (4.72:1); hover darkens the fill to
+`accent` 85 % over `bg0` (white 5.85:1) — lightening it would drop white text to 3.69:1.
 
 ### Measured WCAG contrast (`node` one-off, sRGB relative luminance)
 

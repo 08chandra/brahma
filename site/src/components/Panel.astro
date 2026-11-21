@@ -8,12 +8,13 @@ import Label from './Label.astro';
 
 interface Props {
   title?: string;
+  titleAs?: 'h2' | 'h3' | 'p'; // heading level of the title; `p` when the panel is a widget, not a section
   dense?: boolean;
   flush?: boolean; // body has no padding (for tables that run edge to edge)
   class?: string;
   id?: string;
 }
-const { title, dense = false, flush = false, class: className, id } = Astro.props;
+const { title, titleAs = 'h3', dense = false, flush = false, class: className, id } = Astro.props;
 const hasActions = Astro.slots.has('actions');
 ---
 
@@ -21,7 +22,7 @@ const hasActions = Astro.slots.has('actions');
   {
     (title || hasActions) && (
       <header class="panel__head">
-        {title && <Label as="h3">{title}</Label>}
+        {title && <Label as={titleAs}>{title}</Label>}
         {hasActions && (
           <div class="panel__actions">
             <slot name="actions" />
