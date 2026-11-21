@@ -271,10 +271,21 @@ public final class WALShipper: @unchecked Sendable {
     private let grace: TimeInterval
     private let sleeper: Sleeper
     private let note: @Sendable (String) -> Void
-    /// Told when `start` found a live litestream for this config that it cannot prove it started (no recorded start time, or
-    /// another one), with its pid: no second litestream is started, and the caller tells the owner (Task 9c fix round 2).
-    private let onPaused: (@Sendable (Int32) -> Void)?
+    /// Told when shipping pauses (Task 9c fix rounds 2 and 3): a live litestream for this config that this engine cannot prove
+    /// it started (`foreign`: nothing is signalled, no second one is started, before every launch), or a child whose start time
+    /// could not be read twice (`startUnreadable`: each was stopped as its own unreaped child). The caller tells the owner.
+    private let onPaused: (@Sendable (PauseReason) -> Void)?
+    /// The leader's start time right after a spawn (tests inject a failing one): `ProcessTable.entry(pid)?.start`.
+    private let startTimeProbe: @Sendable (Int32) -> Double?
     private let launchProbe: (@Sendable () -> Void)?
+
+    /// Why `start` or a restart launched nothing.
+    public enum PauseReason: Equatable, Sendable {
+        /// A live litestream `replicate -config <this config>` of this user that is not this shipper's own child.
+        case foreign(pid: Int32)
+        /// Two spawns in a row whose start time could not be read; both children were stopped.
+        case startUnreadable
+    }
     /// Awake seconds, for how long one run lasted (`ShipperBackoff.healthyRun`); a test seam.
     private let awakeUptime: @Sendable () -> TimeInterval
     private let lock = NSLock()
@@ -291,8 +302,10 @@ public final class WALShipper: @unchecked Sendable {
                 sleeper: @escaping Sleeper = { try await AwakeTime.sleep(for: $0) },
                 note: @escaping @Sendable (String) -> Void = { _ in },
                 awakeUptime: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() },
-                onPaused: (@Sendable (Int32) -> Void)? = nil) {
+                onPaused: (@Sendable (PauseReason) -> Void)? = nil,
+                startTimeProbe: (@Sendable (Int32) -> Double?)? = nil) {
         self.onPaused = onPaused
+        self.startTimeProbe = startTimeProbe ?? { ProcessTable.entry($0)?.start }
         self.executable = executable
         self.arguments = WALShipping.replicateArguments(paths: paths)
         self.environment = tools.litestreamEnvironment
@@ -307,19 +320,37 @@ public final class WALShipper: @unchecked Sendable {
     /// How many times litestream has been started.
     public var startCount: Int { lock.withLock { starts } }
 
-    /// Blocking for at most about `grace` + 2 s when a stale litestream has to be stopped first. When the pid file names a live
-    /// litestream for this config that this engine cannot prove it started (`StaleOutcome.unprovenLive`), nothing is started:
-    /// two litestreams must not replicate one database, and nothing unproven is ever signalled; `onPaused` tells the owner.
+    /// Blocking for at most about `grace` + 2 s when a stale litestream has to be stopped first. Nothing is started while a live
+    /// litestream for this config exists that this engine cannot prove it started: the one the pid file names without a
+    /// matching start (`StaleOutcome.unprovenLive`), or any other found by a read-only look at the process table
+    /// (`foreignLitestream`, repeated before every launch, Task 9c fix round 3). Two litestreams must not replicate one
+    /// database, and nothing unproven is ever signalled; `onPaused` tells the owner.
     public func start() {
         lock.lock(); defer { lock.unlock() }
         guard task == nil else { return }
         let outcome = Self.reapStale(paths: paths, grace: grace)
         if let text = outcome.text { note(text) }
-        if case .unprovenLive(let pid) = outcome {
-            onPaused?(pid)
+        if case .unprovenLive(let pid, _) = outcome {
+            onPaused?(.foreign(pid: pid))
+            return
+        }
+        if let pid = Self.foreignLitestream(paths: paths, excluding: nil) {
+            note("litestream pid \(pid) is replicating this database and this engine did not start it; WAL shipping is paused until it is stopped")
+            onPaused?(.foreign(pid: pid))
             return
         }
         task = Task.detached { [self] in await supervise() }
+    }
+
+    /// A live `litestream replicate -config <this config>` of this user other than `excluding` (this shipper's own child), or
+    /// nil. Read-only: the table is read and argvs looked at; nothing is signalled. Zombies and this process are skipped.
+    static func foreignLitestream(paths: BrahmaPaths, excluding own: Int32?) -> Int32? {
+        let config = WALShipping.configURL(paths: paths).path
+        let me = getpid(), uid = getuid()
+        for entry in ProcessTable.snapshot() where entry.uid == uid && !entry.isZombie && entry.pid != me && entry.pid != own && entry.pid > 1 {
+            if let argv = ProcessArguments.of(entry.pid), isLitestream(argv, config: config) { return entry.pid }
+        }
+        return nil
     }
 
     /// Whether `start` is supervising a litestream (false before `start`, after `stop`, or while paused on an unproven one).
@@ -343,7 +374,7 @@ public final class WALShipper: @unchecked Sendable {
         while !Task.isCancelled {
             let began = awakeUptime()
             let status = await runOnce()
-            if Task.isCancelled || status == -2 { return }
+            if Task.isCancelled || status == -2 || status == -3 { return }   // stopped before it started, or paused
             if awakeUptime() - began >= ShipperBackoff.healthyRun { backoff.reset() }
             let delay = backoff.take()
             note("litestream exited (\(status)); restarting in \(delay)")
@@ -363,23 +394,51 @@ public final class WALShipper: @unchecked Sendable {
                     continuation.resume(returning: -2)                      // stopped before it started
                     return
                 }
-                // The child leads its own process group, so litestream's own helpers (ssh, sftp) go down with it.
-                let child: ProcessGroupChild
-                do {
-                    child = try ProcessGroupChild.spawn(executable: executable, arguments: [executable] + arguments,
-                                                        environment: environment,
-                                                        workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
-                                                        output: -1)
-                } catch {
+                // Before every launch (a restart too): a litestream for this database that is not ours pauses shipping.
+                if let pid = Self.foreignLitestream(paths: paths, excluding: nil) {
+                    task = nil
                     lock.unlock()
-                    continuation.resume(returning: -1)
+                    note("litestream pid \(pid) is replicating this database and this engine did not start it; WAL shipping is paused until it is stopped")
+                    onPaused?(.foreign(pid: pid))
+                    continuation.resume(returning: -3)
                     return
                 }
-                starts += 1
+                // The child leads its own process group, so litestream's own helpers (ssh, sftp) go down with it. Its start
+                // time is read right after the spawn and recorded with its pid: a stop path signals it only while all three
+                // match. A start that cannot be read leaves no proof, so that child (provably ours: our own unreaped child) is
+                // stopped at once and the spawn tried once more; a second failure pauses shipping (Task 9c fix round 3).
+                let child: ProcessGroupChild
+                var start: Double?
+                var attempts = 0
+                repeat {
+                    attempts += 1
+                    let spawned: ProcessGroupChild
+                    do {
+                        spawned = try ProcessGroupChild.spawn(executable: executable, arguments: [executable] + arguments,
+                                                              environment: environment,
+                                                              workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
+                                                              output: -1)
+                    } catch {
+                        lock.unlock()
+                        continuation.resume(returning: -1)
+                        return
+                    }
+                    starts += 1
+                    start = startTimeProbe(spawned.pid)
+                    if start != nil { child = spawned; break }
+                    spawned.signalGroup(SIGKILL)
+                    spawned.finish()
+                    note("litestream pid \(spawned.pid): its start time could not be read, so it was stopped (attempt \(attempts) of 2)")
+                    if attempts == 2 {
+                        task = nil
+                        lock.unlock()
+                        onPaused?(.startUnreadable)
+                        continuation.resume(returning: -3)
+                        return
+                    }
+                } while true
                 process = child
-                // pid, config, and the leader's start time (Task 9c fix round 1): a stop path signals it only while all three match.
-                let start = ProcessTable.entry(child.pid)?.start ?? 0
-                let record = "\(child.pid)\n\(WALShipping.configURL(paths: paths).path)\n\(start)\n"
+                let record = "\(child.pid)\n\(WALShipping.configURL(paths: paths).path)\n\(start ?? 0)\n"
                 if (try? TranscriptCapture.writePrivate(Data(record.utf8), to: Self.pidFile(paths: paths))) == nil {
                     note("could not write \(Self.pidFile(paths: paths).path)")
                 }
@@ -433,7 +492,9 @@ public final class WALShipper: @unchecked Sendable {
         case leftAlone(Int32)
         /// Litestream for this config, alive, but without proof this engine started it (an older two-line record, or a start
         /// time that does not match): never signalled; the caller must not start a second one.
-        case unprovenLive(Int32)
+        case unprovenLive(Int32, StartProblem)
+
+        enum StartProblem: Equatable { case missing, mismatched }
 
         var text: String? {
             switch self {
@@ -441,8 +502,11 @@ public final class WALShipper: @unchecked Sendable {
             case .removedUnreadable: "removed an unreadable litestream.pid"
             case .stopped(let pid): "stopped litestream pid \(pid), left running by an earlier engine"
             case .leftAlone(let pid): "litestream.pid named pid \(pid), which is not litestream for this config; it was left alone"
-            case .unprovenLive(let pid):
-                "litestream.pid named pid \(pid), litestream for this config with no recorded start time to match; it was left alone"
+            case .unprovenLive(let pid, .missing):
+                "litestream.pid named pid \(pid), litestream for this config, but recorded no start time; it was left alone"
+                + " and WAL shipping is paused until it is stopped"
+            case .unprovenLive(let pid, .mismatched):
+                "litestream.pid named pid \(pid), litestream for this config, but its start time is not the recorded one; it was left alone"
                 + " and WAL shipping is paused until it is stopped"
             }
         }
@@ -461,8 +525,8 @@ public final class WALShipper: @unchecked Sendable {
         guard let pid = lines.first.flatMap({ Int32($0) }), pid > 1 else { return .removedUnreadable }
         guard kill(pid, 0) == 0 || errno == EPERM else { return .nothing }          // gone already
         guard let argv = ProcessArguments.of(pid), isLitestream(argv, config: config) else { return .leftAlone(pid) }
-        guard lines.count > 2, let recordedStart = Double(lines[2]), recordedStart > 0,
-              ProcessTable.entry(pid)?.start == recordedStart else { return .unprovenLive(pid) }
+        guard lines.count > 2, let recordedStart = Double(lines[2]), recordedStart > 0 else { return .unprovenLive(pid, .missing) }
+        guard ProcessTable.entry(pid)?.start == recordedStart else { return .unprovenLive(pid, .mismatched) }
         kill(pid, SIGTERM)
         let soft = AwakeTime.uptime() + grace
         while kill(pid, 0) == 0, AwakeTime.uptime() < soft { Thread.sleep(forTimeInterval: 0.01) }
@@ -475,11 +539,19 @@ public final class WALShipper: @unchecked Sendable {
         return .stopped(pid)
     }
 
-    /// The owner's notice when `start` paused on an unproven litestream (engine-written; the pid is the engine's own number).
-    public static func pausedNotice(pid: Int32) -> (title: String, body: String) {
-        ("WAL shipping paused",
-         "A litestream for this database (pid \(pid)) is running that this engine did not start, so no second one was started. "
-         + "Stop that process, then relaunch Brahma or save the backup settings again.")
+    /// The owner's notice when shipping paused (engine-written; the pid is the engine's own number). Only a relaunch restarts
+    /// shipping: the shipper is made once per engine start.
+    public static func pausedNotice(_ reason: PauseReason) -> (title: String, body: String) {
+        switch reason {
+        case .foreign(let pid):
+            ("WAL shipping paused",
+             "A litestream for this database (pid \(pid)) is running that this engine did not start, so no second one was started. "
+             + "Stop that litestream process, then relaunch Brahma.")
+        case .startUnreadable:
+            ("WAL shipping paused",
+             "Brahma could not read its own litestream's start time twice in a row and stopped both, so WAL shipping is off. "
+             + "Relaunch Brahma to try again.")
+        }
     }
 
     /// litestream (directly, or a script run by its interpreter: the name is the first or second argument) running

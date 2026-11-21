@@ -62,7 +62,7 @@ public final class EngineHost {
     @ObservationIgnored private let tickInterval: Duration
     @ObservationIgnored private var lock: OrchestratorLock?
     @ObservationIgnored private var engineTask: Task<Void, Never>?
-    /// The running orchestrator, so `stop` can end its litestream directly.
+    /// The running orchestrator (its litestream and caffeinate end inside its own bounded shutdown; `stop` only cancels and waits).
     @ObservationIgnored private var engine: Orchestrator?
     @ObservationIgnored private var rememberedTools: Result<EngineTools, EngineSetupError>?
     /// The bounded wait of the `stop` in progress, so a second quit request can end it at once (`forceStop`).

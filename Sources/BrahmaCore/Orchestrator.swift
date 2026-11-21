@@ -353,18 +353,18 @@ public actor Orchestrator {
         }
         let store = self.store, clock = self.clock
         let shipper = WALShipper(executable: litestream, paths: paths, tools: backupTools, sleeper: walSleeper, note: { [self] in log($0) },
-                                 onPaused: { pid in
-                                     // An unproven litestream for this database (Task 9c fix round 2): shipping stays paused and the
-                                     // owner is told once a day, in engine-written text.
-                                     let notice = WALShipper.pausedNotice(pid: pid)
+                                 onPaused: { reason in
+                                     // An unproven litestream for this database, or a child whose start could not be read (Task 9c fix
+                                     // rounds 2 and 3): shipping stays paused and the owner is told once a day, in engine-written text.
+                                     let notice = WALShipper.pausedNotice(reason)
                                      try? BackupTargets.noticeOncePerDay(store: store, title: notice.title, body: notice.body, now: clock())
                                  })
         walShipper = shipper
         shipper.start()
     }
 
-    /// Stops the litestream supervisor and its child (the engine is shutting down: `runForever` ends here, and the app's
-    /// `EngineHost.stop` calls it too). Blocking for at most `WALShipper.stopGrace` + 2 s.
+    /// Stops the litestream supervisor and its child. Since Task 9c the shutdown does this as a bounded step of its own
+    /// (`shutdown`, on a dedicated thread); this method remains for tests. Blocking for at most `WALShipper.stopGrace` + 2 s.
     public func stopWALShipping() {
         walShipper?.stop()
         walShipper = nil
@@ -375,7 +375,7 @@ public actor Orchestrator {
     /// Keeps the Mac awake while agents run (the owner's `preventSleep`); ended with the engine (`stopSleepPrevention`).
     nonisolated let sleepGuard: SleepGuard
 
-    /// Ends caffeinate (the engine is shutting down: `runForever` ends here, and the app's `EngineHost.stop` calls it too).
+    /// Ends caffeinate. Since Task 9c the shutdown does this as a bounded step of its own (`shutdown`); this method remains for tests.
     public func stopSleepPrevention() async { await sleepGuard.shutdown() }
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
@@ -1477,6 +1477,19 @@ public actor Orchestrator {
             end = .interrupted()
         } else if agentCapped {
             end = .interrupted(partial: result)
+        } else if case .startNotRecorded? = runnerError as? TurnError {
+            // Nothing ran: the runner killed the child it had just spawned because its start time could not be read, so no exact
+            // record could name it (Task 9c fix round 3). The engine's fault, not the agent's: `interrupted`, so no charge to the
+            // agent or the item (no failure count, no backoff, the lease kept), the scheduler retries it as any interrupted turn,
+            // and the owner can see why in the activity.
+            attempt {
+                try store.appendEvent(ActivityEvent(
+                    companyId: agent.companyId, agentId: agent.id, turnId: turn.id, kind: .error,
+                    text: "@\(agent.name)'s turn was stopped before it ran: the start time of its process could not be read, so the "
+                        + "engine could not record it; it is retried",
+                    createdAt: now))
+            }
+            end = .interrupted()
         } else if case .interrupted? = runnerError as? TurnError {
             // SIGTERM, or killed with background work pending (even after an early result): not the agent's doing.
             end = .interrupted(partial: result)
