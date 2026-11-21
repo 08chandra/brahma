@@ -86,13 +86,26 @@ extension Store {
     }
 
     /// At a holder turn's end (fix round 2): a session that is tainted now marks the items it holds, even when the taint came
-    /// from an earlier turn of the same session.
-    public func markHeldItemsIfTainted(agentId: String) throws {
+    /// from an earlier turn of the same session. Plan C Ruling 20: also every item the turn touched and no longer holds, as the
+    /// turn-end taint record takes them: those it held as the turn started (`heldAtStart`) and every item in the turn's claim
+    /// log (`turnId`), released since or not. Done items are left alone. `home`: where the hook flag file is read (the
+    /// orchestrator's data home), else the store's.
+    public func markHeldItemsIfTainted(agentId: String, turnId: String? = nil, heldAtStart: [String] = [], home: URL? = nil) throws {
         try writer.write { db in
             guard let agent = try Agent.fetchOne(db, key: agentId) else { return }
             var tainted = agent.sessionTainted
-            if !tainted, let home = dataHome, let flag = TaintFlag.url(home: home, agentId: agentId) { tainted = TaintFlag.exists(flag) }
-            if tainted { try Store.markHeldItemsTainted(db: db, agentId: agentId) }
+            if !tainted, let home = home ?? dataHome, let flag = TaintFlag.url(home: home, agentId: agentId) { tainted = TaintFlag.exists(flag) }
+            guard tainted else { return }
+            try Store.markHeldItemsTainted(db: db, agentId: agentId)
+            var touched = Set(heldAtStart)
+            if let turnId {
+                touched.formUnion(try String.fetchAll(db, sql: "SELECT itemId FROM leaseClaim WHERE agentId = ? AND turnId = ?",
+                                                      arguments: [agentId, turnId]))
+            }
+            for itemId in touched {
+                try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE id = ? AND companyId = ? AND status <> 'done'",
+                               arguments: [itemId, agent.companyId])
+            }
         }
     }
 

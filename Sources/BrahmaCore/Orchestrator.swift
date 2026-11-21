@@ -1538,8 +1538,13 @@ public actor Orchestrator {
         }
         // Task 10: the lab's new commits are recorded with the session's taint state, then a fresh session a refused high-risk
         // call asked for is applied (both flags and the flag file cleared). Git, off the cooperative pool.
-        // A tainted session marks every item it holds at turn end, leases taken mid-turn included (S21).
-        if launched, !isReview { attempt { try store.markHeldItemsIfTainted(agentId: agent.id) } }
+        // A tainted session marks every item it holds at turn end, leases taken mid-turn included (S21), and (Plan C Ruling 20)
+        // every item the turn touched and released: held as it started, or in its claim log. The hook flag is read under `paths`.
+        if launched, !isReview {
+            attempt {
+                try store.markHeldItemsIfTainted(agentId: agent.id, turnId: turn.id, heldAtStart: Array(heldAtStart.keys), home: paths.home)
+            }
+        }
         if launched, let labWorkspace {
             let (store, handle, turnId, ended, start) = (self.store, agent.name, turn.id, now, labAtStart)
             // The row OR the flag file (10b, I2); a tainted turn's lab is marked here, before the flag can be cleared below. S30: when
