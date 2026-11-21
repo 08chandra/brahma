@@ -1,8 +1,8 @@
 ---
 /**
  * Starlight `Footer` override: Starlight's own footer (pagination, edit link, last
- * updated) followed by a one-line colophon — licence, and a source link only when the
- * repository is public (`site.repoURL !== ''`).
+ * updated) followed by a one-line colophon — licence, third-party notices, and a source link
+ * only when the repository is public (`site.repoURL !== ''`).
  */
 import Default from '@astrojs/starlight/components/Footer.astro';
 import { site } from '../../site.config.ts';
@@ -13,6 +13,8 @@ import { site } from '../../site.config.ts';
   <span class="colophon__name">{site.title}</span>
   <span class="colophon__sep" aria-hidden="true">·</span>
   <a class="colophon__link" href="/license/">{site.license}</a>
+  <span class="colophon__sep" aria-hidden="true">·</span>
+  <a class="colophon__link" href="/third-party-notices/">Third-party notices</a>
   {
     site.repoURL !== '' && (
       <>

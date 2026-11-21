@@ -447,7 +447,7 @@ dispatch + manager override via `update_work_item owner`).
   > 7 reports refused at generation (attrition may exceed and raises an org
   issue).
 
-#### 4.5.3 Role cards v2 **[owner 2026-10-21 17:37 gstack study; 3a T1 built]**
+#### 4.5.3 Role cards v2 **[owner 2026-10-21 17:37 skill-pack study; 3a T1 built]**
 - Each role = `RoleTemplate` in a versioned pack: title, kind (executive,
   architect, manager, individual; directors are generated managers), handle prefix, prompt (≤ 5000 chars),
   company tools, models by mode, `playbooks[itemType]` (≤ 2500 chars each;
@@ -1094,7 +1094,7 @@ health history, grants ledger, later meter/trust/HR (3b).
   FTC endorsement rules; per-company approved-claims list (important for CPG).
 - Recurring work items (cron + item type + optional pre-check script that
   skips the turn when there is nothing to do) for calendars and metrics pulls.
-  **[call, gstack/Ability research rec 11; lands with M]**
+  **[call, skill-pack/Ability research rec 11; lands with M]**
 
 ### 4.14 External communication (Plan 7) **[owner 2026-10-20]**
 - Owner connects accounts per company (a dedicated company mailbox via Gmail
@@ -1392,7 +1392,7 @@ Kept so they are not lost; none is built unless the owner adopts it (Q2/Q4).
   companies; #21 PII tags, license/SCA scan, retention + legal hold,
   hash-chained audit tables; owner away mode; resume brief; dotted lines and
   per-agent money authority are explicitly not recommended.
-- gstack/Ability research: #12 typed deliverables with owner rating (3b
+- skill-pack/Ability research: #12 typed deliverables with owner rating (3b
   input), #14 steward-style digest content (folded into 5L digest), #17
   specialist review sub-agents (3b), #18 two-scale estimates, #19 per-model
   card overlays, #20 debt ledger.
@@ -1400,7 +1400,7 @@ Kept so they are not lost; none is built unless the owner adopts it (Q2/Q4).
 ## Appendix B. Sources
 Old spec and improvements proposal; `docs/research/` (existing projects,
 failures, design review, operating model and edge cases, end-goal efficiency
-review, gstack/Ability.ai); visual brief `2026-10-20-visual-design.md`; plans
+review, skill pack/Ability.ai); visual brief `2026-10-20-visual-design.md`; plans
 P1, P2 (built), 3a (worktree `plan3a-work`), 5L, 4a, 4b, 3b (written);
 amendments (3a review, builder checks 1–2, 5L builder check, efficiency,
-gstack, merge-conflict); controller decision log `autonomous-run.md`.
+skill pack, merge-conflict); controller decision log `autonomous-run.md`.
