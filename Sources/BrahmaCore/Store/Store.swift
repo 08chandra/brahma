@@ -38,6 +38,8 @@ public final class Store: Sendable {
     let gitLockTimeout = GitLockTimeout()
     let mergeRefProbe = MergeRefProbe()
     let journalProbe = JournalProbe()
+    /// Tests only: the git runner the ref code uses and a failing company read at a turn's end (Plan C2a).
+    let refHooks = RefHooks()
     /// How much output a plan-turn barrier git call may produce before the barrier fails closed (tests shrink it).
     let planBarrierOutputLimit = GitOutputLimit()
     /// Called inside the kill transaction of every agent (Plan 5-lite revokes grants, Plan 7 reassigns threads).
