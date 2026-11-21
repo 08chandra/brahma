@@ -132,11 +132,17 @@ public struct TaintedCommit: Codable, Equatable, Sendable, FetchableRecord, Pers
     public var createdAt: Date
     public var clearedBy: String?
     public var clearedAt: Date?
+    /// The commit the engine's rebase replayed it as (`carryTaintThroughRebase`): no longer on the branch, and not an orphan.
+    public var carriedTo: String?
+
+    /// A row whose `sha` is `unrecorded-<id>`: the commits of an item could not be listed, so none of them is provably clean.
+    public static let unrecordedPrefix = "unrecorded-"
 
     public init(companyId: String, sha: String, itemId: String?, agentId: String?, turnId: String?, source: String, createdAt: Date,
-                clearedBy: String? = nil, clearedAt: Date? = nil) {
+                clearedBy: String? = nil, clearedAt: Date? = nil, carriedTo: String? = nil) {
         self.companyId = companyId; self.sha = sha; self.itemId = itemId; self.agentId = agentId; self.turnId = turnId
         self.source = source; self.createdAt = createdAt; self.clearedBy = clearedBy; self.clearedAt = clearedAt
+        self.carriedTo = carriedTo
     }
 }
 

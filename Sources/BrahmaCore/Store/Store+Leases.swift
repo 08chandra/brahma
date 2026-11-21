@@ -116,6 +116,11 @@ extension Store {
         let lease = WorkLease(itemId: item.id, companyId: item.companyId, agentId: agentId, acquiredAt: now,
                               expiresActive: active + WorkLease.ttl)
         try lease.insert(db)
+        // Plan C2a: the claim log (the turn it was made in; its trusted head comes from `recordClaimHead`).
+        try db.execute(sql: """
+            INSERT INTO leaseClaim (companyId, agentId, itemId, turnId, createdAt)
+            VALUES (?, ?, ?, (SELECT id FROM turn WHERE agentId = ? AND outcome = ? ORDER BY startedAt DESC, rowid DESC LIMIT 1), ?)
+            """, arguments: [item.companyId, agentId, item.id, agentId, TurnOutcome.inProgress.rawValue, now])
         try recordItemEvent(db: db, item: item, actor: engine ? "system" : agentId, kind: .leaseClaimed,
                             text: engine ? "assigned by the engine" : "claimed by @\(actor.handle)", now: now)
         return lease
