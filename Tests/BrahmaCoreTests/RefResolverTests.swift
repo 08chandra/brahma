@@ -81,9 +81,26 @@ import GRDB
     @Test(.disabled("4a Task 6 pending: Artifact")) func artifactTitlesSanitized() throws {
         // 4a-gap: an artifact titled "Pay\u{202E}lacoL" resolves with the bidi control stripped, a Cyrillic "Рay" one as
         // confusable, and a 300-character one capped at 120.
+        // Seeded through 4a's artifact rows once they exist (Task 6); the columns follow 4a's plan.
         let fx = try RefFixture()
-        let r = try fx.resolve(.owner, try fx.ref("AR-1"))
-        #expect(r.visibility == .full)
+        func seed(_ number: Int, _ title: String) throws {
+            try fx.store.writer.write { db in
+                try db.execute(sql: "INSERT INTO artifact (id, companyId, number, title) VALUES (?, ?, ?, ?)",
+                               arguments: [UUID().uuidString, fx.c.id, number, title])
+            }
+        }
+        try seed(1, "Pay\u{202E}lacoL")
+        try seed(2, "\u{0420}ay now")
+        try seed(3, String(repeating: "w", count: 300))
+        let bidi = try fx.resolve(.owner, try fx.ref("AR-1"))
+        #expect(bidi.visibility == .full)
+        #expect(!bidi.title.unicodeScalars.contains { $0.value == 0x202E })
+        #expect(bidi.title.contains("PaylacoL"))
+        let cyrillic = try fx.resolve(.owner, try fx.ref("AR-2"))
+        #expect(SafeTitle.make(cyrillic.title).confusable)
+        let long = try fx.resolve(.owner, try fx.ref("AR-3"))
+        #expect(long.title.count <= SafeTitle.max)
+        #expect(long.title.hasSuffix("\u{2026}"))
     }
 
     @Test func artifactResolvesMissingUntil4a() throws {
@@ -133,6 +150,90 @@ import GRDB
         #expect(diff.title == "ENG-1 diff (uncommitted)")
         #expect(diff.subtitle == "+1 \u{2212}0 in 1 file")
         #expect(try fx.resolve(.eng1, try fx.ref("ENG-1:nope.ts@worktree")).visibility == .missing)
+    }
+
+    @Test func pinsLiveKinds() throws {
+        let fx = try RefFixture()
+        let agent = try fx.store.pinRef(try fx.ref("@eng-3"), for: .owner, companyId: fx.c.id, messageRefId: "mr-a")
+        #expect(agent.params["was"] == fx.eng3.state.rawValue)
+        #expect(agent.canonical == "@eng-3")
+        let now = fx.now, cId = fx.c.id, ctoId = fx.cto.id
+        try fx.store.writer.write { db in
+            try PreviewSurface(id: UUID().uuidString, companyId: cId, name: "web", position: 0, build: nil, run: "npm start",
+                               url: "http://127.0.0.1:{port}/", setById: ctoId, createdAt: now, updatedAt: now).insert(db)
+        }
+        let preview = try fx.store.pinRef(try fx.ref("preview:web/checkout@iphone"), for: .agent(fx.qa2.id), companyId: fx.c.id,
+                                          messageRefId: "mr-p")
+        #expect(preview.params["was"] == "idle")
+        #expect(preview.params["main"] == (try fx.head()))
+        #expect(preview.params["path"] == "/checkout" && preview.params["viewport"] == "iphone")
+        #expect(preview.canonical == "preview:web/checkout@iphone")
+        let resolved = try fx.resolve(.qa2, try fx.ref("preview:web/checkout@iphone"))
+        #expect(resolved.title == "preview web/checkout" && resolved.subtitle == "idle · iphone")
+    }
+
+    @Test func latestRunOfAnItem() throws {
+        let fx = try RefFixture()
+        let now = fx.now, cId = fx.c.id, itemId = fx.item.id
+        let head = try fx.head("item/ENG-1")
+        try fx.store.writer.write { db in
+            try VerificationRun(id: "run-old", companyId: cId, itemId: itemId, checkRevision: 0, scriptHash: "h", commit: head,
+                                command: "true", workingDirectory: ".", timeoutSeconds: 60, purpose: .submit, status: .failed,
+                                exitCode: 1, createdAt: now.addingTimeInterval(-60)).insert(db)
+            try VerificationRun(id: "run-new", companyId: cId, itemId: itemId, checkRevision: 0, scriptHash: "h", commit: head,
+                                command: "true", workingDirectory: ".", timeoutSeconds: 60, purpose: .submit, status: .passed,
+                                exitCode: 0, createdAt: now).insert(db)
+        }
+        let latest = try fx.resolve(.qa2, try fx.ref("ENG-1:run"))
+        #expect(latest.visibility == .full)
+        #expect(latest.title == "run · ENG-1" && latest.subtitle == "passed · exit 0")
+        #expect(try fx.resolve(.qa2, try fx.ref("run:run-old")).subtitle == "failed · exit 1")
+        #expect(try fx.resolve(.qa2, try fx.ref("ENG-9:run")).visibility == .missing)
+    }
+
+    /// A ref arriving with every field set leaves with all of them blanked, whatever the reason.
+    @Test func blankingClearsEveryField() throws {
+        let fx = try RefFixture()
+        let full = WorkRef(kind: .resource, id: "1", branch: "item/ENG-1", rev: "abcdef1", range: LineRange(start: 1, end: 9),
+                           params: ["file": "x", "was": "y"])
+        let locked = try fx.resolve(.eng1, full)
+        #expect(locked.visibility == .locked(approverRole: "owner"))
+        let unreachable = WorkRef(kind: .file, id: "src/a.ts", rev: "abcdef1", range: LineRange(start: 1, end: 2), params: ["k": "v"])
+        let missing = try fx.resolve(.eng1, unreachable)
+        #expect(missing.visibility == .missing)
+        for r in [locked, missing] {
+            #expect(r.ref == WorkRef(kind: r.ref.kind, id: ""))
+            #expect(r.title == "" && r.subtitle == "" && r.bytes == nil && r.newer == nil && !r.tainted && r.taintReason == nil)
+        }
+    }
+
+    /// An agent of company D naming company C gets nothing of C's.
+    @Test func otherCompanyReaderGetsMissing() throws {
+        let fx = try RefFixture()
+        let outsider = try fx.store.hire(companyId: fx.d.id, name: "spy", role: "engineer", model: "sonnet")
+        for s in ["F-2", "ENG-1", "src/a.ts", "#eng", "A-5"] {
+            let r = try fx.store.resolveRef(try fx.ref(s), for: .agent(outsider.id), companyId: fx.c.id)
+            #expect(r.visibility == .missing && r.title == "" && r.ref.id == "", "\(s)")
+        }
+    }
+
+    /// `.brahma` places outside the allowlist and the private places are refused before any filesystem access: an existing
+    /// one and a missing one look the same; `home` is never shareable, as SafeFS has it.
+    @Test func forbiddenBrahmaPlacesAreNoOracle() throws {
+        let fx = try RefFixture()
+        try fx.git.write(".brahma/checks/run.sh", "echo\n")
+        try fx.git.write(".brahma/home/qa-2/t", "home\n")
+        for who in [RefFixture.Who.owner, .qa2] {
+            let existing = try fx.resolve(who, try fx.ref(".brahma/checks/run.sh"))
+            let missing = try fx.resolve(who, try fx.ref(".brahma/checks/nope.sh"))
+            #expect(existing.visibility == .refused && missing.visibility == .refused)
+            var (a, b) = (existing, missing)
+            a.opaqueId = ""; b.opaqueId = ""
+            #expect(a == b)
+            #expect(try fx.resolve(who, try fx.ref(".brahma/home/qa-2/t")).visibility == .refused)
+        }
+        try fx.git.write(".brahma/artifacts/a.txt", "art\n")
+        #expect(try fx.resolve(.qa2, try fx.ref(".brahma/artifacts/a.txt")).visibility == .full)
     }
 
     @Test func otherAgentLabRefusedOnResolve() throws {

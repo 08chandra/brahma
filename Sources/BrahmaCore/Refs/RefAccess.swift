@@ -9,8 +9,10 @@ public enum RefDecision: Equatable, Sendable {
 }
 
 /// Read access for refs (design §4.2), decided by ML's one access engine (`MemoryAccess.level`) with no second predicate.
-/// Every lookup is bound to the company (`companyId = ?`); an object of another company, an unknown one and a reader of
-/// another company are all `.refused` here (the resolver shows the first two as `.missing`).
+/// `canRead` decides the class only: it does not prove that the object exists or that it is this company's (a file path or
+/// a commit sha is decided without git). Existence and company membership are the resolver's (`Store.resolveRef`, which
+/// shows an unknown or another company's object as `.missing`). Every row lookup is still bound to the company
+/// (`companyId = ?`), a row it does not find is `.refused`, and so is a reader of another company.
 ///
 /// The class per kind: file, diff, commit, item, run, preview, release, agent and sprint are company; a `.brahma` lab, home
 /// or notes path is private to its agent; a message or thread follows its channel (members, else locked) or DM
@@ -18,8 +20,9 @@ public enum RefDecision: Equatable, Sendable {
 /// flagged one is secret); a kb page its page restriction (and a named section's markers); a memory entry its memory doc;
 /// an ask ML's per-party class (owner, requester, internal approver, decider; else refused); a fact the owner's.
 public enum RefAccess {
+    /// `catalog` is the store's (`Store.catalog`): roles and executive seats are read from it.
     public static func canRead(_ reader: Reader, _ ref: WorkRef, companyId: String, db: Database,
-                               catalog: PackCatalog = .builtin) throws -> RefDecision {
+                               catalog: PackCatalog) throws -> RefDecision {
         guard let ctx = try readerContext(reader, companyId: companyId, db: db, catalog: catalog),
               let subject = try subject(ref, companyId: companyId, db: db) else { return .refused }
         return decide(ctx, subject)
@@ -35,6 +38,7 @@ public enum RefAccess {
     }
 
     static func decide(_ ctx: ReaderContext, _ s: Subject) -> RefDecision {
+        if s.forbiddenPlace { return .refused }
         let level = MemoryAccess.level(ctx, access: s.access, sensitivity: s.sensitivity, readerSet: s.readerSet,
                                        restrictions: s.restrictions, futureHolders: s.futureHolders)
         if case .full = level {
@@ -58,6 +62,9 @@ public enum RefAccess {
         var futureHolders = false
         /// A non-reader is refused, not offered an approver (a DM, an ask, an agent's private place, a fact).
         var refusedWhenUnreadable = false
+        /// A `.brahma` place no ref may name (outside SafeFS's allowlist and the agents' labs and notes): refused for every
+        /// reader, before any filesystem access, so an existing and a missing one look the same.
+        var forbiddenPlace = false
         var record: Record
     }
 
@@ -86,6 +93,7 @@ public enum RefAccess {
         switch ref.kind {
         case .file:
             if let key = ref.itemKey { guard try item(db, companyId, key) != nil else { return nil } }
+            if isForbiddenPlace(ref.id) { return Subject(forbiddenPlace: true, record: .file(place: nil)) }
             guard let place = privatePlace(ref) else { return Subject(record: .file(place: nil)) }
             guard ref.branch == nil, ref.rev == nil,
                   let agent = try Agent.fetchOne(db, sql: "SELECT * FROM agent WHERE companyId = ? AND name = ?",
@@ -194,7 +202,9 @@ public enum RefAccess {
         case .channel:
             guard let channel = try Channel.fetchOne(db, sql: "SELECT * FROM channel WHERE companyId = ? AND name = ? AND kind = 'channel'",
                                                      arguments: [companyId, ref.id]) else { return nil }
-            let members = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM channelMember WHERE channelId = ?", arguments: [channel.id]) ?? 0
+            let members = try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM channelMember m JOIN channel c ON c.id = m.channelId WHERE m.channelId = ? AND c.companyId = ?
+                """, arguments: [channel.id, companyId]) ?? 0
             return Subject(access: .channel(channel.id), record: .channel(channel, members: members))
         case .sprint:
             guard let n = Int(ref.id), let sprint = try Sprint.fetchOne(db, sql: "SELECT * FROM sprint WHERE companyId = ? AND number = ?",
@@ -205,16 +215,25 @@ public enum RefAccess {
         }
     }
 
-    /// The agent handle owning a private `.brahma` place the path is in (`labs/<h>/…`, `home/<h>/…`,
-    /// `notes/agents/<h>.md`), or nil for any other path.
+    /// The agent handle owning a private `.brahma` place the path is in (`labs/<h>/…`, `notes/agents/<h>.md`), or nil for
+    /// any other path. (`home/<h>` is never shareable: SafeFS refuses it, so it is a forbidden place.)
     static func privatePlace(_ ref: WorkRef) -> String? {
         let parts = ref.id.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         guard parts.count >= 3, parts[0] == ".brahma" else { return nil }
         switch parts[1] {
-        case "labs", "home": return parts[2]
+        case "labs": return parts[2]
         case "notes" where parts.count == 4 && parts[2] == "agents" && parts[3].hasSuffix(".md"): return String(parts[3].dropLast(3))
         default: return nil
         }
+    }
+
+    /// A `.brahma/…` path that is neither under one of `SafeFS.brahmaAllowlist`'s children nor a private place (a lab or an
+    /// agent's notes file): `home`, `checks`, team notes, `wt`, the vault-like rest.
+    static func isForbiddenPlace(_ path: String) -> Bool {
+        guard path == ".brahma" || path.hasPrefix(".brahma/") else { return false }
+        let rest = String(path.dropFirst(".brahma/".count))
+        if SafeFS.brahmaAllowlist.contains(where: { rest.hasPrefix($0 + "/") }) { return false }
+        return privatePlace(WorkRef(kind: .file, id: path)) == nil
     }
 
     static func item(_ db: Database, _ companyId: String, _ key: String) throws -> WorkItem? {
