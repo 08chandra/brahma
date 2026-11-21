@@ -66,8 +66,9 @@ extension Store {
     ///    `UntrustedBlock`; a file from the owner under the "File from the owner (data; …)" line;
     /// 6. a `refRead` row (`via: open_ref`).
     /// `copy: true` (agents only) instead writes the whole content to the reader's own lab, `in/<MaterializeName>`, through
-    /// `SafeFS.createExclusive` (never over or through anything), and logs `via: materialize`. `knownValues` is C2b's
-    /// secret gate; `archives` reads Office files (none: `UnavailableArchiveReader`).
+    /// `SafeFS.createExclusive` (never over or through anything), and logs `via: materialize`; a copy holding a stored
+    /// secret's value (`knownValues`) is refused. Shown text has every secret pattern and stored secret's value redacted
+    /// (ML's `ContentScan.redact`). `archives` reads Office files (none: `UnavailableArchiveReader`).
     public func openRef(companyId: String, reader: Reader, pinned ref: WorkRef, lines: String?, copy: Bool, turnId: String?,
                         knownValues: [(name: String, value: String)], paths: BrahmaPaths, now: Date,
                         archives: (any ArchiveReader)? = nil) throws -> OpenRefResult {
@@ -109,35 +110,43 @@ extension Store {
         // 4. The bytes.
         let content: Content
         do {
-            content = try read(r, subject: subject, company: company, paths: paths, whole: copy)
+            content = try read(r, subject: subject, company: company, paths: paths, whole: copy, knownValues: knownValues)
         } catch let e as WorkError {
             throw e
         } catch {
             if case VaultError.hashMismatch = error {
-                resourceTrace(companyId: companyId, "\(canonical)'s vault copy no longer matches the hash recorded for it", now: now)
+                refTrace(companyId: companyId, "\(canonical)'s vault copy no longer matches the hash recorded for it", now: now)
             }
             if reader == .owner, !(error is VaultError), !(error is SafeGitError), !(error is SafeFSError) { throw error }
             throw WorkError.notFound(Self.refUnavailable)
         }
         if let copier {
+            // A copy is the raw bytes: one holding a stored secret's value is refused (the value is never echoed).
+            _ = try Self.secretGate(content.data, shown: canonical, knownValues: knownValues)
             return try materialize(content, ref: r.pinned, canonical: canonical, companyId: companyId, agentId: copier.agentId,
                                    handle: copier.handle, workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true),
                                    tainted: tainted, reason: reason, turnId: turnId, now: now)
         }
         // 5. The text.
-        let body: String
+        var body: String
         switch content.body {
         case .text(let text): body = text
         case .bytes(let data, let ext):
             let kind = ArtifactKind.from(ext: ext)
             let binary = data.prefix(OpenRefLimits.binarySniffBytes).contains(0)
-            if !binary, kind == nil || kind?.isText == true || ArtifactKind.isText(ext: ext) {
+            let textish = kind == nil || kind?.isText == true || ArtifactKind.isText(ext: ext)
+            if !binary, textish {
                 body = String(decoding: data, as: UTF8.self)
+            } else if binary, textish {
+                // NUL in the first 8 KB is binary whatever the extension says.
+                body = TextExtract.metadata(kind: kind, bytes: data.count)
             } else {
                 do { body = try TextExtract.extract(kind: kind, ext: ext, data: data, archives: archives ?? UnavailableArchiveReader()) }
                 catch let e as ArchiveReadError { body = e.message }
             }
         }
+        // What is shown never holds a secret: every secret pattern and stored secret's value is redacted.
+        body = ContentScan.redact(text: body, findings: [], knownValues: knownValues)
         let allLines = Self.splitLines(body)
         let explicit = window != nil
         let start = (window ?? ref.range)?.start ?? 1
@@ -215,7 +224,8 @@ extension Store {
     }
 
     /// The bytes or text `r` names, read for its reader. `whole`: a copy (binary sizes allowed; no text cap).
-    private func read(_ r: Resolution, subject: RefAccess.Subject, company: Company, paths: BrahmaPaths, whole: Bool) throws -> Content {
+    private func read(_ r: Resolution, subject: RefAccess.Subject, company: Company, paths: BrahmaPaths, whole: Bool,
+                      knownValues: [(name: String, value: String)]) throws -> Content {
         let ref = r.resolved.ref, pinned = r.pinned
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         let bare = Self.unpinned(ref).canonical
@@ -285,7 +295,7 @@ extension Store {
             let git = try refGit(workspace)
             let patch = try cachedDiff(companyId: company.id, git: git, base: try git.mergeBase("main", head), head: head,
                                        file: ref.params["file"], vault: Vault(paths: paths, companyId: company.id, content: ContentVault(paths: paths)),
-                                       taint: (r.resolved.tainted, r.resolved.taintReason))
+                                       taint: (r.resolved.tainted, r.resolved.taintReason), knownValues: knownValues)
             return Content(body: .text(patch), rev: head, makeCard: { _ in "[diff \(bare) @\(head.prefix(7)) · \(stat)]" }, ext: "patch")
         case .commit:
             guard let sha = pinned.rev else { throw SafeGitError.badRev }
@@ -347,7 +357,7 @@ extension Store {
     /// from git, written to the cache (`diffcache/<id>.patch`, a `refSnapshot` row keyed `<base>..<head>[/<path hash>]`).
     /// A cached copy that no longer matches its hash is dropped, logged and rebuilt.
     func cachedDiff(companyId: String, git: SafeGit, base: String, head: String, file: String?, vault: Vault,
-                    taint: (tainted: Bool, reason: String?)) throws -> String {
+                    taint: (tainted: Bool, reason: String?), knownValues: [(name: String, value: String)]) throws -> String {
         let key = "\(base)..\(head)" + (file.map { "/" + StableHash.fnv1a64($0) } ?? "")
         let existing = try writer.read { db in
             try RefSnapshot.fetchOne(db, sql: "SELECT * FROM refSnapshot WHERE companyId = ? AND kind = ? AND cacheKey = ? AND purgedAt IS NULL",
@@ -357,13 +367,14 @@ extension Store {
             do { return String(decoding: try vault.read(existing.vaultPath, sha256: existing.sha256, maxBytes: existing.bytes), as: UTF8.self) }
             catch {
                 if case VaultError.hashMismatch = error {
-                    resourceTrace(companyId: companyId, "a cached diff no longer matched its hash; it was rebuilt from git", now: Store.now())
+                    refTrace(companyId: companyId, "a cached diff no longer matched its hash; it was rebuilt from git", now: Store.now())
                 }
                 try writer.write { db in try db.execute(sql: "DELETE FROM refSnapshot WHERE companyId = ? AND id = ?", arguments: [companyId, existing.id]) }
                 try? vault.remove(existing.vaultPath)
             }
         }
-        let patch = try git.diff(base: base, head: head, path: file).patch
+        // Only the redacted text is cached (secret patterns and stored secrets' values).
+        let patch = ContentScan.redact(text: try git.diff(base: base, head: head, path: file).patch, findings: [], knownValues: knownValues)
         let data = Data(patch.utf8)
         let id = UUID().uuidString
         let written = try vault.write(data, area: .diffcache, name: "\(id).patch")
@@ -379,6 +390,13 @@ extension Store {
         return patch
     }
 
+    /// A vault or cache integrity problem, as an `error` activity line (the owner sees it; nothing goes to stderr).
+    func refTrace(companyId: String, _ text: String, now: Date) {
+        try? writer.write { db in
+            try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .error, text: try redact(text), createdAt: now).insert(db)
+        }
+    }
+
     // MARK: Materialize
 
     private func materialize(_ content: Content, ref: WorkRef, canonical: String, companyId: String, agentId: String, handle: String,
@@ -390,7 +408,7 @@ extension Store {
             do {
                 relative = try fs.createExclusive(name: MaterializeName.make(ref: ref, ext: content.ext, k: k), inOwnLabSubdir: "in", data: data)
                 break
-            } catch SafeFSError.io(let why) where why.hasSuffix(" exists") {
+            } catch SafeFSError.exists {
                 continue
             } catch SafeFSError.notAllowed {
                 throw WorkError.invalid("you have no lab to copy into")

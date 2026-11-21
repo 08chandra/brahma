@@ -227,9 +227,11 @@ import GRDB
         let resolved = try cf.fx.resolve(.qa2, file)
         #expect(resolved.tainted && resolved.taintReason == Self.reason)
         // A pin made now keeps the taint after the holder's session is clean again.
-        let pinned = try cf.store.pinRef(file, for: .agent(cf.fx.qa2.id), companyId: cId, messageRefId: "mr-t", paths: cf.paths)
+        let pinned = try cf.store.pinRef(file, for: .agent(cf.fx.qa2.id), companyId: cId, messageRefId: "mr-t", knownValues: [], paths: cf.paths)
         try cf.store.endThrowawaySessionTaint(agentId: engId)
-        #expect(try cf.store.refTaint(file, companyId: cId) == (false, nil))
+        // The holder's session is clean again, but 5-lite's mark on the item it held while tainted is sticky: its worktree
+        // still holds what that session wrote (fail closed).
+        #expect(try cf.store.refTaint(file, companyId: cId) == (true, "from a session that read outside content"))
         #expect(try cf.store.refTaint(pinned, companyId: cId) == (true, Self.reason))
         let pinnedResolved = try cf.store.resolveRef(pinned, for: .owner, companyId: cId)
         #expect(pinnedResolved.tainted && pinnedResolved.provenance == .external("tainted-session:docs.swift.org"))
@@ -276,6 +278,144 @@ import GRDB
         #expect(activity.contains { $0.kind == .access && $0.text == "Owner vouched for ENG-1's changes" })
         #expect(throws: WorkError.self) { try cf.store.vouchItem(itemId: "nope", now: cf.now) }
     }
+
+    // MARK: Fix round 1
+
+    /// Records the fixture's item commit (touching src/a.ts and src/b.ts) as tainted; returns it.
+    @discardableResult
+    static func taintItemCommit(_ cf: CollabFixture) throws -> String {
+        let base = try cf.fx.git.git(["merge-base", "main", "item/ENG-1"]), head = try cf.fx.head("item/ENG-1")
+        try cf.store.recordTaintedCommits(companyId: cf.c.id, itemId: cf.fx.item.id, agentId: cf.fx.eng3.id, turnId: nil,
+                                          headBefore: base, headAfter: head, source: "docs.swift.org",
+                                          git: SafeGit(workspace: cf.workspace), now: cf.now)
+        return head
+    }
+
+    /// I1: a tainted commit is tainted whichever ref names it: a commit ref (full or abbreviated), a key-less file at that
+    /// rev, and a rev whose history can't be read (fail closed).
+    @Test func commitAndKeylessRefsCarryTaint() throws {
+        let cf = try CollabFixture()
+        let sha = try Self.taintItemCommit(cf)
+        func taint(_ s: String) throws -> (tainted: Bool, reason: String?) { try cf.store.refTaint(try cf.fx.ref(s), companyId: cf.c.id) }
+        #expect(try taint("commit:\(sha)") == (true, Self.reason))
+        #expect(try taint("commit:\(sha.prefix(7))").tainted)
+        #expect(try taint("src/a.ts@\(sha)") == (true, Self.reason))
+        #expect(try taint("commit:\(try cf.fx.head())") == (false, nil))
+        #expect(try taint("src/a.ts@\(try cf.fx.head())") == (false, nil))
+        #expect(try taint("src/a.ts@0123456789abcdef0123456789abcdef01234567").tainted)    // history unreadable: fail closed
+        #expect(try cf.fx.resolve(.qa2, try cf.fx.ref("commit:\(sha)")).tainted)
+        let out = try cf.open(.qa2, "commit:\(sha)")
+        #expect(out.tainted && out.text.hasPrefix("Untrusted content from commit:\(sha)"))
+        #expect(try cf.agent(cf.fx.qa2).sessionTainted)
+        let file = try cf.open(.eng1, "src/a.ts@\(sha)")
+        #expect(file.tainted && file.text.hasPrefix("Untrusted content from"))
+    }
+
+    /// I1: `@worktree` content holds the branch's committed lines: tainted by those commits whoever holds it now, and a pin
+    /// keeps it.
+    @Test func worktreeCarriesCommittedTaint() throws {
+        let cf = try CollabFixture()
+        try Self.taintItemCommit(cf)
+        _ = try cf.fx.git.ws.addWorktree(key: "ENG-1")
+        let file = try cf.fx.ref("ENG-1:src/a.ts@worktree")
+        #expect(try cf.store.refTaint(file, companyId: cf.c.id) == (true, Self.reason))
+        #expect(!(try cf.store.refTaint(try cf.fx.ref("ENG-1:src/checkout.tsx@worktree"), companyId: cf.c.id)).tainted)
+        let pinned = try cf.store.pinRef(file, for: .agent(cf.fx.qa2.id), companyId: cf.c.id, messageRefId: "mr-wt", knownValues: [],
+                                         paths: cf.paths)
+        #expect(pinned.params["taint"] == "docs.swift.org")
+        #expect(try cf.open(.qa2, pinned: pinned).tainted)
+    }
+
+    /// I2 (ruling 5): the engine's rebase carries the taint to the rewritten commits, mapped one to one: the tainted commit's
+    /// replay is tainted, a clean commit's is not; the diff (what the review reads) and the files read as before.
+    @Test func rebasedItemStaysTainted() throws {
+        let cf = try CollabFixture()
+        let tainted = try Self.taintItemCommit(cf)                               // touches src/a.ts, src/b.ts
+        let clean = try cf.commit(["src/c.ts": Data("c\n".utf8)], on: "item/ENG-1", message: "clean")
+        let (itemId, cId) = (cf.fx.item.id, cf.c.id)
+        try cf.store.writer.write { db in try db.execute(sql: "UPDATE workItem SET verifiedCommit = ? WHERE id = ?", arguments: [clean, itemId]) }
+        try cf.commit(["docs/main.md": Data("moved\n".utf8)], message: "main moves")
+        try cf.fx.git.git(["rebase", "-q", "main", "item/ENG-1"])
+        try cf.fx.git.git(["checkout", "-q", "main"])
+        let rebased = try cf.fx.head("item/ENG-1"), replayed = try cf.fx.git.git(["rev-parse", "\(rebased)~1"])
+        #expect(replayed != tainted && rebased != clean)
+        try cf.store.finishMerge(itemId: itemId, result: .rebased(head: rebased), triggerAfterLanding: false, now: cf.now)
+        let shas = try cf.store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT sha FROM taintedCommit WHERE companyId = ? AND clearedBy IS NULL", arguments: [cId])
+        }
+        #expect(Set(shas) == [tainted, replayed])
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:diff"), companyId: cId) == (true, Self.reason))
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:src/a.ts"), companyId: cId) == (true, Self.reason))
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:src/c.ts"), companyId: cId) == (false, nil))
+        #expect(try cf.store.refTaint(try cf.fx.ref("commit:\(replayed)"), companyId: cId).tainted)
+        #expect(try cf.fx.resolve(.qa2, try cf.fx.ref("ENG-1:diff")).tainted)
+        try cf.store.vouchItem(itemId: itemId, now: cf.now)
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:diff"), companyId: cId) == (false, nil))
+    }
+
+    /// I2: without the pre-rebase head the mapping can't be made: every new commit is tainted (fail closed); and a rewrite
+    /// nothing carried (the holder's own squash) leaves the item's diff and files tainted.
+    @Test func unmappedRewritesFailClosed() throws {
+        let cf = try CollabFixture()
+        try Self.taintItemCommit(cf)
+        try cf.commit(["src/c.ts": Data("c\n".utf8)], on: "item/ENG-1", message: "clean")
+        try cf.commit(["docs/main.md": Data("moved\n".utf8)], message: "main moves")
+        try cf.fx.git.git(["rebase", "-q", "main", "item/ENG-1"])
+        try cf.fx.git.git(["checkout", "-q", "main"])
+        let rebased = try cf.fx.head("item/ENG-1")
+        try cf.store.finishMerge(itemId: cf.fx.item.id, result: .rebased(head: rebased), triggerAfterLanding: false, now: cf.now)
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:src/c.ts"), companyId: cf.c.id).tainted)
+        // A squash the engine did not make: nothing of the item's tainted work is on the branch, so all of it is tainted.
+        let other = try CollabFixture()
+        try Self.taintItemCommit(other)
+        try other.fx.git.git(["checkout", "-q", "item/ENG-1"])
+        try other.fx.git.git(["reset", "-q", "--soft", "main"])
+        try other.fx.git.git(["commit", "-q", "-m", "squashed"])
+        try other.fx.git.git(["checkout", "-q", "main"])
+        #expect(try other.store.refTaint(try other.fx.ref("ENG-1:diff"), companyId: other.c.id) == (true, Self.reason))
+        #expect(try other.store.refTaint(try other.fx.ref("ENG-1:src/b.ts"), companyId: other.c.id).tainted)
+    }
+
+    /// I3: the resolver carries every kind's taint: a message from a tainted session (backfilled: no write-time mark) and a
+    /// non-file ref pinned by a tainted session; opening either taints the reader and frames it as untrusted.
+    @Test func resolverCarriesTaintForEveryKind() throws {
+        let cf = try CollabFixture()
+        let (mId, cId) = (cf.fx.engMessage.id, cf.c.id)
+        try cf.store.writer.write { db in
+            try db.execute(sql: "UPDATE message SET taintedOrigin = 0, fromTaintedSession = 1, taintSource = 'docs.swift.org' WHERE companyId = ? AND id = ?",
+                           arguments: [cId, mId])
+        }
+        let msg = try cf.fx.ref("msg:\(mId)")
+        let resolved = try cf.fx.resolve(.eng1, msg)
+        #expect(resolved.tainted && resolved.taintReason == Self.reason)
+        let out = try cf.open(.eng1, "msg:\(mId)")
+        #expect(out.tainted && out.text.hasPrefix("Untrusted content from msg:\(mId)"))
+        #expect(try cf.agent(cf.fx.eng1).sessionTainted)
+        // An item pinned by a tainted session.
+        let pinned = try cf.store.pinRef(try cf.fx.ref("ENG-1"), for: .agent(cf.fx.eng1.id), companyId: cId, messageRefId: "mr-i",
+                                         knownValues: [])
+        #expect(pinned.params["taint"] != nil)
+        let item = try cf.store.resolveRef(pinned, for: .agent(cf.fx.qa2.id), companyId: cId)
+        #expect(item.tainted && item.provenance.raw.hasPrefix("external:tainted-session:"))
+        #expect(try cf.open(.qa2, pinned: pinned).tainted)
+        #expect(try cf.agent(cf.fx.qa2).sessionTainted)
+    }
+
+    /// I4: a lease claimed during a tainted turn has no head at the turn's start; its commits are recorded all the same.
+    @Test func midTurnClaimRecordsTaint() async throws {
+        let h = try Holder(claim: false)
+        let (store, engId, companyId, key, wt) = (h.store, h.eng.id, h.company.id, h.item.key, h.worktree(h.item))
+        let shas = ShaBox()
+        try await h.turn {
+            try store.markTainted(agentId: engId, source: "docs.swift.org")
+            _ = try CompanyTools(store: store, companyId: companyId, agentId: engId).call(name: "claim_lease", arguments: ["key": .string(key)])
+            shas.append(try Holder.commit(wt, "src/mid.ts", "mid\n"))
+        }
+        let rows = try h.rows()
+        #expect(Set(rows.map(\.sha)) == Set(shas.all))
+        #expect(rows.allSatisfy { $0.itemId == h.item.id && $0.source == "docs.swift.org" })
+    }
+
 }
 
 /// Shas a turn's side effect records, read by the test afterwards.

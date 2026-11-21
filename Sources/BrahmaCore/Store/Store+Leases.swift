@@ -13,6 +13,9 @@ public struct WorkLease: Codable, Equatable, Sendable, FetchableRecord, Persista
     public var agentId: String
     public var acquiredAt: Date
     public var expiresActive: Double
+    /// Plan C2a: the item branch's head when the lease was claimed (`recordClaimHead`): where the taint record of a turn that
+    /// claimed it starts.
+    public var claimHead: String? = nil
 
     public init(itemId: String, companyId: String, agentId: String, acquiredAt: Date, expiresActive: Double) {
         self.itemId = itemId; self.companyId = companyId; self.agentId = agentId
