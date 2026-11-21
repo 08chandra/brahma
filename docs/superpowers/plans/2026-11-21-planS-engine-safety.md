@@ -20,13 +20,11 @@
 
 **Spec (authoritative):** `docs/superpowers/specs/2026-11-21-engine-safety-design.md` (cited as "spec §n"). It argues from `docs/superpowers/specs/2026-11-21-design-analysis-input.md`. Read both before Task S1. Decisions marked "(architect's call)" in the spec are binding. Changing one needs a controller ruling.
 
-**Owner questions:** the plan is written for the spec's defaults:
-- Q1: 3a `commitAll` stays in-process.
-- Q2: S14 migrates the 12 relaying tools; the rest use a frozen legacy shim.
-- Q3: deploy smoke stays in-engine.
-- Q4: helper features are "unavailable" off macOS.
-
-If the owner answers differently, the controller adds or extends the task the spec names.
+**Owner decisions, 2026-11-21 (spec, top section):**
+1. 3a's submit and auto-commit staging moves into the helper (Task S10b).
+2. **All** MCP tool outputs are typed. A temporary legacy shim exists between S14a and S14b only, and S14b deletes it.
+3. Deployed-site smoke moves into the helper (Task S9b).
+4. With no Seatbelt available, helper-backed features say "unavailable".
 
 ## Global Constraints
 
@@ -71,9 +69,11 @@ Copied from Plans 3a, 5-lite, 4a and C (as amended) and still binding, except wh
 | `loopbackHTTP` | ≤ 20 requests · 10 s each · ≤ 210 s per call · request body ≤ 64 KiB · headers ≤ 16 KiB · body read ≤ 4 × `SmokeRequest.bodyKept` | `HelperLimits.loopbackHTTP` |
 | `stageCopy` | 60 s · ≤ 2000 entries · depth ≤ 32 · 4a `ArtifactPolicy` caps · OpenAPI ≤ 2 MiB | `HelperLimits.stageCopy` |
 | `extractText` | 30 s · `ArchiveLimits` (200 MiB, ratio 100) · text ≤ 2 MiB | `HelperLimits.extractText` |
+| `worktreeCommit` | 60 s · 3a's `stage` caps as shipped (S1 records them) · ≤ 2000 changed paths · changed bytes ≤ 200 MiB · pack ≤ 256 MiB · FSIZE = 3a's per-file cap | `HelperLimits.worktreeCommit` |
+| `httpsProbe` | ≤ 20 requests per round · 10 s each · ≤ 210 s per call · body read ≤ 64 KiB · headers ≤ 16 KiB · https only · no redirects | `HelperLimits.httpsProbe` |
 | `selftest` | 5 s | `HelperLimits.selftest` |
 | `SafeRead.smallText` default limit | 4096 bytes | `SafeRead.defaultLimit` |
-| Budgets (p95, release build) | selftest ≤ 60 ms · diff 10k ≤ 400 ms · diff 1k ≤ 120 ms · status 10k ≤ 150 ms · HTTP overhead ≤ 60 ms · stage 20 MB ≤ 400 ms · extract 5 MB docx ≤ 2 s · RSS selftest ≤ 64 MB, diff ≤ 160 MB | `HelperBudgets` |
+| Budgets (p95, release build) | selftest ≤ 60 ms · diff 10k ≤ 400 ms · diff 1k ≤ 120 ms · status 10k ≤ 150 ms · HTTP overhead ≤ 60 ms · stage 20 MB ≤ 400 ms · commit 10k/10 changed ≤ 600 ms · https overhead ≤ 80 ms per round · extract 5 MB docx ≤ 2 s · RSS selftest ≤ 64 MB, diff ≤ 160 MB | `HelperBudgets` |
 | Live-diff fallback cadence (B10) | measured p95 × 4, clamped 2…10 s | `ChangesLimits.adaptiveInterval(measured:)` |
 | Fuzz cases | 500 default · 10 000 with `BRAHMA_FUZZ=1` | `FuzzConfig.cases` |
 
@@ -263,7 +263,7 @@ Plan S's first commit changes no product code. It records the shipped names and 
 
 **Interfaces:**
 - Produces:
-  - `public struct ToolPaths: Sendable, Equatable { public let git: String; public let claude: String?; public let unzip: String; public let tar: String; public let sh: String; public let sandboxExec: String; public let gitVersion: String }`
+  - `public struct ToolPaths: Sendable, Equatable { public let git: String; public let claude: String?; public let unzip: String; public let tar: String; public let curl: String /* prefers /usr/bin/curl */; public let sh: String; public let sandboxExec: String; public let gitVersion: String }`
   - `public static func resolve(path: String, forbiddenRoots: [URL], xcrunFind: (String) -> String?) -> Result<ToolPaths, ToolPathsError>`.
     - Candidate directories: the absolute `PATH` entries that exist and are owned by root or `getuid()`, are not group- or world-writable, and are not inside a `forbiddenRoots` entry (company workspaces, data homes), judged by `SandboxPath.isInside` on resolved paths.
     - `/usr/bin/git` → `xcrunFind("git")`.
@@ -401,7 +401,7 @@ Plan S's first commit changes no product code. It records the shipped names and 
 **Interfaces:**
 - Consumes: `SandboxPolicyFactory.decide(.helper(op), …)` (S7), `Spawn`/`ToolPaths` (S5), `SandboxSweep`, `ChildGroups`, `EngineFiles`, `PrincipalSet` (S6).
 - Produces:
-  - `public enum HelperOp: String, Codable, Sendable, CaseIterable { case worktreeDiff, worktreeStatus, loopbackHTTP, stageCopy, extractText, selftest }`.
+  - `public enum HelperOp: String, Codable, Sendable, CaseIterable { case worktreeDiff, worktreeStatus, worktreeCommit, loopbackHTTP, httpsProbe, stageCopy, extractText, selftest }`. S8 implements only `selftest`; the others are declared now and implemented by S9–S12 and S9b/S10b. An unimplemented op refuses with code `notImplemented`, and a test pins that each is implemented by the end of S12 (`HelperProtocolTests.everyOpImplemented`, enabled in S12).
   - `public struct HelperRequest<Args: Codable & Sendable>: Codable, Sendable { let v: Int; let op: HelperOp; let callDir: String; let args: Args }`.
   - `public enum HelperResult<R: Codable & Sendable>: Codable, Sendable { case ok(R); case refused(HelperRefusal) }` and `public struct HelperRefusal: Codable, Sendable, Equatable { let code: String; let detail: String }`.
   - `public struct HelperOutFile: Codable, Sendable { let name: String; let size: Int; let sha256: String }`. Names are one `SafeFS.components`-valid component, or a relative path for `stageCopy` folders.
@@ -481,6 +481,45 @@ Plan S's first commit changes no product code. It records the shipped names and 
 
 ---
 
+### Task S9b: Deployed-site smoke through the helper (`httpsProbe`, plus `loopbackHTTP` for `DevHost`)
+
+**Files:**
+- Create: `Sources/BrahmaSafety/Helper/Ops/HTTPSProbeOp.swift`, `Tests/BrahmaCoreTests/DeploySmokeHelperTests.swift`
+- Modify:
+  - `Sources/BrahmaCore/Release/DeploySmoke.swift`: `run(base:requests:expectText:http:…)` becomes `run(base:requests:expectText:transport: SmokeTransport, …)`. The rounds, attempts, interval, `expectText` and cancellation logic stay.
+  - `Release/ReleaseExecutor.swift:456`, which resolves `.release(releaseId)` once and passes the principals.
+  - `Release/DevReleaseScenario.swift`.
+  - `Release/UploadStager.swift`: a precondition that `stage` is called only after the build run reported a clean sweep (`StragglerReport` empty or all killed). Otherwise it throws `ReleaseError.stage("the build left processes running; output not staged")`.
+  - `Sources/BrahmaSafety/Policy/SandboxPolicyFactory.swift`: `.helper(.httpsProbe)` may carry `.outbound(allow: [host])` with exactly one domain, and no other helper op may have network except `loopbackConnect`.
+  - `SafetyLintTests`: `loopbackHTTP` zero in `Release/DeploySmoke.swift` and `DevReleaseScenario.swift`, plus the spec §6.8.2 allowlist.
+
+**Interfaces:**
+- Consumes: `HelperClient` (S8), `LoopbackHTTPOp` (S9), `EgressProxyPool.proxy(for:)` (5-lite), `ToolPaths.curl` (S5), `PrincipalResolver.resolve(.release / .mainSmoke)` (S6).
+- Produces:
+  - `public enum SmokeTransport { case https(host: String), devHost(port: UInt16) }` with `static func route(base: URL) -> Decision<SmokeTransport>`:
+    - `https` with a non-IP host → `.https`;
+    - `http://127.0.0.1:<port>` or `http://localhost:<port>` equal to a `DevHost` the engine started → `.devHost`;
+    - anything else → `.deny("the smoke base must be an https host or Brahma's dev host")`.
+  - `HTTPSProbeArgs { curl: String; proxyPort: UInt16; host: String; requests: [LoopbackRequest] }` (it reuses S9's request type; `path` is engine-built by `DeploySmoke.url(base:path:)`).
+  - `HTTPSProbeResult { responses: [LoopbackResponse] }`.
+  - The curl argv is exactly spec §6.4.4 "How `httpsProbe` works". `HOME=<call>/home`.
+
+- [ ] **Step 1: Write the failing tests.**
+  - All of L's `DeploySmokeTests` cases re-pointed through `InProcessHelperTransport`: rounds, `expectText`, redirect-as-answer, cancellation, off-host paths.
+  - `DeploySmokeHelperTests.routeRefusesOtherBases`: `http://example.com`, `https://10.0.0.1`, `https://[::1]`, `file:///` → deny.
+  - `devHostUsesLoopback`.
+  - `curlArgvIsFixed`: snapshot the argv the op builds for a sample request; it must contain `--proto =https`, `--max-redirs 0`, `--proxy http://127.0.0.1:<p>` and `-q`.
+  - `privateResolutionFailsSmoke` (live sandbox, no internet needed): a proxy allow-list for `localtest.me` (which resolves to 127.0.0.1) → the result is a failure whose text matches `privateHostText`, and the local test server sees no request (B12).
+  - `failingTransportFailsRelease`: `.unavailable` → the smoke is not `ok`, and the release does not advance.
+  - `uploadStagerRequiresCleanSweep`.
+  - `DeploySmokeHelperTests.publicHTTPS` (`BRAHMA_LIVE=1` only): `GET https://example.com/` → status 200.
+- [ ] **Step 2: Run them and confirm they fail.** Expected: FAIL.
+- [ ] **Step 3: Implement the op and the routing, then migrate the 2 callers.** Redaction of bodies and errors stays engine-side, as today.
+- [ ] **Step 4: Run the focused tests, the full suite and the bench (https overhead ≤ 80 ms per round, measured against a local TLS test server through the proxy).**
+- [ ] **Step 5: Commit.** `git commit -m "feat(core,safety): deployed-site smoke via the helper through the egress proxy; DevHost via loopback (B12)"`
+
+---
+
 ### Task S10: Helper ops `worktreeDiff` and `worktreeStatus`
 
 **Files:**
@@ -519,6 +558,46 @@ Plan S's first commit changes no product code. It records the shipped names and 
 - [ ] **Step 3: Implement the ops (the exact pipeline in spec §6.4.4), then migrate the callers and delete the in-engine walker.** The helper re-checks that `args.git ∈ ToolPaths.gitCandidates` (passed in the request and validated as an absolute regular executable that is not inside the worktree).
 - [ ] **Step 4: Run the focused tests, the full suite and the bench.** Expected: PASS, with budgets met (diff 10k ≤ 400 ms, 1k ≤ 120 ms, status ≤ 150 ms). If the 10k diff misses its budget, B10 applies (already implemented). Record that in the commit, and do not stop.
 - [ ] **Step 5: Commit.** `git commit -m "feat(core,safety): worktree diff/status in the helper (fresh index, no repo writes); in-engine walker removed (B4, B5, B10)"`
+
+---
+
+### Task S10b: Commit staging in the helper (`worktreeCommit`)
+
+**Files:**
+- Create: `Sources/BrahmaSafety/Helper/Ops/WorktreeCommitOp.swift`, `Tests/BrahmaCoreTests/WorktreeCommitHelperTests.swift`, `Tests/BrahmaCoreTests/Fixtures/commit-parity/*.json` (tree shas captured from the old walker)
+- Modify:
+  - `Sources/BrahmaCore/Git/GitWorkspace.swift`: `commitAll`/`commitAllWithParent` become `async` and go through the helper for the staging. Delete `stage(_:in:relative:)`, its descriptor walker, `maxUnsafeAdds` and its helpers. Keep `ownTip`, the `update-ref <ref> <new> <expected>` swap and `testHook("checked")`. Add `importPack(_ file: VerifiedOutFile) throws`, which runs `index-pack --stdin --strict --fix-thin` with `GitHardening` and `cwd` = the common dir, and `verifyCommit(_ commit: String, parent: String, caps:) throws`.
+  - `Sources/BrahmaCore/MCP/WorkTools.swift:421, 473` (submit and auto-commit before release).
+  - `GitWorkspace.removeWorktree` (`:1231`, auto-commit at removal).
+  - The `EngineGitGuardTests.gitCalls` pattern (it keeps matching `commitAll`).
+  - `SafetyLintTests`: `descriptor` and `dirWalk` counts in `Git/GitWorkspace.swift` drop by the walker's hits.
+
+**Interfaces:**
+- Consumes: `HelperClient` (S8), `WorktreeDiffOp`'s environment builder (S10, shared as `HelperGitEnv.make(commonDir:workTree:callDir:)`), `PrincipalResolver.resolve(.worktree(…))` (S6).
+- Produces:
+  - `WorktreeCommitArgs { git: String; commonDir: String; workTree: String; tip: String /* full sha */; messageFile: String /* <call>/message */; identity: GitIdentity /* name, email, epoch seconds, tz, set by the engine */; caps: CommitCaps }`.
+  - `WorktreeCommitResult { outcome: .nothingToCommit | .committed(commit: String, tree: String, pack: HelperOutFile) }`.
+  - `GitWorkspace.commitAllWithParent(in:message:) async throws -> (parent: String?, commit: String)?`. It keeps the same contract as today: nil when there is nothing to commit, and `GitError.failed` texts unchanged for a moved branch. A helper refusal maps to `GitError.failed(command: "stage", status: -1, stderr: "could not stage the worktree (<code>)")` (B11).
+  - Verification: `cat-file -t == commit`; exactly one parent == `tip`; `rev-list --objects tip..commit | count ≤ caps.maxObjects`; `ls-tree -r --name-only <commit>` has no path equal to or under `.brahma`.
+
+- [ ] **Step 1: Capture parity before changing anything.**
+  - On the pre-task code, add and run `WorktreeCommitHelperTests.captureParity` (with `BRAHMA_RECORD_GOLDENS=1`). It builds the fixture matrix of spec §10.3 "Commit" (regular, executable, symlink, deleted, gitignored, `.brahma`-only, nested repo, a non-UTF-8 name, a 3a-cap-exceeding file) and records each `commitAll` tree sha, or its refusal text.
+  - Commit the fixtures alone: `test(core): commit-staging parity fixtures before the helper`.
+- [ ] **Step 2: Write the failing tests.**
+  - `treeShasMatchParity`: every fixture gives the same tree sha, or the same refusal.
+  - `agentIndexNeverRead`: a forged agent index that marks a modified file clean → the commit still contains the change.
+  - `forgedPackRejected`: a fake transport returns a pack holding a commit whose parent is not `tip` → `GitError`, and the branch is unchanged.
+  - `packWithBrahmaPathRejected`.
+  - `oversizedPackRefusedBeforeImport`.
+  - `branchMovedMeanwhileFailsSwap`: unchanged 3a behaviour, kept.
+  - `failingTransportNeverCommits`: `.unavailable` → submit refused with the B11 text, and no ref moved.
+  - `swappedWorktreeRootCommitsNothingOutsideReach` (live sandbox).
+  - All 3a, 4a and C tests that submit, auto-commit or remove worktrees pass unchanged through `InProcessHelperTransport`.
+  - `HelperBenchTests.worktreeCommit10k`, ≤ 600 ms.
+- [ ] **Step 3: Run them and confirm they fail.**
+- [ ] **Step 4: Implement the op (spec §6.4.4 "How `worktreeCommit` works"), the import and the verification, then migrate the 3 callers and delete the walker.**
+- [ ] **Step 5: Run the focused tests, the full suite and the bench.** If the budget is missed, stop and go to the controller. There is no pre-decided fallback for submit.
+- [ ] **Step 6: Commit.** `git commit -m "feat(core,safety): submit/auto-commit staged in the helper, imported via index-pack --strict and verified; in-engine stage walker removed (B11)"`
 
 ---
 
@@ -578,7 +657,7 @@ Plan S's first commit changes no product code. It records the shipped names and 
 
 ### Task S13: Typed prompt text and the digest families
 
-S13 and S14 may run in a parallel lane after S4.
+S13, S14a and S14b may run as a parallel lane after S4.
 
 **Files:**
 - Create: `Sources/BrahmaSafety/Prompt/Trusted.swift`, `Prompt/Untrusted.swift`, `Prompt/PromptBuilder.swift`, `Tests/BrahmaSafetyTests/PromptBuilderTests.swift`, `Tests/BrahmaCoreTests/DigestGoldenTests.swift`, `Tests/BrahmaCoreTests/Fixtures/digests/*.txt`
@@ -617,30 +696,57 @@ S13 and S14 may run in a parallel lane after S4.
 
 ---
 
-### Task S14: The `ToolOutput` boundary and the relaying tools
+### Task S14a: The `ToolOutput` boundary and the 12 relaying tools
 
 **Files:**
 - Modify:
   - `Sources/BrahmaCore/MCP/CompanyTools.swift` (`call`/`dispatch` return `ToolOutput`), `MCP/MCPServer.swift` (writes `output.text`);
-  - the 12 relaying tools of spec §6.6.5 as confirmed in S1 §14: `readChannel`, `list_channels`, `list_agents`, `list_work`, `show_work_item` (`WorkTools.swift`), `search_memory`, `recall` (`MemoryTools.swift`), `search_kb`, `kb_read` (`HandbookTools.swift`), and C's `open_ref`, `search` and thread reads;
-  - every other handler: `ToolOutput.legacy(text, tool: "<name>")`.
+  - the 12 relaying tools of spec §6.6.5 as confirmed in S1 §14: `read_channel`, `list_channels`, `list_agents`, `list_work`, `show_work_item` (`WorkTools.swift`), `search_memory`, `recall` (`MemoryTools.swift`), `search_kb`, `kb_read` (`HandbookTools.swift`), and C's `open_ref`, `search` and thread reads;
+  - every other handler, temporarily: `ToolOutput.legacy(text, tool: "<name>")`.
 - Create: `Sources/BrahmaSafety/Prompt/ToolOutput.swift`, `Tests/BrahmaCoreTests/ToolOutputTests.swift`
 
 **Interfaces:**
 - Produces:
   - `public typealias ToolOutput = RenderedPrompt`.
-  - `public static func legacy(_ s: String, tool: StaticString) -> RenderedPrompt`, allowed only for `ToolOutputLegacy.allowed: Set<String>` (frozen: the non-relaying tool names on merged `main`). For a tool outside the set it returns an error-shaped prompt `"internal error: tool output not typed"` and asserts in DEBUG.
-  - Each relaying tool renders other principals' text with `PromptBuilder.field`/`quote`, using taint from ML's `taintAt`/`currentTaint` or the row's taint, as the tool does today.
+  - **Temporary** `public static func legacy(_ s: String, tool: StaticString) -> RenderedPrompt`, allowed only for `ToolOutputLegacy.allowed: Set<String>` (the non-relaying tool names on merged `main`). For a tool outside the set it returns `"internal error: tool output not typed"` and asserts in DEBUG.
+  - Each relaying tool renders other principals' text with `PromptBuilder.field`/`quote`, taking taint from ML's `taintAt`/`currentTaint` or the row's taint, as the tool does today.
 
 - [ ] **Step 1: Write the failing tests.**
-  - `ToolOutputTests.legacySetIsFrozen`: `ToolOutputLegacy.allowed == <literal set>` and `allowed ∩ relaying == ∅`. Every name in `CompanyToolNames.all` is in exactly one of them.
-  - `ToolOutputTests.<tool>FramesAuthorText`, one per relaying tool: seed a message, title or memory with the hostile string from S13 → the output has no unprefixed line from it.
-  - `ToolOutputTests.<tool>WithholdsTaintedWhereToday`: keep each tool's current withholding behaviour.
-  - Existing MCP tool tests pass, with string comparisons against `output.text`.
+  - `ToolOutputTests.legacySetOnlyShrinks`: `ToolOutputLegacy.allowed ⊆ <literal set recorded now>` and `allowed ∩ relaying == ∅`. Every name in `CompanyToolNames.all` is relaying, or in `allowed`, or typed.
+  - `ToolOutputTests.<tool>FramesAuthorText`, one per relaying tool: seed the hostile string from S13 → no unprefixed line from it.
+  - `ToolOutputTests.<tool>WithholdsTaintedWhereToday`.
+  - Existing MCP tool tests pass, comparing against `output.text`.
 - [ ] **Step 2: Run them and confirm they fail.**
 - [ ] **Step 3: Implement the boundary and migrate the 12 tools.**
 - [ ] **Step 4: Run the focused tests and the full suite.**
-- [ ] **Step 5: Commit.** `git commit -m "feat(core): typed MCP tool output; relaying tools framed by the renderer, legacy set frozen"`
+- [ ] **Step 5: Commit.** `git commit -m "feat(core): typed MCP tool output boundary; relaying tools framed by the renderer"`
+
+---
+
+### Task S14b: Every remaining tool typed; the legacy shim deleted
+
+**Files:**
+- Modify: every handler still in `ToolOutputLegacy.allowed`. S1 recorded the full list, about 33 tools across `MCP/CompanyTools.swift`, `WorkTools.swift`, `LeadTools.swift`, `MemoryTools.swift`, `HandbookTools.swift`, `DeployTools.swift`, `HumanTaskTools.swift`, `SafetyTools.swift`, `ExtensionTools.swift`, `PreviewTools.swift`, `QueueTools.swift`, `ReviewTools.swift`, `AuditTools.swift`, plus C's, 4a's (`publish_artifact`) and C5b's (`show`) tools. Also the error paths in `CompanyTools.call` (`describe(RouterError)`, `WorkError` texts).
+  - Delete `ToolOutput.legacy` and `ToolOutputLegacy`.
+  - `SafetyLintTests`: the `prompt` rule is zero.
+- Test: `Tests/BrahmaCoreTests/ToolOutputTests.swift`
+
+**Interfaces:**
+- Consumes: `PromptBuilder` (S13), `ToolOutput` (S14a).
+- Rules:
+  - Echoed agent input (channel names, handles a caller typed, titles, notes, reasons, paths, commands) is `Untrusted(from: .agent(callerId), taint: <caller's current taint>)` and rendered with `field` or `quote`.
+  - Engine wording, counts, refs and keys are `Trusted`/`TrustedToken`.
+  - Error texts are `Trusted` templates with `Untrusted` fields.
+
+- [ ] **Step 1: Write the failing tests.**
+  - `ToolOutputTests.everyToolTyped`: `ToolOutputLegacy` no longer exists. A source scan of `Sources/BrahmaCore/MCP` finds no `legacy(`.
+  - `ToolOutputTests.echoedInputIsFramed`: call each tool that echoes input (`post_message`, `create_channel`, `set_blocked`, `create_work_item`, `update_work_item`, `comment_work_item`, `request_from_owner`, `request_human_task`, `propose_decision`, `kb_write`, `remember`, `set_preview_command`, `set_smoke_check`, `set_main_check`, `set_deploy_config`, `publish_artifact`) with the hostile string → the output has no unprefixed line from it and no raw ESC/RLO.
+  - `ToolOutputTests.errorTextsFramed`: a refusal echoing a bad id → the id is flattened.
+  - Existing MCP tool tests pass unchanged on `output.text`. A changed expected string must be a flattening of agent input, listed in the commit.
+- [ ] **Step 2: Run them and confirm they fail.**
+- [ ] **Step 3: Migrate every remaining handler, then delete the shim.**
+- [ ] **Step 4: Run the focused tests and the full suite.**
+- [ ] **Step 5: Commit.** `git commit -m "feat(core): every MCP tool output built from Trusted/Untrusted parts; legacy shim removed"`
 
 ---
 
@@ -675,7 +781,7 @@ S13 and S14 may run in a parallel lane after S4.
 
 **Files:**
 - Modify:
-  - `Sources/BrahmaCore/Safety/SandboxCanary.swift` and `Safety/CanaryProbes.swift`: model-free helper probes using `SelftestOp` under each helper purpose's policy (`worktreeDiff`, `worktreeStatus`, `loopbackHTTP`, `stageCopy`, `extractText`). Each must be denied the data home, the owner home stand-in, another company workspace, another loopback port and writes outside the call dir, and must be allowed its own places. A failure files the existing `sandbox-check` alert (`.allCompanies(.sandboxCheck)`).
+  - `Sources/BrahmaCore/Safety/SandboxCanary.swift` and `Safety/CanaryProbes.swift`: model-free helper probes using `SelftestOp` under each helper purpose's policy (`worktreeDiff`, `worktreeStatus`, `worktreeCommit`, `loopbackHTTP`, `httpsProbe`, `stageCopy`, `extractText`). For `httpsProbe`, the probes also check that a connection to a private address through the proxy is refused. Each must be denied the data home, the owner home stand-in, another company workspace, another loopback port and writes outside the call dir, and must be allowed its own places. A failure files the existing `sandbox-check` alert (`.allCompanies(.sandboxCheck)`).
   - `README.md` (remove "This is Plan 3a"; add a short "Engine safety" paragraph naming `BrahmaSafety`, the helper and the lint).
   - The spec: append §15 "Executable invariants". Map each invariant to its pinning test: `SafetyLintTests`, `KernelBoundaryTests`, `PrincipalSetTests.unknownNeverFull`, `PolicyRenderPropertyTests`, `HelperClientTests.misbehavingHelperNeverYieldsSuccess`, `WorktreeDiffHelperTests.forgedAgentIndexCannotHideAChange`, `PromptBuilderTests.lookalikeFramingStaysQuoted`, `AlertScopeTests.everyHoldReasonIsGlobal`.
   - `docs/superpowers/specs/2026-11-21-engine-safety-design.md` §8: confirm or correct each B-row against what shipped, plus the measured budget column.
@@ -711,10 +817,10 @@ S13 and S14 may run in a parallel lane after S4.
 
 | Spec | Covered by |
 |---|---|
-| §2 G1 (helper) | S8–S12 |
+| §2 G1 (helper) | S8–S12, S9b (deploy smoke), S10b (commit staging) |
 | G2 (principal) | S6 |
 | G3 (factory, render race) | S7 |
-| G4 (prompts) | S13–S14 |
+| G4 (prompts and all tool outputs) | S13, S14a, S14b |
 | G5 (module, lint) | S1, S3, S15 |
 | G6 (default-deny) | S4 |
 | G7 (fail-opens, `regularText`) | S2 |
@@ -725,7 +831,7 @@ S13 and S14 may run in a parallel lane after S4.
 | §9 budgets | S8–S12 bench steps |
 | §13 re-baseline | S1 |
 
-Owner question defaults are reflected in the header; the non-goals have no task.
+The owner decisions of 2026-11-21 are reflected in the header, S9b, S10b and S14a/S14b. The non-goals have no task.
 
 **Types used across tasks:**
 - `PrincipalSet` (S6) is consumed by S7, S8 and S9–S12.
@@ -733,14 +839,15 @@ Owner question defaults are reflected in the header; the non-goals have no task.
 - `ValidatedPolicy` (S7) is consumed by `HelperTransport.call` (S8).
 - `HelperReply`/`HelperOutFile` (S8) are used by S11's `recheckStaged` and S12.
 - `SafeGit.WorktreeDiff` loses `blobShas` in S10 only.
-- `RenderedPrompt` (S13) is aliased as `ToolOutput` (S14).
+- `RenderedPrompt` (S13) is aliased as `ToolOutput` (S14a). `ToolOutput.legacy` is removed by S14b.
+- `HelperGitEnv.make` (S10) is shared by S10b. `LoopbackRequest`/`LoopbackResponse` (S9) are reused by S9b. `ToolPaths.curl` (S5) is used by S9b.
 - `SandboxNetwork.loopbackConnect` is introduced in S8 and used in S9.
 
-**Proportion:** 16 tasks. Code appears only as signatures; the algorithms are fixed by the spec (§6.4.4 pipeline, §6.4.5 lifecycle).
+**Proportion:** 19 tasks. Code appears only as signatures; the algorithms are fixed by the spec (§6.4.4 pipeline, §6.4.5 lifecycle).
 
-**Effort estimate:** about 16 tasks at 4a/C's observed pace (implementer, opus review, ≤ 2 fix rounds each). Size by task:
-- **L:** S3, S8, S10, S13.
-- **M:** S6, S7, S11, S14, S15, S16.
+**Effort estimate (re-estimated after the owner decisions):** 19 tasks at 4a/C's observed pace (implementer, opus review, ≤ 2 fix rounds each). Size by task:
+- **L:** S3, S8, S10, S10b, S13, S14b.
+- **M:** S6, S7, S9b, S11, S14a, S15, S16.
 - **S:** S1, S2, S4, S5, S9, S12.
 
-That is roughly 6–9 working days of subagent-driven execution, or 1.5–2 calendar weeks with usage pauses, comparable to Plan 4a.
+That is roughly 9–12 working days of subagent-driven execution, or 2–2.5 calendar weeks with usage pauses. The owner decisions add about 3 days: S10b is the riskiest addition, because it touches submit.

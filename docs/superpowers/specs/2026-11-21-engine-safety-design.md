@@ -7,23 +7,19 @@
 
 ---
 
-## Owner questions
+## Owner decisions, 2026-11-21
 
-None of these blocks the build. Each has a recommended default, and the plan is written for the default. An owner answer that differs changes the task named.
+The four questions this spec first asked were answered by the owner (relayed by the coordinator). The rest of the spec and the plan follow these answers.
 
-1. **Should 3a's submit and auto-commit staging (`GitWorkspace.commitAll` / `stage`) move into the helper as well?** That is the descriptor-fed walker that commits an agent's worktree at submit and at worktree removal.
-   - *Default: no, not in Plan S.*
-   - It writes engine-owned git objects from descriptors it has checked. It does not interpret agent bytes beyond copying them.
-   - It is 3a's most-tested path, and moving it means importing a pack from the helper on every submit.
-   - It is listed as follow-up F1 (§12). Choosing "yes" adds one task after S10, of about the same size as S10.
-2. **How much of the MCP tool output boundary should be typed in Plan S?**
-   - *Default: type the boundary (`ToolOutput`) and migrate the 12 tools that relay another principal's text (§6.6.5).* The other tools stay on a frozen legacy shim that no new tool may use.
-   - Choosing "all tools" roughly doubles Task S14.
-3. **Should deployed-site smoke checks move into the helper?** These are `DeploySmoke`, the release HTTP checks against hosting URLs.
-   - *Default: no.* Their targets come from the owner-configured hosting provider. Moving them needs TLS through the egress proxy inside the helper. This is listed as follow-up F2.
-   - Choosing "yes" adds an `httpsProbe` operation to Task S9.
-4. **Is it acceptable that helper-backed features say "unavailable" on platforms without Seatbelt (Linux CI)?**
-   - *Default: yes.* Today C's live diffs run in the engine's own process on any platform. After Plan S they need the helper, and with no sandbox they fail closed, consistent with `UnavailableSandboxRunner`.
+1. **3a's submit and auto-commit staging moves into the helper now.** This covers `GitWorkspace.commitAll`/`commitAllWithParent` and its descriptor-fed `stage` walker, with callers:
+   - submit (`WorkTools.swift:473`);
+   - auto-commit before release (`WorkTools.swift:421`);
+   - auto-commit at worktree removal (`GitWorkspace.swift:1231`).
+
+   The design is the helper op `worktreeCommit` (§6.4.4) and Task S10b. Former follow-up F1 is withdrawn.
+2. **Every MCP tool's output is typed now, not only the 12 relaying tools.** A temporary `ToolOutput.legacy` shim may exist during the migration (S14a). It is deleted by S14b, so at the end of Plan S no shim exists and every handler builds its output with `PromptBuilder` (§6.6.5).
+3. **Deployed-site smoke checks move into the helper.** This covers `DeploySmoke`, L's release smoke against the hosting URL or the local `DevHost`. The design is the helper op `httpsProbe` plus the existing `loopbackHTTP` for `DevHost` (§6.4.4), and Task S9b. Former follow-up F2 is withdrawn.
+4. **When Seatbelt is not available, helper-backed features say "unavailable".** This was the recommended default and is kept: fail closed, consistent with `UnavailableSandboxRunner`, with no in-process fallback.
 
 ---
 
@@ -68,7 +64,9 @@ Plan S builds exactly that, on the shapes 4a and C actually shipped. It keeps ev
     - live and `wt:` worktree diffs and worktree status (replacing C's in-process `WorktreeListing` and `SafeGit.worktreeDiff` phases 1–3, and 3a's `isDirty` on item worktrees);
     - preview smoke, readiness and demo HTTP requests (4a and L);
     - artifact and OpenAPI staging copies with sniffing (4a);
-    - archive text extraction (C2a).
+    - archive text extraction (C2a);
+    - 3a's submit and auto-commit staging: `commitAll`/`stage`, which becomes `worktreeCommit` (owner decision 1);
+    - deployed-site smoke checks: L's `DeploySmoke`, which becomes `httpsProbe`, or `loopbackHTTP` for `DevHost` (owner decision 3).
 - **G2 — One principal model.** A `Principal`/`PrincipalSet` is resolved once per action, from engine records only. The rules:
   - least-privileged contributor wins;
   - any lookup failure becomes `.unknown`;
@@ -80,7 +78,7 @@ Plan S builds exactly that, on the shapes 4a and C actually shipped. It keeps ev
 - **G4 — Typed prompt text.**
   - Turn prompts (system and user) are `RenderedPrompt` values. They can only be produced by `PromptBuilder` from `Trusted` (engine literals and validated tokens) and `Untrusted` (agent or external text, with provenance and taint) parts.
   - Framing, capping, flattening and taint handling happen in the renderer and cannot be skipped.
-  - The MCP tool result boundary is typed the same way (`ToolOutput`).
+  - The MCP tool result boundary is typed the same way (`ToolOutput`). **Every** tool is migrated, and no legacy shim remains at the end (owner decision 2).
 - **G5 — One safety module plus a lint.**
   - A new SwiftPM target `BrahmaSafety` owns:
     - the path layer (`EngineFiles`, `SafeFS`, `SandboxPath`, `SafeRead`);
@@ -107,7 +105,7 @@ Plan S builds exactly that, on the shapes 4a and C actually shipped. It keeps ev
 - **A second Unix user for agents** (analysis #11), **an Endpoint Security extension**, or **moving off `sandbox-exec`** (analysis §7: options not recommended). The Seatbelt base stays `(allow default)` plus the existing deny lists (analysis §7.5). Plan S does not change the agent sandbox's rules.
 - **Agent turn sandboxing** (`SandboxScope.forTurn`, `ClaudeSettingsCompiler`). Turns are already derived from their agent. Plan S only pins `forTurn`'s call sites with the lint (**architect's call**: unifying Claude Code settings with Seatbelt policies is a separate, larger design).
 - **The engine as a launchd agent** (#10), **Orchestrator decomposition** (#9), **a `Store` `CompanyScope` handle** (#6's Store half; only the alert scope is in Plan S) and **a general BrahmaCore module split** (#12; only `BrahmaSafety` is extracted).
-- **3a's `commitAll`/`stage`** (Owner question 1, default no) and **deployed-site smoke** (Owner question 3, default no).
+- Provider API calls (`ProviderProbe`, `ReleaseExecutor`'s calls to hosting APIs with the owner's credentials), push delivery and engine health checks. Their targets are owner-configured endpoints, not agent-chosen ones. They stay on `URLSession` and are allowlisted by the lint (**architect's call**).
 - **App-side reading** (`BrahmaAppModel`) of engine-confined artifact copies. The app reads only engine-owned copies, so the lint scope is `Sources/BrahmaCore` and `Sources/brahma` (**architect's call**).
 - **Persistent or warm helper processes.** Measured one-shot latency is well within budget (§9). A warm pool is follow-up F3, and only if the S8 benchmark fails its budget.
 - **New owner-facing UI.** Plan S adds activity lines, `brahma doctor` items and one Insights note text. It adds no new view, sidebar item or CLI verb, which respects the concept budget.
@@ -419,6 +417,8 @@ Plan S migrates every current instance (§7.4). The lint (§6.8) stops new ones:
 | `loopbackHTTP` | `BackendAdapter.smoke` (start, demo), `WebAdapter` readiness GET and demo GET | `.preview` | — (helper binary only) | call dir | `.loopbackConnect(port)` | no | ≤ 20 requests per call; request body ≤ 64 KiB; kept body ≤ `SmokeRequest.bodyKept` chars (helper reads ≤ 4×); headers ≤ 16 KiB | per request 10 s; call ≤ 210 s |
 | `stageCopy` | `Store.publishArtifact` (file, folder, glTF set); `BackendAdapter.copyOpenAPI` | `.publish` / `.preview` | the resolved source (file, folder, or the glTF's folder) | call dir | none | no | 4a's `ArtifactPolicy` caps and remaining quota; OpenAPI ≤ 2 MiB; ≤ 2000 entries, depth ≤ 32 | 60 s |
 | `extractText` | `OpenRef` via `TextExtract.extract` (C2a) | `.vaultBlob` | an engine-made held copy of the blob | call dir | none | no (runs `/usr/bin/unzip` inside the helper) | `ArchiveLimits` (200 MiB decompressed, ratio 100); text out ≤ 2 MiB | 30 s |
+| `worktreeCommit` | `GitWorkspace.commitAll`/`commitAllWithParent` (callers: submit `WorkTools.swift:473`, auto-commit before release `WorkTools.swift:421`, auto-commit at worktree removal `GitWorkspace.swift:1231`) | `.worktree` | the item worktree (or the dir being committed); the repo's git common dir | call dir | none | no | 3a's `stage` caps as shipped (S1 records them; `maxUnsafeAdds` 1000 among them); ≤ 2000 changed paths; changed bytes ≤ 200 MiB; pack ≤ 256 MiB; FSIZE = 3a's per-file cap | 60 s |
+| `httpsProbe` | `DeploySmoke.run` (L release smoke against the hosting URL; `ReleaseExecutor.swift:456`) | `.release` / `.mainSmoke` | — (helper binary only) | call dir | `.outbound(allow: [base host])` through the egress proxy (which refuses private and loopback addresses) | no (runs `ToolPaths.curl`) | ≤ 20 requests per round; body read ≤ 64 KiB (`expectText` window); headers ≤ 16 KiB | per request 10 s (`SmokeRequest`'s pinned 10 s); call ≤ 210 s |
 | `selftest` | `brahma doctor`, the canary | `.engine` | call dir | call dir | none or `.loopbackConnect(testPort)` | no | — | 5 s |
 
 All rows share these rules:
@@ -454,6 +454,44 @@ All rows share these rules:
 - Git does all ignore and attribute parsing, so the engine keeps no gitignore parser (C's principle). Git may follow anything, but it can only reach what the holder could already read.
 - Modified-file mtimes (C5b `lastEdit`) come from `lstat` in the helper.
 - `blobShas` is dropped from `WorktreeDiff`: grep finds no consumer.
+
+**How `worktreeCommit` works (owner decision 1, **architect's call** on the mechanism).** It uses the same environment as `worktreeDiff`, with a fresh `GIT_INDEX_FILE=<call>/index`, `GIT_OBJECT_DIRECTORY=<call>/objects` and alternates = the common dir's objects. The steps:
+1. `read-tree <tip>`, where `tip` is the engine-recorded `refs/heads/item/<KEY>`, passed as a full sha. For the non-item branch of `commitAll`, it is `HEAD`'s commit resolved by the engine.
+2. A size pre-check over `git ls-files -m -o --exclude-standard -z` (with `:(exclude).brahma`, as 3a's `stage` does): each file is `lstat`ed against 3a's caps. The pre-check refuses as `stage` refuses today.
+3. `add -A -- . ':(exclude).brahma'`.
+4. `write-tree`.
+5. `commit-tree <tree> -p <tip>` with the message from a request file, and the author/committer identity and dates passed by the engine in the environment.
+6. `rev-list --objects <commit> --not <tip>` | `pack-objects` into `<call>/out/commit.pack`.
+
+The result is `{ commit, tree, packFile }`, or `{ nothingToCommit: true }` when the tree equals `tip`'s tree. The engine then:
+- reads the pack from the quiescent `out/` (§6.4.6) and checks its size;
+- imports it with `git index-pack --stdin --strict --fix-thin` (`GitHardening`, `cwd` = the common dir) into the repository's own `objects/pack`;
+- verifies, in the engine:
+  - `cat-file -t <commit> == commit`;
+  - its only parent is `tip`;
+  - its tree is reachable;
+  - `rev-list --objects tip..commit` is within the caps;
+  - the tree holds no `.brahma` entry;
+- advances the branch with 3a's existing `update-ref <ref> <new> <tip>` compare-and-swap. A branch that moved meanwhile fails the swap, as today.
+
+Two properties follow:
+- The agent's own index is never read.
+- Nothing reaches the repository except through `index-pack --strict` and the engine's checks. A compromised helper can at worst produce a commit of bytes the holder could already read, which is what an agent can commit by itself anyway.
+
+The secret scans 5-lite hooks into submit and merge run on the resulting commit unchanged. 3a's in-engine `stage` walker and `maxUnsafeAdds` path are deleted (S10b).
+
+**How `httpsProbe` works (owner decision 3, **architect's call** on the mechanism).**
+- It runs the system `curl` (`ToolPaths.curl`, normally `/usr/bin/curl`, LibreSSL with a file-based CA bundle, so no keychain or trustd mach service is needed under Seatbelt; checks already do TLS this way through the proxy). The arguments are fixed:
+  - `-q -sS --proto =https --max-redirs 0 --max-time 10 --max-filesize 65536`;
+  - `--proxy http://127.0.0.1:<egress port> --noproxy ""`;
+  - `-X <method>` (one of the `SmokeRequest` methods), `--data-binary @<call>/body-<n>`;
+  - `-D <call>/out/headers-<n> -o <call>/out/body-<n> -w '%{http_code} %{time_total}'`;
+  - the URL `https://<base host><path>`.
+- The URL is built by the engine with `DeploySmoke.url(base:path:)` and must stay on the base host.
+- `HOME=<call>/home`, so no `.curlrc` is read.
+- The egress proxy is the 5-lite `EgressProxyPool` proxy for the allow-list `[base host]`. It resolves the name itself and refuses private, link-local and loopback addresses, so a DNS-rebinding base cannot reach the Mac's own services.
+
+A `DevHost` base (L's local dev release scenario, `http://127.0.0.1:<port>`) is not https: those rounds use `loopbackHTTP` with `.loopbackConnect(devHostPort)`. Any other scheme or host shape is refused before a helper is started. `DeploySmoke`'s round logic (attempts, interval, `expectText` in the first 64 KB of `/`, cancellation) stays in the engine, and each round is one helper call.
 
 **`loopbackHTTP`** is a minimal HTTP/1.1 client over a BSD socket to `127.0.0.1:<port>` only. It sends `Connection: close`, `Host: 127.0.0.1:<port>`, `Content-Length`; it follows no redirect and has no TLS, cookies or proxy.
 - **architect's call:** it avoids CFNetwork's mach-service dependencies inside Seatbelt, and loopback previews are plain HTTP.
@@ -523,7 +561,7 @@ Each caller maps them to its existing user-facing texts. A helper failure never 
     - are owned by root or the current user;
     - are not group- or world-writable;
     - are not inside any company workspace or data home.
-  - The first regular executable `git`, `claude`, `unzip` and `tar` found there is used.
+  - The first regular executable `git`, `claude`, `unzip`, `tar` and `curl` found there is used. `curl` prefers `/usr/bin/curl` (LibreSSL, file CA bundle) for `httpsProbe`.
   - The macOS `/usr/bin/git` shim is replaced by its real target (`xcrun --find git`, run once). Inside the helper sandbox the shim would need xcrun's cache writes.
   - `sandbox-exec`, `/bin/sh`, `/usr/bin/unzip` and `/usr/bin/tar` are fixed absolute paths.
   - git must be ≥ 2.43 (3a's attr-source floor).
@@ -605,8 +643,10 @@ S13 first captures golden renders of every digest family over the existing test 
 #### 6.6.5 Tool outputs (`ToolOutput`)
 
 `CompanyTools.call(...)` and every tool handler return `ToolOutput` (= `RenderedPrompt`).
-- **Migrated in S14** are the 12 tools that relay text written by another principal: `read_channel`, `list_channels`, `list_agents`, `list_work`, `show_work_item`, `search_memory`, `recall`, `search_kb`, `kb_read`, and C's `open_ref`, `search` and thread reads. Task S1 re-confirms the list on merged `main`.
-- **Every other handler** returns `ToolOutput.legacy(_ s: String, tool: StaticString)`. A test pins the set of tools allowed to call `legacy` (frozen). A tool not in the set cannot use it, so a new tool must use `PromptBuilder`.
+- **Every** tool handler builds its output with `PromptBuilder` (owner decision 2). Tool-specific names, titles, messages, paths, channel names and any other agent- or owner-written text are `Untrusted` fields or quotes. Engine wording is `Trusted`.
+- The migration runs in two tasks:
+  - **S14a** types the boundary and migrates the 12 tools that relay text written by another principal: `read_channel`, `list_channels`, `list_agents`, `list_work`, `show_work_item`, `search_memory`, `recall`, `search_kb`, `kb_read`, and C's `open_ref`, `search` and thread reads. S1 re-confirms the list. Every other handler temporarily returns `ToolOutput.legacy(_ s: String, tool: StaticString)`, a shim restricted to a pinned set that only shrinks.
+  - **S14b** migrates every remaining handler (the full `CompanyToolNames.all` on merged `main`, recorded by S1) and **deletes `ToolOutput.legacy`**. A test asserts that the symbol no longer exists (lint `prompt` rule: zero).
 
 ### 6.7 Default-deny shapes
 
@@ -663,11 +703,11 @@ The lint scans `Sources/BrahmaCore` and `Sources/brahma`. It holds a checked-in 
 | `descriptor` | `open(`, `openat(`, `fstatat(`, `lstat(`, `readlink(`, `realpath(`, `O_NOFOLLOW` | 170 open-family + 104 `O_NOFOLLOW` / ~48 files | **zero** in `Refs/`, `Preview/`, `Merge/`, `Store/Store+Artifacts.swift`, `MCP/`, `Changes/`; elsewhere the baseline may only shrink |
 | `fileAPI` | `FileManager.default`, `Data(contentsOf:`, `String(contentsOf`, `.write(to:`, `FileHandle(for` | 265 + 43 / 68 files | **zero** in the same agent-facing set; baseline elsewhere (most hits are the engine's own data home, backups and extensions) |
 | `dirWalk` | `enumerator(at:`, `contentsOfDirectory(`, `opendir(`, `fdopendir(`, `readdir(` | measured in S1 | **zero** outside `BrahmaSafety` except a listed allowlist of engine-owned roots (backups, data home sweep) |
-| `loopbackHTTP` | `URLSession`, `HTTPProbing`, `URLSessionHTTPProbe` in `Preview/` | 26 lines / 9 files overall | **zero** in `Preview/`; release/push/health allowlisted |
+| `loopbackHTTP` | `URLSession`, `HTTPProbing`, `URLSessionHTTPProbe` | 26 lines / 9 files overall | **zero** in `Preview/` and `Release/DeploySmoke.swift`/`DevReleaseScenario.swift`; allowlisted only in `Owner/PushChannel.swift`, `Engine/EngineHealth.swift`, `Hosting/ProviderProbe.swift` and the provider-API calls of `Release/ReleaseExecutor.swift` (owner-configured endpoints) |
 | `failOpen` | `?? true`, `?? false`, `try?` | — | **zero** in `BrahmaSafety` and `Principal/`; baseline-only-shrinks in `Safety/` and `Sandbox/` remnants |
 | `alertScope` | `EngineAlerts.raise(` without `scope:` | 30 / 17 | **zero** (the compiler enforces it too) |
 | `turnScope` | `SandboxScope.forTurn(` | measured in S1 | the call sites present on merged `main`, frozen |
-| `prompt` | a `String` stored into `TurnRequest.prompt`/`appendSystemPrompt`; `ToolOutput.legacy(` outside the frozen tool set | — | enforced by types; lint pins the frozen set |
+| `prompt` | a `String` stored into `TurnRequest.prompt`/`appendSystemPrompt`; `ToolOutput.legacy(` | — | enforced by types; `legacy` **zero** after S14b (the symbol is deleted) |
 
 `BrahmaSafetyTests` adds a second static test: no file in `Sources/BrahmaSafety` imports `GRDB` or references `Store`. That keeps the kernel engine-agnostic and the helper free of database code.
 
@@ -731,15 +771,18 @@ Each migration keeps the produced policy identical. A test per purpose compares 
 | Loopback HTTP | `BackendAdapter.smoke` (start, demo), `WebAdapter.swift:35` (demo GET), `:100` (readiness GET) | S9 |
 | Staged copies | `Store.publishArtifact` (file, folder, glTF; 16 descriptor calls and 14 `O_NOFOLLOW` in `Store+Artifacts.swift`), `BackendAdapter.copyOpenAPI` | S11 |
 | Archive text | `SandboxedUnzipReader.members` + `TextExtract.extract` (1 caller, `OpenRef:137`) | S12 |
+| Commit staging | `GitWorkspace.commitAll`/`commitAllWithParent` + `stage` (3 callers: `WorkTools.swift:421, 473`, `GitWorkspace.swift:1231`) | S10b |
+| Deployed-site smoke | `DeploySmoke.run` with `http: any HTTPProbing` (1 caller, `ReleaseExecutor.swift:456`; plus `DevReleaseScenario`'s `URLSessionHTTPProbe`) | S9b |
+| Release upload staging | `UploadStager.stage` walks a build's output after the sandboxed build ended | stays: the output is a quiescent tree once the build's sweep is clean (§6.4.6). S9b adds an assertion that `stage` runs only after a clean sweep |
 | `.git` pointer reads | `GitWorkspace.regularText` | S2 (in-process `SafeRead`, allowed by §6.4.1) |
 
 The in-engine implementations are **deleted** in the task that migrates their callers, together with their now-dead tests. Their behavioural tests are kept and re-pointed at the helper path through an in-process test transport (§10.2).
 
 ### 7.5 Spawns → `Spawn`/`ToolPaths` (S5): 14 lines in 5 files (§6.5)
 
-### 7.6 Prompts → `PromptBuilder` (S13–S14)
+### 7.6 Prompts → `PromptBuilder` (S13, S14a, S14b)
 
-Turn prompts: 7 digest families (§6.6.3), 108 framing-helper uses in the turn and review files. Tool outputs: 12 relaying tools (§6.6.5).
+Turn prompts: 7 digest families (§6.6.3), 108 framing-helper uses in the turn and review files. Tool outputs: all tools. The C tree's dispatchers have about 45 distinct tool names across 13 `MCP/*.swift` files (2846 lines); 12 relaying tools go in S14a and the rest in S14b (§6.6.5).
 
 ### 7.7 Alerts → `AlertScope` (S4): 30 call lines in 17 files; about 22 pass no `companyId` today
 
@@ -760,6 +803,8 @@ The agent-facing directories go to zero (§6.8.2). The rest of `BrahmaCore` keep
 | B7 | Commit subjects, check commands, blocked reasons and review flags in digests are taint-framed when their author's session was tainted (they were only flattened). | Agents (prompt text) | Not owner-visible. Listed for reviewers. |
 | B8 | Alerts that were broadcast to every company although the condition belonged to one now go to that company only. Each case is listed in the S4 commit. | Multi-company owners | Release note. |
 | B9 | git, claude, unzip and tar are resolved once at engine start to absolute paths. A `PATH` change takes effect at the next engine start. | Owners who change `PATH` | `brahma doctor` "tools" line. |
+| B11 | Submit, auto-commit before release and auto-commit at worktree removal build their commit in the helper. A worktree the helper cannot read (a link to a place the holder cannot read) now refuses the submit with the existing "could not stage" text, where 3a's walker refused per file. The commit content is otherwise identical (parity-tested). Submit gains the helper cost (budget §9.2). | Everyone, at submit | Release note; the submit refusal text names the helper reason. |
+| B12 | Deployed-site smoke requests go through the egress proxy, which refuses private, loopback and link-local addresses. A hosting URL that resolves to such an address now fails its smoke ("the smoke host resolves to a private address"). | Owners whose deploy URL resolves privately | The release's smoke result line; release note. |
 | B10 | When the S8 benchmark shows the live diff of the company's largest worktree over budget, `LiveChanges` refreshes at that worktree's measured cost × 4 (at least 2 s, at most 10 s), not every 2 s. | Owners with very large worktrees | The CHANGES header shows "refreshing every N s". |
 
 ## 9. Performance budget (measured, not guessed)
@@ -798,6 +843,8 @@ Conclusions:
 | `loopbackHTTP` overhead beyond the server's own time, per call | ≤ 60 ms | — |
 | `stageCopy` of one 20 MB file | ≤ 400 ms | — |
 | `extractText` of a 5 MB docx | ≤ 2 s | — |
+| `worktreeCommit`, 10 000-file worktree, 10 changed files | ≤ 600 ms (including the engine's `index-pack` and verification) | the diff pipeline's 269 ms plus `write-tree`/`commit-tree`/`pack-objects`; S10b measures |
+| `httpsProbe` overhead beyond the request's own network time, per round | ≤ 80 ms | — |
 | Engine-side CPU per observed live diff at the 2 s cadence, 10 000 files | ≤ 15 % of one core | ≈ 13 % (269 ms / 2 s) |
 | Helper peak RSS (`selftest`, `worktreeDiff` 10k) | ≤ 64 MB / ≤ 160 MB | — |
 
@@ -840,6 +887,8 @@ Deterministic seeds, 500 cases each by default, 10 000 with `BRAHMA_FUZZ=1`:
 - **Publish (S11):** every 4a `ArtifactTests` case passes.
 - **Smoke (S9):** every `BackendAdapterTests`/`MainSmokeTests` case passes.
 - **Extract (S12):** C2a `OpenRefTests` extract cases pass.
+- **Commit (S10b):** every 3a `commitAll`/submit/auto-commit test passes. For a fixture matrix (regular, executable, symlink, deleted, gitignored, `.brahma`-only, nested repo, a non-UTF-8 name), the helper commit's tree sha equals the old walker's tree sha, captured before deletion.
+- **Deploy smoke (S9b):** every L `DeploySmokeTests` case passes through a test transport. A live test (`BRAHMA_LIVE=1` only) probes one public https URL through the real proxy.
 - **Digests (S13):** goldens.
 
 ### 10.4 Canary (S16)
@@ -862,13 +911,14 @@ Results are recorded in the final task report. A canary failure blocks the merge
 | A `whenTainted:` choice made wrongly while migrating digests. | Medium | Goldens plus a hostile fixture. `.frame` is the default when unsure (**architect's call**). `.withhold` only where 4a/C already withhold. |
 | A wrong `AlertScope` verdict silences an engine-wide alert in other companies. | Low | Engine-wide reasons are a named enum. A reviewer checks each call's verdict, listed in the commit. A test pins that every `EngineHold` reason raises `.allCompanies`. |
 | Owner-visible regressions in Full companies (B1). | Low | Only unknown-principal cases change, and each says so in the activity feed. |
+| Moving commit staging (S10b) regresses 3a's most-tested path (submit). | Medium | Tree-sha parity captured before deletion; 3a's compare-and-swap `update-ref` unchanged; `index-pack --strict` plus engine verification; S10b is gated on all submit, merge and release tests passing unchanged. |
+| TLS inside the helper (S9b) needs something Seatbelt denies. | Low–medium | System `curl` with a file CA bundle, as sandboxed checks already do through the same proxy. A live test is in S9b, and canary probe `httpsProbe` in S16. |
 | Plan S grows into a rewrite. | Medium | Non-goals (§3) and fixed task scopes. "While here" refactors are banned (Global Constraints in the plan). |
 | C is cut per the analysis (C4c, C5b deferred) before Plan S starts. | Medium | S1 records which C shapes exist. S10 migrates whichever `worktreeDiff` callers exist. A C5b that lands later must use the helper (lint `dirWalk`/`spawn`). |
 
 ## 12. Follow-ups (not in Plan S)
 
-- **F1.** `commitAll`/`stage` through the helper, importing a pack (Owner question 1).
-- **F2.** Deployed-site smoke through the helper with TLS through the egress proxy (Owner question 3).
+- **F1, F2:** withdrawn. They are in Plan S per owner decisions 1 and 3 (S10b, S9b).
 - **F3.** A warm per-principal helper pool, only if a budget fails.
 - **F4.** `CompanyScope` for Store writes (analysis #6, second half).
 - **F5.** Remaining raw file APIs in the engine-owned areas (Backup, Extensions).
@@ -879,5 +929,5 @@ Results are recorded in the final task report. A canary failure blocks the merge
 
 - **Starts only when** 4a and C are both merged to `main` and `main` is green. Plan S runs on a branch from that `main`.
 - **S1 is the re-baseline.** It records the shipped names and counts, which later tasks treat as authoritative over this spec's C-tree counts.
-- **Parallel lane.** S13–S14 (prompts) are independent of S8–S12 (helper) and may run as a parallel lane. Everything else is sequential: S1 → S2 → S3 → S4 → S5 → S6 → S7 → S8 → S9 → S10 → S11 → S12 → S15 → S16.
+- **Parallel lane.** S13 → S14a → S14b (prompts and tool outputs) are independent of S8–S12 (helper) and may run as a parallel lane after S4. Everything else is sequential: S1 → S2 → S3 → S4 → S5 → S6 → S7 → S8 → S9 → S9b → S10 → S10b → S11 → S12 → S15 → S16. S16 starts only after S14b.
 - **4b and dogfood.** Plan S must merge before the dogfood run. A 4b lane that lands meanwhile must pass `SafetyLintTests`. The baseline is not raised for it without a controller ruling.
