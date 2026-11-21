@@ -870,7 +870,7 @@ extension Store {
         var secretScan = SecretScanState.none
         if case .pattern(let label, _) = verdict {
             guard SecretGate.isRedactable(data, ext: ArtifactKind.ext(of: fileName)) else {
-                throw SecretGate.binaryRefusal(fileName, label: label, what: "sent")
+                throw SecretGate.binaryRefusal(fileName, label: label, what: "sent", knownValues: knownValues)
             }
             data = RedactedCopy.make(data, findings: [], knownValues: knownValues)
             secretScan = .redacted

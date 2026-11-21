@@ -70,7 +70,7 @@ extension Store {
                                                knownValues: knownValues, store: self, companyId: companyId)
             if case .pattern(let label, _) = verdict {
                 // A redacted copy in the vault, never a git blob.
-                guard SecretGate.isRedactable(data, ext: ext) else { throw SecretGate.binaryRefusal(ref.canonical, label: label, what: "shared") }
+                guard SecretGate.isRedactable(data, ext: ext) else { throw SecretGate.binaryRefusal(ref.canonical, label: label, what: "shared", knownValues: knownValues) }
                 guard let paths else { throw WorkError.invalid("a redacted copy is kept in the vault; it needs the data home") }
                 if ref.isWorktree, source == nil, let item = try writer.read({ db in try RefAccess.item(db, companyId, ref.itemKey ?? "") }) {
                     source = try contentSource(ref, item: item)

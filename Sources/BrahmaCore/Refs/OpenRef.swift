@@ -136,7 +136,7 @@ extension Store {
             var copied = content
             if case .pattern(let label, _) = verdict {
                 guard SecretGate.isRedactable(content.data, ext: content.ext) else {
-                    throw SecretGate.binaryRefusal(canonical, label: label, what: "copied")
+                    throw SecretGate.binaryRefusal(canonical, label: label, what: "copied", knownValues: knownValues)
                 }
                 copied.body = .bytes(RedactedCopy.make(content.data, findings: [], knownValues: knownValues), ext: content.ext)
             }

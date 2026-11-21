@@ -124,7 +124,9 @@ import Foundation
         #expect(!calls.contains { $0.args.contains("hash-object") && $0.args.contains(where: { $0.hasSuffix("src/a.txt") }) },
                 "hash-object was given an agent path")
         #expect(calls.contains { $0.args.contains("repack") && $0.args.contains("-a") && $0.args.contains("-d") })
-        #expect(has(["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"]))
+        // C2b R1-1: only the share refs' reflogs are expired, never `--all`.
+        #expect(has(["for-each-ref", "refs/brahma/shares/"]))
+        #expect(!calls.contains { $0.args.contains("reflog") && $0.args.contains("--all") })
         #expect(calls.contains { $0.args.contains("--batch-check") && $0.stdin == Data((sha + "\n").utf8) }, "the purge did not verify its objects")
     }
 
@@ -353,7 +355,9 @@ import Foundation
     }
 
     /// R1: a purged blob that only reflogs reach (the item branch's, moved back; the worktree's `HEAD`; a moved share ref's
-    /// with `core.logAllRefUpdates=always`) is gone after the purge, or the purge says it is incomplete.
+    /// with `core.logAllRefUpdates=always`) is gone after the purge, or the purge says it is incomplete. C2b R1-1: only the
+    /// share refs' reflogs are expired, so what a branch's or a worktree's reflog keeps is reported (incomplete), never
+    /// silently kept, and that reflog is left as it was.
     @Test func purgeIsFailClosed() throws {
         let r = try Repo()
         let git = SafeGit(workspace: r.root)
@@ -371,12 +375,49 @@ import Foundation
         try git.updateShareRef("p", to: before)
         #expect(try r.f.git(["reflog", "show", "refs/brahma/shares/p"]).contains(String(commit.prefix(7))))
         #expect(try r.f.git(["cat-file", "-e", blob]) == "" && (try r.f.git(["cat-file", "-e", commit])) == "")
+        let branchLog = try r.f.git(["reflog", "show", "item/ENG-1"])
+        #expect(throws: SafeGitError.purgeIncomplete(remaining: 2), "the branch's and the worktree's reflogs still reach them") {
+            try git.expireAndPrune(purged: [blob, commit])
+        }
+        #expect(try r.f.git(["reflog", "show", "item/ENG-1"]) == branchLog, "a branch's reflog was expired")
+        #expect(try r.f.git(["reflog", "show", "refs/brahma/shares/p"]).isEmpty, "the share ref's reflog was kept")
+        // Once the owner clears those reflogs, the purge completes.
+        try r.f.git(["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"])
         try git.expireAndPrune(purged: [blob, commit])
         #expect(throws: (any Error).self, "the purged blob is still in the repository") { try r.f.git(["cat-file", "-e", blob]) }
         #expect(throws: (any Error).self, "the purged commit is still in the repository") { try r.f.git(["cat-file", "-e", commit]) }
         #expect(try r.head("item/ENG-1") == before && (try r.f.git(["rev-parse", "refs/brahma/shares/p"])) == before)
         // An object a branch still reaches is reported, never silently kept.
         #expect(throws: SafeGitError.purgeIncomplete(remaining: 1)) { try git.expireAndPrune(purged: [before]) }
+    }
+
+    /// C2b R1-1: a share purge leaves every other reflog alone (an unrelated branch's, a worktree's `HEAD`).
+    @Test func sharePurgeKeepsOtherReflogs() throws {
+        let r = try Repo()
+        let git = SafeGit(workspace: r.root)
+        try r.f.git(["config", "core.logAllRefUpdates", "always"])
+        try r.f.git(["branch", "side"])
+        try r.f.write("side.txt", "side\n")
+        try r.f.git(["checkout", "-q", "side"])
+        try r.f.git(["add", "side.txt"]); try r.f.git(["commit", "-q", "-m", "side"])
+        try r.f.git(["checkout", "-q", "main"])
+        try r.f.write("wt.txt", "wt\n", in: r.wt)
+        try r.f.git(["add", "wt.txt"], in: r.wt); try r.f.git(["commit", "-q", "-m", "wt"], in: r.wt)
+        let side = try r.f.git(["reflog", "show", "side"]), head = try r.f.git(["reflog", "show", "HEAD"], in: r.wt)
+        #expect(!side.isEmpty && !head.isEmpty)
+        let main = try r.head("main")
+        let tree = try r.f.git(["rev-parse", "\(main)^{tree}"])
+        let pinned = try r.f.git(["commit-tree", tree, "-m", "pinned"])
+        try git.updateShareRef("gone", to: pinned)
+        try git.updateShareRef("kept", to: main)
+        try git.updateShareRef("kept", to: pinned)
+        try git.updateShareRef("kept", to: main)
+        try git.deleteShareRef("gone")
+        try git.expireAndPrune(purged: [pinned])
+        #expect(try r.f.git(["reflog", "show", "side"]) == side)
+        #expect(try r.f.git(["reflog", "show", "HEAD"], in: r.wt) == head)
+        #expect(try r.f.git(["reflog", "show", "refs/brahma/shares/kept"]).isEmpty, "a share ref's reflog is expired")
+        #expect(throws: (any Error).self) { try r.f.git(["cat-file", "-e", pinned]) }
     }
 
     /// Forwards to the live runner (anchored when asked) and runs `after` once, right after the first process whose arguments

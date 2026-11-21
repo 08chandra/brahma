@@ -83,6 +83,23 @@ extension Store {
     }
 
     public func startTurn(agentId: String, now: Date = Store.now()) throws -> Turn {
+        try startTurn(agentId: agentId, now: now, fenceWait: PurgeFence.defaultWait)
+    }
+
+    /// `startTurn`, recorded under the company's `PurgeFence` held shared (C2b fix round 1), waiting up to `fenceWait` while
+    /// an owner's purge holds it; `WorkError.conflict` past that.
+    public func startTurn(agentId: String, now: Date, fenceWait: Duration) throws -> Turn {
+        guard let home = dataHome ?? refHooks.fenceHome else { return try startTurnRecord(agentId: agentId, now: now) }
+        guard let companyId = try writer.read({ db in
+            try String.fetchOne(db, sql: "SELECT companyId FROM agent WHERE id = ?", arguments: [agentId])
+        }) else { throw StoreError.notFound }
+        guard let turn = try PurgeFence.withShared(home: home, companyId: companyId, wait: fenceWait, {
+            try startTurnRecord(agentId: agentId, now: now)
+        }) else { throw WorkError.conflict("the owner is purging content in this company; start the turn again in a moment") }
+        return turn
+    }
+
+    private func startTurnRecord(agentId: String, now: Date) throws -> Turn {
         try writer.write { db in
             guard let agent = try Agent.fetchOne(db, key: agentId) else { throw StoreError.notFound }
             var turn = Turn(id: UUID().uuidString, agentId: agentId, companyId: agent.companyId, startedAt: now,

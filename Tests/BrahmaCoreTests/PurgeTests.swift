@@ -212,11 +212,41 @@ import GRDB
             try Row.fetchOne(db, sql: "SELECT fact, purgedAt FROM memoryEntry WHERE companyId = ? AND number = ?", arguments: [cId, cf.fx.hrMemory])
         }
         #expect((entry?["purgedAt"] as Date?) != nil && (entry?["fact"] as String?) != "eng-3 had a rough review")
-        // A live record is not content this purge removes: refused, never reported as done.
-        #expect(throws: WorkError.self) { try purge(cf, try cf.fx.ref("ENG-1"), now: cf.now) }
-        #expect(throws: WorkError.self) { try purge(cf, try cf.fx.ref("#eng"), now: cf.now) }
+        // A live record is not content this purge removes: refused with the reason, never reported as done.
+        let why = WorkError.invalid("items, asks, kb pages, messages and the like are live records, not shared content: there are no "
+                                    + "stored bytes to purge. Purge the file or resource they carry, or edit the record itself")
+        #expect(throws: why) { try purge(cf, try cf.fx.ref("ENG-1"), now: cf.now) }
+        #expect(throws: why) { try purge(cf, try cf.fx.ref("#eng"), now: cf.now) }
         // A file nothing shared is not found.
         #expect(throws: WorkError.notFound("that ref isn't available to you")) { try purge(cf, try cf.fx.ref("src/a.ts"), now: cf.now) }
+    }
+
+    /// R1-8: the running-turn check and the git prune are atomic with respect to a turn starting: while a purge holds the
+    /// company's purge fence no turn starts, and a turn that started after the first check refuses the purge.
+    @Test func purgeFencedAgainstTurnStart() throws {
+        let cf = try CollabFixture()
+        cf.store.refHooks.setFenceHome(cf.paths.home)
+        let cId = cf.c.id, eng1 = cf.fx.eng1.id
+        // A turn start while the fence is held: refused (the agent stays ready), and it starts once the fence is gone.
+        let store = cf.store, now = cf.now
+        let (started, lifecycle) = try PurgeFence.withExclusive(home: cf.paths.home, companyId: cId) { () throws -> (Bool, Bool) in
+            let begun = try store.beginTurn(agentId: eng1, now: now) != nil
+            let direct = (try? store.startTurn(agentId: eng1, now: now, fenceWait: .milliseconds(50))) != nil
+            return (begun, direct)
+        }
+        #expect(!started && !lifecycle)
+        #expect(try cf.store.writer.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM turn WHERE companyId = ?", arguments: [cId]) } == 0)
+        // A turn that starts between the purge's first check and its fence: the purge re-checks under the fence and refuses.
+        let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
+        try cf.fx.git.write("src/a.ts", "pinned\n", in: wt)
+        let pinned = try cf.store.pinRef(try cf.fx.ref("ENG-1:src/a.ts@worktree"), for: .agent(eng1), companyId: cId,
+                                         messageRefId: "mr-f", knownValues: [], paths: cf.paths)
+        try Self.record(cf, pinned, id: "mr-f", at: cf.now)
+        cf.store.refHooks.setAfterPurgeTurnCheck { _ = try store.beginTurn(agentId: eng1, now: now) }
+        #expect(throws: WorkError.self) { try purge(cf, pinned, now: cf.now) }
+        #expect(try Self.state(cf, "mr-f") == "ok")
+        #expect(try cf.fx.git.git(["rev-parse", "refs/brahma/shares/mr-f"]) == pinned.rev)
+        cf.store.refHooks.setAfterPurgeTurnCheck(nil)
     }
 
     @Test func purgeIncompleteAlertsOwner() throws {

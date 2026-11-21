@@ -49,8 +49,9 @@ public struct UnavailableArchiveReader: ArchiveReader {
 /// Before anything runs, ML's `ArchiveRatio.stats` reads the central directory (nothing inflated): a ratio, size or entry count
 /// over the limits, a symlink entry or an unsafe name refuses the read, as 4a's publish does. Only members whose names are
 /// plain (`[A-Za-z0-9._/-]` plus `[` and `]`, no `..`) are asked for; a `[` is passed as `[[]`, so `unzip`'s wildcard
-/// matching takes every name literally (Office's `[Content_Types].xml` included). The temp directory is removed whatever
-/// happens.
+/// matching takes every name literally (Office's `[Content_Types].xml` included). An unzip failure is never masked by the
+/// pipe into `head` (it leaves a `.err` file), and every member must come out at exactly the size the central directory
+/// declares; either refuses the read. The temp directory is removed whatever happens.
 public struct SandboxedUnzipReader: ArchiveReader {
     public static let unzip = "/usr/bin/unzip"
     public static let timeout: Duration = .seconds(60)
@@ -86,15 +87,19 @@ public struct SandboxedUnzipReader: ArchiveReader {
         if stats.hasSymlink || stats.hasUnsafeName { throw ArchiveReadError.unsafe }
         let entries: [ZipInventory.Entry]
         do { entries = try ZipInventory.entries(of: data) } catch { throw ArchiveReadError.unreadable }
-        let names = entries.filter { !$0.isDirectory && !$0.isSymlink && Self.isPlain($0.name) && wanted($0.name) }
-            .prefix(ArchiveLimits.maxMembers).map(\.name)
+        // C2b fix round 1 (ruling 30): a directory is a `/`-named entry holding nothing; any other entry is a file.
+        let chosen = entries.filter { !ArchiveMemberScan.isDirectoryEntry($0) && !$0.isSymlink && Self.isPlain($0.name) && wanted($0.name) }
+            .prefix(ArchiveLimits.maxMembers)
+        let names = chosen.map(\.name), sizes = chosen.map(\.uncompressedSize)
         guard !names.isEmpty else { return [] }
 
         let q = ExtensionValidator.shellQuote
         let (heldDir, outDir) = (held.resolvedForSandbox, out.resolvedForSandbox)
         let copy = heldDir.appending(path: "archive.zip").path
+        // unzip's own failure is never masked by the pipe (whose status is head's): it leaves `m<i>.err` (C2b fix round 1).
         let command = names.enumerated().map { i, name in
-            "\(q(Self.unzip)) -p \(q(copy)) \(q(Self.literal(name))) 2>/dev/null | /usr/bin/head -c \(limits.bytes + 1) > \(q(outDir.appending(path: "m\(i)").path))"
+            "{ \(q(Self.unzip)) -p \(q(copy)) \(q(Self.literal(name))) 2>/dev/null || echo failed > \(q(outDir.appending(path: "m\(i).err").path)); }"
+                + " | /usr/bin/head -c \(limits.bytes + 1) > \(q(outDir.appending(path: "m\(i)").path))"
         }.joined(separator: " && ")
         let policy = SandboxPolicy(writable: [outDir], readable: [heldDir], network: .none, toolchain: false)
         let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
@@ -106,11 +111,14 @@ public struct SandboxedUnzipReader: ArchiveReader {
         var result: [(name: String, data: Data)] = []
         var total = 0
         for (i, name) in names.enumerated() {
-            guard let bytes = EngineFiles.readNoFollow(outDir.appending(path: "m\(i)"), under: outDir, limit: limits.bytes + 1) else {
+            guard !FileManager.default.fileExists(atPath: out.appending(path: "m\(i).err").path),
+                  let bytes = EngineFiles.readNoFollow(outDir.appending(path: "m\(i)"), under: outDir, limit: limits.bytes + 1) else {
                 throw ArchiveReadError.unreadable
             }
             total += bytes.count
             guard bytes.count <= limits.bytes, total <= limits.bytes else { throw ArchiveReadError.expands }
+            // Exactly what the central directory declares: a member unzip could not fully decode is a failure, never short.
+            guard bytes.count == sizes[i] else { throw ArchiveReadError.unreadable }
             result.append((name, bytes))
         }
         return result
