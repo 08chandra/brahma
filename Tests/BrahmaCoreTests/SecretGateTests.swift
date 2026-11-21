@@ -864,4 +864,75 @@ struct StubArchiveReader: ArchiveReader {
         }
         cf.store.refHooks.setRedactedCopy(nil)
     }
+
+    // MARK: Fix round 4
+
+    /// A deflate local header at the start of `rest`: `method` 8, the declared compressed size `declared` (past the end of
+    /// the bytes when large), the name `a.txt`.
+    static func deflateHeader(declared: UInt32, uncompressed: UInt32 = 0) -> Data {
+        func le16(_ v: UInt16) -> [UInt8] { [UInt8(v & 0xFF), UInt8(v >> 8)] }
+        func le32(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8(v >> 24)] }
+        return Data([0x50, 0x4B, 0x03, 0x04] + le16(20) + le16(0) + le16(8) + le16(0) + le16(0) + le32(0) + le32(declared)
+                    + le32(uncompressed) + le16(5) + le16(0)) + Data("a.txt".utf8)
+    }
+
+    /// R4-2 (ruling 34, item 3): the deflate probe reads a bounded slice of the bytes in place (no copy of the rest), probes
+    /// at most 64 headers in one call, and a cap hit means an archive: 50 MB holding 100,000 deflate headers whose sizes run
+    /// past the end and whose data fails at once is an archive, in bounded time. Probing stops at the check's deadline (an
+    /// archive then; the check's own deadline refuses it).
+    @Test(.timeLimit(.minutes(3))) func archiveProbeIsBounded() throws {
+        let one = Self.deflateHeader(declared: 0xFFFF_FFFE) + Data(repeating: 0xFF, count: 465)
+        var big = Data()
+        big.reserveCapacity(one.count * 100_000)
+        for _ in 0..<100_000 { big.append(one) }
+        #expect(big.count == 50_000_000)
+        let started = AwakeTime.uptime()
+        #expect(ArchiveMemberScan.isArchive(big, ext: "txt"))
+        #expect(AwakeTime.uptime() - started < 30, "\(AwakeTime.uptime() - started) s")
+        // One such header alone is no archive (its data fails at once), unless the deadline is already past.
+        let lone = Data("notes\n".utf8) + Self.deflateHeader(declared: 0xFFFF_FFFE) + Data(repeating: 0xFF, count: 64)
+        #expect(!ArchiveMemberScan.isArchive(lone, ext: "txt"))
+        #expect(ArchiveMemberScan.isArchive(lone, ext: "txt", deadline: AwakeTime.uptime() - 1))
+        #expect(!ArchiveMemberScan.isArchive(lone, ext: "txt", deadline: AwakeTime.uptime() + 60))
+    }
+
+    /// R4-3 (controller ruling, truncated deflate): only a deflate DATA error means "no archive". The reviewer's
+    /// `trunc_small.txt` (20 KB of text deflated, half the data kept, the declared size past the end): the stream runs out
+    /// before it ends, which a lenient reader (`bsdtar`) still prints, so it is an archive and refused. Random bytes holding a
+    /// deflate header whose data hits a reserved block type at once: no archive, clean.
+    @Test func truncatedDeflateIsAnArchive() throws {
+        let cf = try CollabFixture()
+        var rng = SeededBytes(state: 0x7C2B)
+        var words: [String] = []
+        let letters = Array("abcdefghijklmnopqrstuvwxyz")
+        while words.joined(separator: " ").utf8.count < 20_000 {
+            words.append(String((0..<(2 + rng.below(7))).map { _ in letters[rng.below(letters.count)] }))
+            if words.count == 1500 { words.append("leak \(Self.aws) end") }
+        }
+        let text = Data(words.joined(separator: " ").utf8)
+        let deflated = try (text as NSData).compressed(using: .zlib) as Data   // raw DEFLATE
+        let trunc = Self.deflateHeader(declared: UInt32(deflated.count), uncompressed: UInt32(text.count)) + deflated.prefix(deflated.count / 2)
+        #expect(!String(decoding: trunc, as: UTF8.self).contains(Self.aws))
+        #expect(ArchiveMemberScan.isArchive(trunc, ext: "txt"))
+        #expect(throws: WorkError.self) { try check(cf, trunc, canonical: "trunc_small.txt") }
+        // A data error straight away (block type 3): plain bytes.
+        let noise = Data(rng.bytes(200).map { $0 == 0x50 ? 0x51 : $0 })
+        let broken = noise + Self.deflateHeader(declared: 0xFFFF_FFFE) + Data([0x07]) + Data(rng.bytes(100).map { $0 == 0x50 ? 0x51 : $0 })
+        #expect(!ArchiveMemberScan.isArchive(broken, ext: "bin"))
+        #expect(try check(cf, broken, ext: "bin", canonical: "noise.bin") == .clean)
+    }
+
+    /// R4-5: the cache keys a verdict by everything detection reads besides the bytes, the extension included: the same
+    /// bytes as `.txt` (clean) and as `.docx` (an archive that can't be read, refused) each get their own verdict, in either
+    /// order.
+    @Test func cacheKeyedByExtension() throws {
+        let cf = try CollabFixture()
+        let first = Data("plain notes \(UUID().uuidString)\n".utf8), second = Data("plain notes \(UUID().uuidString)\n".utf8)
+        #expect(try check(cf, first, ext: "txt", canonical: "notes.txt") == .clean)
+        #expect(throws: WorkError.self) { try check(cf, first, ext: "docx", canonical: "notes.docx") }
+        #expect(throws: WorkError.self) { try check(cf, second, ext: "docx", canonical: "other.docx") }
+        #expect(try check(cf, second, ext: "txt", canonical: "other.txt") == .clean)
+        #expect(SecretGate.cacheVersion(store: cf.store, companyId: cf.c.id, ext: "txt", knownValues: Self.known)
+                != SecretGate.cacheVersion(store: cf.store, companyId: cf.c.id, ext: "docx", knownValues: Self.known))
+    }
 }

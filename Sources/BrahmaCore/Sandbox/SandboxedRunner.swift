@@ -27,8 +27,9 @@ public struct SandboxPolicy: Equatable, Sendable {
     public var readable: [URL]
     public var network: SandboxNetwork
     public var toolchain: Bool
-    /// C2b fix round 3: the most physical memory (summed footprint, bytes) the run's process group may use; past it the
-    /// runner kills the group (`GroupRun.memoryExceeded`). nil: no limit.
+    /// C2b fix round 3: the most physical memory (summed footprint, bytes) the run may use (round 4: its own process,
+    /// whatever group it is in, and its process group); past it the runner kills the run (`GroupRun.memoryExceeded`). nil:
+    /// no limit.
     public var memoryLimit: Int? = nil
     /// C2b fix round 3 (m-C): a deny-default profile instead of the standard allow-default one (`SeatbeltProfile`
     /// `renderConfined`). `readable` entries are then the only trees it may read beyond the system; `writable` entries are
@@ -55,8 +56,9 @@ public struct SandboxPolicy: Equatable, Sendable {
 }
 
 /// What a confined run (`SandboxPolicy.confined`) may do besides read the system's own libraries and frameworks: run
-/// exactly these programs (and the shell `/bin/sh` runs through), read these files and list these directories, and create
-/// and write exactly these files. No network, no mach service but the run's own marker, nothing else.
+/// exactly these programs (round 4: no shell, no fork; such a run is one program, `SandboxedRunner.runProgramBlocking`),
+/// read these files and list these directories, and create and write exactly these files. No network, no mach service
+/// but the run's own marker, nothing else.
 public struct SandboxConfinement: Equatable, Sendable {
     public var executables: [URL]
     public var readableFiles: [URL]
@@ -82,6 +84,13 @@ public protocol SandboxedRunner: Sendable {
     /// it on the calling thread.
     func runBlocking(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
                      policy: SandboxPolicy) -> CheckOutcome
+    /// C2b fix round 4 (R4-4): runs one program as itself (`arguments`, argv with `arguments[0]` the program; no shell)
+    /// to completion or `timeout`, on the calling thread, as the leader of a new session. Its standard output goes to
+    /// `stdoutURL` (created anew), at most `stdoutCap` bytes: one byte more and the run is killed, its tail ending with
+    /// `GroupRun.outputExceeded`. Its standard error goes to `outputURL`. The outcome's exit code is the program's own (or
+    /// 128 + the signal that ended it). Never throws. A runner that can't run a program this way says it could not run.
+    func runProgramBlocking(arguments: [String], cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+                            stdoutURL: URL, stdoutCap: Int, policy: SandboxPolicy) -> CheckOutcome
     /// Starts `command` as a long-running process (a preview); its output goes to `logURL`.
     func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess
 }
@@ -98,6 +107,14 @@ extension SandboxedRunner {
             return CheckOutcome(exitCode: nil, timedOut: true, tail: "the sandboxed run never reported back")
         }
         return value
+    }
+}
+
+extension SandboxedRunner {
+    /// Fails closed: only a runner that implements it runs a program directly.
+    public func runProgramBlocking(arguments: [String], cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+                                   stdoutURL: URL, stdoutCap: Int, policy: SandboxPolicy) -> CheckOutcome {
+        GroupRun.fail("this sandbox can't run a program directly", outputURL: outputURL)
     }
 }
 

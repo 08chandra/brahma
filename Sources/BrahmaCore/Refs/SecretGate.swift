@@ -100,17 +100,39 @@ public enum ArchiveMemberScan {
 
     /// Bytes that hold a zip: an end record within the last 64 KB + 22 bytes (where every zip reader looks), a plausible
     /// local header anywhere (`plausibleLocalHeader`), or a name that says zip. Four bytes `PK\x03\x04` followed by anything
-    /// else are not a zip (ruling 32).
-    public static func isArchive(_ data: Data, ext: String) -> Bool {
+    /// else are not a zip (ruling 32). Round 4 (R4-2, ruling 34): the deflate probes of one call share one `ProbeBudget`,
+    /// bounded in headers, bytes and (with `deadline`, the check's) time; a spent budget means an archive (fail closed).
+    public static func isArchive(_ data: Data, ext: String, deadline: TimeInterval? = nil) -> Bool {
         if archiveExts.contains(ext.lowercased()) { return true }
         let tail = max(data.startIndex, data.endIndex - (65_535 + 22))
         if data.range(of: endMagic, in: tail..<data.endIndex) != nil { return true }
+        var budget = ProbeBudget(deadline: deadline)
         var from = data.startIndex
         while from < data.endIndex, let r = data.range(of: zipMagic, in: from..<data.endIndex) {
-            if plausibleLocalHeader(data, at: r.lowerBound) { return true }
+            if plausibleLocalHeader(data, at: r.lowerBound, budget: &budget) { return true }
             from = r.lowerBound + 1
         }
         return false
+    }
+
+    /// What one `isArchive` call may spend on deflate probes (R4-2): at most `maxHeaders` headers probed, `maxBytes` input
+    /// bytes read in all (each probe at most `sliceBytes`), and nothing past `deadline`. Spent → an archive.
+    struct ProbeBudget {
+        static let maxHeaders = 64
+        static let maxBytes = 1 << 20
+        static let sliceBytes = 1 << 16
+        var headers = 0
+        var bytes = 0
+        let deadline: TimeInterval?
+
+        /// Takes one probe of up to `size` input bytes; false when the budget can't pay for it.
+        mutating func take(_ size: Int) -> Bool {
+            if let deadline, AwakeTime.uptime() > deadline { return false }
+            guard headers < Self.maxHeaders, size <= Self.maxBytes - bytes else { return false }
+            headers += 1
+            bytes += size
+            return true
+        }
     }
 
     /// The compression methods APPNOTE names (stored, shrunk, reduced, imploded, deflate, deflate64, bzip2, LZMA, zstd, xz,
@@ -119,10 +141,13 @@ public enum ArchiveMemberScan {
 
     /// Whether a zip local header parses at `offset` (an index of `data`), as amended ruling 32 has it: a method a zip may
     /// use, the name and extra field inside the bytes, and data that stays inside them: a compressed size that fits in what
-    /// is left (or zip64's marker, or 0 with a data descriptor), or, deflated, data that decodes whatever size is declared.
+    /// is left (or zip64's marker, or 0 with a data descriptor), or, deflated, data that is not a deflate error. Round 4
+    /// (R4-3, the controller's ruling on truncated deflate): only a deflate DATA ERROR means "no archive"; data that decodes,
+    /// runs out before its stream ends, or runs past the probe's slice or output is an archive. The probe reads at most
+    /// `ProbeBudget.sliceBytes` of the bytes in place (no copy) and is paid for from `budget`; a spent budget is an archive.
     /// The version and the name's length play no part (they only limit what a reader accepts). Every read is bounds-checked
     /// first.
-    static func plausibleLocalHeader(_ data: Data, at offset: Data.Index) -> Bool {
+    static func plausibleLocalHeader(_ data: Data, at offset: Data.Index, budget: inout ProbeBudget) -> Bool {
         guard offset >= data.startIndex, data.endIndex - offset >= 30 else { return false }
         func u16(_ k: Int) -> Int { Int(data[offset + k]) | Int(data[offset + k + 1]) << 8 }
         func u32(_ k: Int) -> Int { u16(k) | u16(k + 2) << 16 }
@@ -132,18 +157,13 @@ public enum ArchiveMemberScan {
         let left = data.endIndex - offset - 30 - nameLength - extraLength
         guard left >= 0 else { return false }
         if compressed == 0xFFFF_FFFF || (compressed == 0 && flags & 0x08 != 0) || compressed <= left { return true }
-        // A deflated entry whose declared size runs past the bytes still counts when its data decodes (a reader may go by
-        // the stream, not the size): a probe of at most 64 KiB of output.
+        // A deflated entry whose declared size runs past the bytes still counts unless its data is a deflate error (a
+        // reader may go by the stream, not the size, and prints what a cut stream holds).
         guard method == 8 else { return false }
         let start = offset + 30 + nameLength + extraLength
-        do {
-            _ = try EmbeddedContent.inflateRaw(Data(data[start...]), cap: 1 << 16, failure: ArchiveReadError.unreadable)
-            return true
-        } catch let e as ArchiveReadError {
-            return e == overBudget   // it went on decoding past the probe
-        } catch {
-            return false
-        }
+        let slice = min(left, ProbeBudget.sliceBytes)
+        guard budget.take(slice) else { return true }
+        return EmbeddedContent.deflateProbe(data[start..<(start + slice)], outputCap: 1 << 16) != .dataError
     }
 
     /// The compressed format whose magic `data` starts with, among those the engine can't open: gzip, bzip2, xz, zstd, 7z,
