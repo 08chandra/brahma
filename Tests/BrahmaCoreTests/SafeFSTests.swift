@@ -167,7 +167,7 @@ import Foundation
         #expect(try Data(contentsOf: url) == Data("shared".utf8))
         var st = stat()
         #expect(lstat(url.path, &st) == 0 && st.st_mode & 0o777 == 0o444)
-        #expect(throws: (any Error).self) { try f.fs.createExclusive(name: "x.md", inOwnLabSubdir: "shares", data: Data("again".utf8)) }
+        #expect(throws: SafeFSError.exists) { try f.fs.createExclusive(name: "x.md", inOwnLabSubdir: "shares", data: Data("again".utf8)) }
         #expect(try Data(contentsOf: url) == Data("shared".utf8))
         #expect(throws: SafeFSError.badPath) { try f.fs.createExclusive(name: "../x.md", inOwnLabSubdir: "shares", data: Data()) }
         #expect(throws: SafeFSError.badPath) { try f.fs.createExclusive(name: "y.md", inOwnLabSubdir: "../qa-2", data: Data()) }

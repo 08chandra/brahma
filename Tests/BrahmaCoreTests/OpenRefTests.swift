@@ -203,6 +203,11 @@ struct CollabFixture {
         let blob = try cf.open(.eng1, "blob.dat").text
         #expect(blob.contains("file · 100 bytes; open_ref can't read its text — use copy: true and your own tools"))
         #expect(!blob.contains("AAAA"))
+        // NUL in the first 8 KB is binary whatever the extension says (M9).
+        try cf.commit(["nul.txt": Data("text then\u{0}binary\n".utf8)])
+        let nul = try cf.open(.eng1, "nul.txt").text
+        #expect(nul.contains("text · 17 bytes; open_ref can't read its text — use copy: true and your own tools"))
+        #expect(!nul.contains("binary"))
         let doc = try cf.open(.eng1, "doc.pdf").text
         #expect(doc.contains("pdf · 100 bytes; open_ref can't read its text — use copy: true and your own tools"))
         // TextExtract directly: lossy text, and images by their header.

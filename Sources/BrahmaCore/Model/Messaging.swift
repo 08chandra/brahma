@@ -53,7 +53,8 @@ public struct Message: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     /// What the message is (Plan C): ordinary text, a share, a show request or answer, a file ask, an engine line.
     public var kind: MessageKind = .text
     /// Plan C: written by an agent whose session had read outside content (ML's `Store.currentTaint` when it was posted), and
-    /// what that was. Reading the message does not taint its reader; its text reaches readers inside `UntrustedBlock`.
+    /// what that was. Its text reaches readers inside `UntrustedBlock`, and opening it (`open_ref`) taints the reader
+    /// (`Store.refTaint`).
     public var fromTaintedSession: Bool = false
     public var taintSource: String? = nil
 }

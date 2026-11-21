@@ -1603,6 +1603,7 @@ enum Migrations {
                 t.add(column: "taintSource", .text)
             }
             try backfillMessageTaint(db)
+            try db.alter(table: "workLease") { t in t.add(column: "claimHead", .text) }   // the item branch's head at claim
             try db.create(table: "messageRef") { t in
                 t.primaryKey("id", .text)
                 t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
