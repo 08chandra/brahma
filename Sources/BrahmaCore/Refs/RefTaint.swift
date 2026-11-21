@@ -611,15 +611,16 @@ extension Store {
     }
 
     /// At the end of a turn of a tainted session (ruling 6): records the commits it made on every item branch it touched —
-    /// the union of the items it held as the turn started (`heldAtStart`: item id → head then), every item it claimed during
-    /// the turn (the claim log, even one released since), the leases it holds now and the turn's own leased item. Each starts
-    /// at its head at turn start, else the trusted head of its first claim in the turn, else the lease's trusted claim head,
-    /// else the merge base with `main` (never a head an agent could have moved). A read that fails falls back to what is known
-    /// and alerts the owner. Never throws.
+    /// the union of the items it held as the turn started (`heldAtStart`: item id → head then; `heldItemsAtStart`, P2 R4-3:
+    /// every one of them from the leases, a head git couldn't read then included), every item it claimed during the turn (the
+    /// claim log, even one released since), the leases it holds now and the turn's own leased item. Each starts at its head
+    /// at turn start, else (held then, or the turn's own, with no head read) the merge base with `main`, else the trusted head
+    /// of its first claim in the turn, else the lease's trusted claim head, else the merge base (never a head an agent could
+    /// have moved). A read that fails falls back to what is known and alerts the owner. Never throws.
     public func recordTurnTaints(companyId: String, agentId: String, turnId: String, heldAtStart: [String: String],
-                                 leasedItemId: String?, source: String, now: Date) {
+                                 heldItemsAtStart: [String] = [], leasedItemId: String?, source: String, now: Date) {
         var targets: [String: String?] = heldAtStart.mapValues { Optional($0) }
-        if let leasedItemId, targets[leasedItemId] == nil { targets[leasedItemId] = .some(nil) }
+        for itemId in heldItemsAtStart + [leasedItemId].compactMap({ $0 }) where targets[itemId] == nil { targets[itemId] = .some(nil) }
         do {
             let (claims, leases) = try writer.read { db in
                 (try Row.fetchAll(db, sql: "SELECT itemId, claimHead FROM leaseClaim WHERE agentId = ? AND turnId = ? ORDER BY id",

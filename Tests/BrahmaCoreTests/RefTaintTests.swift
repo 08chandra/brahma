@@ -522,6 +522,52 @@ import GRDB
         #expect(try store.workItem(id: h.other.id)?.taintedOrigin == false)
     }
 
+    /// R4-3: an item held as the turn started (claimed before it), released mid-turn by a session tainted only through the
+    /// hook flag file, is marked at the turn's end: with its branch head readable at the start, and (`headReadable` false)
+    /// when the taint code's git could not read it then. The held-at-start set comes from the leases, not from git.
+    private func heldAtStartReleasedMidTurn(headReadable: Bool) async throws {
+        let h = try Holder()
+        let (store, engId, companyId, key, home) = (h.store, h.eng.id, h.company.id, h.item.key, h.world.paths.home)
+        #expect(try store.lease(itemId: h.item.id)?.agentId == engId)
+        if !headReadable { store.refHooks.setGitRunner(FailingGitRunner()) }
+        try await h.turn {
+            store.refHooks.setGitRunner(nil)        // readable again inside the turn: the turn end can record its commits
+            #expect(TaintFlag.write(home: home, agentId: engId, source: TaintPolicy.hookErrorSource))
+            _ = try CompanyTools(store: store, companyId: companyId, agentId: engId).call(name: "release_lease", arguments: ["key": .string(key)])
+        }
+        #expect(try h.turns().count == 1)
+        #expect(try store.lease(itemId: h.item.id) == nil)
+        #expect(try store.agent(id: engId)?.sessionTainted == false)
+        #expect(try store.workItem(id: h.item.id)?.taintedOrigin == true, "head readable at the start: \(headReadable)")
+        #expect(try store.workItem(id: h.other.id)?.taintedOrigin == false)
+    }
+
+    @Test func flagOnlyTaintMarksHeldItemReleasedMidTurn() async throws {
+        try await heldAtStartReleasedMidTurn(headReadable: true)
+    }
+
+    @Test func flagOnlyTaintMarksHeldItemWhoseHeadWasUnreadable() async throws {
+        try await heldAtStartReleasedMidTurn(headReadable: false)
+    }
+
+    /// R4-2: the three `vC-taint-order` triggers exist, on their tables, after the whole migration chain (a fresh database and
+    /// the store's own). A later migration that rebuilds `artifact`, `taintedCommit` or `workItemEvent` drops its triggers
+    /// silently; for `workItemEvent` that fails open (status sequences stop), so it must fail here.
+    @Test func taintOrderTriggersSurviveTheMigrationChain() throws {
+        let expected = [["taintOrder_clear", "taintedCommit"], ["taintOrder_publish", "artifact"], ["taintOrder_status", "workItemEvent"]]
+        func triggers(_ db: Database) throws -> [[String]] {
+            try Row.fetchAll(db, sql: """
+                SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger' AND name IN ('taintOrder_publish', 'taintOrder_clear', 'taintOrder_status')
+                ORDER BY name
+                """).map { [$0["name"], $0["tbl_name"]] }
+        }
+        let queue = try DatabaseQueue()
+        try Migrations.migrator().migrate(queue)
+        #expect(try queue.read(triggers) == expected)
+        let store = try Store.inMemory()
+        #expect(try store.writer.read(triggers) == expected)
+    }
+
     /// R2-2 (ruling 6), R3-4: a release and a re-claim in the same turn can't move the start past commits made before them.
     /// Both claims have a trusted head here (the engine recorded each), so a record starting at the last claim would miss the
     /// first commit: only the first claim's head is the start.
