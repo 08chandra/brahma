@@ -107,8 +107,10 @@ private struct PreviewBodyView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
-            Hairline()
+            if showsHeader {
+                header
+                Hairline()
+            }
             content
         }
         .task(id: tabId) {
@@ -246,14 +248,26 @@ private struct PreviewBodyView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .terminal(let lines, let footer):
+            TerminalPreviewView(lines: lines, footer: footer)
+        case .backend(let smoke, let logTail, let operations, let operationsNote):
+            BackendPreviewView(smoke: smoke, logTail: logTail, operations: operations, operationsNote: operationsNote)
+        case .artifact(let artifact, let all):
+            ArtifactPreviewView(artifact: artifact, all: all, model: model)
         default:
-            // `.web`, and the cases 4a and Collab add to the open enum (L-1).
+            // `.web`, and the cases 9b (`.simulator`, `.window`) and Collab add to the open enum (L-1).
             if case .web(let url, let origin, let builtBy) = body_ {
                 WebPreviewView(url: url, origin: origin, path: path, viewport: viewport, builtBy: builtBy, reloadKey: reloadKey)
             } else {
                 MonoEmptyState("UNSUPPORTED PREVIEW")
             }
         }
+    }
+
+    /// The ARTIFACTS body carries its own header (the picker and Reveal in Finder); the pane's row would be empty over it.
+    private var showsHeader: Bool {
+        if case .artifact = body_ { return false }
+        return true
     }
 
     /// The surface's commit, or the live release's ref: a change reloads the page.

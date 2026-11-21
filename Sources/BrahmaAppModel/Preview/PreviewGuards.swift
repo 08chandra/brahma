@@ -72,6 +72,25 @@ public enum PreviewGuards {
         return String(decoding: data, as: UTF8.self)
     }
 
+    /// The content rule list of an artifact's web view (Plan 4a Task 9a, fix 11): a block on everything, then
+    /// `ignore-previous-rules` for `^file:` and `^about:`. An artifact is a copy on disk that loads with
+    /// `loadFileURL(_:allowingReadAccessTo:)`, so nothing it names may leave the disk: no http(s), no websockets, no `data:`
+    /// (its images sit beside it). Top-level navigation is held to the copy's folder by
+    /// `PreviewNavigationPolicy.allowsArtifact` as well.
+    public static let artifactRuleList: String = {
+        let rules: [[String: Any]] = [
+            ["trigger": ["url-filter": ".*"], "action": ["type": "block"]],
+            ["trigger": ["url-filter": "^file:"], "action": ["type": "ignore-previous-rules"]],
+            ["trigger": ["url-filter": "^about:"], "action": ["type": "ignore-previous-rules"]],
+        ]
+        // A fixed literal list: the serialization of three string dictionaries cannot fail.
+        let data = (try? JSONSerialization.data(withJSONObject: rules, options: [.withoutEscapingSlashes, .sortedKeys])) ?? Data()
+        return String(decoding: data, as: UTF8.self)
+    }()
+
+    /// The compiled list's identifier in `WKContentRuleListStore`.
+    public static let artifactRuleListIdentifier = "brahma.artifact.file-only"
+
     /// Builds the rule list for `origin` and compiles it with `compile(identifier, json)` (WebKit's
     /// `WKContentRuleListStore` in the app). Any failure is `.failed`: the caller shows an error state and makes no web view.
     @MainActor

@@ -21,6 +21,8 @@ public enum RendererCaps {
     public static let maxImagePixels = 64_000_000
     /// The largest glTF/glb parsed in process; larger files get the file card.
     public static let maxInProcessModelBytes = 20_971_520
+    /// The most of a text or code file the app shows (Task 9a's `.text` body); the lines of it go through `truncateLine`.
+    public static let maxTextBytes = 1_048_576
 
     /// `s`, or its longest prefix of at most `maxLineBytes` bytes that ends on a scalar boundary, plus `…`.
     public static func truncateLine(_ s: Substring) -> String {
@@ -33,15 +35,16 @@ public enum RendererCaps {
     }
 
     /// Why `readRegularFile` gave nothing.
-    enum FileReadFailure: Error, Equatable {
+    public enum FileReadFailure: Error, Equatable, Sendable {
         case notRegular, tooLarge, unreadable
     }
 
     /// The whole content of `url` when it is a regular file of at most `maxBytes`. The one file opener of every preview
     /// reader: `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` (a link swapped in is `.notRegular`; a FIFO cannot block the open),
     /// then `fstat` on the descriptor requires `S_IFREG` and a size within `maxBytes` before any read (`.tooLarge`
-    /// otherwise), then `O_NONBLOCK` is cleared and the file is read.
-    static func readRegularFile(_ url: URL, maxBytes: Int) throws -> Data {
+    /// otherwise), then `O_NONBLOCK` is cleared and the file is read. Public for the app's file renderers (Task 9a), which
+    /// call it inside `parse`.
+    public static func readRegularFile(_ url: URL, maxBytes: Int) throws -> Data {
         let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { throw errno == ELOOP ? FileReadFailure.notRegular : FileReadFailure.unreadable }
         defer { close(fd) }

@@ -1,0 +1,9 @@
+part,qty,unit_cost,supplier,lead_days,notes
+Enclosure shell,120,4.80,Initech Plastics,14,"ABS, matte black"
+Main board,120,18.25,Globex Circuits,21,rev C
+OLED 1.3in,120,6.40,Acme Displays,10,"128x64, I2C"
+Haptic motor,240,0.95,Globex Circuits,7,
+Li-Po 500mAh,120,3.10,Acme Power,28,"UN38.3 cert, ships ground"
+Strap clasp,240,0.42,Initech Plastics,14,
+Screws M1.6,960,0.03,Fastenal,3,"pack of 100"
+Packaging box,120,1.15,PaperCo,12,"recycled kraft, printed 1 color"

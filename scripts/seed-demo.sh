@@ -91,6 +91,19 @@ git -C "$W" -c user.name=Brahma -c user.email=engine@brahma.local -c commit.gpgs
 "$B" main accept Initech >/dev/null
 "$B" hosting set Initech --provider cloudflare-pages --project initech-demo --account-id 0123456789abcdef0123456789abcdef >/dev/null
 
+# Plan 4a: a CLI demo (its sealed output is the DEMO tab's terminal; the engine runs it from main) and three artifacts published
+# from the workspace, AR-1..AR-3 in this order (the UI snapshots rely on it). The fixtures are copied into docs/ first (fix 14);
+# the clip is Task 9b's and is published only once it exists, so AR-1 and AR-2 keep their numbers either way.
+for f in mock.html parts.csv clip-9x16.mp4; do
+  [ -f "scripts/fixtures/$f" ] && cp "scripts/fixtures/$f" "$W/docs/$f"
+done
+"$B" preview set Initech demo --kind cli --demo "printf '\033[32mPASS\033[0m streaks\n'; ls" >/dev/null
+"$B" artifacts publish Initech "$W/docs/mock.html" --title "Landing mock" >/dev/null
+"$B" artifacts publish Initech "$W/docs/parts.csv" --title "Parts list" >/dev/null
+if [ -f "$W/docs/clip-9x16.mp4" ]; then
+  "$B" artifacts publish Initech "$W/docs/clip-9x16.mp4" --title "Launch reel" >/dev/null
+fi
+
 # Plan ML: Work › Resources — a note (FROM YOU), a PDF from outside (EXTERNAL, scoped to the engineering team) and a link.
 D="$(mktemp -d)"
 printf '# Habit tracker brand notes\n\nColors: teal and slate. Tone: calm, encouraging.\n' >"$D/brand-notes.md"
