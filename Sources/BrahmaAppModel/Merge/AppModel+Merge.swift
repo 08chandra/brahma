@@ -22,11 +22,14 @@ extension AppModel {
     /// A fresh form over the stored settings.
     public var mergeSettingsForm: MergeSettingsForm { MergeSettingsForm(snapshot.merge.settings) }
 
-    public func saveMergeSettings(_ form: MergeSettingsForm) async {
-        guard let companyId = selectedCompanyId else { return }
-        if let message = form.validate() { errorMessage = message; return }
+    /// True when the settings were saved; false (with `errorMessage` set) when the form or the write was refused, so the sheet
+    /// can stay open with what was typed.
+    @discardableResult
+    public func saveMergeSettings(_ form: MergeSettingsForm) async -> Bool {
+        guard let companyId = selectedCompanyId else { return false }
+        if let message = form.validate() { errorMessage = message; return false }
         let settings = form.settings
-        await ownerWrite("save the merge settings") { store in try store.setMergeSettings(companyId: companyId, settings, by: .owner) }
+        return await ownerWrite("save the merge settings") { store in try store.setMergeSettings(companyId: companyId, settings, by: .owner) } != nil
     }
 
     /// Owner only: a `failed` request goes back in the queue as a fresh one (`Store.requestMergeRetry`).

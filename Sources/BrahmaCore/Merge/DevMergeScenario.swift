@@ -153,16 +153,18 @@ public enum DevMergeScenario {
         // The engine's check of the submitted commit, run here as the engine's tick would start it.
         let deadline = AwakeTime.now + checkWait   // awake time, as the engine's own deadlines (AwakeTimeTests)
         while try store.workItem(id: item.id)?.verifiedCommit == nil {
-            if let run = try store.queuedVerifications(limit: 20).first(where: { $0.itemId == item.id }) {
-                let output = paths.companyDir(run.companyId).appending(path: "check-output/\(run.id).log")
-                guard let begun = try store.beginVerification(runId: run.id, outputPath: output.path) else { continue }
+            if let run = try store.queuedVerifications(limit: 20).first(where: { $0.itemId == item.id }),
+               let begun = try store.beginVerification(runId: run.id, outputPath: paths.companyDir(run.companyId)
+                                                            .appending(path: "check-output/\(run.id).log").path) {
                 await orchestrator.performCheck(run: begun)
-            } else if let latest = try store.latestVerification(itemId: item.id), latest.status != .queued && latest.status != .running {
-                throw WorkError.invalid("\(item.key)'s check \(latest.status.rawValue): \(Store.flat(latest.outputTail ?? "", max: 300))")
-            } else {
-                guard AwakeTime.now < deadline else { throw WorkError.invalid("\(item.key)'s check did not finish") }
-                try await AwakeTime.sleep(for: .milliseconds(200))
+                continue
             }
+            if let latest = try store.latestVerification(itemId: item.id), latest.status != .queued && latest.status != .running {
+                throw WorkError.invalid("\(item.key)'s check \(latest.status.rawValue): \(Store.flat(latest.outputTail ?? "", max: 300))")
+            }
+            // Nothing to run right now (queued for later, or a run another path began): the deadline, then a short wait (M5).
+            guard AwakeTime.now < deadline else { throw WorkError.invalid("\(item.key)'s check did not finish") }
+            try await AwakeTime.sleep(for: .milliseconds(200))
         }
 
         // The reviewer the engine settled on, approving from its own review turn through the review tool.

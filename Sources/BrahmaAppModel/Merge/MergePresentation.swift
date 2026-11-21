@@ -128,19 +128,21 @@ public struct MergeHeader: Equatable, Sendable {
     public var batch: String
     /// The strategy's title ("Rebase + fast-forward").
     public var strategy: String
-    /// `MAIN CHECK <command>` (agent-controlled: `Text(verbatim:)`), or `MAIN CHECK NONE`.
+    /// `MAIN CHECK <command>` (agent-controlled: `Text(verbatim:)`, one trimmed line), or `MAIN CHECK NONE`.
     public var mainCheck: String
+    /// Whether a main check is set (the chip's weight; never read off the text, a command may end in "NONE").
+    public var hasMainCheck: Bool
     /// `HELD: <reason>` while the queue is held (a `warning` chip with the Resume button).
     public var held: String?
     /// `BATCH AT <STEP>` while the engine is still finishing a batch from its journal (a `running` chip).
     public var unfinishedBatch: String?
 
     public init(title: String, tone: MergeTone, detail: String, canResume: Bool, main: String = "MAIN —", batch: String = "BATCH 1",
-                strategy: String = MergeStrategy.ff.title, mainCheck: String = "MAIN CHECK NONE", held: String? = nil,
-                unfinishedBatch: String? = nil) {
+                strategy: String = MergeStrategy.ff.title, mainCheck: String = "MAIN CHECK NONE", hasMainCheck: Bool = false,
+                held: String? = nil, unfinishedBatch: String? = nil) {
         self.title = title; self.tone = tone; self.detail = detail; self.canResume = canResume
-        self.main = main; self.batch = batch; self.strategy = strategy; self.mainCheck = mainCheck; self.held = held
-        self.unfinishedBatch = unfinishedBatch
+        self.main = main; self.batch = batch; self.strategy = strategy; self.mainCheck = mainCheck; self.hasMainCheck = hasMainCheck
+        self.held = held; self.unfinishedBatch = unfinishedBatch
     }
 
     public static func make(_ m: MergeSnapshot) -> MergeHeader {
@@ -149,7 +151,8 @@ public struct MergeHeader: Equatable, Sendable {
         var h = MergeHeader(title: "QUEUE IDLE", tone: .muted, detail: detail, canResume: false,
                             main: "MAIN " + (m.mainCommit.map(MergeRows.sha7) ?? "—"), batch: "BATCH \(m.settings.batchSize)",
                             strategy: m.settings.strategy.title,
-                            mainCheck: "MAIN CHECK " + (m.settings.mainCheck.map { MergeRows.oneLine($0.command) } ?? "NONE"),
+                            mainCheck: "MAIN CHECK " + (m.settings.mainCheck.map { MergeRows.oneLine($0.command).trimmingCharacters(in: .whitespaces) } ?? "NONE"),
+                            hasMainCheck: m.settings.mainCheck != nil,
                             unfinishedBatch: m.unfinishedBatch.map { "BATCH AT " + $0.step.rawValue.uppercased() })
         if let hold = m.hold {
             // Held: the reason first, and still `main` and any unfinished batch (they matter most now).

@@ -44,7 +44,7 @@ struct MergeQueueView: View {
                 MonoChip(text: header.batch, color: BrahmaTheme.text0, fill: BrahmaTheme.bg4)
                 Text(verbatim: header.strategy).font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text1).lineLimit(1)
                 // The command is agent-controlled and may be long: one line, cut in the middle, whole in the tooltip.
-                MonoChip(text: header.mainCheck, color: header.mainCheck.hasSuffix(" NONE") ? BrahmaTheme.text2 : BrahmaTheme.text0, fill: BrahmaTheme.bg4)
+                MonoChip(text: header.mainCheck, color: header.hasMainCheck ? BrahmaTheme.text0 : BrahmaTheme.text2, fill: BrahmaTheme.bg4)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .frame(maxWidth: 520, alignment: .leading)
@@ -76,18 +76,57 @@ struct MergeQueueView: View {
 
     // MARK: Table
 
+    /// One layout for the header and every row: fixed columns, and DETAIL the only flexible one, so the cells line up whatever
+    /// the content (M1). `retry` is the trailing button column.
+    private enum Column: CaseIterable {
+        case ref, key, title, owner, status, detail, commit, queued, retry
+
+        var header: String {
+            switch self {
+            case .ref: "Ref"
+            case .key: "Key"
+            case .title: "Title"
+            case .owner: "Owner"
+            case .status: "Status"
+            case .detail: "Detail"
+            case .commit: "Commit"
+            case .queued: "Queued"
+            case .retry: ""
+            }
+        }
+
+        /// Nil: the flexible column.
+        var width: CGFloat? {
+            switch self {
+            case .ref: 44
+            case .key: 80
+            case .title: 200
+            case .owner: 90
+            case .status: 96
+            case .detail: nil
+            case .commit: 64
+            case .queued: 112
+            case .retry: 56
+            }
+        }
+    }
+
+    private func sized<V: View>(_ column: Column, _ view: V) -> some View {
+        Group {
+            if let width = column.width {
+                view.frame(width: width, alignment: column == .retry ? .trailing : .leading)
+            } else {
+                view.frame(minWidth: 160, maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
     private func table(_ rows: [MergeRow]) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: BrahmaTheme.spaceS) {
-                ColumnHeader("Ref").frame(width: 44, alignment: .leading)
-                ColumnHeader("Key").frame(width: 80, alignment: .leading)
-                ColumnHeader("Title").frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
-                ColumnHeader("Owner").frame(width: 90, alignment: .leading)
-                ColumnHeader("Status").frame(width: 90, alignment: .leading)
-                ColumnHeader("Detail").frame(minWidth: 160, maxWidth: .infinity, alignment: .leading)
-                ColumnHeader("Commit").frame(width: 64, alignment: .leading)
-                ColumnHeader("Queued").frame(width: 112, alignment: .leading)
-                Spacer().frame(width: 56)
+                ForEach(Column.allCases, id: \.self) { column in
+                    sized(column, ColumnHeader(column.header))
+                }
             }
             .padding(.horizontal, BrahmaTheme.spaceS)
             .frame(height: BrahmaTheme.denseRowHeight)
@@ -96,35 +135,41 @@ struct MergeQueueView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                         HStack(spacing: BrahmaTheme.spaceS) {
-                            Text(verbatim: row.ref).font(BrahmaTheme.mono).foregroundStyle(BrahmaTheme.text0).frame(width: 44, alignment: .leading)
-                            Text(verbatim: row.itemKey).font(BrahmaTheme.mono).foregroundStyle(BrahmaTheme.text0).lineLimit(1)
-                                .frame(width: 80, alignment: .leading)
-                            Text(verbatim: row.title).font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text1).lineLimit(1)
-                                .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
-                            Text(verbatim: row.holder).font(BrahmaTheme.mono).foregroundStyle(BrahmaTheme.text1).lineLimit(1)
-                                .frame(width: 90, alignment: .leading)
-                            StatusChip(label: row.statusTitle, color: Self.toneColor(row.tone), pulse: row.tone == .running)
-                                .frame(width: 90, alignment: .leading)
-                            Text(verbatim: row.detail).font(BrahmaTheme.monoSmall).foregroundStyle(detailColor(row)).lineLimit(1)
-                                .truncationMode(.tail)
-                                .frame(minWidth: 160, maxWidth: .infinity, alignment: .leading)
-                                .help(Text(verbatim: row.detail))
-                            Text(verbatim: row.commit).font(BrahmaTheme.mono).foregroundStyle(BrahmaTheme.text1).frame(width: 64, alignment: .leading)
-                            Text(verbatim: row.when).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text2).frame(width: 112, alignment: .leading)
-                            Group {
-                                if row.canRetry {
-                                    Button("Retry") { Task { await model.retryMerge(requestId: row.id) } }
-                                        .buttonStyle(.brahma)
-                                        .help("Put this failed merge back in the queue; the engine merges it next")
-                                }
+                            ForEach(Column.allCases, id: \.self) { column in
+                                sized(column, cell(column, row))
                             }
-                            .frame(width: 56, alignment: .trailing)
                         }
                         .tableRow(index: index)
                         .accessibilityElement(children: .combine)
                         .accessibilityLabel(Text(verbatim: "\(row.ref) \(row.itemKey) \(row.statusTitle) \(row.detail)"))
                     }
                 }
+            }
+        }
+    }
+
+    @ViewBuilder private func cell(_ column: Column, _ row: MergeRow) -> some View {
+        switch column {
+        case .ref: Text(verbatim: row.ref).font(BrahmaTheme.mono).foregroundStyle(BrahmaTheme.text0)
+        case .key: Text(verbatim: row.itemKey).font(BrahmaTheme.mono).foregroundStyle(BrahmaTheme.text0).lineLimit(1)
+        case .title: Text(verbatim: row.title).font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text1).lineLimit(1)
+        case .owner: Text(verbatim: row.holder).font(BrahmaTheme.mono).foregroundStyle(BrahmaTheme.text1).lineLimit(1)
+        case .status: StatusChip(label: row.statusTitle, color: Self.toneColor(row.tone), pulse: row.tone == .running)
+        case .detail:
+            Text(verbatim: row.detail).font(BrahmaTheme.monoSmall).foregroundStyle(detailColor(row)).lineLimit(1)
+                .truncationMode(.tail)
+                .help(Text(verbatim: row.detail))
+        case .commit: Text(verbatim: row.commit).font(BrahmaTheme.mono).foregroundStyle(BrahmaTheme.text1)
+        case .queued: Text(verbatim: row.when).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text2)
+        case .retry:
+            if row.canRetry {
+                Button("Retry") { Task { await model.retryMerge(requestId: row.id) } }
+                    .buttonStyle(.brahma)
+                    .help("Put this failed merge back in the queue; the engine merges it next")
+            } else {
+                // Never an empty cell: an empty view takes no width and no HStack spacing, which would pull this row's
+                // columns off the header's.
+                Color.clear.frame(width: 0, height: 0)
             }
         }
     }

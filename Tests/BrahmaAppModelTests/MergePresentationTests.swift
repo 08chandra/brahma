@@ -107,7 +107,10 @@ import BrahmaCore
         var configured = Self.snapshot()
         configured.settings = MergeSettings(mainCheck: CheckSpec(command: "test -f index.html\n"), batchSize: 4, strategy: .merge)
         let c = MergeHeader.make(configured)
-        #expect(c.batch == "BATCH 4" && c.strategy == "Rebase + merge commit" && c.mainCheck == "MAIN CHECK test -f index.html ")
+        #expect(c.batch == "BATCH 4" && c.strategy == "Rebase + merge commit" && c.mainCheck == "MAIN CHECK test -f index.html" && c.hasMainCheck)
+        // "none" is data, not the text: a command that ends in NONE is still a check.
+        configured.settings.mainCheck = CheckSpec(command: "echo NONE")
+        #expect(MergeHeader.make(configured).hasMainCheck && !idle.hasMainCheck)
         var noMain = Self.snapshot()
         noMain.mainCommit = nil
         #expect(MergeHeader.make(noMain).detail == "no main yet" && MergeHeader.make(noMain).main == "MAIN —")

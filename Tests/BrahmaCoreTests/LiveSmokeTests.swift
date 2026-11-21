@@ -361,7 +361,14 @@ struct LiveSmokeTests {
         let lead = try store.hire(companyId: companyId, name: "lead", role: "manager", model: "haiku")
         let eng = try store.hire(companyId: companyId, name: "eng", role: "engineer", model: "haiku", managerId: lead.id)
         let cto = try store.hire(companyId: companyId, name: "cto", role: "cto", model: "sonnet")
-        let oldMain = try #require(try store.company(id: companyId)?.mainCommit, "no engine-accepted main")
+        // The default Sandboxed profile needs the owner's sandbox canary, which a temp home has no probes for (every turn would
+        // stay blocked): the turns run on the Workspace profile, as both sibling live tests do (I2). Merge checks, main smokes
+        // and the deploy still run under the real sandbox.
+        let userHome = root.appending(path: "user", directoryHint: .isDirectory)   // the home the sandbox patch protects: never the real one
+        try FileManager.default.createDirectory(at: userHome, withIntermediateDirectories: true)
+        try store.updateSandbox(companyId: companyId, SandboxPatch(profile: .workspace), userHome: userHome)
+        company = try #require(try store.company(id: companyId))
+        let oldMain = try #require(company.mainCommit, "no engine-accepted main")
 
         // 2. The main check, L's smoke check, and the deploy config with a build into a subfolder (fix 5). The smoke check runs
         //    at main's commit in an export, before any build: it checks the source file (the deploy's own smoke GETs dist/).
@@ -372,21 +379,30 @@ struct LiveSmokeTests {
                                   smoke: [SmokeRequest(method: "GET", path: "/hello.txt")], expectText: nil)
 
         // 3. L's FakeHostingAdapter over a loopback dev host; its token in a MemoryVault through Store.setSecret (the engine's vault).
-        //    The token goes in once the turns are over: the turns' `brahma mcp` children read no in-process vault, and a company
-        //    secret they cannot load would make them refuse every tool call.
+        //    The token goes in once the turns are over: the turns' `brahma mcp` children read the home's file store (M6), not an
+        //    in-process vault, and a company secret they cannot load would make them refuse every tool call.
+        //    The deploy runs under the real platform sandbox (I3): the fake CLI is pre-placed in the release tools folder (the
+        //    executor then installs nothing, as goalToLiveURL's marker does), and `FakeHostGrant` opens the host folder to the exact
+        //    `…/.bin/fake deploy` command only, L's `DevHostSandbox` grant for this adapter; the build and the token step keep
+        //    their real policies.
         let vault = MemoryVault()
         let hostRoot = paths.home.appending(path: "dev-host", directoryHint: .isDirectory)
         try BrahmaPaths.ensurePrivateDirectory(hostRoot)
         let hostDir = try EngineFiles.directory(workspace: hostRoot, company.slug, mode: 0o700)
         let server = try DevHostServer(base: hostDir)
         defer { server.stop() }
-        //    The deploy's steps (the build, the fake `npm`, `fake deploy`) run as real processes through `FakeSandbox`, not under
-        //    Seatbelt: the fake CLI writes the host folder itself, which the engine's deploy policy opens only to L's dev-host
-        //    `cp` (`DevHostSandbox`); goalToLiveURL is the sandboxed deploy. Merge checks and main smokes here stay sandboxed.
         let adapter = FakeHostingAdapter(server: server.url, hostRoot: hostDir)
-        let toolsPath = try FakeHostingAdapter.tools().path + ":/usr/bin:/bin"
-        let releaseDeps = ReleaseDependencies(sandbox: FakeSandbox(), unsandboxed: FakeSandbox(), http: URLSessionHTTPProbe(),
-                                              adapters: { _ in adapter }, sleep: { _ in }, environment: ["PATH": toolsPath, "LANG": "C"])
+        let layout = try store.releaseLayout(companyId: companyId)
+        try BrahmaPaths.ensurePrivateDirectory(layout.root)
+        let binDir = "tools/\(adapter.cli)/node_modules/.bin"
+        try EngineFiles.directory(workspace: layout.root, binDir, mode: 0o700)
+        _ = try EngineFiles.create(Data(FakeTools.text(FakeHostingAdapter.cliScript).utf8), workspace: layout.root, dir: binDir, name: "fake",
+                                   mode: 0o700)
+        let fakeBin = layout.deployTools(cli: adapter.cli).appending(path: "node_modules/.bin/fake", directoryHint: .notDirectory)
+        let proxies = EgressProxyPool()
+        let platform = SandboxRunners.platformDefault(baseline: { Orchestrator.checkBaseline(store: store, paths: paths) }, proxies: proxies)
+        let releaseDeps = ReleaseDependencies(sandbox: FakeHostGrant(base: platform, hostDir: hostDir, deployBin: fakeBin),
+                                              http: URLSessionHTTPProbe(), adapters: { _ in adapter })
 
         // 4. SMOKE-1, ready for eng with lead as reviewer; 5. the DM with 3a's live-test instruction.
         let item = try store.createWorkItem(companyId: companyId, by: .owner, draft: WorkItemDraft(
@@ -399,7 +415,8 @@ struct LiveSmokeTests {
             text: "Claim \(item.key) with claim_lease, work in the worktree it gives you, make its check pass, then call submit_for_review.")
 
         // 6. The real engine until the item is done.
-        let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp, vault: vault, releaseDeps: releaseDeps)
+        let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp, vault: vault, releaseDeps: releaseDeps,
+                                        mcpEnvironment: [SecretStore.environmentVariable: "file"])
         try await orchestrator.start()
         let loop = Task { await orchestrator.runForever(interval: .milliseconds(500)) }
         func waitFor(_ what: String, seconds: Int, _ done: () throws -> Bool) async throws -> Bool {
@@ -411,34 +428,54 @@ struct LiveSmokeTests {
             print("TIMED OUT waiting for \(what)")
             return false
         }
-        var deployed: Release?
-        let finished = try await waitFor("\(item.key) done", seconds: 330) { try store.workItem(id: item.id)?.status == .done }
-        if finished {
-            try await Task.sleep(for: .seconds(3))   // the post-merge bookkeeping and the main smoke start
-            let mainHead = try GitFixture.plainGit(["rev-parse", "main"], in: ws).trimmingCharacters(in: .whitespacesAndNewlines)
-            // The main smoke for the new head (reason `merge`), then the deploy proposed by cto and approved by the owner.
-            let smoked = try await waitFor("the main smoke at \(mainHead.prefix(7))", seconds: 120) {
-                try store.mainSmokeRuns(companyId: companyId).contains { $0.commit == mainHead && $0.status == .passed }
+        struct Progress { var finished = false; var deployed: Release? }
+        // The drive: 270 + 3 + 45 + 90 s of waits, which leave the doctor (above) and a normal teardown inside the 10-minute
+        // limit. A stalled teardown (engine stop ≤ 120 s, previews 30 s, proxies 15 s, wall-time bounds the limit does not cut
+        // short) can run past it: the limit's issue is then recorded and teardown still finishes. Whatever ends the drive (done,
+        // a throw, the limit's cancellation), teardown runs before anything is asserted, so the engine never keeps running real
+        // turns (I4).
+        let progress: Progress
+        do {
+            progress = try await withTaskCancellationHandler {
+                var p = Progress()
+                p.finished = try await waitFor("\(item.key) done", seconds: 270) { try store.workItem(id: item.id)?.status == .done }
+                guard p.finished else { return p }
+                try await Task.sleep(for: .seconds(3))   // the post-merge bookkeeping and the main smoke start
+                let mainHead = try GitFixture.plainGit(["rev-parse", "main"], in: ws).trimmingCharacters(in: .whitespacesAndNewlines)
+                // The main smoke for the new head (reason `merge`), then the deploy proposed by cto and approved by the owner.
+                let smoked = try await waitFor("the main smoke at \(mainHead.prefix(7))", seconds: 45) {
+                    try store.mainSmokeRuns(companyId: companyId).contains { $0.commit == mainHead && $0.status == .passed }
+                }
+                let smokes = try store.mainSmokeRuns(companyId: companyId).map { "\($0.reason.rawValue) \($0.status.rawValue) \($0.sha7)" }
+                #expect(smoked, "no passed main smoke at \(mainHead.prefix(7)): \(smokes)")
+                try store.setSecret(companyId: companyId, name: adapter.tokenSecret, value: Self.fakeHostToken, isTest: false, vault: vault)
+                try store.reloadRedactorIfNeeded(vault: vault)
+                let (release, ask) = try store.proposeDeploy(companyId: companyId, by: cto.id, version: "0.1.0", notes: "hello.txt on main",
+                                                             vault: vault, adapters: { _ in adapter }, npmPresent: true)
+                server.serve(folder: release.ref)
+                _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true)
+                let live = try await waitFor("\(release.ref) deployed", seconds: 90) {
+                    guard let r = try store.release(companyId: companyId, ref: release.ref) else { return false }
+                    return !r.status.isOpen
+                }
+                p.deployed = try store.release(companyId: companyId, ref: release.ref)
+                #expect(live, "\(release.ref) still open: \(p.deployed?.status.rawValue ?? "gone")")
+                return p
+            } onCancel: {
+                loop.cancel()   // the time limit cancels this task only; the engine's unstructured task is cancelled here
             }
-            let smokes = try store.mainSmokeRuns(companyId: companyId).map { "\($0.reason.rawValue) \($0.status.rawValue) \($0.sha7)" }
-            #expect(smoked, "no passed main smoke at \(mainHead.prefix(7)): \(smokes)")
-            try store.setSecret(companyId: companyId, name: adapter.tokenSecret, value: Self.fakeHostToken, isTest: false, vault: vault)
-            try store.reloadRedactorIfNeeded(vault: vault)
-            let (release, ask) = try store.proposeDeploy(companyId: companyId, by: cto.id, version: "0.1.0", notes: "hello.txt on main",
-                                                         vault: vault, adapters: { _ in adapter }, npmPresent: true)
-            server.serve(folder: release.ref)
-            _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true)
-            let live = try await waitFor("\(release.ref) deployed", seconds: 180) {
-                guard let r = try store.release(companyId: companyId, ref: release.ref) else { return false }
-                return !r.status.isOpen
-            }
-            deployed = try store.release(companyId: companyId, ref: release.ref)
-            #expect(live, "\(release.ref) still open: \(deployed?.status.rawValue ?? "gone")")
+        } catch {
+            let cancelled = Task.isCancelled
+            let td = await teardown(loop: loop, orchestrator: orchestrator, proxies: proxies, store: store, root: root, stopEngine: true)
+            print("ABORTED (cancelled \(cancelled)): \(error); teardown: \(td.summary)")
+            throw error
         }
-        loop.cancel()
-        await loop.value   // cancels and awaits in-flight turns, checks, merges and the release
+        let td = await teardown(loop: loop, orchestrator: orchestrator, proxies: proxies, store: store, root: root, stopEngine: false)
+        print("TEARDOWN: \(td.summary)")
         let dump = try store.events(afterId: 0).map(\.text).joined(separator: "\n")
-        guard finished else { Issue.record("timed out; item not done. Events:\n\(dump)"); return }
+        guard progress.finished else { Issue.record("timed out; item not done. Events:\n\(dump)"); return }
+        #expect(td.stalled.isEmpty, "teardown stalled: \(td.stalled)")
+        #expect(td.killed.isEmpty, "processes outlived the engine's own stop: \(td.killed)")
 
         // main holds hello.txt; the item is done because it merged.
         let shown = try GitFixture.plainGit(["show", "main:hello.txt"], in: ws)
@@ -473,7 +510,7 @@ struct LiveSmokeTests {
         #expect(guardResult == .ok, "main guard: \(guardResult)")
 
         // The release deployed through the fake adapter, at main's head, with the fake host's URL.
-        let r1 = try #require(deployed, "no release proposed\n\(dump)")
+        let r1 = try #require(progress.deployed, "no release proposed\n\(dump)")
         #expect(r1.status == .deployed, "\(r1.ref) \(r1.status.rawValue): \(r1.failedReason ?? "")\n\(dump)")
         #expect(r1.commit == mainHead)
         #expect(r1.productionURL?.hasPrefix("https://fake-") == true, "productionURL \(r1.productionURL ?? "nil")")
@@ -484,7 +521,7 @@ struct LiveSmokeTests {
         let turns = try await store.writer.read { db in try Turn.filter(Column("companyId") == companyId).fetchAll(db) }
         #expect(!turns.contains { ($0.modelsUsed ?? "").lowercased().contains("opus") }, "an opus turn ran")
         #expect(turns.filter { $0.kind == .review && $0.itemId == item.id }.count == 1, "review turns: \(turns.filter { $0.kind == .review }.count)")
-        #expect(await orchestrator.runningCount() == 0)
+        if td.stalled.isEmpty { #expect(await orchestrator.runningCount() == 0) }
         #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
     }
 
@@ -1242,5 +1279,36 @@ final class LiveRunMonitor: @unchecked Sendable {
             for pid in matching() where kill(pid, SIGKILL) == 0 { out.append("pid \(pid) SIGKILL") }
         }
         return out
+    }
+}
+
+/// The platform sandbox with the fake host's folder writable for exactly the fake provider CLI's deploy
+/// (`<release tools>/node_modules/.bin/fake deploy …`): L's `DevHostSandbox` grant (`DevHost.swift`) for `FakeHostingAdapter`
+/// (Plan 4a Task 10 fix round 1, I3). Every other command (the build in the export, the smoke on main) runs with its policy as it
+/// is; the token step keeps HOME + cwd writable, the tools readable, its network list and its token-only environment.
+private struct FakeHostGrant: SandboxedRunner {
+    let base: any SandboxedRunner
+    let hostDir: URL
+    let deployBin: URL
+
+    func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+             policy: SandboxPolicy) async -> CheckOutcome {
+        await base.run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL,
+                       policy: granted(command, policy))
+    }
+
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
+        try base.spawn(command: command, cwd: cwd, environment: environment, logURL: logURL, policy: granted(command, policy))
+    }
+
+    /// The deploy step's policy with the host folder writable (kept off `writable[0]`, the TMPDIR, and the last entry, the
+    /// toolchain HOME); any other command's policy as it is. The executor quotes the argv it was given, so both the logical and
+    /// the resolved path of the CLI are accepted.
+    func granted(_ command: String, _ policy: SandboxPolicy) -> SandboxPolicy {
+        let prefixes = [deployBin.path, SandboxPath.resolve(deployBin.path)].map { ShellQuote.joinArgv([$0, "deploy"], rawRefs: []) + " " }
+        guard prefixes.contains(where: { command.hasPrefix($0) }), !policy.writable.isEmpty else { return policy }
+        var p = policy
+        p.writable.insert(hostDir.resolvedForSandbox, at: 1)
+        return p
     }
 }

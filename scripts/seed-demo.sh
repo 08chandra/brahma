@@ -147,9 +147,10 @@ rm -rf "$D"
 # tools and merged by the real queue (M-1, MERGED); a second item written on the old main that touches streak.txt too bounces
 # on the conflict (M-2, BOUNCED) and is back with its holder. The app's merge snapshots (`merge`, `item:INITE-2`) rely on it.
 # The queue lands nothing while the root checkout has uncommitted changes (3a quarantines them and waits for the owner), so the
-# PRD and the fixtures left in docs/ go on main first, as index.html did: the engine identity, then `main accept`.
+# PRD and the fixtures left in docs/ go on main first: the owner's own commit (its identity is the owner's, never the engine's;
+# `main accept` is what makes it the record), then `main accept`.
 git -C "$W" add docs
-git -C "$W" -c user.name=Brahma -c user.email=engine@brahma.local -c commit.gpgsign=false commit -q -m "PRD and demo fixtures" >/dev/null
+git -C "$W" -c user.name=Owner -c user.email=owner@brahma.local -c commit.gpgsign=false commit -q -m "PRD and demo fixtures" >/dev/null
 "$B" main accept Initech >/dev/null
 "$B" merge settings Initech --main-check "test -f index.html" >/dev/null
 "$B" items edit Initech INITE-2 --status ready >/dev/null

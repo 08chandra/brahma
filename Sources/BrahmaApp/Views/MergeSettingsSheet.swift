@@ -90,9 +90,10 @@ struct MergeSettingsSheet: View {
     private func save() {
         saving = true
         Task {
-            await model.saveMergeSettings(form)
+            // On a refusal the sheet stays open with what was typed; the error shows in the window's alert.
+            let saved = await model.saveMergeSettings(form)
             saving = false
-            model.presentedSheet = nil
+            if saved { model.presentedSheet = nil }
         }
     }
 }

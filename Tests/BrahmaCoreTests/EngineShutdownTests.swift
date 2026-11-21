@@ -28,7 +28,10 @@ private final class SlowStartAdapter: PreviewAdapter, @unchecked Sendable {
 
 /// The engine's bounded shutdown (Plan 4a Task 9c): the turn kill and the preview stop run together under one bound, what is
 /// still running when it passes is named, and a second quit request kills the recorded groups and records the turns.
-@Suite(.scratch) struct EngineShutdownTests {
+/// Every test here has a time limit (Task 10 fix round 1, I1): a gate left shut by a missed precondition fails the test, never
+/// the whole run (run 1 of Task 10's suite sat at the 1800 s wall on `turnKillAndPreviewStopRunTogether`).
+@Suite(.scratch, .timeLimit(.minutes(5)))
+struct EngineShutdownTests {
     /// Two steps that each need the other to have started finish only when they run together. The bound here only guards
     /// against the deadlock a sequential run would be; it is generous because the full suite can starve the cooperative pool
     /// for a long time (the hard timer fires on its own thread whether or not the steps were ever scheduled).
@@ -69,7 +72,8 @@ private final class SlowStartAdapter: PreviewAdapter, @unchecked Sendable {
         var table = PreviewAdapters.defaults(deps)
         table[.cli] = slow
         deps.adapters = table
-        let w = try World(store: store, previewDeps: deps)
+        // A normal memory source: the real one would let a busy host veto the preview start this test waits for (I1).
+        let w = try World(store: store, memory: NormalMemoryPressure(), previewDeps: deps)
         let company = try w.company("Acme")
         let devops = try w.hire(company, "devops")
         let f = GitFixture(existing: URL(fileURLWithPath: company.workspacePath, isDirectory: true))
@@ -92,21 +96,25 @@ private final class SlowStartAdapter: PreviewAdapter, @unchecked Sendable {
         w.fake.childrenEntered = childrenEntered
         w.fake.childrenGate = children
         try w.dm(company, devops)
+        // The helper tasks wait with a limit, and every gate is opened on the way out: if the start or the turn never came (a
+        // starved pool), the test fails at the precondition below instead of waiting on gates nothing will open (I1).
+        defer { children.open(); slow.mayReturn.open(); slow.cancelled.open(); childrenEntered.open() }
         let waits = Task {
-            await slow.cancelled.wait()
+            await slow.cancelled.wait(upTo: .seconds(360))
             children.open()
         }
         let frees = Task {
-            await childrenEntered.wait()
+            await childrenEntered.wait(upTo: .seconds(360))
             slow.mayReturn.open()
         }
-        let deadline = AwakeTime.deadline(after: .seconds(60))
+        // Generous, like the suite's other bounds: the full suite can starve the cooperative pool for well over a minute.
+        let deadline = AwakeTime.deadline(after: .seconds(120))
         while AwakeTime.now < deadline {
             await w.orchestrator.tick()
             if slow.entered.opened, turnRunning.opened { break }
             try await Task.sleep(for: .milliseconds(20))
         }
-        #expect(slow.entered.opened && turnRunning.opened, "the preview start and the turn are in flight")
+        try #require(slow.entered.opened && turnRunning.opened, "the preview start and the turn are in flight")
 
         let left = await w.orchestrator.shutdown(bound: .seconds(300))   // a deadlock guard only; see stepsRunConcurrently
         #expect(left == [], "both stops ended inside the bound")

@@ -33,6 +33,24 @@ final class Gate: @unchecked Sendable {
             if resumeNow { c.resume() }
         }
     }
+
+    /// `wait()` raced against `limit` (awake time): true when the gate opened, false when the limit passed first (the gate is
+    /// then opened, so the waiter it left behind resumes too). For a test's helper tasks, which must end even when the gate's
+    /// opener never ran (Task 10 fix round 1, I1).
+    @discardableResult
+    func wait(upTo limit: Duration) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask { await self.wait(); return true }
+            group.addTask {
+                try? await AwakeTime.sleep(for: limit)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            if !first { open() }
+            return first
+        }
+    }
 }
 
 /// Scripted `TurnRunning` for orchestrator tests. Each agent handle has a queue of scripts, one per turn;
