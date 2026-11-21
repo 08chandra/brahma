@@ -70,6 +70,8 @@ private struct InboxCard: View {
     @State private var redirect = ""
     @State private var showRedirect = false
     @State private var confirmChanged = false
+    /// C2b-carry (b): the owner confirms which of the colliding files this alert's vouch is for.
+    @State private var confirmFileVouch = false
     @State private var showRescind = false
     @State private var rescindNote = ""
     @State private var busy = false
@@ -87,6 +89,7 @@ private struct InboxCard: View {
             }
             brief
             documentView
+            fileVouchSides
             controls
         }
         .padding(BrahmaTheme.spaceM)
@@ -104,6 +107,42 @@ private struct InboxCard: View {
         .alert("The document changed after it was proposed. Approve the current version?", isPresented: $confirmChanged) {
             Button("Approve") { decide(true, acknowledgeChange: true) }
             Button("Cancel", role: .cancel) {}
+        }
+        .alert("Vouch for the file marked THIS ALERT, not the other one?", isPresented: $confirmFileVouch) {
+            Button("Vouch for this file") { run { await model.vouchFile(askId: row.id, acknowledgeAmbiguity: true) } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(verbatim: "Their names show the same. Only the file this alert is about (its id and sha256 above) is vouched. "
+                 + "If it is a PDF, Brahma shares only a flattened re-render of its visible pages.")
+        }
+    }
+
+    // MARK: Colliding file vouch (C2b-carry (b))
+
+    /// The files this alert's vouch could be taken for, side by side: name as shown, id, sha256, refused at.
+    @ViewBuilder private var fileVouchSides: some View {
+        if row.canVouchFile && row.fileVouchNeedsConfirmation {
+            label("Files whose names show the same")
+            HStack(alignment: .top, spacing: BrahmaTheme.spaceS) {
+                ForEach(Array(row.fileVouchSides.enumerated()), id: \.offset) { _, side in
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: BrahmaTheme.spaceXS) {
+                            if side.isThisAlert { StatusChip(label: "This alert", color: BrahmaTheme.accent) }
+                            if side.vouched { StatusChip(label: "Vouched", color: BrahmaTheme.text2) }
+                        }
+                        Text(verbatim: side.shown).font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text0).textSelection(.enabled)
+                        Text(verbatim: "id " + side.id).font(BrahmaTheme.monoTiny).foregroundStyle(BrahmaTheme.text1).textSelection(.enabled)
+                        Text(verbatim: "sha256 " + side.sha256).font(BrahmaTheme.monoTiny).foregroundStyle(BrahmaTheme.text1).textSelection(.enabled)
+                        Text(verbatim: "refused " + side.refusedAt.formatted(date: .abbreviated, time: .standard))
+                            .font(BrahmaTheme.monoTiny).foregroundStyle(BrahmaTheme.text2)
+                    }
+                    .padding(BrahmaTheme.spaceS)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(side.isThisAlert ? BrahmaTheme.bg4 : BrahmaTheme.bg1)
+                    .overlay(RoundedRectangle(cornerRadius: BrahmaTheme.radius).strokeBorder(BrahmaTheme.line, lineWidth: 1))
+                    .overlay(alignment: .leading) { if side.isThisAlert { Rectangle().fill(BrahmaTheme.accent).frame(width: 2) } }
+                }
+            }
         }
     }
 
@@ -254,8 +293,13 @@ private struct InboxCard: View {
                 if row.canVouchFile {
                     // C2b fix round 5 (Ruling 38): the owner vouches for exactly the bytes the secret gate refused for
                     // their structure.
-                    Button("Vouch for this file") { run { await model.vouchFile(askId: row.id) } }
-                        .buttonStyle(.brahma).disabled(busy)
+                    // C2b-carry (b): a file whose name collides with another refused file's vouches only after the owner
+                    // confirms which file it is (the files are shown side by side above).
+                    Button(row.fileVouchNeedsConfirmation ? "Vouch for this file…" : "Vouch for this file") {
+                        if row.fileVouchNeedsConfirmation { confirmFileVouch = true } else { run { await model.vouchFile(askId: row.id) } }
+                    }
+                    .buttonStyle(.brahma).disabled(busy)
+                    .help("If it is a PDF, Brahma shares only a flattened re-render of its visible pages.")
                 }
                 if row.canRescind {
                     Button("Rescind…") { showRescind = true }.buttonStyle(.brahma)

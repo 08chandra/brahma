@@ -7,7 +7,8 @@ import GRDB
 /// canonical form; the name itself is never kept, only `shown`, as messages show it) and the bytes' SHA-256: any byte
 /// changed, another name or another company, and the vouch does not apply. A vouch lets the gate past those structure
 /// refusals only: every byte it can read is still scanned (a stored value or a secret pattern refuses as before), and no
-/// taint is touched. Owner callers only: `brahma vouch file <company> --sha256 <64 hex> <path>` and the refusal alert's Inbox action
+/// taint is touched. Owner callers only: `brahma vouch file <company> --id <64 hex> --sha256 <64 hex> [<path>]` (C2b-carry (b):
+/// the file's id, `canonicalHash`, and the bytes' full hash bind the vouch; no name decides it) and the refusal alert's Inbox action
 /// (`AppModel.vouchFile`); no agent tool reaches it.
 public struct FileVouch: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "fileVouch"
@@ -87,9 +88,8 @@ extension Store {
                                           && Column("status") == AskStatus.pendingOwner.rawValue
                                           && Column("subjectId") == Store.engineAlertKey(reasonKey)).fetchCount(db)
                 guard open == 0 else { return }
-                let how = shown == SecretGate.withheldName
-                    ? "use Vouch for this file here"
-                    : "run \(SecretGate.vouchCommand(slug: company.slug, shown: shown, sha256: sha256)), or use Vouch for this file here"
+                let how = "run \(SecretGate.vouchCommand(slug: company.slug, id: hash, sha256: sha256, shown: shown)), or use Vouch for "
+                    + "this file here"
                 let text = "\(shown) was refused: \(reason). If you trust this exact file (sha256 \(sha256)), \(how). "
                     + "A vouch skips only this check: Brahma still scans what it can read of the file and refuses a stored secret "
                     + "or a secret pattern in it, and any change to the file ends the vouch."
@@ -100,45 +100,44 @@ extension Store {
         }
     }
 
-    /// The owner vouches for the file the gate refused under `canonical` in the company, naming the refused bytes by their
-    /// full `sha256` (all 64 hex digits, as the refusal and the alert print them). Ruling 40 (B-4): the file is identified
-    /// by its canonical name only (`canonicalHash`); the name as a refusal showed it is accepted only when it shows exactly
-    /// one refused file (else the refusal lists them as ambiguous), and never steers the vouch to another file. The hash
-    /// must match a recorded version exactly: a prefix never vouches. Breaker B-2 (Ruling 28's class): only the version the
-    /// gate refused LAST for that file can be vouched this way, so a command printed for an earlier version, pasted after the
-    /// file was rewritten and refused again, vouches nothing; the refusal shows the version refused last and its own
-    /// command. Those exact bytes then pass the gate's structure refusals. An owner activity line; the refusal's alert is
-    /// closed. Owner callers only (the owner CLI, `brahma vouch file`). Vouching the last version again is a no-op that
-    /// returns the vouch.
+    /// C2b-carry (b), Ruling 40 as the controller bound it: the owner vouches for the file whose id is `fileId` (its
+    /// canonical name's hash, `canonicalHash`, as the refusal and the alert print it) and whose refused bytes are `sha256`
+    /// (all 64 hex digits). A vouch binds to those two only: no name lookup ever decides which file is vouched. `name`, when
+    /// the owner typed one (the printed command carries the name as shown, for the owner to read), must be that file's
+    /// shown or canonical name, and is checked for collisions only.
+    /// - Only the version the gate refused LAST for that file vouches (breaker B-2): a command printed before the file
+    ///   was rewritten and refused again vouches nothing; the refusal names that file's newest version and its command
+    ///   (the same id: never another file's).
+    /// - Any name collision refuses as ambiguous, vouching nothing (`collisions`): another refused file shown the same,
+    ///   whose canonical name is this one's shown name (or the other way round), or that the typed name names. The refusal
+    ///   lists every colliding file (shown name, id, sha256 prefix, refused at), each with its own exact command carrying
+    ///   `--ambiguous-ok` (`acknowledgeAmbiguity`); only that form vouches a colliding file, and only its own row.
+    /// Those exact bytes under that name then pass the gate's structure refusals (a PDF: through its flattened copy,
+    /// Ruling 42). An owner activity line; the refusal's alert is closed. Owner callers only (the owner CLI, `brahma vouch
+    /// file`). Vouching the last version again is a no-op that returns the vouch.
     @discardableResult
-    public func vouchFile(companyId: String, canonical: String, sha256: String, now: Date) throws -> FileVouch {
-        let hash = sha256.lowercased()
+    public func vouchFile(companyId: String, fileId: String, sha256: String, name: String? = nil, acknowledgeAmbiguity: Bool = false,
+                          now: Date) throws -> FileVouch {
+        let hash = sha256.lowercased(), id = fileId.lowercased()
         guard hash.count == 64, hash.allSatisfy(\.isHexDigit) else {
             throw WorkError.invalid("give the file's full sha256 (all 64 hex digits), as the refusal prints it")
         }
+        guard id.count == 64, id.allSatisfy(\.isHexDigit) else {
+            throw WorkError.invalid("give the file's id (all 64 hex digits), as the refusal prints it")
+        }
+        let zone = ownerTimeZone()
         return try writer.write { db in
             guard let company = try Company.fetchOne(db, key: companyId) else { throw WorkError.notFound("no such company") }
-            var rows = try FileVouch.fetchAll(db, sql: """
+            let rows = try FileVouch.fetchAll(db, sql: """
                 SELECT * FROM fileVouch WHERE companyId = ? AND canonicalHash = ? ORDER BY refusedAt DESC
-                """, arguments: [companyId, Self.canonicalHash(canonical)])
-            if rows.isEmpty {
-                // The name as a refusal showed it: only when it is one file's.
-                let shown = try FileVouch.fetchAll(db, sql: """
-                    SELECT * FROM fileVouch WHERE companyId = ? AND shown = ? ORDER BY refusedAt DESC
-                    """, arguments: [companyId, canonical])
-                let files = Dictionary(grouping: shown, by: \.canonicalHash)
-                if files.count > 1 {
-                    let listed = files.values.compactMap(\.first).sorted { $0.refusedAt > $1.refusedAt }
-                        .map { "one last refused as sha256 \($0.sha256.prefix(12))… (\($0.reason))" }.joined(separator: "; ")
-                    throw WorkError.invalid("more than one file Brahma refused is shown as \(shown[0].shown) (\(listed)), so the name doesn't "
-                                            + "say which; vouch for the one you mean from its alert in the Inbox, which names it exactly")
-                }
-                rows = shown
-            }
+                """, arguments: [companyId, id])
             guard let newest = rows.first else {
-                // (The name is not echoed: it is the caller's own text, and may hold anything.)
-                throw WorkError.notFound("Brahma has not refused a file by that name for its structure in this company, so there is "
+                throw WorkError.notFound("Brahma has not refused a file with that id for its structure in this company, so there is "
                                          + "nothing to vouch for")
+            }
+            // (A typed name is not echoed: it is the caller's own text, and may hold anything.)
+            if let name, name != newest.shown, Self.canonicalHash(name) != id {
+                throw WorkError.invalid("the name given is not the name of the file with that id; nothing was vouched")
             }
             // The version refused last.
             let last = rows.filter { $0.refusedAt == newest.refusedAt }
@@ -147,12 +146,16 @@ extension Store {
             }
             guard newest.sha256 == hash else {
                 let how = newest.vouchedAt == nil
-                    ? "if you trust the file as it is now, run \(SecretGate.vouchCommand(slug: company.slug, shown: newest.shown, sha256: newest.sha256))"
+                    ? "if you trust the file as it is now, run \(SecretGate.vouchCommand(slug: company.slug, id: newest.canonicalHash, sha256: newest.sha256, shown: newest.shown))"
                     : "that version is already vouched for"
                 let what = rows.contains { $0.sha256 == hash }
                     ? "that sha256 is not the version of \(newest.shown) Brahma refused last: the file changed since that command was printed"
                     : "Brahma never refused \(newest.shown) with that sha256"
                 throw WorkError.invalid("\(what), and was last refused as sha256 \(newest.sha256); \(how)")
+            }
+            let colliding = try Self.collisions(db, target: newest, typed: name)
+            if !colliding.isEmpty && !acknowledgeAmbiguity {
+                throw Self.ambiguous([newest] + colliding, slug: company.slug, zone: zone, inbox: false)
             }
             var row = newest
             guard row.vouchedAt == nil else { return row }
@@ -160,21 +163,84 @@ extension Store {
         }
     }
 
-    /// The refusal alert's action: the owner vouches for the file `alertAskId` is about (`vouchFile`). Any other ask is
-    /// refused. Owner callers only (the app).
+    /// C2b-carry (b): every other refused file (another `canonicalHash`) in `target`'s company that the owner could take
+    /// for it: shown the same; whose canonical name is `target`'s shown name, or whose shown name is `target`'s canonical
+    /// name; or, when the owner typed a name, shown as that name or named by it. The newest row of each file, newest first.
+    static func collisions(_ db: Database, target: FileVouch, typed: String?) throws -> [FileVouch] {
+        let others = try FileVouch.fetchAll(db, sql: """
+            SELECT * FROM fileVouch WHERE companyId = ? AND canonicalHash != ? ORDER BY refusedAt DESC
+            """, arguments: [target.companyId, target.canonicalHash])
+        let shownHash = canonicalHash(target.shown), typedHash = typed.map(canonicalHash)
+        var seen = Set<String>()
+        return others.filter { other in
+            let collides = other.shown == target.shown || other.canonicalHash == shownHash || canonicalHash(other.shown) == target.canonicalHash
+                || (typed.map { other.shown == $0 } ?? false) || other.canonicalHash == typedHash
+            return collides && seen.insert(other.canonicalHash).inserted
+        }
+    }
+
+    /// The ambiguity refusal: every file listed (shown name, id, sha256 prefix, refused at), each with its own exact
+    /// command carrying `--ambiguous-ok` (the Inbox: the alert's confirmation instead).
+    static func ambiguous(_ files: [FileVouch], slug: String, zone: TimeZone, inbox: Bool) -> WorkError {
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.timeZone = zone
+        format.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let listed = files.enumerated().map { k, f in
+            "(\(k + 1)) \(f.shown) — id \(f.canonicalHash), sha256 \(f.sha256.prefix(12))…, refused \(format.string(from: f.refusedAt))"
+                + (f.vouchedAt == nil ? "" : ", already vouched")
+                + (inbox ? "" : ": \(SecretGate.vouchCommand(slug: slug, id: f.canonicalHash, sha256: f.sha256, shown: f.shown, acknowledged: true))")
+        }.joined(separator: "; ")
+        let how = inbox
+            ? "check which file you mean, then confirm in the Inbox, where the files are shown side by side"
+            : "check which file you mean, then run that file's own command"
+        return WorkError.invalid("\(files.count) files Brahma refused could be taken for one another by their names, so nothing was "
+                                 + "vouched; \(how): \(listed)")
+    }
+
+    /// C2b-carry (b): the file the alert `alertAskId` is about, and every other refused file it could be taken for
+    /// (`collisions`); the Inbox shows them side by side and asks for the owner's explicit confirmation before it vouches a
+    /// colliding file. Nil for any other ask.
+    public func fileVouchChoice(alertAskId: String) throws -> (file: FileVouch, colliding: [FileVouch])? {
+        try writer.read { db in
+            guard let ask = try Ask.fetchOne(db, key: alertAskId), Self.isFileVouchAlert(ask), let subject = ask.subjectId else { return nil }
+            let id = String(subject.dropFirst(Store.engineAlertKey(Self.fileVouchReasonPrefix).count))
+            guard let row = try FileVouch.fetchOne(db, key: id), row.companyId == ask.companyId else { return nil }
+            return (row, try Self.collisions(db, target: row, typed: nil))
+        }
+    }
+
+    /// The refusal alert's action: the owner vouches for the file `alertAskId` is about (its exact row: that id and those
+    /// bytes). A file that collides with another refused file (`collisions`) vouches only with `acknowledgeAmbiguity`, the
+    /// owner's confirmation after the Inbox showed the files side by side. Any other ask is refused. Owner callers only
+    /// (the app).
     @discardableResult
-    public func vouchFile(alertAskId: String, now: Date) throws -> FileVouch {
-        try writer.write { db in
+    public func vouchFile(alertAskId: String, acknowledgeAmbiguity: Bool = false, now: Date) throws -> FileVouch {
+        let zone = ownerTimeZone()
+        return try writer.write { db in
             guard let ask = try Ask.fetchOne(db, key: alertAskId), Self.isFileVouchAlert(ask), let subject = ask.subjectId else {
                 throw WorkError.invalid("only the alert about a file refused for its structure can vouch for that file")
             }
             let id = String(subject.dropFirst(Store.engineAlertKey(Self.fileVouchReasonPrefix).count))
-            guard var row = try FileVouch.fetchOne(db, key: id), row.companyId == ask.companyId else {
+            guard var row = try FileVouch.fetchOne(db, key: id), row.companyId == ask.companyId,
+                  let company = try Company.fetchOne(db, key: row.companyId) else {
                 throw WorkError.notFound("the file this alert is about is no longer recorded")
             }
             guard row.vouchedAt == nil else { return row }
+            let colliding = try Self.collisions(db, target: row, typed: nil)
+            if !colliding.isEmpty && !acknowledgeAmbiguity {
+                throw Self.ambiguous([row] + colliding, slug: company.slug, zone: zone, inbox: true)
+            }
             return try vouch(db, &row, now: now)
         }
+    }
+
+    /// What a vouch does, as the CLI and the Inbox say it (Ruling 42: a PDF is shared only as a flattened re-render of
+    /// its visible pages).
+    public static func vouchedLine(_ row: FileVouch) -> String {
+        "If it is a PDF, Brahma shares only a flattened re-render of its visible pages, checked again like any file (the "
+            + "original is never shared); other files pass the structure check, and every byte Brahma can read in them is still "
+            + "scanned for stored secrets and secret patterns. Any change to the file ends the vouch."
     }
 
     /// Marks `row` vouched by the owner, logs it, and closes its alert.

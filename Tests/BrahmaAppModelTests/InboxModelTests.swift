@@ -148,6 +148,51 @@ import GRDB
         #expect(!(w.model.inboxRows.first { $0.id == alert.id }?.canVouchFile ?? false), "the vouch is still offered once done")
     }
 
+    /// C2b-carry (b): the Inbox action for a file whose shown name collides with another refused file's (here B is named
+    /// exactly as A's refusal shows A) vouches nothing without the owner's explicit confirmation.
+    @Test func collidingFileVouchNeedsConfirmation() async throws {
+        let w = try await WorkWorld.make()
+        let store = w.store, company = w.company
+        let nameA = "docs/" + String(repeating: "a", count: 260) + "-one.pdf"
+        let nameB = SecretGate.shown(nameA, knownValues: [])
+        let a = Data("%PDF-1.7 file A in the app".utf8), b = Data("%PDF-1.7 file B in the app".utf8)
+        for (name, data) in [(nameA, a), (nameB, b)] {
+            #expect(throws: WorkError.self) {
+                try SecretGate.check(data, ext: "pdf", canonical: name, archives: FlaggedPDFReader(), knownValues: [], store: store,
+                                     companyId: company.id)
+            }
+        }
+        await w.refresh()
+        let alertA = try #require(w.model.inboxRows.first { $0.kind == .engineAlert && $0.summary.contains(SHA256.hex(a)) })
+        func vouched() async throws -> [String] {
+            try await store.writer.read { db in
+                try String.fetchAll(db, sql: "SELECT sha256 FROM fileVouch WHERE companyId = ? AND vouchedAt IS NOT NULL", arguments: [company.id])
+            }
+        }
+        #expect(alertA.canVouchFile)
+        await w.model.vouchFile(askId: alertA.id)
+        #expect(w.model.errorMessage != nil, "a colliding file was vouched without confirmation")
+        #expect(try await vouched().isEmpty)
+        // The row shows both files side by side (this alert's first) and asks for confirmation; confirmed, it vouches A only.
+        #expect(alertA.fileVouchNeedsConfirmation)
+        #expect(alertA.fileVouchSides.map(\.sha256) == [SHA256.hex(a), SHA256.hex(b)], "\(alertA.fileVouchSides)")
+        #expect(alertA.fileVouchSides.map(\.id) == [Store.canonicalHash(nameA), Store.canonicalHash(nameB)])
+        #expect(alertA.fileVouchSides.first?.isThisAlert == true && alertA.fileVouchSides.last?.isThisAlert == false)
+        w.model.errorMessage = nil
+        await w.model.vouchFile(askId: alertA.id, acknowledgeAmbiguity: true)
+        #expect(w.model.errorMessage == nil, "\(w.model.errorMessage ?? "")")
+        #expect(try await vouched() == [SHA256.hex(a)])
+        // A file with no collision needs no confirmation.
+        let plain = Data("%PDF-1.7 a plain file".utf8)
+        #expect(throws: WorkError.self) {
+            try SecretGate.check(plain, ext: "pdf", canonical: "docs/plain.pdf", archives: FlaggedPDFReader(), knownValues: [], store: store,
+                                 companyId: company.id)
+        }
+        await w.refresh()
+        let plainAlert = try #require(w.model.inboxRows.first { $0.kind == .engineAlert && $0.summary.contains(SHA256.hex(plain)) })
+        #expect(plainAlert.canVouchFile && !plainAlert.fileVouchNeedsConfirmation)
+    }
+
     @Test func changedDocumentRequiresAck() async throws {
         let w = try await WorkWorld.make()
         try w.writeDoc("docs/prd.md", "# Plan\n\nOriginal.")

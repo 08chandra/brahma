@@ -50,6 +50,25 @@ public struct InboxRow: Equatable, Identifiable, Sendable {
     /// The alert about a file the secret gate refused for its structure (C2b fix round 5, Ruling 38): the owner can vouch
     /// for exactly those bytes (`AppModel.vouchFile`).
     public var canVouchFile: Bool = false
+    /// C2b-carry (b): when this file's name collides with another refused file's, every file it could be taken for, this
+    /// one first, shown side by side; the vouch then needs the owner's explicit confirmation (`AppModel.vouchFile(askId:
+    /// acknowledgeAmbiguity:)`). Empty otherwise.
+    public var fileVouchSides: [FileVouchSide] = []
+    /// The vouch needs the owner's confirmation that this is the file they mean.
+    public var fileVouchNeedsConfirmation: Bool { !fileVouchSides.isEmpty }
+}
+
+/// One of the refused files a colliding file vouch could be taken for, as the Inbox shows it (every field engine text:
+/// the name as shown, already redacted, shown verbatim).
+public struct FileVouchSide: Equatable, Sendable {
+    public var shown: String
+    /// The file's id (its canonical name's hash).
+    public var id: String
+    public var sha256: String
+    public var refusedAt: Date
+    public var vouched: Bool
+    /// The file this alert is about.
+    public var isThisAlert: Bool
 }
 
 public enum InboxRows {
@@ -97,7 +116,11 @@ public enum InboxRows {
                 decidedLine: decided,
                 approveLabel: quarantine ? "Merge into main" : "Approve",
                 canVouchRestore: pending && a.kind == .engineAlert && a.subjectId == Store.restoreAlertSubject && work.restoreVouchOpen,
-                canVouchFile: pending && Store.isFileVouchAlert(a))
+                canVouchFile: pending && Store.isFileVouchAlert(a),
+                fileVouchSides: pending ? (work.fileVouchChoices[a.id] ?? []).enumerated().map { k, f in
+                    FileVouchSide(shown: f.shown, id: f.canonicalHash, sha256: f.sha256, refusedAt: f.refusedAt, vouched: f.vouchedAt != nil,
+                                  isThisAlert: k == 0)
+                } : [])
         }
         return work.inbox.map { row($0, .pending) } + work.fyi.map { row($0, .fyi) } + work.recentDecided.map { row($0, .recent) }
     }

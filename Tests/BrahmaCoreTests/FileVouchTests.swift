@@ -27,7 +27,8 @@ struct UnverifiedPDFReader: ArchiveReader {
     /// The suffix every structure refusal ends with: the exact command for `canonical` in `company`, naming the refused
     /// bytes' full sha256 (breaker B-2, Ruling 40 (B-4): all 64 hex digits, which the command requires).
     static func command(_ company: Company, _ canonical: String, _ data: Data) -> String {
-        " — the owner can vouch for this exact file: brahma vouch file \(company.slug) --sha256 \(SHA256.hex(data)) \(SecretGate.shellQuoted(canonical))"
+        " — the owner can vouch for this exact file: brahma vouch file \(company.slug) --id \(Store.canonicalHash(canonical)) --sha256 "
+            + "\(SHA256.hex(data)) \(SecretGate.shellQuoted(canonical))"
     }
 
     /// `error` without the vouch command for `canonical` in `company` (for `data`) when it ends with exactly that command
@@ -220,12 +221,12 @@ struct UnverifiedPDFReader: ArchiveReader {
         let first = outcome { try check(cf, v1, canonical: "spec.pdf", archives: reader) }
         #expect(first == structure + Self.command(cf.c, "spec.pdf", v1), "\(first)")
         let summaries = try fileAlerts(cf).map(\.summary)
-        #expect(summaries.contains { $0.contains("brahma vouch file \(cf.c.slug) --sha256 \(p1) spec.pdf") }, "\(summaries)")
+        #expect(summaries.contains { $0.contains("brahma vouch file \(cf.c.slug) --id \(Store.canonicalHash("spec.pdf")) --sha256 \(p1) spec.pdf") }, "\(summaries)")
         // An agent rewrites the file: v2 is refused too, its own command printed.
         #expect(outcome { try check(cf, v2, canonical: "spec.pdf", archives: reader) } == structure + Self.command(cf.c, "spec.pdf", v2))
         // v1's command, pasted now: refused, naming v2 and its command; nothing vouched.
         let stale = vouchRefusal { try cf.store.vouchFile(companyId: cId, canonical: "spec.pdf", sha256: p1, now: cf.now) }
-        #expect(stale?.contains("brahma vouch file \(cf.c.slug) --sha256 \(p2) spec.pdf") == true, "\(stale ?? "vouched")")
+        #expect(stale?.contains("brahma vouch file \(cf.c.slug) --id \(Store.canonicalHash("spec.pdf")) --sha256 \(p2) spec.pdf") == true, "\(stale ?? "vouched")")
         #expect(try vouchRows(cf, cId).allSatisfy { ($0["vouchedAt"] as Date?) == nil })
         #expect(outcome { try check(cf, v2, canonical: "spec.pdf", archives: reader) }.hasPrefix(structure))
         // v2's command vouches v2 (and only v2).
@@ -266,7 +267,8 @@ struct UnverifiedPDFReader: ArchiveReader {
         #expect(try cf.store.vouchFile(companyId: cId, canonical: "report.pdf", sha256: Self.full(doc), now: cf.now).sha256 == SHA256.hex(doc))
         #expect(outcome { try check(cf, doc, canonical: "report.pdf", archives: reader) } == "clean")
 
-        // Two files whose names show the same.
+        // Two files whose names show the same (C2b-carry (b): a vouch binds the id and the full hash; any name collision
+        // refuses as ambiguous, listing both, until the exact acknowledged form names one).
         let stem = "docs/" + String(repeating: "a", count: 260)
         let (nameA, nameB) = (stem + "-one.pdf", stem + "-two.pdf")
         let shownA = SecretGate.shown(nameA, knownValues: Self.known)
@@ -277,22 +279,35 @@ struct UnverifiedPDFReader: ArchiveReader {
         func vouched(_ data: Data) throws -> Bool {
             try vouchRows(cf, cId).contains { ($0["sha256"] as String?) == SHA256.hex(data) && ($0["vouchedAt"] as Date?) != nil }
         }
-        let ambiguous = vouchRefusal { try cf.store.vouchFile(companyId: cId, canonical: shownA, sha256: Self.full(a), now: cf.now) }
-        #expect(ambiguous?.contains("more than one file") == true && ambiguous?.contains(String(SHA256.hex(a).prefix(12))) == true
-                && ambiguous?.contains(String(SHA256.hex(b).prefix(12))) == true, "\(ambiguous ?? "vouched")")
+        let (idA, idB) = (Store.canonicalHash(nameA), Store.canonicalHash(nameB))
+        let ambiguous = vouchRefusal { try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(a), name: shownA, now: cf.now) }
+        #expect(ambiguous?.contains("could be taken for one another") == true && ambiguous?.contains(String(SHA256.hex(a).prefix(12))) == true
+                && ambiguous?.contains(String(SHA256.hex(b).prefix(12))) == true && ambiguous?.contains(idA) == true
+                && ambiguous?.contains(idB) == true, "\(ambiguous ?? "vouched")")
+        // (Even without a typed name: the shown names collide.)
+        #expect(vouchRefusal { try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(a), now: cf.now) }?
+                    .contains("could be taken for one another") == true)
         #expect(try !vouched(a) && !vouched(b))
-        // A's name with B's bytes: nothing (B is not a version of A).
-        #expect(vouchRefusal { try cf.store.vouchFile(companyId: cId, canonical: nameA, sha256: Self.full(b), now: cf.now) } != nil)
+        // A's id with B's bytes: nothing (B is not a version of A), even acknowledged.
+        #expect(vouchRefusal { try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(b), acknowledgeAmbiguity: true, now: cf.now) } != nil)
+        // A's id with a name that is neither A's shown nor canonical name: nothing.
+        #expect(vouchRefusal { try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(a), name: nameB, acknowledgeAmbiguity: true,
+                                                      now: cf.now) } != nil)
         #expect(try !vouched(a) && !vouched(b))
-        // B's alert vouches B, exactly.
+        // B's alert: ambiguous too until the owner confirms; then it vouches B, exactly.
         let alertB = try #require(try fileAlerts(cf).first { $0.summary.contains(SHA256.hex(b)) })
-        let rowB = try cf.store.vouchFile(alertAskId: alertB.id, now: cf.now)
-        #expect(rowB.sha256 == SHA256.hex(b) && rowB.canonicalHash == Store.canonicalHash(nameB))
+        let choice = try #require(try cf.store.fileVouchChoice(alertAskId: alertB.id))
+        #expect(choice.file.canonicalHash == idB && choice.colliding.map(\.canonicalHash) == [idA])
+        #expect(vouchRefusal { try cf.store.vouchFile(alertAskId: alertB.id, now: cf.now) }?.contains("confirm in the Inbox") == true)
+        #expect(try !vouched(a) && !vouched(b))
+        let rowB = try cf.store.vouchFile(alertAskId: alertB.id, acknowledgeAmbiguity: true, now: cf.now)
+        #expect(rowB.sha256 == SHA256.hex(b) && rowB.canonicalHash == idB)
         #expect(try vouched(b) && !vouched(a))
         #expect(outcome { try check(cf, b, canonical: nameB, archives: reader) } == "clean")
         #expect(outcome { try check(cf, a, canonical: nameA, archives: reader) }.hasPrefix(structure))
-        // A by its own name and full hash.
-        #expect(try cf.store.vouchFile(companyId: cId, canonical: nameA, sha256: Self.full(a), now: cf.now).canonicalHash == Store.canonicalHash(nameA))
+        // A by its id, full hash and acknowledgement.
+        #expect(try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(a), name: shownA, acknowledgeAmbiguity: true,
+                                       now: cf.now).canonicalHash == idA)
         #expect(outcome { try check(cf, a, canonical: nameA, archives: reader) } == "clean")
         // B's vouch is B's name's: B's bytes under A's name are refused.
         #expect(outcome { try check(cf, b, canonical: nameA, archives: reader) }.hasPrefix(structure))
@@ -365,32 +380,153 @@ struct UnverifiedPDFReader: ArchiveReader {
         }
         let noKey = try home(initOwner: false)
         let sha = Self.full(noKey.pdf)
-        let refusedNoKey = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--sha256", sha], home: noKey.home.url)
+        let id = Store.canonicalHash("docs/spec.pdf")
+        let refusedNoKey = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--id", id, "--sha256", sha], home: noKey.home.url)
         #expect(refusedNoKey.status != 0 && refusedNoKey.stderr.contains("owner key missing"), "\(refusedNoKey.stderr)")
         #expect(try vouched(noKey).vouched == false)
 
         let h = try home(initOwner: true)
-        let agent = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--sha256", sha], home: h.home.url, extra: ["BRAHMA_AGENT_ID": "agent-1"])
+        let agent = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--id", id, "--sha256", sha], home: h.home.url, extra: ["BRAHMA_AGENT_ID": "agent-1"])
         #expect(agent.status != 0 && agent.stderr.contains("owner commands can't run inside an agent turn"), "\(agent.stderr)")
         let afterAgent = try vouched(h)
         #expect(!afterAgent.vouched && !afterAgent.passes)
-        #expect(try runBrahma(["vouch", "file", "nosuch", "docs/spec.pdf", "--sha256", sha], home: h.home.url).status != 0)
+        #expect(try runBrahma(["vouch", "file", "nosuch", "docs/spec.pdf", "--id", id, "--sha256", sha], home: h.home.url).status != 0)
         // Breaker B-2: the sha256 is required; without it nothing is vouched.
-        let bare = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf"], home: h.home.url)
+        let bare = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--id", id], home: h.home.url)
         #expect(bare.status != 0 && bare.stderr.contains("--sha256"), "\(bare.stderr)")
         // Ruling 40 (B-4): the full hash, never a prefix.
-        let prefixed = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--sha256", String(sha.prefix(12))], home: h.home.url)
+        let prefixed = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--id", id, "--sha256", String(sha.prefix(12))], home: h.home.url)
         #expect(prefixed.status != 0, "\(prefixed.stdout)")
         #expect(try vouched(h).vouched == false)
-        let unknown = try runBrahma(["vouch", "file", "acme", "docs/other.pdf", "--sha256", sha], home: h.home.url)
+        let unknown = try runBrahma(["vouch", "file", "acme", "docs/other.pdf", "--id", Store.canonicalHash("docs/other.pdf"), "--sha256", sha],
+                                    home: h.home.url)
         #expect(unknown.status != 0, "\(unknown.stdout)")
+        // Breaker B-4 / C2b-carry (b): the id is required; the file's id with another file's name vouches nothing.
+        #expect(try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--sha256", sha], home: h.home.url).status != 0)
+        #expect(try runBrahma(["vouch", "file", "acme", "docs/other.pdf", "--id", id, "--sha256", sha], home: h.home.url).status != 0)
+        #expect(try vouched(h).vouched == false)
 
-        let owner = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--sha256", sha], home: h.home.url)
+        let owner = try runBrahma(["vouch", "file", "acme", "docs/spec.pdf", "--id", id, "--sha256", sha], home: h.home.url)
         #expect(owner.status == 0, "\(owner.stderr)")
         #expect(owner.stdout.contains("docs/spec.pdf") && owner.stdout.contains(String(SHA256.hex(h.pdf).prefix(12))), "\(owner.stdout)")
         let after = try vouched(h)
         #expect(after.vouched && after.passes)
         #expect(after.lines.contains { $0.contains("Owner vouched for docs/spec.pdf") }, "\(after.lines)")
+    }
+
+    /// The words of the first `brahma vouch file …` command in `text` (after `brahma`), as a shell reads them: single
+    /// quotes, `\` outside them; the command ends at the end of the text or an unquoted `;`.
+    static func pastedCommand(_ text: String, containing: String? = nil) -> [String]? {
+        var rest = Substring(text)
+        while let r = rest.range(of: "brahma vouch file ") {
+            var words: [String] = [], word = "", inWord = false, quoted = false
+            var chars = rest[r.upperBound...].makeIterator()
+            loop: while let c = chars.next() {
+                if quoted {
+                    if c == "'" { quoted = false } else { word.append(c) }
+                    continue
+                }
+                switch c {
+                case "'": quoted = true; inWord = true
+                case "\\": if let n = chars.next() { word.append(n); inWord = true }
+                case ";": break loop
+                case " ", "\t", "\n":
+                    if inWord { words.append(word); word = ""; inWord = false }
+                default: word.append(c); inWord = true
+                }
+            }
+            if inWord { words.append(word) }
+            let command = ["vouch", "file"] + words
+            if containing.map({ command.contains($0) }) ?? true { return command }
+            rest = rest[r.upperBound...]
+        }
+        return nil
+    }
+
+    /// C2b-carry (b), the last breaker review's `rrbrkShownCollidesWithCanonical` through the owner's own path: the
+    /// command a refusal printed, pasted into `brahma vouch file`. A vouch binds to the file's id (its canonical name's
+    /// hash) and the full sha256 only; no name decides which file is vouched.
+    /// - B is named exactly as A's refusal shows A (`SecretGate.shown(A)`, 200 characters ending `…`). Pasting A's
+    ///   command never vouches B and never steers to B alone: it is refused as ambiguous, listing both (id, sha256,
+    ///   refused at), each with its own exact command carrying `--ambiguous-ok`; nothing is vouched. A's acknowledged
+    ///   command then vouches A, and only A.
+    /// - The same bytes under C and D = shown(C): pasting C's command vouches nothing (before, it vouched D).
+    /// - A prefix of the hash is refused; the full hash of a file no other file collides with vouches it.
+    @Test func rrbrkShownCollidesWithCanonical() throws {
+        let home = try OwnerTestHome(initOwner: true)
+        let paths = ownerPaths(home.url)
+        try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        let nameA = "docs/" + String(repeating: "a", count: 260) + "-one.pdf"
+        let nameB = SecretGate.shown(nameA, knownValues: [])
+        let nameC = "docs/" + String(repeating: "c", count: 260) + "-x.pdf"
+        let nameD = SecretGate.shown(nameC, knownValues: [])
+        #expect(nameB != nameA && nameB.hasSuffix("…") && SecretGate.shown(nameB, knownValues: []) == nameB)
+        let a = Data("%PDF-1.7 file A".utf8), b = Data("%PDF-1.7 file B".utf8), same = Data("%PDF-1.7 the same bytes".utf8)
+        let plain = Data("%PDF-1.7 a report".utf8)
+        var messages: [String: String] = [:]
+        let companyId: String
+        do {
+            let store = try Store(path: paths.database.path, backupsDir: paths.backupsDir)
+            defer { try? store.close() }
+            companyId = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: paths.workspaces).id
+            for (name, data) in [(nameA, a), (nameB, b), (nameC, same), (nameD, same), ("report.pdf", plain)] {
+                do {
+                    _ = try SecretGate.check(data, ext: "pdf", canonical: name, archives: UnverifiedPDFReader(parts: []), knownValues: [],
+                                             store: store, companyId: companyId)
+                    Issue.record("\(name) was not refused")
+                } catch let e as WorkError { messages[name] = e.message }
+            }
+        }
+        func vouched() throws -> [(canonicalHash: String, sha256: String)] {
+            let store = try Store(path: paths.database.path, backupsDir: paths.backupsDir)
+            defer { try? store.close() }
+            return try store.writer.read { db in
+                try Row.fetchAll(db, sql: "SELECT canonicalHash, sha256 FROM fileVouch WHERE companyId = ? AND vouchedAt IS NOT NULL",
+                                 arguments: [companyId]).map { (canonicalHash: $0["canonicalHash"] as String, sha256: $0["sha256"] as String) }
+            }
+        }
+        // A's printed command, pasted: ambiguous, both listed, nothing vouched.
+        let commandA = try #require(Self.pastedCommand(messages[nameA] ?? ""), "\(messages[nameA] ?? "")")
+        let pastedA = try runBrahma(commandA, home: home.url)
+        let listing = pastedA.stderr + pastedA.stdout
+        #expect(pastedA.status != 0, "\(listing)")
+        #expect(listing.contains(String(SHA256.hex(a).prefix(12))) && listing.contains(String(SHA256.hex(b).prefix(12))), "\(listing)")
+        #expect(listing.contains(Store.canonicalHash(nameA)) && listing.contains(Store.canonicalHash(nameB)), "\(listing)")
+        #expect(try vouched().isEmpty)
+        // A's acknowledged command from the listing vouches A, and only A.
+        guard let ackA = Self.pastedCommand(listing, containing: SHA256.hex(a)) else {
+            Issue.record("no command for A in the listing: \(listing)")
+            return
+        }
+        #expect(ackA.contains("--ambiguous-ok") && ackA.contains(Store.canonicalHash(nameA)), "\(ackA)")
+        let ackB = try #require(Self.pastedCommand(listing, containing: SHA256.hex(b)))
+        #expect(ackB.contains("--ambiguous-ok") && ackB.contains(Store.canonicalHash(nameB)), "\(ackB)")
+        // The acknowledgement alone, without the file's id, vouches nothing.
+        var withoutId = ackA
+        if let i = withoutId.firstIndex(of: "--id"), i + 1 < withoutId.count { withoutId.removeSubrange(i...(i + 1)) }
+        #expect(try runBrahma(withoutId, home: home.url).status != 0)
+        #expect(try vouched().isEmpty)
+        let ran = try runBrahma(ackA, home: home.url)
+        #expect(ran.status == 0, "\(ran.stderr)")
+        let afterA = try vouched()
+        #expect(afterA.count == 1 && afterA.first?.canonicalHash == Store.canonicalHash(nameA) && afterA.first?.sha256 == SHA256.hex(a), "\(afterA)")
+
+        // The same bytes under C and D: C's command vouches nothing.
+        let commandC = try #require(Self.pastedCommand(messages[nameC] ?? ""))
+        let pastedC = try runBrahma(commandC, home: home.url)
+        #expect(pastedC.status != 0, "\(pastedC.stdout)")
+        #expect((pastedC.stderr + pastedC.stdout).contains(Store.canonicalHash(nameD)), "\(pastedC.stderr)")
+        #expect(try vouched().count == 1)
+
+        // No collision: a 12-hex prefix is refused; the printed command (the full hash) vouches.
+        let commandR = try #require(Self.pastedCommand(messages["report.pdf"] ?? ""))
+        let sha = SHA256.hex(plain)
+        let prefixed = commandR.map { $0 == sha ? String(sha.prefix(12)) : $0 }
+        #expect(try runBrahma(prefixed, home: home.url).status != 0)
+        #expect(try vouched().count == 1)
+        let full = try runBrahma(commandR, home: home.url)
+        #expect(full.status == 0, "\(full.stderr)")
+        #expect(try vouched().contains { $0.canonicalHash == Store.canonicalHash("report.pdf") && $0.sha256 == sha })
     }
 
     /// No agent tool reaches the file vouch: no company tool is named for it, and no tool source calls it or writes it.
@@ -402,5 +538,14 @@ struct UnverifiedPDFReader: ArchiveReader {
             if code.range(of: #"\bvouchFile\b|fileVouch"#, options: .regularExpression) != nil { reaches.append(path) }
         }
         #expect(reaches.isEmpty, "a tool path reaches the file vouch: \(reaches)")
+    }
+}
+
+extension Store {
+    /// Tests: the vouch for the file named `canonical` by its id (its canonical name's hash) and full hash, as the printed
+    /// command gives them (C2b-carry (b): the id and the hash bind the vouch).
+    @discardableResult
+    func vouchFile(companyId: String, canonical: String, sha256: String, now: Date) throws -> FileVouch {
+        try vouchFile(companyId: companyId, fileId: Store.canonicalHash(canonical), sha256: sha256, now: now)
     }
 }

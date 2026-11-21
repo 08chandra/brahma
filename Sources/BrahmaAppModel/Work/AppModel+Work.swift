@@ -201,9 +201,13 @@ extension AppModel {
 
     /// The action of the alert about a file the secret gate refused for its structure (C2b fix round 5, Ruling 38): the
     /// owner vouches for exactly the bytes it refused (`Store.vouchFile(alertAskId:)`, the same path as `brahma vouch file`;
-    /// the alert is closed). Any other ask is refused.
-    public func vouchFile(askId: String) async {
-        _ = await ownerWrite("vouch for the file") { store in try store.vouchFile(alertAskId: askId, now: Date()) }
+    /// the alert is closed). Any other ask is refused. C2b-carry (b): a file whose name collides with another refused file's
+    /// (the row's `fileVouchSides`, shown side by side) vouches only with `acknowledgeAmbiguity`, the owner's explicit
+    /// confirmation; without it the vouch is refused and nothing is vouched.
+    public func vouchFile(askId: String, acknowledgeAmbiguity: Bool = false) async {
+        _ = await ownerWrite("vouch for the file") { store in
+            try store.vouchFile(alertAskId: askId, acknowledgeAmbiguity: acknowledgeAmbiguity, now: Date())
+        }
     }
 
     @discardableResult

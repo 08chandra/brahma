@@ -401,7 +401,7 @@ public enum SecretGate {
         let name = shown(canonical, knownValues: knownValues)
         func structural(_ reason: String) -> WorkError {
             store.recordStructureRefusal(companyId: companyId, canonical: canonical, shown: name, sha256: sha, reason: reason, now: Store.now())
-            return WorkError.invalid(reason + vouchHint(store: store, companyId: companyId, shown: name, sha256: sha))
+            return WorkError.invalid(reason + vouchHint(store: store, companyId: companyId, canonical: canonical, shown: name, sha256: sha))
         }
         if let version, let refused = ScanCache.shared.refusal(sha256: sha, version: version) {
             if refused.hasPrefix(structureMark) {
@@ -450,21 +450,25 @@ public enum SecretGate {
         e == SandboxedPDFReader.unaccounted || e == ArchiveMemberScan.unscannableMethod || EmbeddedContent.isFormatRefusal(e.message)
     }
 
-    /// The end of a structure refusal: the exact command by which the owner can vouch for the file (`brahma vouch file
-    /// <company slug> --sha256 <the refused bytes' full sha256> <name as shown>`, the name quoted for the shell when
-    /// it needs it); the Inbox when the name is withheld. Breaker B-2: the command names the version it was printed for, so
-    /// pasted after the file changed it vouches nothing (`Store.vouchFile`).
-    static func vouchHint(store: Store, companyId: String, shown: String, sha256: String) -> String {
-        guard shown != withheldName, let company = try? store.company(id: companyId) else {
+    /// The end of a structure refusal: the exact command by which the owner can vouch for the file (`vouchCommand`: the
+    /// file's id and the refused bytes' full sha256, then the name as shown, for the owner to read). Breaker B-2: the command
+    /// names the version it was printed for, so pasted after the file changed it vouches nothing (`Store.vouchFile`).
+    /// C2b-carry (b): the id (`Store.canonicalHash` of the ref's canonical name) and the hash bind the vouch; a name never
+    /// decides which file is vouched, and a name that collides with another refused file's refuses as ambiguous.
+    static func vouchHint(store: Store, companyId: String, canonical: String, shown: String, sha256: String) -> String {
+        guard let company = try? store.company(id: companyId) else {
             return " — the owner can vouch for this exact file (sha256 \(sha256)) from the Inbox"
         }
-        return " — the owner can vouch for this exact file: " + vouchCommand(slug: company.slug, shown: shown, sha256: sha256)
+        return " — the owner can vouch for this exact file: "
+            + vouchCommand(slug: company.slug, id: Store.canonicalHash(canonical), sha256: sha256, shown: shown)
     }
 
-    /// `brahma vouch file <slug> --sha256 <the full 64 hex digits> <name>` (the option before the name, which may follow
-    /// `--`). Ruling 40 (B-4): the full hash, which the vouch must match exactly.
-    static func vouchCommand(slug: String, shown: String, sha256: String) -> String {
-        "brahma vouch file \(slug) --sha256 \(sha256) \(shellQuoted(shown))"
+    /// `brahma vouch file <slug> --id <the file's id, 64 hex digits> --sha256 <the full 64 hex digits> [--ambiguous-ok]
+    /// <name>` (the options before the name, which may follow `--`; no name when it is withheld). Ruling 40 (B-4): the full
+    /// hash. C2b-carry (b): the id, and `--ambiguous-ok` (`acknowledged`) only in the ambiguity refusal's own listing.
+    static func vouchCommand(slug: String, id: String, sha256: String, shown: String, acknowledged: Bool = false) -> String {
+        "brahma vouch file \(slug) --id \(id) --sha256 \(sha256)" + (acknowledged ? " --ambiguous-ok" : "")
+            + (shown == withheldName ? "" : " \(shellQuoted(shown))")
     }
 
     /// `text` as one shell word for the vouch command's last argument: as is when it holds only characters no shell treats
