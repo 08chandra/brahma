@@ -160,6 +160,22 @@ private struct PreviewBodyView: View {
                     .accessibilityLabel(Text("Preview path"))
                 viewportMenu(compact: compact)
             }
+            if case .simulator(let udid) = body_ {
+                Button { SimulatorLauncher.open(udid: udid) } label: {
+                    Label("Open Simulator", systemImage: "iphone").labelStyle(compact ? AnyLabelStyle.iconOnly : .titleAndIcon)
+                }
+                .buttonStyle(.brahma)
+                .fixedSize()
+                .help("Open the Simulator app on this device")
+            }
+            if case .window(let pid) = body_ {
+                Button { NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateAllWindows]) } label: {
+                    Label("Bring to Front", systemImage: "macwindow.on.rectangle").labelStyle(compact ? AnyLabelStyle.iconOnly : .titleAndIcon)
+                }
+                .buttonStyle(.brahma)
+                .fixedSize()
+                .help("Bring the app's windows to the front")
+            }
             Spacer(minLength: 0)
         }
     }
@@ -254,8 +270,12 @@ private struct PreviewBodyView: View {
             BackendPreviewView(smoke: smoke, logTail: logTail, operations: operations, operationsNote: operationsNote)
         case .artifact(let artifact, let all):
             ArtifactPreviewView(artifact: artifact, all: all, model: model)
+        case .simulator(let udid):
+            SimulatorFramesView(udid: udid)
+        case .window(let pid):
+            WindowCaptureView(pid: pid)
         default:
-            // `.web`, and the cases 9b (`.simulator`, `.window`) and Collab add to the open enum (L-1).
+            // `.web`, and the cases Collab adds to the open enum (L-1).
             if case .web(let url, let origin, let builtBy) = body_ {
                 WebPreviewView(url: url, origin: origin, path: path, viewport: viewport, builtBy: builtBy, reloadKey: reloadKey)
             } else {

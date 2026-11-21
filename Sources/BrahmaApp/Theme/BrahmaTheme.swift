@@ -76,6 +76,9 @@ enum BrahmaTheme {
     static let spaceL: CGFloat = 16
     static let radius: CGFloat = 2
     static let radiusLarge: CGFloat = 3
+    /// The phone frame's outer corner radius and bezel width (Plan 4a); used only by `PhoneFrame`.
+    static let deviceRadius: CGFloat = 28
+    static let deviceBezel: CGFloat = 10
 
     // MARK: Sizes
     static let railWidth: CGFloat = 52

@@ -49,7 +49,9 @@ public final class SimulatorScreenshotSource: FrameSource {
         loop = nil
     }
 
-    static func isDeviceId(_ s: String) -> Bool {
+    /// A Simulator device id: hex digits and dashes, at most 64 bytes. Public for the app's "Open Simulator" button, which hands
+    /// the udid to `open` only when this passes.
+    nonisolated public static func isDeviceId(_ s: String) -> Bool {
         !s.isEmpty && s.utf8.count <= 64 && s.allSatisfy { $0.isHexDigit || $0 == "-" }
     }
 

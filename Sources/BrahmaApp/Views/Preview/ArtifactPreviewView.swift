@@ -34,7 +34,9 @@ struct ArtifactPreviewView: View {
             header
             Hairline()
             if let fileBody {
-                FileBodyView(body: fileBody, provenance: artifact.provenance, builtBy: byHandle, publishedBy: byHandle)
+                FileBodyView(body: fileBody, provenance: artifact.provenance, builtBy: byHandle, publishedBy: byHandle,
+                             phoneFrameOverride: model.phoneFrameOverride[artifact.id],
+                             onPhoneFrame: { model.setPhoneFrame($0, artifactId: artifact.id) })
                     .id(artifact.id)
             } else {
                 MonoEmptyState("NO WORKSPACE", detail: "The company's workspace isn't known yet, so the artifact can't be opened.")

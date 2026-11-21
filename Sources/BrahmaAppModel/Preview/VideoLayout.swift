@@ -16,4 +16,11 @@ public enum VideoLayout: Equatable, Sendable {
         if abs(rotationDegrees.rounded().truncatingRemainder(dividingBy: 180)) == 90 { swap(&w, &h) }
         return phoneRange.contains(w / h) ? .phone : .plain
     }
+
+    /// The rotation of a track's preferred transform (`CGAffineTransform`'s `a` and `b`: the first column), in degrees
+    /// within -180...180: identity 0, a quarter turn ±90, a half turn 180. A non-finite entry reads as 0 (the clip plays plain).
+    public static func rotationDegrees(a: Double, b: Double) -> Double {
+        guard a.isFinite, b.isFinite, a != 0 || b != 0 else { return 0 }
+        return atan2(b, a) * 180 / .pi
+    }
 }

@@ -552,6 +552,19 @@ import Testing
         #expect(VideoLayout.layout(width: 1080, height: .nan, rotationDegrees: 0) == .plain)
     }
 
+    /// The rotation of a track's preferred transform, from its `a` and `b` entries: identity 0°, a quarter turn ±90°, a half
+    /// turn 180°; a non-finite entry is 0° (plain). A 1920×1080 track turned a quarter is a phone clip.
+    @Test func rotationDegreesFromTransform() {
+        #expect(VideoLayout.rotationDegrees(a: 1, b: 0) == 0)
+        #expect(VideoLayout.rotationDegrees(a: 0, b: 1) == 90)
+        #expect(VideoLayout.rotationDegrees(a: 0, b: -1) == -90)
+        #expect(VideoLayout.rotationDegrees(a: -1, b: 0) == 180)
+        #expect(VideoLayout.rotationDegrees(a: .nan, b: 0) == 0)
+        #expect(VideoLayout.rotationDegrees(a: 0, b: .infinity) == 0)
+        #expect(VideoLayout.layout(width: 1920, height: 1080, rotationDegrees: VideoLayout.rotationDegrees(a: 0, b: 1)) == .phone)
+        #expect(VideoLayout.layout(width: 1920, height: 1080, rotationDegrees: VideoLayout.rotationDegrees(a: 1, b: 0)) == .plain)
+    }
+
     // MARK: Frames
 
     final class Counter: @unchecked Sendable {

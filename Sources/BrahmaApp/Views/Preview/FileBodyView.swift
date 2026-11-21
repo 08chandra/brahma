@@ -7,7 +7,8 @@ import BrahmaAppModel
 /// `FileBody.make(…).effectiveMode(for: provenance)`, so an agent's or an outside image is never decoded in process. Every
 /// read and parse runs through `RendererCaps.parse` over the hardened `readRegularFile` (no links, no FIFOs, a size cap);
 /// past the parse timeout, or when the file cannot be read, the body says `CAN'T SHOW THIS FILE`. Everything the file says
-/// is agent-controlled: `Text(verbatim:)` throughout. `.gltf` and `.video` are Task 9b's.
+/// is agent-controlled: `Text(verbatim:)` throughout. `.gltf` (`ModelPreviewView`) and `.video` (`VideoPreviewView`) are
+/// Task 9b's; a video body's PHONE FRAME choice is the host's to keep (`phoneFrameOverride`, `onPhoneFrame`).
 struct FileBodyView: View {
     let file: FileBody
     let provenance: Provenance
@@ -15,17 +16,26 @@ struct FileBodyView: View {
     var builtBy = ""
     /// The file card's PUBLISHED BY value.
     var publishedBy = ""
+    /// The owner's PHONE FRAME choice for a video body when the host keeps one (`AppModel.phoneFrameOverride`), and where the
+    /// chip's toggles go; with no `onPhoneFrame` the video view keeps the choice itself.
+    var phoneFrameOverride: Bool? = nil
+    var onPhoneFrame: ((Bool) -> Void)? = nil
 
-    init(body: FileBody, provenance: Provenance, builtBy: String = "", publishedBy: String = "") {
+    init(body: FileBody, provenance: Provenance, builtBy: String = "", publishedBy: String = "",
+         phoneFrameOverride: Bool? = nil, onPhoneFrame: ((Bool) -> Void)? = nil) {
         self.file = body
         self.provenance = provenance
         self.builtBy = builtBy
         self.publishedBy = publishedBy
+        self.phoneFrameOverride = phoneFrameOverride
+        self.onPhoneFrame = onPhoneFrame
     }
 
     /// Stats the file (never reads it) and shows it.
-    init(url: URL, kind: ArtifactKind, root: URL, provenance: Provenance, builtBy: String = "", publishedBy: String = "") {
-        self.init(body: FileBody.make(url: url, kind: kind, root: root), provenance: provenance, builtBy: builtBy, publishedBy: publishedBy)
+    init(url: URL, kind: ArtifactKind, root: URL, provenance: Provenance, builtBy: String = "", publishedBy: String = "",
+         phoneFrameOverride: Bool? = nil, onPhoneFrame: ((Bool) -> Void)? = nil) {
+        self.init(body: FileBody.make(url: url, kind: kind, root: root), provenance: provenance, builtBy: builtBy, publishedBy: publishedBy,
+                  phoneFrameOverride: phoneFrameOverride, onPhoneFrame: onPhoneFrame)
     }
 
     private var isAgentMade: Bool {
@@ -63,9 +73,11 @@ struct FileBodyView: View {
                 card
             case .text:
                 TextFileView(url: file.url)
-            case .gltf, .video:
-                // Task 9b's renderers.
-                MonoEmptyState("UNSUPPORTED PREVIEW")
+            case .gltf:
+                // Only gltf/glb ≤ 20 MB arrive here (`FileBody.make`); the mesh is parsed in process by the bounds-checked loader.
+                ModelPreviewView(url: file.url)
+            case .video:
+                VideoPreviewView(url: file.url, root: file.root, phoneFrameOverride: phoneFrameOverride, onPhoneFrame: onPhoneFrame)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
