@@ -183,3 +183,16 @@ extension Store {
                     tainted: tainted, via: via, turnId: turnId, createdAt: now).insert(db)
     }
 }
+
+/// Tests only: seams of the ref code (`Store.refHooks`): the git runner `refGit` uses (a fake that fails), and a company read
+/// that fails at a turn's taint record.
+final class RefHooks: @unchecked Sendable {
+    private let lock = NSLock()
+    private var runner: (any GitProcessRunning)?
+    private var companyReadFails = false
+
+    var gitRunner: (any GitProcessRunning)? { lock.withLock { runner } }
+    var failCompanyRead: Bool { lock.withLock { companyReadFails } }
+    func setGitRunner(_ r: (any GitProcessRunning)?) { lock.withLock { runner = r } }
+    func setFailCompanyRead(_ fails: Bool) { lock.withLock { companyReadFails = fails } }
+}

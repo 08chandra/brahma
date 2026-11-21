@@ -9,6 +9,9 @@ extension Store {
     /// The reason a `.brahma/…` file at a rev other than `main`'s recorded head is tainted (ruling 8).
     static let brahmaRevReason = "a .brahma file outside main's recorded head"
 
+    /// The reason a `.brahma/…` file on disk that no item or hand-off accounts for is tainted (ruling 9).
+    static let unplacedBrahmaReason = "a .brahma file no item accounts for"
+
     /// The reason a session's taint gives what it produced.
     static func sessionReason(_ source: String) -> String { "from a session that read \(source)" }
 
@@ -105,7 +108,9 @@ extension Store {
             return try commitRowSource(companyId: companyId, sha: ref.rev ?? ref.id).map { (true, Self.sessionReason($0)) } ?? (false, nil)
         case .file, .diff:
             if ref.kind == .file, ref.itemKey == nil {
-                guard let rev = ref.rev else { return (false, nil) }
+                guard let rev = ref.rev else {
+                    return ref.id.hasPrefix(".brahma/") ? try onDiskBrahmaTaint(ref, companyId: companyId) : (false, nil)
+                }
                 // Ruling 8: a `.brahma/…` path at any rev but `main`'s engine-recorded head is tainted (it can be force-added on
                 // an item branch, and a pinned blob of a live `.brahma` file carries no record of who wrote it).
                 if ref.id.hasPrefix(".brahma/") {
@@ -129,6 +134,39 @@ extension Store {
             return try contentSource(ref, item: item).map { (true, Self.sessionReason($0)) } ?? (false, nil)
         default:
             return (false, nil)
+        }
+    }
+
+    /// Ruling 9: a rev-less `.brahma/…` file read from disk takes the taint of the item it belongs to.
+    /// - `progress/<KEY>.md`: the item's holder's session now, or 5-lite's sticky mark (a tainted session held it);
+    /// - `handoffs/<KEY>/…`: the hand-off row's own mark (its writer's session when it was written), or the item's as above;
+    ///   a file no hand-off row names can't be attributed: tainted;
+    /// - `resources/company/…`: clean (the engine mirrors only untainted, unflagged owner resources there);
+    /// - an agent's lab or notes (private: only it and the owner read them): its own place, not judged here;
+    /// - anything else (`artifacts`, an unknown item): it can't be determined, so tainted (fail closed).
+    private func onDiskBrahmaTaint(_ ref: WorkRef, companyId: String) throws -> (tainted: Bool, reason: String?) {
+        let unknown = (true, Optional(Self.unplacedBrahmaReason))
+        if RefAccess.privatePlace(ref) != nil { return (false, nil) }
+        let parts = ref.id.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 3 else { return unknown }
+        func item(_ key: String) throws -> WorkItem? { try writer.read { db in try RefAccess.item(db, companyId, key) } }
+        func itemSource(_ item: WorkItem) throws -> String? {
+            try holderSource(item: item) ?? (item.taintedOrigin ? "outside content" : nil)
+        }
+        switch parts[1] {
+        case "resources" where parts[2] == "company":
+            return (false, nil)
+        case "progress" where parts.count == 3 && parts[2].hasSuffix(".md"):
+            guard let item = try item(String(parts[2].dropLast(3))) else { return unknown }
+            return try itemSource(item).map { (true, Self.sessionReason($0)) } ?? (false, nil)
+        case "handoffs":
+            guard let item = try item(parts[2]) else { return unknown }
+            let handoffs = try handoffs(itemId: item.id).filter { $0.companyId == companyId && $0.path.hasSuffix("/" + ref.id) }
+            guard let handoff = handoffs.last else { return unknown }
+            if handoff.taintedOrigin { return (true, Self.sessionReason("outside content")) }
+            return try itemSource(item).map { (true, Self.sessionReason($0)) } ?? (false, nil)
+        default:
+            return unknown
         }
     }
 
@@ -168,10 +206,11 @@ extension Store {
         for (itemId, itemRows) in byItem {
             guard let item = try workItem(id: itemId), item.companyId == companyId, let newest = itemRows.first else { continue }
             let branch: Set<String>
-            if let head = try? git.head("item/\(item.key)") {
+            if try git.branchExists("item/\(item.key)") {
+                let head = try git.head("item/\(item.key)")
                 branch = Set(try git.revList(try git.mergeBase("main", head), head))
             } else {
-                branch = []      // no branch (gone): nothing of it is on one
+                branch = []      // no branch (gone): nothing of it is on one. A git failure throws instead (fail closed).
             }
             if itemRows.contains(where: { !branch.contains($0.sha) }) { out[itemId] = (newest.source, branch) }
         }
@@ -221,13 +260,16 @@ extension Store {
         let itemRows = rows.filter { $0.itemId == item.id }
         do {
             // None of the item's commits is provably clean (a rewrite nothing carried, an unrecorded turn): all of it is tainted.
-            if let orphan = try orphanedItems(companyId: item.companyId, rows: itemRows)[item.id] { return orphan.source }
+            let orphaned = try orphanedItems(companyId: item.companyId, rows: rows)
+            if let orphan = orphaned[item.id] { return orphan.source }
             guard let company = try company(id: item.companyId) else { throw WorkError.notFound("no such company") }
             let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
             let head = try ref.rev ?? git.head("item/\(item.key)")
             let base = try git.mergeBase("main", head)
             let history = ref.kind == .diff ? try git.revList(base, head) : try git.logShas(range: "\(base)..\(head)", path: ref.id)
-            return history.first(where: { bySha[$0] != nil }).flatMap { bySha[$0] }
+            if let hit = history.first(where: { bySha[$0] != nil }) { return bySha[hit] }
+            // A commit of another orphaned item's branch on this one (a reset onto it, a cherry-pick that reused it).
+            return orphaned.values.first(where: { other in history.contains { other.commits.contains($0) } })?.source
         } catch {
             // The history can't be read (the branch is gone, git failed): any uncleared commit of the item taints it.
             return itemRows.first?.source
@@ -314,25 +356,29 @@ extension Store {
         } catch {
             alertTaintRecord(companyId: companyId, itemId: nil, what: "the items this turn touched could not be read (\(error))", now: now)
         }
-        guard let company = try? company(id: companyId) else {
+        // Without the company (its workspace), nothing can be listed: every target still gets the fail-closed marker below.
+        var workspace: URL?
+        if !refHooks.failCompanyRead, let company = try? company(id: companyId) {
+            workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+        } else {
             alertTaintRecord(companyId: companyId, itemId: nil, what: "the company could not be read", now: now)
-            return
         }
-        let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         for (itemId, start) in targets {
             recordTurnTaint(companyId: companyId, itemId: itemId, agentId: agentId, turnId: turnId, start: start, source: source,
                             workspace: workspace, now: now)
         }
     }
 
-    /// Records `<start>..head(item/<KEY>)` of one item as tainted commits (`start` nil: the merge base with `main`). Fail
+    /// Records `<start>..head(item/<KEY>)` of one item as tainted commits (`start` nil: the merge base with `main`; `workspace`
+    /// nil: the company could not be read, so straight to the fail-closed marker). Fail
     /// closed: when that can't be done, every commit from the merge base is recorded instead; when not even that, an
     /// `unrecorded-…` marker makes all of the item's commits tainted (`orphanedItems`), the item is marked (5-lite's sticky
     /// `taintedOrigin`, which taints its worktree) and the owner gets an engine alert. Never throws.
     public func recordTurnTaint(companyId: String, itemId: String, agentId: String, turnId: String?, start: String?,
-                                source: String, workspace: URL, now: Date) {
+                                source: String, workspace: URL?, now: Date) {
         var failure: (any Error)?
         do {
+            guard let workspace else { throw WorkError.notFound("the company's workspace could not be read") }
             guard let item = try workItem(id: itemId), item.companyId == companyId else { return }
             let git = try refGit(workspace)
             let after = try git.head("item/\(item.key)")
