@@ -46,9 +46,9 @@ While the hold is on, failed turns do not count against agents, retries do not s
 
 The title bar has the mode switch (`LOW` / `BALANCED` / `MAX`). The strip below it shows the five-hour and seven-day utilisation, when the window resets, and the pace line (`7D ON PACE`, or ahead by a percentage). A **WHY** banner appears when nothing is running and says why. **Work › Budget** shows the week's pace, the spend by mode and a storage panel.
 
-<img src="/screenshots/map.png" srcset="/screenshots/map@2x.png 2x" width="1600" height="1000" alt="Mission Control with the agent-map panel (Initech, 12 agents): the mode switch and agent counts in the title bar, a WHY banner reading 3 asks wait for you, and the usage strip with five-hour and seven-day figures" loading="lazy" decoding="async" />
+<img src="/screenshots/map.png" srcset="/screenshots/map@2x.png 2x" width="1600" height="1000" alt="Mission Control with the agent-map panel (Initech: a 12-seat org, 6 agents seated): the mode switch and agent counts in the title bar, a WHY banner reading 3 asks wait for you, and the usage strip with five-hour and seven-day figures" loading="lazy" decoding="async" />
 
-*Mission Control with the agent-map panel (Initech, 12 agents). The WHY banner and the usage strip sit above the panels.*
+*Mission Control with the agent-map panel (Initech: a 12-seat org, 6 agents seated). The WHY banner and the usage strip sit above the panels.*
 
 ## From the CLI
 

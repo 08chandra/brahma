@@ -774,6 +774,9 @@ footer .meta {
     width: 2.5rem;
     height: 2.5rem;
   }
+  .expressive-code .copy button::after {
+    margin: 0.625rem; /* a 20 px glyph in the 40 px hit area, level with 16 px code */
+  }
   /* The always-visible 40 px button gets a header of its own instead of sitting on the code
    * (where it would also stay while a wide block scrolls sideways). Titled frames: the tab bar
    * / terminal bar grows to 44 px and the button is centred in it. Untitled frames: a 48 px

@@ -3,6 +3,7 @@ title: Inside Brahma
 description: How the engine, sandbox, scheduler and Mac app fit together.
 sidebar:
   order: 0
+  label: Overview
 ---
 
 Brahma is the governed local AI org: agents propose, the engine verifies and

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build the public website in site/: run the generators (when present), then
-# install pinned dependencies, build and run the site checks.
+# Build the public website in site/: install the pinned npm dependencies first
+# (the generators need them: sharp for the screenshots, @fontsource for the API
+# theme), then run the generators, build and run the site checks.
 #
 # Usage: scripts/site-build.sh [--skip-generators] [--skip-lighthouse]
 #
@@ -46,18 +47,27 @@ generators=(
   scripts/site-api-docs.sh
 )
 
+# npm ci comes first: a fresh checkout has no site/node_modules, and the generators
+# import from it (site/scripts/optimize-screenshots.mjs needs sharp; site-api-docs.sh
+# copies the @fontsource faces).
+run_step "npm ci" bash -c 'cd site && npm ci'
+
 if [[ $skip_generators -eq 1 ]]; then
   echo "site-build: WARNING: --skip-generators set; screenshots, CLI reference and API reference are not regenerated" >&2
 else
+  # Every listed generator must exist and be executable: generated output is
+  # gitignored and persists, so a skipped generator would leave stale CLI pages,
+  # screenshots or /api in place and the generated-output check would still pass.
   for step in "${generators[@]}"; do
-    if [[ -x "$step" ]]; then
-      run_step "$step" "$step"
+    if [[ ! -x "$step" ]]; then
+      echo "site-build: step failed: $step (missing or not executable)" >&2
+      exit 1
     fi
+    run_step "$step" "$step"
   done
 fi
 
 cd site
-run_step "npm ci" npm ci
 run_step "npx playwright install chromium" npx playwright install chromium
 run_step "npm run og" npm run og
 run_step "npm run build" npm run build

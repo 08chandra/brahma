@@ -3,6 +3,7 @@ title: Safety
 description: "How Brahma limits what agents can touch: profiles, the sandbox, the taint rule, secrets, the sandbox canary, the emergency stop and backups. Each page says what the piece does and what it does not do."
 sidebar:
   order: 2
+  label: Overview
 ---
 
 ## What it is

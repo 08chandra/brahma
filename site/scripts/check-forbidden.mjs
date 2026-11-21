@@ -7,9 +7,11 @@
 // .webmanifest). Two groups of patterns:
 //
 //   private  — checked everywhere, including the generated API reference (dist/api/**):
-//              build-machine paths (`/Users/`), `.superpowers`, the `BRAHMA_OWNER_KEY`
-//              token, email addresses, and the login name of the user running the check
-//              (`process.env.USER`, compared only — never printed).
+//              build-machine paths (`/Users/`, `/var/folders/`, `/private/var/`,
+//              `/private/tmp/`), `.superpowers`, the `BRAHMA_OWNER_KEY` token, email
+//              addresses, and the login name of the user running the check
+//              (`process.env.USER`, compared only — never printed; the check refuses to
+//              run, exit 2, when USER is unset, so the name can never slip through).
 //   public   — checked outside dist/api/** (DocC pages carry source doc comments verbatim;
 //              the Task 6 review rules on those): the brand words `Palantir` and
 //              `Anthropic` (case-sensitive, as written) and empty links (`href=""`).
@@ -55,6 +57,11 @@ const PAGEFIND_UI_FILES = [
 
 export const PRIVATE_PATTERNS = [
   { name: 'build-machine path (/Users/)', test: (line) => line.includes('/Users/') },
+  // macOS temp dirs: $TMPDIR (/var/folders/<per-user id>/…) and the /private/… targets
+  // of the /var and /tmp symlinks, which generators running in a temp data home print.
+  { name: 'build-machine path (/var/folders/)', test: (line) => line.includes('/var/folders/') },
+  { name: 'build-machine path (/private/var/)', test: (line) => line.includes('/private/var/') },
+  { name: 'build-machine path (/private/tmp/)', test: (line) => line.includes('/private/tmp/') },
   { name: '.superpowers', test: (line) => line.includes('.superpowers') },
   // Whole token: `\b` treats "_" as a word character, so the documented environment
   // variable BRAHMA_OWNER_KEY_STORE (PlatformOwnerKeyStore.environmentVariable) is a
@@ -157,8 +164,11 @@ function main() {
 
   const privatePatterns = [...PRIVATE_PATTERNS, emailPattern(loadPagefindAddresses(siteRoot))];
   const login = loginNamePattern(process.env.USER);
-  if (login) privatePatterns.push(login);
-  else console.log('NOTE login-name check skipped (USER is not set)');
+  if (!login) {
+    console.error('check-forbidden: USER is not set; the login-name check cannot run (set USER to the login name)');
+    process.exit(2);
+  }
+  privatePatterns.push(login);
 
   let files = 0;
   let hits = 0;

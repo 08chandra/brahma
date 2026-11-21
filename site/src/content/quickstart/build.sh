@@ -7,5 +7,5 @@ swift build
 # The CLI is now .build/debug/brahma. Put it on your PATH for this shell:
 export PATH="$PWD/.build/debug:$PATH"
 
-# Optional: the Mac app, built to .build/Brahma.app (a release build).
+# Optional (needs Xcode): the Mac app, built to .build/Brahma.app (a release build).
 # scripts/make-app.sh

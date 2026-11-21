@@ -3,6 +3,7 @@ title: Guides
 description: "Short task guides for the owner: add an agent, keep main green with a smoke check, give agents files, purge a resource, run a preview, run the engine from the terminal, and back up and restore."
 sidebar:
   order: 2
+  label: Overview
 ---
 
 Each guide does one thing. It names the goal in one line, says what you need before you start, gives numbered steps with one command each, and ends with how to check that it worked.

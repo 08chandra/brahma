@@ -26,6 +26,19 @@ import { site } from '../../site.config.ts';
 </div>
 
 <style>
+  /* Pages with a hero (Home, the quick start, 404) have no edit link, last-updated line or
+   * prev/next links, so Starlight's footer boxes are empty; their 3 rem margin and 1.5 rem gap
+   * still stood between the page's last section and the colophon (a ~150 px dead band).
+   * Collapsed, the colophon follows the last section at the --s-8 section rhythm. */
+  :global(html[data-has-hero] .sl-container > footer) {
+    margin-top: 0;
+  }
+  :global(html[data-has-hero] .sl-container > footer > :not(:has(*))) {
+    display: none;
+  }
+  :global(html[data-has-hero]) .colophon {
+    margin-top: var(--s-8);
+  }
   .colophon {
     display: flex;
     flex-wrap: wrap;

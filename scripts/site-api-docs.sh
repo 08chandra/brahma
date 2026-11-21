@@ -207,7 +207,7 @@ find "$OUT" -name '*.html' -print0 | xargs -0 sed -i '' 's#</head>#<link rel="st
 <main>
 <p class="kicker">Inside Brahma · Swift modules</p>
 <h1>API reference</h1>
-<p class="lede">Every public symbol of each module, generated with DocC from the Swift interface of this build.</p>
+<p class="lede">Every public declaration of each module (compiler-synthesized members omitted), generated with DocC from the Swift interface of this build.</p>
 <ul>
 HTML
   for i in "${!documented[@]}"; do

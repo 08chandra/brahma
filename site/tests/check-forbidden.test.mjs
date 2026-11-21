@@ -3,7 +3,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sep } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   PRIVATE_PATTERNS,
   PUBLIC_PATTERNS,
@@ -17,13 +21,27 @@ import {
 
 const names = (hits) => hits.map((h) => `${h.line}:${h.name}`);
 
-test('private patterns: build-machine path, .superpowers and the BRAHMA_OWNER_KEY token', () => {
-  const text = ['fine', 'see /Users/someone/x', 'kept in .superpowers/', 'BRAHMA_OWNER_KEY=abc'].join('\n');
+test('private patterns: build-machine paths, .superpowers and the BRAHMA_OWNER_KEY token', () => {
+  const text = [
+    'fine',
+    'see /Users/someone/x',
+    'kept in .superpowers/',
+    'BRAHMA_OWNER_KEY=abc',
+    'home /var/folders/ab/T/brahma-x',
+    'under /private/tmp/brahma-qs.123',
+    'or /private/var/folders/ab/T',
+  ].join('\n');
   assert.deepEqual(names(scanText(text, { patterns: PRIVATE_PATTERNS })), [
     '2:build-machine path (/Users/)',
     '3:.superpowers',
     '4:BRAHMA_OWNER_KEY',
+    '5:build-machine path (/var/folders/)',
+    '6:build-machine path (/private/tmp/)',
+    '7:build-machine path (/var/folders/)',
+    '7:build-machine path (/private/var/)',
   ]);
+  // The plain repository paths a page may name are not machine paths.
+  assert.deepEqual(scanText('/tmp/x, /var/log, Sources/BrahmaCore, ~/Library', { patterns: PRIVATE_PATTERNS }), []);
 });
 
 test('BRAHMA_OWNER_KEY_STORE (the documented env var) is a different token and passes', () => {
@@ -71,4 +89,22 @@ test('api/ files get only the private patterns; everything else gets both', () =
   assert.deepEqual(patternsFor(['api', 'x', 'index.html'].join(sep), groups), PRIVATE_PATTERNS);
   assert.deepEqual(patternsFor(['apix', 'index.html'].join(sep), groups), [...PRIVATE_PATTERNS, ...PUBLIC_PATTERNS]);
   assert.deepEqual(patternsFor('index.html', groups), [...PRIVATE_PATTERNS, ...PUBLIC_PATTERNS]);
+});
+
+test('the command fails (exit 2) when USER is unset, and passes a clean directory when it is set', () => {
+  const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'check-forbidden.mjs');
+  const dist = mkdtempSync(join(tmpdir(), 'check-forbidden-'));
+  try {
+    writeFileSync(join(dist, 'index.html'), '<html><body>clean</body></html>\n');
+    const env = { ...process.env };
+    delete env.USER;
+    const unset = spawnSync(process.execPath, [script, dist], { env, encoding: 'utf8' });
+    assert.equal(unset.status, 2);
+    assert.match(unset.stderr, /USER is not set/);
+    const set = spawnSync(process.execPath, [script, dist], { env: { ...env, USER: 'someuser' }, encoding: 'utf8' });
+    assert.equal(set.status, 0, set.stdout + set.stderr);
+    assert.match(set.stdout, /^0 forbidden strings \(1 files scanned\)$/m);
+  } finally {
+    rmSync(dist, { recursive: true, force: true });
+  }
 });

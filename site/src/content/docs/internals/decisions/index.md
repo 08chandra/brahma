@@ -3,6 +3,7 @@ title: Decisions
 description: Why Brahma is built the way it is, one page per design spec.
 sidebar:
   order: 3
+  label: Overview
 ---
 
 Each page distils one design spec from `docs/superpowers/specs/` into four parts: the **context** the decision was made in, the **decision** itself, its **consequences** for the code, and the **source** spec. The specs are long and record every review round; these pages keep only what someone changing Brahma needs to know. Where a page and the code disagree, the code wins and the page is wrong.

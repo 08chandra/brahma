@@ -1,5 +1,6 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
+import sitemap from '@astrojs/sitemap';
 import starlight from '@astrojs/starlight';
 import { site } from './site.config.ts';
 
@@ -8,6 +9,9 @@ export default defineConfig({
   // here at go-live; it only affects canonical URLs, sitemap and OG image URLs.
   site: 'https://brahma.invalid',
   integrations: [
+    // Starlight adds @astrojs/sitemap itself only when none is configured. This one leaves
+    // out /styleguide/, which carries robots noindex (src/pages/styleguide.astro).
+    sitemap({ filter: (page) => !page.includes('/styleguide/') }),
     starlight({
       title: site.title,
       description: site.description,
@@ -35,8 +39,8 @@ export default defineConfig({
       pagefind: true,
       lastUpdated: false,
       credits: false,
-      // Social links are added once site.repoURL is set (public repository).
-      social: [],
+      // The header's repository icon appears once site.repoURL is set (public repository).
+      social: site.repoURL !== '' ? [{ icon: 'github', label: 'GitHub', href: site.repoURL }] : [],
       components: {
         Head: './src/components/SiteHead.astro',
         Footer: './src/components/SiteFooter.astro',

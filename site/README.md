@@ -5,25 +5,30 @@ and [Starlight](https://starlight.astro.build). Everything under `site/` is a st
 the output in `site/dist/` is what gets deployed.
 
 Node and npm are used only inside this directory. The rest of the repository is a Swift package.
+The site is built and checked with Node 26 and npm 11 (`node --version`, `npm --version`); the
+generators also need the Swift toolchain the repository's own build uses.
 
 ## Build
 
 From the repository root:
 
 ```
-scripts/site-build.sh                     # generators (if present) → npm ci → Chromium → OG images → build → checks → Lighthouse
+scripts/site-build.sh                     # npm ci → generators → Chromium → OG images → build → checks → Lighthouse
 scripts/site-build.sh --skip-generators   # fast content iteration; skips screenshots, CLI and API reference
 scripts/site-build.sh --skip-lighthouse   # everything but the Lighthouse gate (about three minutes)
 ```
 
-The script runs each generator that exists and is executable (`scripts/site-screenshots.sh`,
+The script runs `npm ci` in `site/` first (a fresh checkout has no `node_modules`, and the
+generators import from it), then each generator (`scripts/site-screenshots.sh`,
 `scripts/site-cli-docs.sh`, `scripts/site-api-docs.sh`), printing `== <step>` before each and
-failing with the step's name if one fails. It then runs `npm ci`, `npx playwright install chromium`
-(the browser the OG generator, the screenshot scripts, Lighthouse and the UI tests drive; a no-op
-once installed), `npm run og`, `npm run build`, `npm run check` and `npm run check:lighthouse` in
-`site/`. With `--skip-generators` the generated-output check would fail by construction, so the
-script runs `check:links`, `check:forbidden` and `check:ui` individually and skips `check:generated`
-with a warning. The flags combine.
+failing with the step's name if one fails, is missing or is not executable (generated output is
+gitignored and persists, so a skipped generator would leave stale pages that still pass the
+generated-output check). It then runs `npx playwright install chromium` (the browser the OG
+generator, the screenshot scripts, Lighthouse and the UI tests drive; a no-op once installed),
+`npm run og`, `npm run build`, `npm run check` and `npm run check:lighthouse` in `site/`. With
+`--skip-generators` the generated-output check would fail by construction, so the script runs
+`check:links`, `check:forbidden` and `check:ui` individually and skips `check:generated` with a
+warning. The flags combine.
 
 Inside `site/`:
 
@@ -38,7 +43,7 @@ npm run check:links     # verify every root-relative href/src in dist/ resolves
 npm run check:forbidden # fail on private content or forbidden branding in dist/ (see below)
 npm run check:generated # fail when the generators' output is missing from dist/
 npm run check:ui        # = test:ui
-npm run check           # check:links && check:forbidden && check:generated && check:ui
+npm run check           # test && check:links && check:forbidden && check:generated && check:ui
 npm run check:lighthouse  # Lighthouse gate (see below); writes .reports/lighthouse/
 npm test                # unit tests (node:test, tests/*.test.mjs)
 npm run test:ui         # browser tests (tests/*.spec.mjs) against a preview it starts on port 4321; build first
@@ -49,12 +54,14 @@ npm run screenshots:final # the owner's "show me the site" set into .screenshots
 ## Quality gate
 
 `npm run check` runs after every build (`scripts/site-build.sh`); `npm run check:lighthouse` runs
-after it unless `--skip-lighthouse`. All four read `dist/`, so build first.
+after it unless `--skip-lighthouse`. `check` starts with the unit tests (`npm test`); the four
+checks after them read `dist/`, so build first.
 
 - **`check:forbidden`** (`scripts/check-forbidden.mjs dist`) scans every text file in `dist/`.
-  Everywhere, including the generated `/api` reference: build-machine paths (`/Users/`),
-  `.superpowers`, the `BRAHMA_OWNER_KEY` token, email addresses, and the login name of the user
-  running the check (`$USER`, compared but never printed). Outside `dist/api/`: the brand words
+  Everywhere, including the generated `/api` reference: build-machine paths (`/Users/`,
+  `/var/folders/`, `/private/var/`, `/private/tmp/`), `.superpowers`, the `BRAHMA_OWNER_KEY` token,
+  email addresses, and the login name of the user running the check (`$USER`, compared but never
+  printed; the check exits 2 when `USER` is unset). Outside `dist/api/`: the brand words
   `Palantir` and `Anthropic` (case-sensitive) and empty links (`href=""`). Hits print as
   `path:line: <pattern>` without the matched text. The only allowances, each an exact token, are
   listed at the top of the script: the `claude` CLI's environment-variable names
@@ -88,16 +95,19 @@ Starlight maps `src/content/docs/` to the site root.
 
 ```
 site.config.ts                   title, description, repoURL, apiBase, license (imported by config and components)
-astro.config.mjs                 Astro + Starlight configuration, sidebar
+astro.config.mjs                 Astro + Starlight configuration, sidebar, sitemap filter
 src/content.config.ts            content collections (docs, i18n)
-src/content/docs/index.md        home page            → /
-src/content/docs/404.md          not-found page       → /404
-src/content/docs/license.mdx     license + notice     → /license/
+src/pages/index.astro            home page            → /
+src/pages/start.astro            quick start          → /start/
+src/pages/404.astro              not-found page       → /404
+src/pages/styleguide.astro       design-system reference (noindex, not in the sitemap) → /styleguide/
+src/content/docs/license.mdx     license + notice (LICENSE and NOTICE imported raw) → /license/
 src/content/docs/docs/           "Using Brahma"       → /docs/...     (autogenerated sidebar group)
 src/content/docs/internals/      "Inside Brahma"      → /internals/...(autogenerated sidebar group)
 src/content/i18n/en.json         UI string overrides (none yet)
 src/styles/tokens.css            design tokens and the dark-only theme
 public/                          static files served as-is (favicon)
+scripts/gen-og.mjs               Open Graph images → public/og/ (npm run og)
 scripts/check-links.mjs          zero-dependency link checker over dist/
 scripts/check-forbidden.mjs      private-content and branding checker over dist/
 scripts/check-generated.mjs      generated-output presence checker over dist/
@@ -108,7 +118,10 @@ scripts/lighthouse.mjs           Lighthouse gate (five pages, mobile + desktop)
 ```
 
 The sidebar has two autogenerated groups, "Using Brahma" (`docs/`) and "Inside Brahma"
-(`internals/`), plus a link to the API reference at `/api/`.
+(`internals/`), plus a link to the API reference at `/api/`. Each section's `index.md` sets
+`sidebar: { label: Overview }` so a group does not repeat its own name as its first item.
+`/styleguide/` is excluded from the sitemap (`@astrojs/sitemap` `filter` in `astro.config.mjs`;
+Starlight adds its own sitemap integration only when none is configured).
 
 ## Generated content
 
@@ -121,7 +134,7 @@ commit them:
 | `public/api/` | `scripts/site-api-docs.sh` | DocC API reference, served at `/api/` |
 | `public/screenshots/` | `scripts/site-screenshots.sh` | app screenshots |
 | `src/generated/modules.json` | `scripts/site-api-docs.sh` | module facts for `ModuleFacts.astro` |
-| `public/og/` | build-time generators | social images |
+| `public/og/` | `npm run og` (`scripts/gen-og.mjs`, run by `scripts/site-build.sh`) | Open Graph images, 1200 × 630 |
 
 `npm run check:links` is strict about every root-relative link except links into `/api/`: when
 `dist/api/index.html` is absent (the API generator did not run) it prints
@@ -203,12 +216,20 @@ replaces it with the real domain; it affects canonical URLs, the sitemap and soc
 
 ## Switches that depend on things outside this directory
 
-- **Installer tab.** The Quick start's "Install the app" tab links to a notarized release build.
-  It stays hidden until a notarized release exists; the content is written so the CLI path stands
-  on its own.
+- **Installer tab.** The Quick start's install step (`src/pages/start.astro`, `InstallTabs`)
+  has two tabs, **Installer** and **Build from source**. Both are always visible; today the
+  Installer tab says "The first stable release is coming; until then build from source" and
+  links to the source tab, which is selected by default (`initial` in
+  `src/components/InstallTabs.astro`). When a notarized release exists: put the download link and
+  its checksum in the `installer` slot in `src/pages/start.astro`, set `initial` to `'installer'`,
+  and update the Install step's brief and Home's Install step (`src/components/HowItWorks.astro`),
+  which say Brahma is built from source until then.
 - **Public repository.** `repoURL` in `site.config.ts` is empty until the repository is public.
-  Components that link to source, show a repository icon or offer "edit this page" are gated on it
-  being non-empty; set it to the repository URL and rebuild.
+  Set it to the repository URL and rebuild: it adds the GitHub button on Home, the `git clone`
+  lines on the quick start, the "View source" links (`SourceLink.astro`) on module pages, the
+  "Source on GitHub" link in the footer colophon and the header's GitHub icon (`social` in
+  `astro.config.mjs`). While it is empty none of these render. Starlight's "Edit this page" link
+  is not configured (`editLink`), and `lastUpdated` is off.
 - **API reference.** `apiBase` in `site.config.ts` defaults to `/api`, the path the DocC generator
   writes under `public/`. Change it only for the two-project deployment above, to
   `<brahma-api project URL>/api`.

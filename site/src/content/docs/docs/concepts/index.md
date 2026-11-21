@@ -3,6 +3,7 @@ title: Concepts
 description: "The pieces of a Brahma company and how they fit together: companies, agents, work items, asks, sprints, modes, reviews, memory, handbook, resources, previews and the agent map."
 sidebar:
   order: 1
+  label: Overview
 ---
 
 ## What it is

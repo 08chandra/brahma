@@ -33,9 +33,9 @@ Messages travel as particles along the reporting lines. Hires, terminations, reo
 
 ## In the app
 
-<img src="/screenshots/map.png" srcset="/screenshots/map@2x.png 2x" width="1600" height="1000" alt="Mission Control with the agent-map panel (Initech, 12 agents)" loading="lazy" decoding="async" />
+<img src="/screenshots/map.png" srcset="/screenshots/map@2x.png 2x" width="1600" height="1000" alt="Mission Control with the agent-map panel (Initech: a 12-seat org, 6 agents seated)" loading="lazy" decoding="async" />
 
-*Mission Control with the agent-map panel (Initech, 12 agents).*
+*Mission Control with the agent-map panel (Initech: a 12-seat org, 6 agents seated).*
 
 The panel shows a card per agent with its handle, role and state. The full map, with the reporting lines, traffic and replay, is the **Agent Map** window.
 

@@ -2,11 +2,14 @@
 /**
  * The four-step strip on Home: Install → Connect `claude` → Create a company → Give it a
  * goal. One hairline band split into four cells; each cell has an engraved serif numeral
- * (text2 at ≥ 48 px, the large-text exception), a sans title, one sentence and the command
- * that does it, in mono, with a Copy button. The buttons stay hidden until the inline
- * script (< 520 bytes) finds the Clipboard API, so no-JS readers never see a dead control; a
- * refused write says "Failed" and a polite live region announces "Copied …" or "Copy failed".
- * Four across from 64 em, two across from 40 em, stacked below.
+ * (text2 at ≥ 48 px, the large-text exception), a sans title linking to the same step on
+ * /start, one sentence and the command that does it, in mono, with a Copy button. The
+ * commands are the quick start's, in its order (src/content/quickstart/*.sh, which
+ * scripts/site-quickstart-check.sh runs), so Home summarises and /start instructs; a step
+ * with two commands shows and copies them as two lines. The buttons stay hidden until the
+ * inline script (< 520 bytes) finds the Clipboard API, so no-JS readers never see a dead
+ * control; a refused write says "Failed" and a polite live region announces "Copied …" or
+ * "Copy failed". Four across from 64 em, two across from 40 em, stacked below.
  */
 import Button from './Button.astro';
 
@@ -15,30 +18,35 @@ interface Props {
 }
 const { headingId } = Astro.props;
 
+// `href` is the step's anchor on /start (start.astro's `route` ids).
 const steps = [
   {
     title: 'Install',
-    body: 'Build the brahma CLI and the Mac app, .build/Brahma.app, from source with Xcode’s Swift 6 on macOS 14 or later. An installer arrives with the first stable release.',
-    command: 'scripts/make-app.sh',
+    href: '/start/#install',
+    body: 'Build the brahma CLI from source with Swift 6 on macOS 14 or later, then put .build/debug on your PATH. An installer arrives with the first stable release.',
+    commands: ['swift build'],
   },
   {
     title: 'Connect claude',
-    body: 'Brahma drives the claude CLI you already use, logged in to your own plan. brahma doctor checks it with a few real probe turns.',
-    command: 'brahma doctor',
+    href: '/start/#connect',
+    body: 'Brahma drives the claude CLI you already use, signed in to your own plan. brahma owner init creates the owner key; brahma doctor checks the CLI with a few real probe turns.',
+    commands: ['brahma owner init', 'brahma doctor'],
   },
   {
     title: 'Create a company',
-    body: 'A git workspace, channels and a twelve-agent org from the software pack, all on your Mac.',
-    command: 'brahma company create Initech --goal "Build a habit tracker" --agents 12',
+    href: '/start/#company',
+    body: 'A git workspace, channels and the software pack’s default org, five agents and one open seat, all on your Mac.',
+    commands: ['brahma company create Acme --goal "Build a todo app"'],
   },
   {
     title: 'Give it a goal',
-    body: 'Start the engine and the org works toward the goal: agents claim items and open reviews, the engine runs the checks and merges what passes. Anything only you can decide lands in your Inbox.',
-    command: 'brahma run',
+    href: '/start/#run',
+    body: 'Start the engine after the sandbox canary passes (see the Quick start) and the org works toward the goal: agents claim items and open reviews, the engine runs the checks and merges what passes. Anything only you can decide lands in your Inbox.',
+    commands: ['brahma run'],
   },
 ];
-// Command names in the copy are set in mono.
-const codeWords = /(brahma doctor|brahma|claude|\.build\/Brahma\.app)/g;
+// Command names in the copy are set in mono (longer phrases first).
+const codeWords = /(brahma owner init|brahma doctor|brahma|claude|swift build|\.build\/debug|PATH)/g;
 const parts = (text: string) => text.split(codeWords).map((part, i) => ({ text: part, code: i % 2 === 1 }));
 ---
 
@@ -50,23 +58,35 @@ const parts = (text: string) => text.split(codeWords).map((part, i) => ({ text: 
           {index + 1}
         </span>
         <h3 class="step__title">
-          <span class="sr-only">Step {index + 1}: </span>
-          {parts(step.title).map((p) => (p.code ? <code>{p.text}</code> : p.text))}
+          <a class="step__link" href={step.href}>
+            <span class="sr-only">Step {index + 1}: </span>
+            {parts(step.title).map((p) => (p.code ? <code>{p.text}</code> : p.text))}
+          </a>
         </h3>
         <p class="step__body">{parts(step.body).map((p) => (p.code ? <code>{p.text}</code> : p.text))}</p>
         <div class="step__cmd">
           <code class="step__code">
-            <span class="step__prompt" aria-hidden="true">$</span>
-            <span>
-              {step.command.split(' ').map((token, i) => (
-                <>
-                  {i > 0 && ' '}
-                  <span class="step__tok">{token}</span>
-                </>
-              ))}
-            </span>
+            {step.commands.map((command) => (
+              <span class="step__line">
+                <span class="step__prompt" aria-hidden="true">$</span>
+                <span>
+                  {command.split(' ').map((token, i) => (
+                    <>
+                      {i > 0 && ' '}
+                      <span class="step__tok">{token}</span>
+                    </>
+                  ))}
+                </span>
+              </span>
+            ))}
           </code>
-          <Button size="sm" class="step__copy" data-copy={step.command} aria-label={`Copy command: ${step.command}`} hidden>
+          <Button
+            size="sm"
+            class="step__copy"
+            data-copy={step.commands.join('\n')}
+            aria-label={`Copy command: ${step.commands.join('; ')}`}
+            hidden
+          >
             Copy
           </Button>
         </div>
@@ -162,6 +182,23 @@ const parts = (text: string) => text.split(codeWords).map((part, i) => ({ text: 
     line-height: 1.25;
     color: var(--text0);
   }
+  /* The title is the link to the step on /start: text0 at rest, an offset underline on hover
+   * (the Home link idiom), the 2 px accent ring on keyboard focus. */
+  .step__link {
+    color: inherit;
+    text-decoration: none;
+  }
+  .step__link:hover {
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 4px;
+    text-decoration-color: var(--text-link);
+  }
+  .step__link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: var(--radius);
+  }
   .step__body {
     margin: 0;
     font-size: var(--text-ui);
@@ -191,15 +228,21 @@ const parts = (text: string) => text.split(codeWords).map((part, i) => ({ text: 
     border-radius: var(--radius);
   }
   .step__code {
-    display: flex;
-    gap: var(--s-2);
-    align-items: baseline;
+    display: grid;
+    gap: 0.125rem;
     min-width: 0;
     padding-block: 0.25rem;
     font-size: var(--step--1);
     line-height: 1.5;
     color: var(--text0);
     overflow-wrap: anywhere;
+  }
+  /* One command per line, each behind its own prompt mark. */
+  .step__line {
+    display: flex;
+    gap: var(--s-2);
+    align-items: baseline;
+    min-width: 0;
   }
   /* Lines break only between tokens, so a flag never splits from its dashes. */
   .step__tok {

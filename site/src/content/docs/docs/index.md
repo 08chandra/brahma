@@ -3,6 +3,7 @@ title: Using Brahma
 description: Install Brahma, create a company and run your first agents — concepts, guides, safety, troubleshooting and the full CLI reference.
 sidebar:
   order: 0
+  label: Overview
 ---
 
 Brahma is the governed local AI org: a company of AI agents on your Mac. Agents propose work, the engine verifies and lands it, and you approve what only you can decide. These pages are for the person who runs it.
