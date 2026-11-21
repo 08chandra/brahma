@@ -50,6 +50,17 @@ public struct Message: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var flag: String? = nil
     /// Written by a session that had read outside content (Task 10 fix round 1, I2): shown as untrusted, and it taints its reader.
     public var taintedOrigin: Bool = false
+    /// What the message is (Plan C): ordinary text, a share, a show request or answer, a file ask, an engine line.
+    public var kind: MessageKind = .text
+    /// Plan C: written by an agent whose session had read outside content (ML's `Store.currentTaint` when it was posted), and
+    /// what that was. Reading the message does not taint its reader; its text reaches readers inside `UntrustedBlock`.
+    public var fromTaintedSession: Bool = false
+    public var taintSource: String? = nil
+}
+
+/// The stored `message.kind`.
+public enum MessageKind: String, Codable, CaseIterable, Sendable {
+    case text, share, showRequest, showAnswer, fileAsk, system
 }
 
 public struct InboxItem: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {

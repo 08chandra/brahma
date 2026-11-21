@@ -6,24 +6,117 @@ import GRDB
 /// rows through the store). Anything but `.full` leaves with only its kind and a fresh opaque handle.
 extension Store {
     public func resolveRef(_ ref: WorkRef, for reader: Reader, companyId: String) throws -> ResolvedRef {
-        try resolveForReader(ref, reader: reader, companyId: companyId, messageRefId: nil).resolved
+        try resolveDetailed(ref, reader: reader, companyId: companyId, messageRefId: nil).resolved
     }
 
     /// `ref` as it is stored with a share: `rev` set to the commit the branch head (or the verified sha) names for committed
     /// files, diffs and commits, and the status at share time in `params["was"]` for items, asks, agents and previews (plus
     /// `params["main"]`, the main commit, for previews). A reader that can't read the ref in full can't pin it
-    /// (`WorkError.forbidden`): a share never widens access. C2a adds `@worktree`, lab, notes and diff snapshots.
-    public func pinRef(_ ref: WorkRef, for reader: Reader, companyId: String, messageRefId: String) throws -> WorkRef {
-        let r = try resolveForReader(ref, reader: reader, companyId: companyId, messageRefId: messageRefId)
-        guard r.resolved.visibility == .full else { throw WorkError.forbidden("there is no such ref you can read") }
-        return r.pinned
+    /// (`WorkError.forbidden`): a share never widens access.
+    ///
+    /// Plan C2a: what can change under a share is frozen.
+    /// - An `@worktree` file, or a file of an allowlisted `.brahma` place, is written to git as a blob from the bytes `SafeFS`
+    ///   checked (`hashObject`), and `refs/brahma/shares/<messageRefId>` points at it: `rev` is the blob, `params["share"]` the
+    ///   ref's id. It opens after the worktree and the branch are gone.
+    /// - An `@worktree` diff becomes a vault snapshot (`snapshots/<id>.patch`, a `refSnapshot` row keyed by `messageRefId`;
+    ///   `params["snapshot"]` its id), which needs the data home (`paths`); a committed diff's patch goes into the diff cache.
+    /// - A private lab or notes file is never pinned (git is company-readable): it is shared as a snapshot
+    ///   (`snapshotPrivateFile`, `WorkError.invalid`).
+    /// - Taint at pin time: a pin made by a session that read outside content (ML's `currentTaint`), or of `@worktree`
+    ///   content whose holder's session is tainted now, carries `params["taint"] = <source>` (`refTaint`: tainted;
+    ///   provenance `.external("tainted-session:<source>")`).
+    public func pinRef(_ ref: WorkRef, for reader: Reader, companyId: String, messageRefId: String,
+                       paths: BrahmaPaths? = nil) throws -> WorkRef {
+        let r = try resolveDetailed(ref, reader: reader, companyId: companyId, messageRefId: messageRefId)
+        guard r.resolved.visibility == .full, let company = r.company, let subject = r.subject else {
+            throw WorkError.forbidden("there is no such ref you can read")
+        }
+        var pinned = r.pinned
+        let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+        var source: String?
+        if case .agent(let id) = reader {
+            source = try writer.read { db in try Self.currentTaint(db: db, agentId: id, home: paths?.home ?? dataHome) }
+        }
+        switch subject.record {
+        case .file(let place) where place != nil:
+            throw WorkError.invalid("a private lab or notes file is shared as a snapshot, not pinned")
+        case .file where ref.rev == nil && (ref.isWorktree || (ref.branch == nil && ref.id.hasPrefix(".brahma/"))):
+            let fs = try SafeFS(workspace: workspace, ownHandle: nil)
+            let file: SafeFile
+            do {
+                if let key = ref.itemKey, ref.isWorktree {
+                    file = try fs.open(ref.id, inWorktree: key, maxBytes: SafeGit.maxBinaryBytes)
+                } else {
+                    file = try fs.open(workspacePath: ref.id, maxBytes: SafeGit.maxBinaryBytes)
+                }
+            } catch is SafeFSError {
+                throw WorkError.forbidden("there is no such ref you can read")
+            }
+            let git = try refGit(workspace)
+            let blob = try git.hashObject(from: file)
+            try git.updateShareRef(messageRefId, to: blob)
+            pinned.rev = blob
+            pinned.params["share"] = messageRefId
+            if ref.isWorktree, source == nil, let item = try writer.read({ db in try RefAccess.item(db, companyId, ref.itemKey ?? "") }) {
+                source = try holderSource(item: item)
+            }
+        case .diff(let item) where ref.isWorktree && ref.params["snapshot"] == nil:
+            guard let paths else { throw WorkError.invalid("an uncommitted diff is kept as a vault snapshot; it needs the data home") }
+            let fs = try SafeFS(workspace: workspace, ownHandle: nil)
+            let temp = try refTempDirectory()
+            defer { try? FileManager.default.removeItem(at: temp) }
+            let worktree = workspace.appending(path: ".brahma/wt/\(item.key)", directoryHint: .isDirectory)
+            let diff = try refGit(workspace).worktreeDiff(key: item.key, worktree: worktree, tempDir: temp, fs: fs)
+            let holder = try holderSource(item: item)
+            let taint = source ?? holder
+            let id = UUID().uuidString
+            let vault = Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths))
+            let data = Data(diff.patch.utf8)
+            let written = try vault.write(data, area: .snapshots, name: "\(id).patch")
+            do {
+                try writer.write { db in
+                    try RefSnapshot(id: id, companyId: companyId, kind: RefSnapshot.worktreeDiff, cacheKey: messageRefId,
+                                    vaultPath: written.path, sha256: written.sha256, bytes: data.count, tainted: taint != nil,
+                                    taintReason: taint.map(Self.sessionReason), createdAt: Store.now()).insert(db)
+                }
+            } catch {
+                try? vault.remove(written.path)
+                throw error
+            }
+            pinned.params["snapshot"] = id
+        case .diff where !ref.isWorktree:
+            // The patch as shared, kept in the vault's diff cache (verified by its hash when read).
+            if let paths, let head = pinned.rev {
+                let git = try refGit(workspace)
+                _ = try cachedDiff(companyId: companyId, git: git, base: try git.mergeBase("main", head), head: head,
+                                   file: ref.params["file"], vault: Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths)),
+                                   taint: try refTaint(pinned, companyId: companyId))
+            }
+        default:
+            break
+        }
+        if let source { pinned.params["taint"] = source }
+        return pinned
+    }
+
+    /// The source of the item's lease holder's session taint now, if any.
+    func holderSource(item: WorkItem) throws -> String? {
+        try writer.read { db in
+            guard let holder = try Self.leaseHolderId(db: db, itemId: item.id) else { return nil }
+            return try Self.currentTaint(db: db, agentId: holder, home: dataHome)
+        }
     }
 
     // MARK: Resolution
 
-    private struct Resolution {
+    /// A resolution with what `openRef` and `pinRef` read next: the subject (for `.full` only), the company and the reader's
+    /// handle.
+    struct Resolution {
         var resolved: ResolvedRef
         var pinned: WorkRef
+        var subject: RefAccess.Subject? = nil
+        var company: Company? = nil
+        var readerHandle: String? = nil
     }
 
     /// What a `.full` object shows.
@@ -41,7 +134,7 @@ extension Store {
 
     private enum Outcome: Error { case missing, refused }
 
-    private func resolveForReader(_ ref: WorkRef, reader: Reader, companyId: String, messageRefId: String?) throws -> Resolution {
+    func resolveDetailed(_ ref: WorkRef, reader: Reader, companyId: String, messageRefId: String?) throws -> Resolution {
         let opaqueId = StableHash.fnv1a64("\(companyId)\u{0}\(messageRefId ?? UUID().uuidString)")
         func blank(_ visibility: Visibility) -> Resolution {
             let r = ResolvedRef(ref: WorkRef(kind: ref.kind, id: ""), reader: reader, visibility: visibility, title: "", subtitle: "",
@@ -62,19 +155,27 @@ extension Store {
         case .locked(let role): return blank(.locked(approverRole: role))
         case .allowed: break
         }
-        let details: Details
+        var details: Details
         do {
             details = try self.details(ref, found.subject, company: found.company, readerHandle: found.handle)
         } catch Outcome.refused {
             return blank(.refused)
-        } catch is Outcome, is SafeGitError, is SafeFSError {
+        } catch is Outcome, is SafeGitError, is SafeFSError, is VaultError {
             return blank(.missing)
         }
+        // Plan C2a: git-backed and live content carries the taint of the session that made it (`refTaint`).
+        if ref.kind == .file || ref.kind == .diff {
+            let taint = try refTaint(ref, companyId: companyId)
+            details.tainted = taint.tainted
+            details.taintReason = taint.reason
+        }
+        if let source = ref.params["taint"] { details.provenance = .external("tainted-session:\(source)") }
         let resolved = ResolvedRef(ref: ref, reader: reader, visibility: .full, title: details.title, subtitle: details.subtitle,
                                    bytes: details.bytes, provenance: details.provenance, tainted: details.tainted,
                                    taintReason: details.taintReason, accessClass: found.subject.access, newer: details.newer,
                                    state: details.state, opaqueId: opaqueId)
-        return Resolution(resolved: resolved, pinned: details.pinned)
+        return Resolution(resolved: resolved, pinned: details.pinned, subject: found.subject, company: found.company,
+                          readerHandle: found.handle)
     }
 
     private func details(_ ref: WorkRef, _ subject: RefAccess.Subject, company: Company, readerHandle: String?) throws -> Details {
@@ -153,6 +254,14 @@ extension Store {
     private func fileDetails(_ ref: WorkRef, workspace: URL, companyId: String, ownHandle: String?) throws -> Details {
         let title = Self.safe(ref.id + (ref.range.map { $0.start == $0.end ? ":\($0.start)" : ":\($0.start)-\($0.end)" } ?? ""))
         let language = Self.language(of: ref.id)
+        // A pinned worktree or `.brahma` file (C2a): the blob its share ref holds, whatever happened to the file since.
+        if let share = ref.params["share"], let blob = ref.rev {
+            let git = try refGit(workspace)
+            guard try git.shareTarget(share) == blob else { throw Outcome.missing }
+            let data = try git.catBlob(blob, binary: true)
+            let subtitle = "\(Self.lines(Self.lineCount(data))) · \(language)" + (ref.isWorktree ? " · as shared" : "")
+            return Details(title: title, subtitle: subtitle, bytes: data.count, pinned: ref)
+        }
         // `.brahma` places (labs, notes, the allowlisted children) and live worktree files: the bytes SafeFS checked.
         if ref.isWorktree || (ref.branch == nil && ref.rev == nil && ref.id.hasPrefix(".brahma/")) {
             let fs = try SafeFS(workspace: workspace, ownHandle: ref.isWorktree ? nil : ownHandle)
@@ -200,6 +309,16 @@ extension Store {
     private func diffDetails(_ ref: WorkRef, item: WorkItem, workspace: URL) throws -> Details {
         let file = ref.params["file"]
         let title = Self.safe("\(item.key) diff" + (file.map { " · \($0)" } ?? ""))
+        // A pinned worktree diff (C2a): the vault snapshot taken when it was shared.
+        if ref.isWorktree, let id = ref.params["snapshot"] {
+            guard let snapshot = try writer.read({ db in
+                try RefSnapshot.fetchOne(db, sql: """
+                    SELECT * FROM refSnapshot WHERE companyId = ? AND id = ? AND kind = ? AND purgedAt IS NULL
+                    """, arguments: [item.companyId, id, RefSnapshot.worktreeDiff])
+            }) else { throw Outcome.missing }
+            return Details(title: Self.safe(title + " (uncommitted, as shared)"), subtitle: "\(snapshot.bytes) bytes", bytes: snapshot.bytes,
+                           tainted: snapshot.tainted, taintReason: snapshot.taintReason, pinned: ref)
+        }
         if ref.isWorktree {
             let fs = try SafeFS(workspace: workspace, ownHandle: nil)
             let temp = try refTempDirectory()
@@ -227,7 +346,7 @@ extension Store {
     }
 
     /// `main` and the branches of the company's open items: what an agent-named sha must be reachable from.
-    private func reachabilityRefs(companyId: String) throws -> [String] {
+    func reachabilityRefs(companyId: String) throws -> [String] {
         let keys = try writer.read { db in
             try String.fetchAll(db, sql: """
                 SELECT key FROM workItem WHERE companyId = ? AND status IN ('inProgress', 'inReview', 'blocked')
@@ -239,11 +358,11 @@ extension Store {
 
     /// Engine git over the company workspace; its captured output goes under the data home's `tmp` (never the process temp
     /// dir when the store has a data home).
-    private func refGit(_ workspace: URL) throws -> SafeGit {
+    func refGit(_ workspace: URL) throws -> SafeGit {
         SafeGit(workspace: workspace, runner: LiveGitRunner(tempRoot: try dataHomeTmp()))
     }
 
-    private func dataHomeTmp() throws -> URL? {
+    func dataHomeTmp() throws -> URL? {
         guard let dataHome else { return nil }
         let tmp = dataHome.appending(path: "tmp", directoryHint: .isDirectory)
         try BrahmaPaths.ensurePrivateDirectory(tmp)
@@ -251,7 +370,7 @@ extension Store {
     }
 
     /// A fresh 0700 directory for one worktree diff, under the data home's `tmp`.
-    private func refTempDirectory() throws -> URL {
+    func refTempDirectory() throws -> URL {
         let root = try dataHomeTmp() ?? FileManager.default.temporaryDirectory
         let dir = root.appending(path: "ref-\(UUID().uuidString)", directoryHint: .isDirectory)
         try BrahmaPaths.ensurePrivateDirectory(dir)
