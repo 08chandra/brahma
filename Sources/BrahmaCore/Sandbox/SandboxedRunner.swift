@@ -27,6 +27,13 @@ public struct SandboxPolicy: Equatable, Sendable {
     public var readable: [URL]
     public var network: SandboxNetwork
     public var toolchain: Bool
+    /// C2b fix round 3: the most physical memory (summed footprint, bytes) the run's process group may use; past it the
+    /// runner kills the group (`GroupRun.memoryExceeded`). nil: no limit.
+    public var memoryLimit: Int? = nil
+    /// C2b fix round 3 (m-C): a deny-default profile instead of the standard allow-default one (`SeatbeltProfile`
+    /// `renderConfined`). `readable` entries are then the only trees it may read beyond the system; `writable` entries are
+    /// the runner's own (its `TMPDIR`), never written by the command.
+    public var confined: SandboxConfinement? = nil
 
     public init(writable: [URL], readable: [URL], network: SandboxNetwork, toolchain: Bool) {
         self.writable = writable; self.readable = readable; self.network = network; self.toolchain = toolchain
@@ -45,6 +52,23 @@ public struct SandboxPolicy: Equatable, Sendable {
         if case .loopbackListen(_, let ports) = network { return ports }
         return []
     }
+}
+
+/// What a confined run (`SandboxPolicy.confined`) may do besides read the system's own libraries and frameworks: run
+/// exactly these programs (and the shell `/bin/sh` runs through), read these files and list these directories, and create
+/// and write exactly these files. No network, no mach service but the run's own marker, nothing else.
+public struct SandboxConfinement: Equatable, Sendable {
+    public var executables: [URL]
+    public var readableFiles: [URL]
+    public var listableDirectories: [URL]
+    public var writableFiles: [URL]
+
+    public init(executables: [URL], readableFiles: [URL], listableDirectories: [URL], writableFiles: [URL]) {
+        self.executables = executables; self.readableFiles = readableFiles
+        self.listableDirectories = listableDirectories; self.writableFiles = writableFiles
+    }
+
+    var all: [URL] { executables + readableFiles + listableDirectories + writableFiles }
 }
 
 /// Runs agent-written commands under a sandbox policy.
@@ -233,9 +257,13 @@ enum SandboxPolicyCheck {
         guard !policy.writable.isEmpty else { throw SandboxError.invalidPath("a sandbox policy needs a writable directory") }
         let baselinePaths = [baseline.userHome] + baseline.protected + baseline.engineHomes + baseline.companyWorkspaces
             + [baseline.darwinUserTemp, baseline.darwinUserCache, baseline.darwinUserDir].compactMap { $0 }
-        for url in policy.writable + policy.readable + baselinePaths {
+        for url in policy.writable + policy.readable + baselinePaths + (policy.confined?.all ?? []) {
             if SandboxPath.isUnsafe(url.path) { throw SandboxError.unsafePathCharacter(url.path) }
             if !url.path.hasPrefix("/") { throw SandboxError.invalidPath(url.path) }
+        }
+        // A confined run's own paths are literals: each must already be resolved (no link on the way).
+        for url in policy.confined?.all ?? [] where SandboxPath.resolve(url.path) != url.path {
+            throw SandboxError.linkedPath(url.path)
         }
         let roots = [baseline.userHome] + baseline.engineHomes + [URL(fileURLWithPath: "/Volumes"), URL(fileURLWithPath: "/")]
         // The same alias/identity helper as turn scopes (`SandboxScope.checkAllowed`): no alias spelling, and overlaps judged by

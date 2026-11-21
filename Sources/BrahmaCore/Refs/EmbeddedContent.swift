@@ -28,7 +28,7 @@ enum EmbeddedContent {
                      budget: ArchiveScanBudget, level: Int, chunk: Int) throws -> [ScanFinding] {
         let archive = ArchiveMemberScan.isArchive(data, ext: ext), pdf = isPDF(data, ext: ext), png = isPNG(data)
         guard archive || pdf || png else { return [] }
-        guard level < budget.depth, !budget.expired else { throw ArchiveMemberScan.overBudget }
+        try budget.ensure(level < budget.depth)
         var found: [ScanFinding] = []
         if archive {
             found += try ArchiveMemberScan.scan(data, archives: archives, expanded: expanded, budget: budget, level: level, chunk: chunk)
@@ -75,7 +75,9 @@ enum EmbeddedContent {
     /// stream checked again.
     static func pdfFindings(_ data: Data, archives: any ArchiveReader, expanded: [(name: String, value: String)],
                             budget: ArchiveScanBudget, level: Int, chunk: Int) throws -> [ScanFinding] {
-        guard budget.bytes > 0, let left = budget.remaining else { throw ArchiveMemberScan.overBudget }
+        try budget.ensure(budget.bytes > 0)
+        try budget.launch()
+        guard let left = budget.remaining else { throw ArchiveMemberScan.outOfTime }
         let parts = try archives.pdfParts(of: data, maxBytes: budget.bytes, timeout: left)
         var total = 0, streams = 0
         for part in parts {
@@ -84,7 +86,7 @@ enum EmbeddedContent {
         }
         budget.bytes -= total
         budget.entries -= streams
-        guard budget.bytes >= 0, budget.entries >= 0, !budget.expired else { throw ArchiveMemberScan.overBudget }
+        try budget.ensure(budget.bytes >= 0 && budget.entries >= 0)
         var found: [ScanFinding] = []
         for part in parts {
             if part.kind.isStream {
@@ -132,7 +134,7 @@ enum EmbeddedContent {
             guard crc32(b[(i + 4)..<end]) == stored else { throw badPNG }
             let body = Array(b[(i + 8)..<end])
             i = end + 4
-            guard !budget.expired else { throw ArchiveMemberScan.overBudget }
+            try budget.ensure(true)
             if first {
                 guard type == "IHDR" else { throw badPNG }
                 first = false
@@ -163,7 +165,7 @@ enum EmbeddedContent {
     static func inflateChunk(_ data: Data, budget: ArchiveScanBudget) throws -> Data {
         let out = try inflateZlib(data, cap: outputCap(input: data.count, budget: budget), failure: badInflate)
         budget.bytes -= out.count
-        guard budget.bytes >= 0, !budget.expired else { throw ArchiveMemberScan.overBudget }
+        try budget.ensure(budget.bytes >= 0)
         return out
     }
 

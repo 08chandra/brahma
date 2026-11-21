@@ -288,10 +288,44 @@ final class OutputCapture: @unchecked Sendable {
     }
 }
 
+/// The physical memory footprint the system charges processes (`proc_pid_rusage`, `ri_phys_footprint`). Darwin only;
+/// elsewhere nil (no watchdog there, and no sandboxed reader either).
+enum MemoryFootprint {
+    /// The summed footprint of every process in process group `pgid`, or nil when the group can't be listed.
+    static func ofGroup(_ pgid: pid_t) -> Int? {
+        #if canImport(Darwin)
+        var pids = [pid_t](repeating: 0, count: 512)
+        let listed = pids.withUnsafeMutableBufferPointer { buffer in
+            proc_listpgrppids(pgid, buffer.baseAddress, Int32(buffer.count * MemoryLayout<pid_t>.stride))
+        }
+        guard listed >= 0 else { return nil }
+        return pids.filter { $0 > 0 }.reduce(0) { $0 + (of($1) ?? 0) }
+        #else
+        return nil
+        #endif
+    }
+
+    /// One process's footprint, or nil.
+    static func of(_ pid: pid_t) -> Int? {
+        #if canImport(Darwin)
+        var info = rusage_info_v4()
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V4, $0) }
+        }
+        return result == 0 ? Int(clamping: info.ri_phys_footprint) : nil
+        #else
+        return nil
+        #endif
+    }
+}
+
 /// The shared blocking body of `ProcessCheckRunner` and `SeatbeltRunner`: spawn into its own process group, capture the
 /// output, enforce the timeout (SIGTERM to the group, SIGKILL `termGrace` later) and cancellation (SIGKILL), sweep the
 /// group when the leader exits, and decode the outcome.
 enum GroupRun {
+    /// The last line of the tail of a run its memory limit stopped (C2b fix round 3).
+    static let memoryExceeded = "the run used more memory than it may, and was stopped"
+
     final class CancelFlag: @unchecked Sendable {
         private let lock = NSLock()
         private var value = false
@@ -314,7 +348,8 @@ enum GroupRun {
 
     static func run(executable: String, arguments: [String], workingDirectory: URL, timeout: TimeInterval, outputURL: URL,
                     environment: [String: String], termGrace: TimeInterval, clock: @Sendable () -> TimeInterval,
-                    cancel: CancelFlag, observer: ProcessGroupChild.Observer? = nil, groups: ChildGroups? = nil) -> CheckOutcome {
+                    cancel: CancelFlag, observer: ProcessGroupChild.Observer? = nil, groups: ChildGroups? = nil,
+                    memoryLimit: Int? = nil) -> CheckOutcome {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: workingDirectory.path, isDirectory: &isDir), isDir.boolValue else {
@@ -352,11 +387,17 @@ enum GroupRun {
                                     tailBytes: ProcessCheckRunner.tailChars * 4, marker: ProcessCheckRunner.truncationMarker)
 
         let deadline = clock() + timeout
-        var timedOut = false, cancelled = false
+        var timedOut = false, cancelled = false, overMemory = false
         var termSentAt: TimeInterval?, killSent = false
         while !child.hasExited() {
             let now = clock()
             if cancel.isSet && !cancelled { cancelled = true; child.signalGroup(SIGKILL); killSent = true }
+            // The memory watchdog (C2b fix round 3): the group's summed footprint, every 10 ms; past the limit, SIGKILL.
+            if let memoryLimit, !overMemory, let used = MemoryFootprint.ofGroup(child.pid), used > memoryLimit {
+                overMemory = true
+                child.signalGroup(SIGKILL)
+                killSent = true
+            }
             if !timedOut && !cancelled && now >= deadline {
                 timedOut = true
                 child.signalGroup(SIGTERM)
@@ -372,6 +413,7 @@ enum GroupRun {
         let status = child.finish()
         let tail = tailText(capture.finish(drain: 2))
 
+        if overMemory { return CheckOutcome(exitCode: nil, timedOut: false, tail: (tail.isEmpty ? "" : tail + "\n") + memoryExceeded) }
         if cancelled { return CheckOutcome(exitCode: nil, timedOut: false, tail: tail) }
         if timedOut { return CheckOutcome(exitCode: nil, timedOut: true, tail: tail) }
         // Its exit was lost (reaped from under us): inconclusive, never a pass (B-M1).

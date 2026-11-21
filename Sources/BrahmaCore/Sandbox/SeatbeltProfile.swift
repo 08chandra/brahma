@@ -109,6 +109,10 @@ public enum SeatbeltProfile {
     /// Baseline paths are always resolved (they are the engine's own).
     public static func render(policy: SandboxPolicy, baseline: SandboxBaseline, proxyPort: UInt16?, marker: String? = nil,
                               resolvePolicyPaths: Bool = true) -> String {
+        if let confinement = policy.confined {
+            return renderConfined(confinement, readable: policy.readable.map { resolvePolicyPaths ? SandboxPath.resolve($0.path) : $0.path },
+                                  marker: marker)
+        }
         func r(_ url: URL) -> String { SandboxPath.resolve(url.path) }
         func checked(_ url: URL) -> String { resolvePolicyPaths ? r(url) : url.path }
         func subpath(_ p: String) -> String { "(subpath \(quote(p)))" }
@@ -250,6 +254,48 @@ public enum SeatbeltProfile {
             lines.append("(allow network-bind network-inbound " + ports.map { "(local ip \(quote("localhost:\($0)")))" }.joined(separator: " ") + ")")
             lines.append("(allow network-outbound " + ports.map { "(remote ip \(quote("localhost:\($0)")))" }.joined(separator: " ") + ")")
         }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// The system places a confined run reads (and maps code from): the dynamic linker's and every framework's.
+    static let confinedSystemReads = ["/System", "/usr/lib", "/usr/share", "/Library/Apple", "/private/var/db/timezone"]
+
+    /// C2b fix round 3 (m-C): a deny-default profile for one engine helper (the PDF reader), written out in full (no system
+    /// profile imported):
+    /// - run only `confinement.executables`, `/bin/sh` and the shell `/bin/sh` hands off to (`/private/var/select/sh`);
+    ///   fork (the shell's pipeline);
+    /// - read the system's libraries, frameworks and their data (`confinedSystemReads`), `/` and the few devices and
+    ///   files libSystem opens, the programs above, `confinement.readableFiles` and `listableDirectories` (the directory
+    ///   itself), and every tree in `readable`; stat only the ancestors of those paths;
+    /// - map code only from the system's frameworks and libraries and the programs above;
+    /// - write only `confinement.writableFiles` (and `/dev/null`, its own descriptors);
+    /// - no network, no IPC, no mach service except the run's marker (`marker`), no signals but to itself.
+    static func renderConfined(_ confinement: SandboxConfinement, readable: [String], marker: String?) -> String {
+        func literal(_ p: String) -> String { "(literal \(quote(p)))" }
+        func subpath(_ p: String) -> String { "(subpath \(quote(p)))" }
+        var programs = ["/bin/sh"] + confinement.executables.map(\.path)
+        let shell = SandboxPath.resolve("/private/var/select/sh")
+        if shell != "/private/var/select/sh" { programs.append(shell) }
+        var seen = Set<String>()
+        programs = programs.filter { seen.insert($0).inserted }
+        let files = confinement.readableFiles.map(\.path) + confinement.listableDirectories.map(\.path)
+        let writes = confinement.writableFiles.map(\.path)
+        var lines = ["(version 1)", "(deny default)"]
+        lines.append("(allow process-exec " + programs.map(literal).joined(separator: " ") + ")")
+        lines.append("(allow process-fork)")
+        lines.append("(allow signal (target self))")
+        lines.append("(allow sysctl-read)")
+        lines.append("(allow system-fcntl (fcntl-command F_ADDFILESIGS_RETURN F_CHECK_LV F_GETPATH))")
+        let ancestors = (programs + files + writes + readable).map { "(path-ancestors \(quote($0)))" }
+        lines.append("(allow file-read-metadata " + (["/private", "/private/var", "/private/tmp", "/private/etc", "/tmp", "/var", "/etc"].map(literal)
+            + ancestors).joined(separator: " ") + ")")
+        lines.append("(allow file-read* " + ([literal("/")] + confinedSystemReads.map(subpath)
+            + ["/private/etc/localtime", "/dev/urandom", "/dev/random", "/private/var/select/sh"].map(literal)
+            + (programs + files).map(literal) + readable.map(subpath)).joined(separator: " ") + ")")
+        lines.append("(allow file-map-executable (subpath \"/System\") (subpath \"/usr/lib\") " + programs.map(literal).joined(separator: " ") + ")")
+        lines.append("(allow file-read-data file-write-data (literal \"/dev/null\") (subpath \"/dev/fd\"))")
+        if !writes.isEmpty { lines.append("(allow file-write* " + writes.map(literal).joined(separator: " ") + ")") }
+        if let marker { lines.append("(allow mach-lookup (global-name \(quote(marker))))") }
         return lines.joined(separator: "\n") + "\n"
     }
 

@@ -163,7 +163,7 @@ public struct SeatbeltRunner: SandboxedRunner {
         var result = GroupRun.run(executable: Self.sandboxExec, arguments: prepared.arguments,
                                   workingDirectory: cwd, timeout: seconds, outputURL: outputURL,
                                   environment: prepared.environment, termGrace: grace, clock: clock, cancel: cancel,
-                                  groups: groups)
+                                  groups: groups, memoryLimit: policy.memoryLimit)
         // B-I4: kill anything the run left behind, recognized by the run's marker (even if it deleted its
         // checkout). N2: killed stragglers leave the outcome as it is (tools that daemonize are normal) and are
         // reported; only ones that could not be killed or classified, or an unreadable process table, make the

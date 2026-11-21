@@ -3,6 +3,9 @@ import Foundation
 #if canImport(PDFKit)
 import PDFKit
 #endif
+#if canImport(Compression)
+import Compression
+#endif
 @testable import BrahmaCore
 
 /// Builds real PDFs for the gate's tests: objects numbered from 1 with a classic cross-reference table whose offsets are
@@ -100,6 +103,74 @@ enum PDFBuild {
             + Data("\nendobj\nstartxref\n\(xref)\n%%EOF\n".utf8)
         return out
     }
+
+    /// The offset the last `startxref` of `pdf` names.
+    static func lastStartxref(_ pdf: Data) -> Int {
+        String(decoding: pdf.suffix(64), as: UTF8.self).components(separatedBy: "startxref\n").last?
+            .split(separator: "\n").first.flatMap { Int($0) } ?? 0
+    }
+
+    /// `base` plus an incremental update holding `objects` (number, body), whose cross-reference section also maps each
+    /// `aliases` number to the offset of the object `aliases[n]` (two numbers, one object).
+    static func update(_ base: Data, objects: [(Int, Data)], aliases: [Int: Int] = [:]) -> Data {
+        var out = base
+        var offsets: [Int: Int] = [:]
+        for (n, body) in objects {
+            offsets[n] = out.count
+            out += Data("\(n) 0 obj\n".utf8) + body + Data("\nendobj\n".utf8)
+        }
+        for (n, target) in aliases { offsets[n] = offsets[target] }
+        let xref = out.count
+        var table = "xref\n0 1\n0000000000 65535 f \n"
+        for n in offsets.keys.sorted() { table += "\(n) 1\n\(pad10(offsets[n] ?? 0)) 00000 n \n" }
+        let size = max(objects.map(\.0).max() ?? 0, aliases.keys.max() ?? 0) + 1
+        table += "trailer\n<< /Size \(size) /Root 1 0 R /Prev \(lastStartxref(base)) >>\nstartxref\n\(xref)\n%%EOF\n"
+        return out + Data(table.utf8)
+    }
+
+    /// zlib (RFC 1950) bytes of `count` zero bytes, compressed in 1 MiB steps: a decompression bomb, never held whole.
+    static func zeroBomb(_ count: Int) -> Data {
+        #if canImport(Compression)
+        let step = 1 << 20
+        let zeros = [UInt8](repeating: 0, count: step)
+        let dst = UnsafeMutablePointer<UInt8>.allocate(capacity: step)
+        defer { dst.deallocate() }
+        var stream = compression_stream(dst_ptr: dst, dst_size: 0, src_ptr: UnsafePointer(dst), src_size: 0, state: nil)
+        guard compression_stream_init(&stream, COMPRESSION_STREAM_ENCODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else { return Data() }
+        defer { compression_stream_destroy(&stream) }
+        var out = Data([0x78, 0x9C])
+        var left = count
+        zeros.withUnsafeBufferPointer { src in
+            while true {
+                let n = min(left, step)
+                left -= n
+                let flags = left == 0 ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
+                stream.src_ptr = src.baseAddress!
+                stream.src_size = n
+                var status = COMPRESSION_STATUS_OK
+                repeat {
+                    stream.dst_ptr = dst
+                    stream.dst_size = step
+                    status = compression_stream_process(&stream, flags)
+                    out.append(dst, count: step - stream.dst_size)
+                } while status == COMPRESSION_STATUS_OK && (stream.src_size > 0 || (flags != 0 && stream.dst_size == 0))
+                if left == 0 || status != COMPRESSION_STATUS_OK { break }
+            }
+        }
+        let a: UInt32 = 1, b = UInt32(count % 65521)
+        let adler = b << 16 | a
+        out.append(contentsOf: [UInt8(adler >> 24), UInt8((adler >> 16) & 0xFF), UInt8((adler >> 8) & 0xFF), UInt8(adler & 0xFF)])
+        return out
+        #else
+        return Data()
+        #endif
+    }
+
+    /// A one-page PDF whose content stream inflates to 768 MiB of zeros (about 0.8 MB on disk).
+    static let memoryBomb: Data = {
+        let z = zeroBomb(768 << 20)
+        return build(page(stream("<< /Length \(z.count) /Filter /FlateDecode >>", z)))
+    }()
 
     /// `pdf` saved by PDFKit with an owner password and `user` as the user password (empty: anyone opens it).
     static func encrypted(_ pdf: Data, user: String) -> Data? {
@@ -308,7 +379,8 @@ struct SeededBytes {
         let stray = PDFBuild.build(PDFBuild.page(PDFBuild.stream("<< /Length \(plain.count) /Filter /FlateDecode >>", plain)),
                                    junk: (before: 5, data: Data("stream\n".utf8) + z + Data("\nendstream\n".utf8)))
         #expect(throws: Self.unaccounted) { try check(cf, stray, canonical: "stray.pdf", archives: reader) }
-        // An earlier revision's stream, replaced by an incremental update: still in the file, refused.
+        // An earlier revision's stream, replaced by an incremental update: still in the file. Round 3: every revision is
+        // read, so the value in it is caught.
         let original = PDFBuild.build(PDFBuild.page(PDFBuild.stream("<< /Length \(z.count) /Filter /FlateDecode >>", z)))
         let previous = String(decoding: original.suffix(40), as: UTF8.self).components(separatedBy: "startxref\n").last?
             .split(separator: "\n").first.flatMap { Int($0) } ?? 0
@@ -317,7 +389,7 @@ struct SeededBytes {
         updated += Data("4 0 obj\n".utf8) + PDFBuild.stream("<< /Length \(plain.count) /Filter /FlateDecode >>", plain) + Data("\nendobj\n".utf8)
         let xref = updated.count
         updated += Data("xref\n4 1\n\(PDFBuild.pad10(at)) 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R /Prev \(previous) >>\nstartxref\n\(xref)\n%%EOF\n".utf8)
-        #expect(throws: Self.unaccounted) { try check(cf, updated, canonical: "revised.pdf", archives: reader) }
+        #expect(throws: Self.refusal("revised.pdf")) { try check(cf, updated, canonical: "revised.pdf", archives: reader) }
         // A filter nobody knows, and a Flate stream that is not zlib.
         let unknown = PDFBuild.build(PDFBuild.page(PDFBuild.stream("<< /Length 6 /Filter /MadeUpDecode >>", Data("opaque".utf8))))
         #expect(throws: Self.undecodable) { try check(cf, unknown, canonical: "odd.pdf", archives: reader) }
@@ -415,7 +487,6 @@ struct SeededBytes {
         #expect(try scripted(ScriptedRunner(parts: good, status: "0", outcome: ok)).parts(of: pdf, maxBytes: 1_000_000).count == 2)
         let cases: [(String, ScriptedRunner)] = [
             ("killed", ScriptedRunner(parts: Data(), status: "137", outcome: ok)),
-            ("timed out", ScriptedRunner(parts: good, status: nil, outcome: CheckOutcome(exitCode: nil, timedOut: true, tail: ""))),
             ("crashed", ScriptedRunner(parts: Data("BRAHMA-PDF/1\n".utf8), status: "139", outcome: ok)),
             ("shell failed", ScriptedRunner(parts: good, status: "0", outcome: CheckOutcome(exitCode: 1, timedOut: false, tail: ""))),
             ("no status", ScriptedRunner(parts: good, status: nil, outcome: ok)),
@@ -429,6 +500,17 @@ struct SeededBytes {
         for (name, runner) in cases {
             #expect(throws: SandboxedPDFReader.unreadable, "\(name)") { try scripted(runner).parts(of: pdf, maxBytes: 1_000_000) }
         }
+        // Round 3: a run that timed out, could not start, or was stopped for its memory says so (and is not cached).
+        #expect(throws: SandboxedPDFReader.tooLong) {
+            try scripted(ScriptedRunner(parts: good, status: nil, outcome: CheckOutcome(exitCode: nil, timedOut: true, tail: ""))).parts(of: pdf, maxBytes: 1_000_000)
+        }
+        #expect(throws: SandboxedPDFReader.couldNotRun) {
+            try scripted(ScriptedRunner(parts: nil, status: nil, outcome: CheckOutcome(exitCode: nil, timedOut: false, tail: "could not run"))).parts(of: pdf, maxBytes: 1_000_000)
+        }
+        #expect(throws: SandboxedPDFReader.tooMuchMemory) {
+            try scripted(ScriptedRunner(parts: nil, status: nil, outcome: CheckOutcome(exitCode: nil, timedOut: false, tail: GroupRun.memoryExceeded))).parts(of: pdf, maxBytes: 1_000_000)
+        }
+        #expect(throws: SandboxedPDFReader.tooMuchMemory) { try scripted(ScriptedRunner(parts: Data(), status: "9", outcome: ok)).parts(of: pdf, maxBytes: 1000) }
         // The helper's own answers.
         #expect(throws: SandboxedPDFReader.encrypted) { try scripted(ScriptedRunner(parts: Data(), status: "3", outcome: ok)).parts(of: pdf, maxBytes: 1000) }
         #expect(throws: SandboxedPDFReader.undecodable) { try scripted(ScriptedRunner(parts: Data(), status: "4", outcome: ok)).parts(of: pdf, maxBytes: 1000) }
@@ -447,14 +529,14 @@ struct SeededBytes {
         // The real sandbox: a helper that never finishes is killed at the time limit, and refused.
         guard Toolchain.seatbeltAvailable else { return }
         let home = try Scratch.homeDir().resolvedForSandbox
-        let script = try FakeTools.script("slow-pdf-helper", "exec /bin/sleep 30").resolvedForSandbox
+        let script = try FakeTools.script("slow-pdf-helper", "while :; do :; done").resolvedForSandbox
         let sbPaths = BrahmaPaths(home: home.appending(path: "home"), workspaces: home.appending(path: "ws"))
         let sbVault = Vault(paths: sbPaths, companyId: cf.c.id, content: ContentVault(paths: sbPaths))
         let slow = SandboxedPDFReader(runner: SeatbeltRunner(baseline: {
             SandboxBaseline.current(paths: sbPaths, otherWorkspaces: [], backupTargets: [])
         }, proxies: EgressProxyPool()), helper: script, scratch: { try sbVault.makeTempDir() })
         let started = AwakeTime.uptime()
-        #expect(throws: SandboxedPDFReader.unreadable) { try slow.parts(of: pdf, maxBytes: 1_000_000, timeout: .seconds(2)) }
+        #expect(throws: SandboxedPDFReader.tooLong) { try slow.parts(of: pdf, maxBytes: 1_000_000, timeout: .seconds(2)) }
         #expect(AwakeTime.uptime() - started < 25)
         #expect(try FileManager.default.contentsOfDirectory(atPath: sbPaths.tmpDir.path).isEmpty)
     }
@@ -588,6 +670,177 @@ struct SeededBytes {
             let slice = input[input.startIndex.advanced(by: 2)...]
             _ = try? EmbeddedContent.pngTexts(slice, budget: ArchiveScanBudget())
             _ = ArchiveMemberScan.isArchive(slice, ext: "bin")
+        }
+    }
+
+    // MARK: Fix round 3
+
+    /// R3-1 (C-1): every revision of the file is read. The reviewer's `rev_dup`: revision 1 draws an AWS key, an update
+    /// replaces that content and maps a second object number to the new object (so a count by cross-reference entries
+    /// would come out even): refused. `rev_noalias`, the same update without the alias: the key in revision 1 is caught. Two bodies of one
+    /// object in a single revision leave one that no revision reaches: refused.
+    @Test func everyRevisionRead() throws {
+        guard Self.helperReady else { return }
+        let cf = try CollabFixture()
+        let reader = try Self.reader(cf)
+        let secret = PDFBuild.zlib(PDFBuild.text("key \(Self.aws)"))
+        let clean = PDFBuild.zlib(PDFBuild.text("hello"))
+        let revision1 = PDFBuild.build(PDFBuild.page(PDFBuild.stream("<< /Filter /FlateDecode /Length \(secret.count) >>", secret)))
+        let newContent = PDFBuild.stream("<< /Filter /FlateDecode /Length \(clean.count) >>", clean)
+        let aliased = PDFBuild.update(revision1, objects: [(4, newContent)], aliases: [6: 4])
+        let plain = PDFBuild.update(revision1, objects: [(4, newContent)])
+        #expect(!String(decoding: aliased, as: UTF8.self).contains(Self.aws))
+        // Two numbers naming one object: refused (the alias is what let one stream stand in for the hidden one).
+        #expect(throws: Self.unaccounted) { try check(cf, aliased, canonical: "rev_dup.pdf", archives: reader) }
+        #expect(throws: SecretGateTests.decodedRefusal("rev_noalias.pdf", "aws-key")) { try check(cf, plain, canonical: "rev_noalias.pdf", archives: reader) }
+        // A stored value in revision 1 of a three-revision file.
+        let stored = PDFBuild.flate("key \(Self.value)")
+        let three = PDFBuild.update(PDFBuild.update(stored, objects: [(4, newContent)]), objects: [(5, Data("<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".utf8))])
+        #expect(throws: Self.refusal("three.pdf")) { try check(cf, three, canonical: "three.pdf", archives: reader) }
+        // Two bodies of object 4 in one revision; the cross-reference names the second.
+        let twice = PDFBuild.build(PDFBuild.page(newContent),
+                                   junk: (before: 4, data: Data("4 0 obj\n".utf8) + PDFBuild.stream("<< /Filter /FlateDecode /Length \(secret.count) >>", secret) + Data("\nendobj\n".utf8)))
+        #expect(throws: Self.unaccounted) { try check(cf, twice, canonical: "twice.pdf", archives: reader) }
+        // A clean multi-revision file passes.
+        #expect(try check(cf, PDFBuild.update(PDFBuild.flate("one"), objects: [(4, newContent)]), canonical: "edited.pdf", archives: reader) == .clean)
+    }
+
+    /// R3-2 (C-2): strings drawn by content streams outside the page text (an annotation's appearance, every appearance
+    /// state, a Form XObject nothing draws, a marked-content property) are read with their escapes decoded.
+    @Test func contentStreamsOutsidePageTextScanned() throws {
+        guard Self.helperReady else { return }
+        let cf = try CollabFixture()
+        let reader = try Self.reader(cf)
+        let octal = "(key \\163\\153\\137test\\137\\065\\061abcdefgh) Tj"
+        func form(_ ops: String, font: Int = 6) -> Data {
+            let body = Data("BT /F1 14 Tf 2 6 Td \(ops) ET".utf8)
+            return PDFBuild.stream("<< /Type /XObject /Subtype /Form /BBox [0 0 280 30] /Resources << /Font << /F1 \(font) 0 R >> >> /Length \(body.count) >>", body)
+        }
+        func annotated(_ ap: String, extra: [Data] = []) -> Data {
+            PDFBuild.build([Data("<< /Type /Catalog /Pages 2 0 R >>".utf8), Data("<< /Type /Pages /Kids [3 0 R] /Count 1 >>".utf8),
+                            Data("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Annots [4 0 R] >>".utf8),
+                            Data("<< /Type /Annot /Subtype /Stamp /Rect [10 40 290 70] /F 4 /AP \(ap) >>".utf8),
+                            form(octal), Data("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".utf8)] + extra)
+        }
+        let annot = annotated("<< /N 5 0 R >>")
+        #expect(!String(decoding: annot, as: UTF8.self).contains(Self.value))
+        #expect(throws: Self.refusal("annot.pdf")) { try check(cf, annot, canonical: "annot.pdf", archives: reader) }
+        // An appearance state (`/D << /Down … >>`) other than the normal one.
+        let states = annotated("<< /N 7 0 R /D << /Down 5 0 R >> >>", extra: [form("(hello) Tj")])
+        #expect(throws: Self.refusal("states.pdf")) { try check(cf, states, canonical: "states.pdf", archives: reader) }
+        // A Form XObject nothing draws.
+        let page = PDFBuild.zlib(PDFBuild.text("hello"))
+        let unused = PDFBuild.build(PDFBuild.page(PDFBuild.stream("<< /Length \(page.count) /Filter /FlateDecode >>", page)) + [form(octal, font: 5)])
+        #expect(throws: Self.refusal("unused.pdf")) { try check(cf, unused, canonical: "unused.pdf", archives: reader) }
+        // A marked-content property (`/ActualText`) in the page's own content.
+        let marked = Data("/Span << /ActualText (\\163k_test_51abcdefgh) >> BDC BT /F1 12 Tf 72 700 Td (x) Tj ET EMC".utf8)
+        let actual = PDFBuild.build(PDFBuild.page(PDFBuild.stream("<< /Length \(marked.count) >>", marked)))
+        #expect(throws: Self.refusal("actual.pdf")) { try check(cf, actual, canonical: "actual.pdf", archives: reader) }
+        // A clean annotation passes.
+        let fine = PDFBuild.build([Data("<< /Type /Catalog /Pages 2 0 R >>".utf8), Data("<< /Type /Pages /Kids [3 0 R] /Count 1 >>".utf8),
+                                   Data("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Annots [4 0 R] >>".utf8),
+                                   Data("<< /Type /Annot /Subtype /Stamp /Rect [10 40 290 70] /F 4 /AP << /N 5 0 R >> >>".utf8),
+                                   form("(\\150ello) Tj"), Data("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".utf8)])
+        #expect(try check(cf, fine, canonical: "fine-annot.pdf", archives: reader) == .clean)
+    }
+
+    /// R3-3 (I-1): a PDF that inflates past the memory limit is stopped and refused well inside the time limit, by the
+    /// engine's watchdog (the run's process group's footprint) and, on its own, by the helper's self-check.
+    @Test(.timeLimit(.minutes(5))) func memoryBombStopped() throws {
+        guard Self.helperReady else { return }
+        let cf = try CollabFixture()
+        let bomb = PDFBuild.memoryBomb
+        #expect(bomb.count < 2_000_000)
+        let home = try Scratch.homeDir().resolvedForSandbox
+        let sbPaths = BrahmaPaths(home: home.appending(path: "home"), workspaces: home.appending(path: "ws"))
+        let sbVault = Vault(paths: sbPaths, companyId: cf.c.id, content: ContentVault(paths: sbPaths))
+        func reader(engine: Int, helper: Int) -> SandboxedPDFReader {
+            SandboxedPDFReader(runner: SeatbeltRunner(baseline: { SandboxBaseline.current(paths: sbPaths, otherWorkspaces: [], backupTargets: []) },
+                                                      proxies: EgressProxyPool()),
+                               helper: Self.helper, scratch: { try sbVault.makeTempDir() }, memoryLimit: engine, helperMemoryLimit: helper)
+        }
+        var started = AwakeTime.uptime()
+        #expect(throws: SandboxedPDFReader.tooMuchMemory, "the engine's watchdog") {
+            try reader(engine: 256 << 20, helper: 64 << 30).parts(of: bomb, maxBytes: ArchiveLimits.maxBytes)
+        }
+        #expect(AwakeTime.uptime() - started < 30)
+        started = AwakeTime.uptime()
+        #expect(throws: SandboxedPDFReader.tooMuchMemory, "the helper's self-check") {
+            try reader(engine: 64 << 30, helper: 256 << 20).parts(of: bomb, maxBytes: ArchiveLimits.maxBytes)
+        }
+        #expect(AwakeTime.uptime() - started < 30)
+        // Through the gate, with the standard 1 GiB limit.
+        #expect(throws: WorkError.invalid("this PDF needs too much memory to scan for secrets")) {
+            try check(cf, bomb, canonical: "bomb.pdf", archives: try Self.reader(cf))
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: sbPaths.tmpDir.path).isEmpty)
+    }
+
+    /// R3-6 (m-B): `stream` followed straight by its data (no end of line) is still a stream keyword: one the reader
+    /// drops is data no walk reaches, refused.
+    @Test func streamWithoutEndOfLineRefused() throws {
+        guard Self.helperReady else { return }
+        let cf = try CollabFixture()
+        let reader = try Self.reader(cf)
+        let z = PDFBuild.zlib(PDFBuild.text("key \(Self.aws)"))
+        let noEOL = PDFBuild.build(PDFBuild.page(Data("<< /Filter /FlateDecode /Length \(z.count) >>\nstream".utf8) + z + Data("\nendstream".utf8)))
+        #expect(throws: WorkError.self) { try check(cf, noEOL, canonical: "noeol.pdf", archives: reader) }
+        let space = PDFBuild.build(PDFBuild.page(Data("<< /Filter /FlateDecode /Length \(z.count) >>\nstream ".utf8) + z + Data("\nendstream".utf8)))
+        #expect(throws: WorkError.self) { try check(cf, space, canonical: "space.pdf", archives: reader) }
+    }
+
+    /// R3-7 (m-C): the helper runs under a deny-default profile: it may run only the pipeline's programs, read only the
+    /// system, its own binary and the one input, write only its two outputs, and reach no network or mach service but the
+    /// run's own marker. Probes run AS the helper show each denial; real PDFs on this Mac still read.
+    @Test func helperProfileIsDenyDefault() throws {
+        let cf = try CollabFixture()
+        let held = URL(fileURLWithPath: "/private/tmp/held"), out = URL(fileURLWithPath: "/private/tmp/out")
+        let policy = SandboxedPDFReader.policy(helper: URL(fileURLWithPath: "/opt/h/brahma-pdf"), held: held, out: out, memoryLimit: 1 << 30)
+        let profile = SeatbeltProfile.render(policy: policy, baseline: SandboxBaseline.current(paths: cf.paths, otherWorkspaces: [], backupTargets: []),
+                                             proxyPort: nil, marker: "dev.brahma.run.test")
+        #expect(profile.contains("(deny default)") && !profile.contains("(allow default)"))
+        #expect(!profile.contains("network-outbound") && !profile.contains("network-bind"))
+        #expect(profile.contains("(allow mach-lookup (global-name \"dev.brahma.run.test\"))"))
+        #expect(profile.components(separatedBy: "mach-lookup").count == 2)
+        #expect(profile.contains("(literal \"/opt/h/brahma-pdf\")") && profile.contains("(literal \"/private/tmp/out/parts\")"))
+        #expect(!profile.contains("(allow file-write* (subpath"))
+        #expect(policy.memoryLimit == 1 << 30)
+        guard Toolchain.seatbeltAvailable else { return }
+        let home = try Scratch.homeDir().resolvedForSandbox
+        let sbPaths = BrahmaPaths(home: home.appending(path: "home"), workspaces: home.appending(path: "ws"))
+        let sbVault = Vault(paths: sbPaths, companyId: cf.c.id, content: ContentVault(paths: sbPaths))
+        let outside = home.appending(path: "outside.txt")
+        try Data("not for the helper\n".utf8).write(to: outside)
+        // Each probe prints a valid, empty helper output only when the action it tries was denied.
+        let empty = #"printf 'BRAHMA-PDF/1\nE\000\000\000\010\000\000\000\000\000\000\000\000'"#
+        let probes: [(String, String)] = [
+            ("read a file outside", "if read line < '\(outside.path)'; then exit 1; fi"),
+            ("read /etc", "if read line < /private/etc/hosts; then exit 1; fi"),
+            ("run another program", "if /bin/cat /dev/null; then exit 1; fi"),
+            ("write outside its outputs", "if : > '\(home.appending(path: "written.txt").path)'; then exit 1; fi"),
+            ("open a network connection", "if exec 3<>/dev/tcp/127.0.0.1/22; then exit 1; fi"),
+        ]
+        for (name, probe) in probes {
+            let script = try FakeTools.script("pdf-probe-\(name.replacingOccurrences(of: " ", with: "-").replacingOccurrences(of: "/", with: ""))", "\(probe) 2>/dev/null\n\(empty)").resolvedForSandbox
+            let probeReader = SandboxedPDFReader(runner: SeatbeltRunner(baseline: {
+                SandboxBaseline.current(paths: sbPaths, otherWorkspaces: [], backupTargets: [])
+            }, proxies: EgressProxyPool()), helper: script, scratch: { try sbVault.makeTempDir() })
+            #expect(throws: Never.self, "\(name) was not denied") { _ = try probeReader.parts(of: PDFBuild.flate("probe"), maxBytes: 10_000) }
+        }
+        #expect(!FileManager.default.fileExists(atPath: home.appending(path: "written.txt").path))
+        // Real PDFs on this Mac still read under it.
+        guard Self.helperReady else { return }
+        let reader = try Self.reader(cf)
+        let places = ["/System/Library/ProductDocuments/ProductGuides", "/System/Library/Audio/MIDI Devices/Generic/Images",
+                      "/System/Library/CoreServices/OSDUIHelper.app/Contents/Resources", "/System/Library/CoreServices/ScriptMonitor.app/Contents/Resources",
+                      "/System/Library/CoreServices/SystemUIServer.app/Contents/Resources", "/System/Library/QuickLook/iWork.qlgenerator/Contents/Resources"]
+        var read = 0
+        for place in places {
+            for name in ((try? FileManager.default.contentsOfDirectory(atPath: place)) ?? []).sorted() where name.hasSuffix(".pdf") && read < 30 {
+                guard let data = FileManager.default.contents(atPath: place + "/" + name) else { continue }
+                #expect(try check(cf, data, canonical: name, archives: reader) == .clean, "\(name)")
+                read += 1
+            }
         }
     }
 }

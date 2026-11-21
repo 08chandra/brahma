@@ -92,6 +92,10 @@ public enum ArchiveMemberScan {
     static let incomplete = ArchiveReadError.refused("this archive can't be scanned for secrets")
     static let tooMany = ArchiveReadError.refused("this archive has too many files to scan for secrets")
     static let overBudget = ArchiveReadError.refused("this archive expands too much to scan for secrets")
+    /// Round 3 (m-A): more sandboxed reads than one check may launch (`ArchiveScanBudget.maxLaunches`).
+    static let tooManyLaunches = ArchiveReadError.refused("this content holds too many nested archives or PDFs to scan for secrets")
+    /// The check's time ran out (not cached: it may pass on another try).
+    static let outOfTime = ArchiveReadError.refused("this content took too long to scan for secrets")
     static let unscannableMethod = ArchiveReadError.refused("this archive uses compression or encryption that can't be scanned for secrets")
 
     /// Bytes that hold a zip: an end record within the last 64 KB + 22 bytes (where every zip reader looks), a plausible
@@ -113,20 +117,33 @@ public enum ArchiveMemberScan {
     /// JPEG, WavPack, PPMd, AES and the rest).
     static let knownMethods: Set<Int> = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 14, 16, 18, 19, 20, 93, 94, 95, 96, 97, 98, 99]
 
-    /// Whether a zip local header parses at `offset` (an index of `data`): a sane version needed (at most 6.3, a known host),
-    /// a known method, a name of at most 1 KiB, the name and extra field inside the bytes, and a compressed size that fits
-    /// in what is left (or zip64's marker, or 0 with a data descriptor). Every read is bounds-checked first.
+    /// Whether a zip local header parses at `offset` (an index of `data`), as amended ruling 32 has it: a method a zip may
+    /// use, the name and extra field inside the bytes, and data that stays inside them: a compressed size that fits in what
+    /// is left (or zip64's marker, or 0 with a data descriptor), or, deflated, data that decodes whatever size is declared.
+    /// The version and the name's length play no part (they only limit what a reader accepts). Every read is bounds-checked
+    /// first.
     static func plausibleLocalHeader(_ data: Data, at offset: Data.Index) -> Bool {
         guard offset >= data.startIndex, data.endIndex - offset >= 30 else { return false }
         func u16(_ k: Int) -> Int { Int(data[offset + k]) | Int(data[offset + k + 1]) << 8 }
         func u32(_ k: Int) -> Int { u16(k) | u16(k + 2) << 16 }
-        let version = u16(4), flags = u16(6), method = u16(8)
+        let flags = u16(6), method = u16(8)
         let compressed = u32(18), nameLength = u16(26), extraLength = u16(28)
-        guard version & 0xFF <= 63, version >> 8 <= 30, knownMethods.contains(method), nameLength <= 1024 else { return false }
+        guard knownMethods.contains(method) else { return false }
         let left = data.endIndex - offset - 30 - nameLength - extraLength
         guard left >= 0 else { return false }
-        if compressed == 0xFFFF_FFFF || (compressed == 0 && flags & 0x08 != 0) { return true }
-        return compressed <= left
+        if compressed == 0xFFFF_FFFF || (compressed == 0 && flags & 0x08 != 0) || compressed <= left { return true }
+        // A deflated entry whose declared size runs past the bytes still counts when its data decodes (a reader may go by
+        // the stream, not the size): a probe of at most 64 KiB of output.
+        guard method == 8 else { return false }
+        let start = offset + 30 + nameLength + extraLength
+        do {
+            _ = try EmbeddedContent.inflateRaw(Data(data[start...]), cap: 1 << 16, failure: ArchiveReadError.unreadable)
+            return true
+        } catch let e as ArchiveReadError {
+            return e == overBudget   // it went on decoding past the probe
+        } catch {
+            return false
+        }
     }
 
     /// The compressed format whose magic `data` starts with, among those the engine can't open: gzip, bzip2, xz, zstd, 7z,
@@ -169,7 +186,7 @@ public enum ArchiveMemberScan {
 
     static func scan(_ data: Data, archives: any ArchiveReader, expanded: [(name: String, value: String)],
                      budget: ArchiveScanBudget, level: Int, chunk: Int) throws -> [ScanFinding] {
-        guard level < budget.depth, !budget.expired else { throw overBudget }
+        try budget.ensure(level < budget.depth)
         let entries: [ZipInventory.Entry]
         do { entries = try ZipInventory.entries(of: data) } catch { throw ArchiveReadError.unreadable }
         let files = entries.filter { !isDirectoryEntry($0) }
@@ -182,6 +199,7 @@ public enum ArchiveMemberScan {
         budget.entries -= files.count
         guard budget.entries >= 0, files.reduce(0, { $0 + $1.uncompressedSize }) <= budget.bytes else { throw overBudget }
         guard !files.isEmpty else { return [] }
+        try budget.launch()
         let members = try archives.members(of: data, wanted: { _ in true },
                                            limits: ArchiveLimits(bytes: budget.bytes, ratio: ArchiveLimits.maxRatio))
         // Every file entry exactly once, each with the length the directory declares: nothing the reader skipped or could
@@ -190,7 +208,7 @@ public enum ArchiveMemberScan {
         let want = files.map { "\($0.name)\u{0}\($0.uncompressedSize)" }.sorted()
         guard got == want else { throw incomplete }
         budget.bytes -= members.reduce(0) { $0 + $1.data.count }
-        guard budget.bytes >= 0, !budget.expired else { throw overBudget }
+        try budget.ensure(budget.bytes >= 0)
         var found: [ScanFinding] = []
         for member in members {
             // Refused when compressed in a format the engine can't open; scanned; opened again when it is an archive, a PDF
@@ -223,21 +241,38 @@ public enum ArchiveMemberScan {
 /// What one check may spend on everything decoded from its bytes, across every nesting level together (C2b fix rounds 1
 /// and 2): decompressed bytes (`ArchiveLimits.maxBytes`), entries (`maxEntries`: every archive member and every decoded PDF
 /// stream; one archive still holds at most `ArchiveLimits.maxMembers`), levels (`ArchiveMemberScan.maxDepth`) and awake
-/// time (`seconds`, the PDF helper's time limit included). Shared by reference: an inner level spends what the outer left.
+/// time (`seconds`, the PDF helper's time limit included), and (round 3, m-A) sandboxed reads launched (`maxLaunches`: each
+/// archive opened, each PDF read). Shared by reference: an inner level spends what the outer left.
 final class ArchiveScanBudget {
     static let maxEntries = 10_000
+    static let maxLaunches = 200
 
     var bytes: Int
     var entries: Int
+    var launches: Int
     let depth: Int
     let deadline: TimeInterval
 
     init(bytes: Int = ArchiveLimits.maxBytes, entries: Int = ArchiveScanBudget.maxEntries, depth: Int = ArchiveMemberScan.maxDepth,
-         seconds: TimeInterval = 120) {
-        self.bytes = bytes; self.entries = entries; self.depth = depth; deadline = AwakeTime.uptime() + seconds
+         seconds: TimeInterval = 120, launches: Int = ArchiveScanBudget.maxLaunches) {
+        self.bytes = bytes; self.entries = entries; self.launches = launches; self.depth = depth
+        deadline = AwakeTime.uptime() + seconds
     }
 
     var expired: Bool { AwakeTime.uptime() > deadline }
+
+    /// Throws when the time is spent (`ArchiveMemberScan.outOfTime`), else when `ok` is false (`overBudget`).
+    func ensure(_ ok: Bool) throws {
+        if expired { throw ArchiveMemberScan.outOfTime }
+        if !ok { throw ArchiveMemberScan.overBudget }
+    }
+
+    /// Spends one sandboxed read; past the cap, `tooManyLaunches`.
+    func launch() throws {
+        try ensure(true)
+        launches -= 1
+        guard launches >= 0 else { throw ArchiveMemberScan.tooManyLaunches }
+    }
 
     /// The time left, or nil once it is spent.
     var remaining: Duration? {
@@ -263,6 +298,7 @@ public final class ScanCache: @unchecked Sendable {
 
     private let lock = NSLock()
     private var entries: [String: ScanVerdict] = [:]
+    private var refusals: [String: String] = [:]
 
     public init() {}
 
@@ -274,6 +310,18 @@ public final class ScanCache: @unchecked Sendable {
         lock.withLock {
             if entries.count >= Self.maxEntries { entries.removeAll(keepingCapacity: true) }
             entries["\(version)\n\(sha256)"] = verdict
+        }
+    }
+
+    /// A refusal's message for these bytes (the ref's name as `SecretGate.refToken`), when one is cached.
+    func refusal(sha256: String, version: String) -> String? {
+        lock.withLock { refusals["\(version)\n\(sha256)"] }
+    }
+
+    func storeRefusal(sha256: String, version: String, message: String) {
+        lock.withLock {
+            if refusals.count >= Self.maxEntries { refusals.removeAll(keepingCapacity: true) }
+            refusals["\(version)\n\(sha256)"] = message
         }
     }
 }
@@ -309,11 +357,24 @@ public enum SecretGate {
         let version = chunk == ContentScan.chunkBytes
             ? cacheVersion(store: store, companyId: companyId, ext: ext, knownValues: knownValues) : nil
         let result: ScanVerdict
+        let name = shown(canonical, knownValues: knownValues)
+        if let version, let refused = ScanCache.shared.refusal(sha256: sha, version: version) {
+            throw WorkError.invalid(refused.replacingOccurrences(of: refToken, with: name))
+        }
         if let version, let cached = ScanCache.shared.result(sha256: sha, version: version) {
             result = cached
         } else {
-            result = try compute(data, ext: ext, archives: archives, knownValues: knownValues, chunk: chunk,
-                                 shown: shown(canonical, knownValues: knownValues))
+            // Round 3 (m-A): a refusal is cached like a verdict, its ref's name left out (a token stands for it), unless it
+            // may pass on another try (no reader, a reader that could not run or ran out of time).
+            do {
+                result = try compute(data, ext: ext, archives: archives, knownValues: knownValues, chunk: chunk, shown: refToken)
+            } catch let error as WorkError {
+                if let version, case .invalid(let message) = error, !transientRefusals.contains(message) {
+                    ScanCache.shared.storeRefusal(sha256: sha, version: version, message: message)
+                }
+                if case .invalid(let message) = error { throw WorkError.invalid(message.replacingOccurrences(of: refToken, with: name)) }
+                throw error
+            }
             if let version { ScanCache.shared.store(sha256: sha, version: version, verdict: result) }
         }
         if case .knownValue(let finding) = result {
@@ -322,6 +383,16 @@ public enum SecretGate {
         }
         return result
     }
+
+    /// What stands for the ref's name in a cached refusal.
+    static let refToken = "\u{1}ref\u{1}"
+
+    /// Refusals that may not hold on another try, so never cached.
+    static let transientRefusals: Set<String> = [
+        "archives can't be scanned on this machine", SandboxedPDFReader.unavailable.message, SandboxedPDFReader.couldNotRun.message,
+        SandboxedPDFReader.tooLong.message, SandboxedUnzipReader.couldNotRun.message, SandboxedUnzipReader.tooLong.message,
+        ArchiveMemberScan.outOfTime.message,
+    ]
 
     /// The cache version for bytes of `ext` in `companyId` checked against `knownValues`: nil when the secrets version
     /// can't be read (nothing is cached or reused then).
@@ -414,8 +485,12 @@ public enum SecretGate {
         let again: ScanVerdict
         do {
             again = try compute(copy, ext: ext, archives: archives, knownValues: knownValues, chunk: ContentScan.chunkBytes, shown: label)
-        } catch {
-            throw WorkError.invalid("\(label) still looks like it holds a secret after redaction, so no copy of it is made")
+        } catch let error as WorkError {
+            // Round 3 (m-D): a secret found in the copy says so; a re-check that could not be made says why.
+            if case .invalid(let message) = error, message.contains(" inside compressed or embedded content") {
+                throw WorkError.invalid("\(label) still looks like it holds a secret after redaction, so no copy of it is made")
+            }
+            throw WorkError.invalid("no redacted copy of \(label) is made: the copy couldn't be checked again (\(error.message))")
         }
         guard again == .clean else {
             throw WorkError.invalid("\(label) still looks like it holds a secret after redaction, so no copy of it is made")

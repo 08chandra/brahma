@@ -23,12 +23,16 @@ public struct PDFPart: Equatable, Sendable {
     public init(kind: Kind, data: Data) { self.kind = kind; self.data = data }
 }
 
-/// C2b fix round 2 (controller ruling 33): the engine never parses a PDF. `brahma-pdf` (PDFKit and CoreGraphics; see its
-/// `main.swift`) runs under the engine's sandbox exactly like `SandboxedUnzipReader`'s unzip: no network, read access to
-/// one private copy of the file in a vault temp directory (`scratch`) and to the helper itself, write access to one output
-/// directory, a hard time limit, and its output cut by `head -c` at the byte cap. Its exit status is recorded apart from the
-/// pipe (a `status` file), so a helper that was killed, crashed or timed out never reads as done. Its output must hold
-/// together exactly (`parse`); anything else refuses. The temp directory is removed whatever happens.
+/// C2b fix rounds 2 and 3 (controller ruling 33): the engine never parses a PDF. `brahma-pdf` (PDFKit and CoreGraphics; see
+/// its `main.swift`) runs under the engine's sandbox the way `SandboxedUnzipReader` runs unzip, on one private copy of the
+/// file in a vault temp directory (`scratch`), with:
+/// - a deny-default profile (`policy`): it may run only the shell, `head` and itself, read only the system's libraries,
+///   itself and that copy, write only its two outputs; no network, no mach service;
+/// - a hard time limit, and a memory limit (`memoryLimit`, 1 GiB) the runner's watchdog enforces on the whole run, besides
+///   the helper's own self-check (`helperMemoryLimit`);
+/// - its output cut by `head -c` at the byte cap, and its exit status recorded apart from the pipe (a `status` file).
+/// A helper that was killed, crashed, ran out of time or memory never reads as done; its output must hold together
+/// exactly (`parse`); anything else refuses. The temp directory is removed whatever happens.
 public struct SandboxedPDFReader: Sendable {
     public static let helperName = "brahma-pdf"
     public static let timeout: Duration = .seconds(60)
@@ -43,15 +47,41 @@ public struct SandboxedPDFReader: Sendable {
     static let unaccounted = ArchiveReadError.refused(
         "this PDF holds data outside its objects (an earlier revision or a stray stream), so it can't be scanned for secrets")
     static let tooMany = ArchiveReadError.refused("this PDF has too many objects to scan for secrets")
+    static let tooMuchMemory = ArchiveReadError.refused("this PDF needs too much memory to scan for secrets")
+    /// The two that may pass on another try (not cached by the gate).
+    static let tooLong = ArchiveReadError.refused("this PDF took too long to scan for secrets")
+    static let couldNotRun = ArchiveReadError.refused("the PDF reader could not run, so this PDF can't be scanned for secrets")
+    /// The most memory one read may use: the run's process group, and the helper on its own.
+    public static let memoryLimit = 1 << 30
+
+    /// The sandbox of one read: `held` (the copy) the only tree it reads besides the system; the helper, the shell and
+    /// `head` the only programs; the helper's directory listable (Foundation looks at its own bundle); `out/parts` and
+    /// `out/status` the only files it writes (`out` itself is the runner's); the memory limit.
+    static func policy(helper: URL, held: URL, out: URL, memoryLimit: Int) -> SandboxPolicy {
+        var policy = SandboxPolicy(writable: [out], readable: [held], network: .none, toolchain: false)
+        policy.confined = SandboxConfinement(executables: [URL(fileURLWithPath: "/usr/bin/head"), helper], readableFiles: [helper],
+                                             listableDirectories: [helper.deletingLastPathComponent()],
+                                             writableFiles: [out.appending(path: partsName), out.appending(path: statusName)])
+        policy.memoryLimit = memoryLimit
+        return policy
+    }
 
     let runner: any SandboxedRunner
     let helper: URL
     let scratch: @Sendable () throws -> URL
+    let memoryLimit: Int
+    let helperMemoryLimit: Int
 
     /// `helper` is the `brahma-pdf` binary (`locate`); `scratch` makes a fresh private directory for one read
     /// (`Vault.makeTempDir`).
     public init(runner: any SandboxedRunner, helper: URL, scratch: @escaping @Sendable () throws -> URL) {
+        self.init(runner: runner, helper: helper, scratch: scratch, memoryLimit: Self.memoryLimit, helperMemoryLimit: Self.memoryLimit)
+    }
+
+    /// Tests set the two memory limits apart, to see each one stop a read on its own.
+    init(runner: any SandboxedRunner, helper: URL, scratch: @escaping @Sendable () throws -> URL, memoryLimit: Int, helperMemoryLimit: Int) {
         self.runner = runner; self.helper = helper; self.scratch = scratch
+        self.memoryLimit = memoryLimit; self.helperMemoryLimit = helperMemoryLimit
     }
 
     /// `brahma-pdf` beside `executable` (the engine's own binary: the CLI, or the app's, whose bundle carries it in
@@ -81,15 +111,17 @@ public struct SandboxedPDFReader: Sendable {
         let input = heldDir.appending(path: "input.pdf").path
         let status = outDir.appending(path: Self.statusName).path
         // The helper's own status is written apart from the pipe (whose status is head's); head cuts the output at the cap.
-        let command = "{ \(q(program.path)) \(q(input)) \(maxBytes); echo $? > \(q(status)); } | /usr/bin/head -c \(maxBytes + 1) > "
+        let command = "{ \(q(program.path)) \(q(input)) \(maxBytes) \(helperMemoryLimit); echo $? > \(q(status)); } | /usr/bin/head -c \(maxBytes + 1) > "
             + q(outDir.appending(path: Self.partsName).path)
-        let policy = SandboxPolicy(writable: [outDir], readable: [heldDir, program], network: .none, toolchain: false)
+        let policy = Self.policy(helper: program, held: heldDir, out: outDir, memoryLimit: memoryLimit)
         let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
         let limit = min(timeout, Self.timeout)
         let outcome = runner.runBlocking(command: command, cwd: outDir, environment: environment, timeout: limit,
                                          outputURL: dir.appending(path: "helper.log"), policy: policy)
-        guard !outcome.timedOut, outcome.exitCode == 0,
-              let said = EngineFiles.readNoFollow(outDir.appending(path: Self.statusName), under: outDir, limit: 16),
+        if outcome.tail.hasSuffix(GroupRun.memoryExceeded) { throw Self.tooMuchMemory }
+        if outcome.timedOut { throw Self.tooLong }
+        guard let exit = outcome.exitCode else { throw Self.couldNotRun }
+        guard exit == 0, let said = EngineFiles.readNoFollow(outDir.appending(path: Self.statusName), under: outDir, limit: 16),
               let code = Int32(String(decoding: said, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)) else {
             throw Self.unreadable
         }
@@ -100,6 +132,7 @@ public struct SandboxedPDFReader: Sendable {
         case 5: throw Self.unaccounted
         case 6: throw ArchiveMemberScan.overBudget
         case 8: throw Self.tooMany
+        case 9: throw Self.tooMuchMemory
         default: throw Self.unreadable
         }
         guard let output = EngineFiles.readNoFollow(outDir.appending(path: Self.partsName), under: outDir, limit: maxBytes + 1) else {
