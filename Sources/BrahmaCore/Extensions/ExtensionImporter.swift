@@ -540,6 +540,10 @@ enum ZipInventory {
         var uncompressedSize: Int
         var isSymlink: Bool
         var isDirectory: Bool
+        /// The central directory's compression method and general-purpose flags (bit 0: encrypted). Read by Plan C's
+        /// `ArchiveMemberScan`; no other caller uses them.
+        var method: Int = 0
+        var flags: Int = 0
     }
 
     static func entries(of data: Data) throws -> [Entry] {
@@ -616,7 +620,8 @@ enum ZipInventory {
                 throw ExtensionError.message("the zip holds an entry of an unsupported file type (\(Store.flat(name, max: 80)))")
             }
             let isDirectory = name.hasSuffix("/") || type == 0o040000 || (external & 0x10) != 0
-            out.append(Entry(name: name, compressedSize: compressed, uncompressedSize: uncompressed, isSymlink: isSymlink, isDirectory: isDirectory))
+            out.append(Entry(name: name, compressedSize: compressed, uncompressedSize: uncompressed, isSymlink: isSymlink, isDirectory: isDirectory,
+                             method: method, flags: flags))
             p = nameStart + nameLength + extraLength + entryComment
         }
         guard p == cdOffset + cdSize else { throw refuse("the central directory holds more or fewer headers than the end record counts") }

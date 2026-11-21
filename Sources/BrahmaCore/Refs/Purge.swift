@@ -1,5 +1,10 @@
 import Foundation
 import GRDB
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// What the owner's purge of a ref (`Store.purge`) removed and what may still hold it. Named apart from ML's `PurgeReport
 /// { backups, transcripts }` (a resource's purge), from which `backupsFlagged` and `transcripts` are copied.
@@ -41,12 +46,18 @@ extension Store {
     /// Taint rows (`taintedCommit`) are never deleted. A purge that could not remove everything (an object git still holds,
     /// a vault file that would not go) raises an engine alert and throws `WorkError.conflict` after recording what it did, so
     /// it can be run again; it is never reported as complete.
+    ///
+    /// C2b fix round 1: the git part runs inside the company's purge fence (`PurgeFence`, which every turn start takes
+    /// shared), and the running-turn check is made again inside it, so no turn starts between the check and the prune. The
+    /// ref's name appears in messages, alerts and notices only with the stored values (`knownValues`, and the engine's
+    /// redactor) and the secret patterns redacted from it.
     public func purge(companyId: String, ref: WorkRef, contentVault: ContentVault, paths: BrahmaPaths,
-                      now: Date = Store.now()) throws -> RefPurgeReport {
+                      knownValues: [(name: String, value: String)] = [], now: Date = Store.now()) throws -> RefPurgeReport {
         guard contentVault.paths == paths else { throw WorkError.invalid("the vault belongs to another data home") }
         guard let company = try company(id: companyId) else { throw WorkError.notFound(Self.refUnavailable) }
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         let canonical = Self.unpinned(ref).canonical
+        let shown = (try? redact(SecretGate.shown(canonical, knownValues: knownValues))) ?? "a shared ref"
         let vault = Vault(paths: paths, companyId: companyId, content: contentVault)
         let blobPin = ref.kind == .file && (ref.isWorktree || (ref.branch == nil && ref.id.hasPrefix(".brahma/")))
 
@@ -98,18 +109,21 @@ extension Store {
         case .file, .diff, .commit:
             guard !rows.isEmpty || !shares.isEmpty || !snapshots.isEmpty else { throw WorkError.notFound(Self.refUnavailable) }
         default:
-            throw WorkError.invalid("only files, diffs, commits, resources and memory entries are purged here")
+            throw WorkError.invalid("items, asks, kb pages, messages and the like are live records, not shared content: there are no "
+                                    + "stored bytes to purge. Purge the file or resource they carry, or edit the record itself")
         }
         let stillInHistory = (ref.kind == .file && !blobPin) || ref.kind == .commit || (ref.kind == .diff && !ref.isWorktree)
 
-        // Git is never pruned under a running turn: refuse before anything changes.
-        if !shares.isEmpty {
+        // Git is never pruned under a running turn: refuse before anything changes (and again inside the fence, below).
+        func refuseWhileRunning() throws {
             let running = try writer.read { db in
                 try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM turn WHERE companyId = ? AND endedAt IS NULL", arguments: [companyId]) ?? 0
             }
-            guard running == 0 else {
-                throw WorkError.conflict("a turn is running in this company; purge \(Store.flat(canonical, max: 200)) when it ends")
-            }
+            guard running == 0 else { throw WorkError.conflict("a turn is running in this company; purge \(shown) when it ends") }
+        }
+        if !shares.isEmpty {
+            try refuseWhileRunning()
+            try refHooks.afterPurgeTurnCheck?()
         }
 
         // What may still hold it: backups taken since it was first shared (all of them when that is unknown), and the
@@ -121,50 +135,65 @@ extension Store {
         var problems: [String] = []
         var incomplete = false
 
-        // 2. The bytes.
-        if let resource {
-            report.vaultPaths = try writer.read { db in
-                try String.fetchAll(db, sql: """
-                    SELECT vaultPath FROM resource WHERE companyId = ? AND (id = ? OR parentId = ?) AND vaultPath IS NOT NULL AND purgedAt IS NULL
-                    ORDER BY number
-                    """, arguments: [companyId, resource.id, resource.id])
-            }
-            let ml = try purgeResource(companyId: companyId, number: resource.number, backups: backups, contentVault: contentVault,
-                                       paths: paths, now: now)
-            report.backupsFlagged = ml.backups
-            report.transcripts = ml.transcripts
-        }
-        if let memoryNumber { try ownerDeleteMemory(companyId: companyId, number: memoryNumber, now: now) }
-        for snapshot in snapshots where snapshot.purgedAt == nil {
-            try writer.write { db in
-                try db.execute(sql: "UPDATE refSnapshot SET purgedAt = ? WHERE companyId = ? AND id = ?", arguments: [now, companyId, snapshot.id])
-            }
-            do { try vault.remove(snapshot.vaultPath) } catch { problems.append("its vault copy \(snapshot.vaultPath) would not go (\(error))") }
-            report.vaultPaths.append(snapshot.vaultPath)
-        }
-
-        // 3. Git: the share refs, then the objects the engine wrote for blob pins.
+        // Steps 2 and 3, inside the fence when git is pruned.
         let shareIds = shares.keys.sorted()
-        var blobs: [String] = []
-        if blobPin {
-            for id in shareIds {
-                if let pinnedObject = shares[id], let oid = pinnedObject, oid.utf8.count == 40 || oid.utf8.count == 64 { blobs.append(oid) }
+        func removeEverything() throws {
+            // 2. The bytes.
+            if let resource {
+                report.vaultPaths = try writer.read { db in
+                    try String.fetchAll(db, sql: """
+                        SELECT vaultPath FROM resource WHERE companyId = ? AND (id = ? OR parentId = ?) AND vaultPath IS NOT NULL AND purgedAt IS NULL
+                        ORDER BY number
+                        """, arguments: [companyId, resource.id, resource.id])
+                }
+                let ml = try purgeResource(companyId: companyId, number: resource.number, backups: backups, contentVault: contentVault,
+                                           paths: paths, now: now)
+                report.backupsFlagged = ml.backups
+                report.transcripts = ml.transcripts
+            }
+            if let memoryNumber { try ownerDeleteMemory(companyId: companyId, number: memoryNumber, now: now) }
+            for snapshot in snapshots where snapshot.purgedAt == nil {
+                try writer.write { db in
+                    try db.execute(sql: "UPDATE refSnapshot SET purgedAt = ? WHERE companyId = ? AND id = ?", arguments: [now, companyId, snapshot.id])
+                }
+                do { try vault.remove(snapshot.vaultPath) } catch { problems.append("its vault copy \(snapshot.vaultPath) would not go (\(error))") }
+                report.vaultPaths.append(snapshot.vaultPath)
+            }
+
+            // 3. Git: the share refs, then the objects the engine wrote for blob pins.
+            var blobs: [String] = []
+            if blobPin {
+                for id in shareIds {
+                    if let pinnedObject = shares[id], let oid = pinnedObject, oid.utf8.count == 40 || oid.utf8.count == 64 { blobs.append(oid) }
+                }
+            }
+            if !shareIds.isEmpty {
+                do {
+                    try GitLock.withLock(paths: paths, companyId: companyId) {
+                        for id in shareIds {
+                            try git.deleteShareRef(id)
+                            report.gitRefs.append(SafeGit.sharesPrefix + id)
+                        }
+                        try git.expireAndPrune(purged: Array(Set(blobs)).sorted())
+                    }
+                } catch SafeGitError.purgeIncomplete(let remaining) {
+                    incomplete = true
+                    problems.append("\(remaining) object(s) are still in the repository (another share, a branch, an index or a worktree still holds them)")
+                } catch {
+                    problems.append("git: \(error)")
+                }
             }
         }
-        if !shareIds.isEmpty {
+        if shareIds.isEmpty {
+            try removeEverything()
+        } else {
             do {
-                try GitLock.withLock(paths: paths, companyId: companyId) {
-                    for id in shareIds {
-                        try git.deleteShareRef(id)
-                        report.gitRefs.append(SafeGit.sharesPrefix + id)
-                    }
-                    try git.expireAndPrune(purged: Array(Set(blobs)).sorted())
+                try PurgeFence.withExclusive(home: dataHome ?? refHooks.fenceHome ?? paths.home, companyId: companyId) {
+                    try refuseWhileRunning()
+                    try removeEverything()
                 }
-            } catch SafeGitError.purgeIncomplete(let remaining) {
-                incomplete = true
-                problems.append("\(remaining) object(s) are still in the repository (another share, a branch, an index or a worktree still holds them)")
-            } catch {
-                problems.append("git: \(error)")
+            } catch let e as PurgeFenceError {
+                throw WorkError.conflict("the purge of \(shown) could not start: \(e)")
             }
         }
 
@@ -187,7 +216,6 @@ extension Store {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         func json(_ list: [String]) throws -> String { String(decoding: try encoder.encode(list), as: UTF8.self) }
-        let shown = Store.flat(canonical, max: 200)
         try writer.write { db in
             var sql = "UPDATE messageRef SET state = 'purged' WHERE companyId = ? AND (canonical = ?"
             var args: StatementArguments = [companyId, canonical]
@@ -218,7 +246,7 @@ extension Store {
             }
         }
         guard problems.isEmpty else {
-            let text = "The purge of \(Store.flat(canonical, max: 120)) is incomplete: \(problems.joined(separator: "; ")). "
+            let text = "The purge of \(shown) is incomplete: \(problems.joined(separator: "; ")). "
                 + (incomplete ? "Remove what still holds it, then purge it again." : "Purge it again.")
             do {
                 try EngineAlerts.raise(store: self, text: text, now: now, reason: "purge-incomplete:\(StableHash.fnv1a64(companyId + "\u{0}" + canonical))",
@@ -229,5 +257,68 @@ extension Store {
             throw WorkError.conflict(text)
         }
         return report
+    }
+}
+
+public enum PurgeFenceError: Error, Equatable, CustomStringConvertible {
+    /// The fence stayed taken for the whole wait.
+    case timeout
+    /// The company id is not one safe path component, or the fence file could not be opened.
+    case unavailable(String)
+
+    public var description: String {
+        switch self {
+        case .timeout: "a turn is starting in this company or another purge is running; try again"
+        case .unavailable(let why): "the company's purge fence is unavailable: \(why)"
+        }
+    }
+}
+
+/// One company's purge fence (C2b fix round 1): an `flock` on `<home>/run/purge-<companyId>.lock`. A purge holds it
+/// exclusively while it checks that no turn runs and prunes git; every turn start holds it shared while it records the
+/// turn (`Store.beginTurn`, `Store.startTurn`), so a turn either is recorded before the purge's check (which then refuses)
+/// or starts after the purge. It lives under the data home, never in a workspace, so no agent can hold it.
+public enum PurgeFence {
+    public static let defaultWait = Duration.seconds(30)
+    static let pollInterval: TimeInterval = 0.02
+
+    public static func lockURL(home: URL, companyId: String) throws -> URL {
+        guard companyId.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) != nil else {
+            throw PurgeFenceError.unavailable("invalid company id")
+        }
+        return home.appending(path: "run", directoryHint: .isDirectory).appending(path: "purge-\(companyId).lock", directoryHint: .notDirectory)
+    }
+
+    /// `body` with the fence held exclusively (a purge), waiting up to `wait`; `PurgeFenceError.timeout` past it.
+    public static func withExclusive<T>(home: URL, companyId: String, wait: Duration = defaultWait, _ body: () throws -> T) throws -> T {
+        guard let value = try with(LOCK_EX, home: home, companyId: companyId, wait: wait, body) else { throw PurgeFenceError.timeout }
+        return value
+    }
+
+    /// `body` with the fence held shared (a turn start), waiting up to `wait` (zero: not at all); nil, without running
+    /// `body`, while a purge holds it.
+    public static func withShared<T>(home: URL, companyId: String, wait: Duration, _ body: () throws -> T) throws -> T? {
+        try with(LOCK_SH, home: home, companyId: companyId, wait: wait, body)
+    }
+
+    private static func with<T>(_ operation: Int32, home: URL, companyId: String, wait: Duration, _ body: () throws -> T) throws -> T? {
+        let url = try lockURL(home: home, companyId: companyId)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch { throw PurgeFenceError.unavailable("\(error)") }
+        // Close-on-exec and no link followed, as `GitLock`.
+        let fd = open(url.path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw PurgeFenceError.unavailable("cannot open the fence file") }
+        defer { close(fd) }
+        let seconds = Double(wait.components.seconds) + Double(wait.components.attoseconds) / 1e18
+        let deadline = AwakeTime.uptime() + seconds
+        while flock(fd, operation | LOCK_NB) != 0 {
+            if errno != EWOULDBLOCK && errno != EINTR { throw PurgeFenceError.unavailable("cannot take the fence") }
+            guard AwakeTime.uptime() < deadline else { return nil }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+        defer { flock(fd, LOCK_UN) }
+        return try body()
     }
 }

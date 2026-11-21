@@ -206,8 +206,8 @@ extension Store {
     }
 }
 
-/// Tests only: seams of the ref code (`Store.refHooks`): the git runner `refGit` uses (a fake that fails), and a company read
-/// that fails at a turn's taint record.
+/// Tests only: seams of the ref code (`Store.refHooks`): the git runner `refGit` uses (a fake that fails), a company read
+/// that fails at a turn's taint record, the purge fence's data home for an in-memory store, and a step inside a purge.
 final class RefHooks: @unchecked Sendable {
     private let lock = NSLock()
     private var runner: (any GitProcessRunning)?
@@ -217,4 +217,12 @@ final class RefHooks: @unchecked Sendable {
     var failCompanyRead: Bool { lock.withLock { companyReadFails } }
     func setGitRunner(_ r: (any GitProcessRunning)?) { lock.withLock { runner = r } }
     func setFailCompanyRead(_ fails: Bool) { lock.withLock { companyReadFails = fails } }
+    private var fence: URL?
+    private var afterTurnCheck: (@Sendable () throws -> Void)?
+    /// The data home whose purge fence turn starts take when the store has none (an in-memory store).
+    var fenceHome: URL? { lock.withLock { fence } }
+    /// Runs between the purge's first running-turn check and its fence (a turn starting in that window).
+    var afterPurgeTurnCheck: (@Sendable () throws -> Void)? { lock.withLock { afterTurnCheck } }
+    func setFenceHome(_ home: URL?) { lock.withLock { fence = home } }
+    func setAfterPurgeTurnCheck(_ body: (@Sendable () throws -> Void)?) { lock.withLock { afterTurnCheck = body } }
 }

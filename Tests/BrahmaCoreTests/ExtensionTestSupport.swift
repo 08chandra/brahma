@@ -166,7 +166,10 @@ final class RecordingRunner: SandboxedRunner, @unchecked Sendable {
 /// Writes a zip of STORED entries with arbitrary names and attributes (what `zip` refuses to produce: `..`, absolute names,
 /// symlink entries, thousands of entries), so the importer's pre-extraction checks can be tested.
 struct ZipBuilder {
-    struct Entry { var name: String; var data: Data; var symlink = false; var declaredSize: Int? = nil; var host = 3; var mode: UInt32? = nil }
+    /// `method` and `flags` are written as given (the data is NOT compressed: a method other than 0 makes undecodable data);
+    /// `external` is OR-ed into the external attributes (e.g. 0x10, the MS-DOS directory bit).
+    struct Entry { var name: String; var data: Data; var symlink = false; var declaredSize: Int? = nil; var host = 3; var mode: UInt32? = nil
+                   var method = 0; var flags = 0; var external: UInt32 = 0 }
     var entries: [Entry] = []
     /// What the end record claims the entry count is (a lie, when set).
     var countOverride: Int? = nil
@@ -174,8 +177,10 @@ struct ZipBuilder {
     var fakeCentral: [String]? = nil
 
     /// `declaredSize` is what the central directory claims the entry inflates to (a lie, when set).
-    mutating func add(_ name: String, _ text: String, symlink: Bool = false, declaredSize: Int? = nil, host: Int = 3, mode: UInt32? = nil) {
-        entries.append(Entry(name: name, data: Data(text.utf8), symlink: symlink, declaredSize: declaredSize, host: host, mode: mode))
+    mutating func add(_ name: String, _ text: String, symlink: Bool = false, declaredSize: Int? = nil, host: Int = 3, mode: UInt32? = nil,
+                      method: Int = 0, flags: Int = 0, external: UInt32 = 0) {
+        entries.append(Entry(name: name, data: Data(text.utf8), symlink: symlink, declaredSize: declaredSize, host: host, mode: mode,
+                             method: method, flags: flags, external: external))
     }
 
     func write(to url: URL) throws {
@@ -186,13 +191,13 @@ struct ZipBuilder {
         for e in entries {
             let name = Array(e.name.utf8), crc = ZipBuilder.crc32(e.data), size = UInt32(e.data.count), offset = UInt32(out.count)
             // The declared size is the same lie in the local header and the central entry (a self-consistent archive).
-            let fixed: [UInt8] = le16(20) + le16(0) + le16(0) + le16(0) + le16(0) + le32(crc) + le32(size) + le32(UInt32(e.declaredSize ?? e.data.count))
+            let fixed: [UInt8] = le16(20) + le16(e.flags) + le16(e.method) + le16(0) + le16(0) + le32(crc) + le32(size) + le32(UInt32(e.declaredSize ?? e.data.count))
                 + le16(name.count) + le16(0)
             out += Data([0x50, 0x4b, 0x03, 0x04] + fixed + name) + e.data
             let mode: UInt32 = e.mode ?? (e.symlink ? 0o120777 : 0o100644)
-            let declared: [UInt8] = le16(20) + le16(0) + le16(0) + le16(0) + le16(0) + le32(crc) + le32(size) + le32(UInt32(e.declaredSize ?? e.data.count))
+            let declared: [UInt8] = le16(20) + le16(e.flags) + le16(e.method) + le16(0) + le16(0) + le32(crc) + le32(size) + le32(UInt32(e.declaredSize ?? e.data.count))
                 + le16(name.count) + le16(0)
-            let header = Data([0x50, 0x4b, 0x01, 0x02] + le16(e.host << 8 | 0x1e) + declared + le16(0) + le16(0) + le16(0) + le32(mode << 16) + le32(offset) + name)
+            let header = Data([0x50, 0x4b, 0x01, 0x02] + le16(e.host << 8 | 0x1e) + declared + le16(0) + le16(0) + le16(0) + le32(mode << 16 | e.external) + le32(offset) + name)
             headers[e.name] = header
             central += header
         }

@@ -43,6 +43,15 @@ struct StubArchiveReader: ArchiveReader {
         return try Data(contentsOf: url)
     }
 
+    /// A zip whose stored bytes hold only placeholders while its directory declares `members` as deflate entries of their real
+    /// sizes: what a real reader would inflate them to is what `StubArchiveReader(members:)` hands back. `tag` makes the
+    /// bytes of each case its own (the gate caches a verdict by the bytes' hash).
+    static func packed(_ members: [(name: String, data: Data)], tag: String) throws -> Data {
+        try zip { z in
+            for (i, m) in members.enumerated() { z.add(m.name, "packed \(tag) \(i)", declaredSize: m.data.count, method: 8) }
+        }
+    }
+
     static func base64(_ s: String, offset: Int) -> String {
         Data((String(repeating: "x", count: offset) + s + "tail!").utf8).base64EncodedString()
     }
@@ -89,18 +98,12 @@ struct StubArchiveReader: ArchiveReader {
         let cf = try CollabFixture()
         // The stored bytes hold a placeholder; the member as inflated holds the value. Each case gets bytes of its own (the
         // gate caches a verdict by the bytes' hash, and a real reader inflates the same bytes the same way).
-        func makeDocx(_ tag: String) throws -> Data {
-            try Self.zip {
-                $0.add("[Content_Types].xml", "<Types/>")
-                $0.add("word/document.xml", "<w:document>compressed \(tag)</w:document>")
-            }
-        }
-        let docx = try makeDocx("whole")
-        #expect(!String(decoding: docx, as: UTF8.self).contains(Self.value))
         let inflated: [(name: String, data: Data)] = [
             ("[Content_Types].xml", Data("<Types/>".utf8)),
             ("word/document.xml", Data("<w:document><w:p><w:r><w:t>key \(Self.value)</w:t></w:r></w:p></w:document>".utf8)),
         ]
+        let docx = try Self.packed(inflated, tag: "whole")
+        #expect(!String(decoding: docx, as: UTF8.self).contains(Self.value))
         do {
             _ = try check(cf, docx, ext: "docx", canonical: "report.docx", archives: StubArchiveReader(members: inflated))
             Issue.record("the member's value was not refused")
@@ -114,47 +117,48 @@ struct StubArchiveReader: ArchiveReader {
             ("word/document.xml", Data("<w:p><w:r><w:t>sk_test_</w:t></w:r><w:r><w:t>51abcdefgh</w:t></w:r></w:p>".utf8)),
         ]
         #expect(throws: Self.refusal("report.docx", line: nil)) {
-            try check(cf, try makeDocx("split"), ext: "docx", canonical: "report.docx", archives: StubArchiveReader(members: split))
+            try check(cf, try Self.packed(split, tag: "split"), ext: "docx", canonical: "report.docx", archives: StubArchiveReader(members: split))
         }
         // A zip by its bytes is an archive whatever its name says.
         #expect(throws: Self.refusal("notes.txt", line: nil)) {
-            try check(cf, try makeDocx("renamed"), ext: "txt", canonical: "notes.txt", archives: StubArchiveReader(members: inflated))
+            try check(cf, try Self.packed(inflated, tag: "renamed"), ext: "txt", canonical: "notes.txt", archives: StubArchiveReader(members: inflated))
         }
         // Clean members pass.
         let clean: [(name: String, data: Data)] = [("[Content_Types].xml", Data("<Types/>".utf8)), ("word/document.xml", Data("<w:t>hi</w:t>".utf8))]
-        #expect(try check(cf, try makeDocx("clean"), ext: "docx", canonical: "report.docx", archives: StubArchiveReader(members: clean)) == .clean)
+        #expect(try check(cf, try Self.packed(clean, tag: "clean"), ext: "docx", canonical: "report.docx", archives: StubArchiveReader(members: clean)) == .clean)
         // Fail closed: no reader, an archive that expands too much, or a member the reader did not hand back.
         #expect(throws: WorkError.invalid("archives can't be scanned on this machine")) {
-            try check(cf, try makeDocx("no reader"), ext: "docx", canonical: "report.docx")
+            try check(cf, try Self.packed(clean, tag: "no reader"), ext: "docx", canonical: "report.docx")
         }
         #expect(throws: WorkError.invalid("this archive expands too much to preview safely")) {
-            try check(cf, try makeDocx("bomb"), ext: "docx", canonical: "report.docx",
+            try check(cf, try Self.packed(clean, tag: "bomb"), ext: "docx", canonical: "report.docx",
                       archives: StubArchiveReader(members: [], error: .refused("this archive expands too much to preview safely")))
         }
         #expect(throws: WorkError.invalid("this archive can't be scanned for secrets")) {
-            try check(cf, try makeDocx("skipped"), ext: "docx", canonical: "report.docx", archives: StubArchiveReader(members: [clean[0]]))
+            try check(cf, try Self.packed(clean, tag: "skipped"), ext: "docx", canonical: "report.docx", archives: StubArchiveReader(members: [clean[0]]))
         }
         // A name that says archive but bytes that aren't one: refused, not passed.
         #expect(throws: WorkError.invalid("this archive can't be read")) {
             try check(cf, Data("plain text\n".utf8), ext: "docx", canonical: "fake.docx", archives: StubArchiveReader(members: clean))
         }
         // A zip inside the zip is opened too.
-        let inner = try Self.zip { $0.add("secret.txt", "placeholder") }
-        let outer = try Self.zip { $0.add("inner.zip", "placeholder") }
+        let innerMember = Data("v=\(SecretGateTests.value)\n".utf8)
+        let inner = try Self.packed([("secret.txt", innerMember)], tag: "inner")
+        let outer = try Self.packed([("inner.zip", inner)], tag: "outer")
         struct Nested: ArchiveReader {
-            let inner: Data
+            let inner: Data, innerMember: Data
             func members(of data: Data, wanted: @Sendable (String) -> Bool, limits: ArchiveLimits) throws -> [(name: String, data: Data)] {
-                if data == inner { return [("secret.txt", Data("v=\(SecretGateTests.value)\n".utf8))] }
+                if data == inner { return [("secret.txt", innerMember)] }
                 return [("inner.zip", inner)]
             }
         }
         #expect(throws: Self.refusal("bundle.zip", line: nil)) {
-            try check(cf, outer, ext: "zip", canonical: "bundle.zip", archives: Nested(inner: inner))
+            try check(cf, outer, ext: "zip", canonical: "bundle.zip", archives: Nested(inner: inner, innerMember: innerMember))
         }
 
         // The pin of such a worktree file is refused before git sees a byte.
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
-        try makeDocx("pin").write(to: wt.appending(path: "report.docx"))
+        try Self.packed(inflated, tag: "pin").write(to: wt.appending(path: "report.docx"))
         #expect(throws: Self.refusal("ENG-1:report.docx@worktree", line: nil)) {
             try cf.store.pinRef(try cf.fx.ref("ENG-1:report.docx@worktree"), for: .agent(cf.fx.eng1.id), companyId: cf.c.id,
                                 messageRefId: "mr-z", knownValues: Self.known, paths: cf.paths, archives: StubArchiveReader(members: inflated))
@@ -187,6 +191,283 @@ struct StubArchiveReader: ArchiveReader {
         }
         let fine = try deflated(["[Content_Types].xml": "<Types>\(padding)</Types>", "word/document.xml": "<w:t>hi \(padding)</w:t>"])
         #expect(try check(cf, fine, ext: "docx", canonical: "fine.docx", archives: sandboxed) == .clean)
+    }
+
+    // MARK: Fix round 1
+
+    static let methodRefusal = WorkError.invalid("this archive uses compression or encryption that can't be scanned for secrets")
+    static let incomplete = WorkError.invalid("this archive can't be scanned for secrets")
+
+    /// R1-2: a member unzip can't decode, an encrypted one, or one that comes back short is never read as empty and clean.
+    @Test func undecodableMembersRefused() throws {
+        let cf = try CollabFixture()
+        let member = "<w:t>key \(Self.value)</w:t>"
+        func members(_ name: String) -> [(name: String, data: Data)] { [(name, Data(member.utf8))] }
+        // LZMA (method 14), and a stored member with the encryption flag: refused whatever the reader hands back.
+        let lzma = try Self.zip { $0.add("word/document.xml", "lzma bytes", method: 14) }
+        #expect(throws: Self.methodRefusal) {
+            try check(cf, lzma, ext: "docx", canonical: "a.docx", archives: StubArchiveReader(members: members("word/document.xml")))
+        }
+        let encrypted = try Self.zip { $0.add("word/document.xml", "cipher text", flags: 1) }
+        #expect(throws: Self.methodRefusal) {
+            try check(cf, encrypted, ext: "docx", canonical: "b.docx", archives: StubArchiveReader(members: []))
+        }
+        // A member shorter than the central directory declares (what a failed inflate leaves) is refused.
+        let short = try Self.zip { $0.add("word/document.xml", String(repeating: "z", count: 64), declaredSize: 4096, method: 8) }
+        #expect(throws: Self.incomplete) {
+            try check(cf, short, ext: "docx", canonical: "c.docx",
+                      archives: StubArchiveReader(members: [("word/document.xml", Data())]))
+        }
+        // The real sandboxed unzip: a deflate member it can't decode is a failure, never an empty member.
+        guard Toolchain.seatbeltAvailable else { return }
+        let home = try Scratch.homeDir().resolvedForSandbox
+        let sbPaths = BrahmaPaths(home: home.appending(path: "home"), workspaces: home.appending(path: "ws"))
+        let sbVault = Vault(paths: sbPaths, companyId: cf.c.id, content: ContentVault(paths: sbPaths))
+        let sandboxed = SandboxedUnzipReader(runner: SeatbeltRunner(baseline: {
+            SandboxBaseline.current(paths: sbPaths, otherWorkspaces: [], backupTargets: [])
+        }, proxies: EgressProxyPool()), scratch: { try sbVault.makeTempDir() })
+        let corrupt = try Self.zip { $0.add("doc.txt", "this is not a deflate stream at all \(Self.value)", method: 8) }
+        #expect(throws: ArchiveReadError.self) {
+            try sandboxed.members(of: corrupt, wanted: { _ in true }, limits: .standard)
+        }
+        #expect(throws: WorkError.self) { try check(cf, corrupt, ext: "zip", canonical: "d.zip", archives: sandboxed) }
+    }
+
+    /// R1-3 (Ruling 29): a zip found anywhere in the bytes is an archive; gzip, bzip2, xz, zstd, 7z and rar can't be scanned.
+    @Test func polyglotsAndOtherFormatsRefused() throws {
+        let cf = try CollabFixture()
+        let secret: [(name: String, data: Data)] = [("secret.txt", Data("v=\(Self.value)\n".utf8))]
+        let inner = try Self.packed(secret, tag: "poly")
+        let reader = StubArchiveReader(members: secret)
+        // Text, then a zip: named .txt, never only raw-scanned.
+        let prefixed = Data(String(repeating: "notes\n", count: 200).utf8) + inner
+        #expect(throws: WorkError.self) { try check(cf, prefixed, ext: "txt", canonical: "notes.txt", archives: reader) }
+        // A PNG with a zip appended.
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + Data(repeating: 7, count: 64) + inner
+        #expect(throws: WorkError.self) { try check(cf, png, ext: "png", canonical: "logo.png", archives: reader) }
+        // A .txt that is really a zip is scanned as one.
+        #expect(throws: Self.refusal("real.txt", line: nil)) {
+            try check(cf, inner + Data(), ext: "txt", canonical: "real.txt", archives: reader)
+        }
+        // Compression formats the engine can't open: refused, whatever they are called.
+        let formats: [(String, [UInt8])] = [
+            ("gzip", [0x1F, 0x8B, 0x08, 0x00]), ("bzip2", Array("BZh9".utf8)), ("xz", [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]),
+            ("zstd", [0x28, 0xB5, 0x2F, 0xFD]), ("7z", [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]), ("rar", Array("Rar!".utf8) + [0x1A, 0x07, 0x00]),
+        ]
+        for (name, magic) in formats {
+            let data = Data(magic) + Data(repeating: 0x41, count: 100)
+            #expect(throws: WorkError.invalid("x.bin is compressed as \(name), which can't be scanned for secrets; share the files inside instead"),
+                    "\(name)") {
+                try check(cf, data, ext: "bin", canonical: "x.bin", archives: reader)
+            }
+        }
+        // A real .tar.gz holding the value.
+        let dir = try tempDir()
+        try Data("v=\(Self.value)\n".utf8).write(to: dir.appending(path: "secret.txt"))
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        p.currentDirectoryURL = dir
+        p.arguments = ["-czf", "out.tar.gz", "secret.txt"]
+        try p.run(); p.waitUntilExit()
+        let tgz = try Data(contentsOf: dir.appending(path: "out.tar.gz"))
+        #expect(throws: WorkError.self) { try check(cf, tgz, ext: "gz", canonical: "out.tar.gz", archives: reader) }
+        // A gzip member inside a zip is refused too.
+        let zipOfGz = try Self.packed([("data.gz", tgz)], tag: "gz")
+        #expect(throws: WorkError.self) {
+            try check(cf, zipOfGz, ext: "zip", canonical: "bundle.zip", archives: StubArchiveReader(members: [("data.gz", tgz)]))
+        }
+        // Text that merely mentions PK is plain text.
+        #expect(try check(cf, Data("PK is a primary key\n".utf8), ext: "md", canonical: "README.md", archives: reader) == .clean)
+    }
+
+    /// R1-4 (Ruling 30): an entry flagged as a directory that has data, or no trailing `/`, is a file the reader must return.
+    @Test func directoryFlaggedEntriesScanned() throws {
+        let cf = try CollabFixture()
+        // A reader that, like the sandboxed unzip before the fix, skips what the inventory calls a directory.
+        let skipsFlagged = StubArchiveReader(members: [])
+        let unixDir = try Self.zip { $0.add("secret.txt", "placeholder", mode: 0o040755) }
+        #expect(throws: Self.incomplete) { try check(cf, unixDir, ext: "zip", canonical: "u.zip", archives: skipsFlagged) }
+        let dosDir = try Self.zip { $0.add("secret.txt", "data", external: 0x10) }
+        #expect(throws: Self.incomplete) { try check(cf, dosDir, ext: "zip", canonical: "w.zip", archives: skipsFlagged) }
+        // A slash-named "directory" with data is a file too.
+        let slashed = try Self.zip { $0.add("dir/", "data", mode: 0o040755) }
+        #expect(throws: Self.incomplete) { try check(cf, slashed, ext: "zip", canonical: "s.zip", archives: skipsFlagged) }
+        // A real directory entry (name ends in /, no data) needs no member.
+        let real = try Self.zip { $0.add("dir/", "", mode: 0o040755); $0.add("dir/a.txt", "placeholder") }
+        #expect(try check(cf, real, ext: "zip", canonical: "r.zip",
+                          archives: StubArchiveReader(members: [("dir/a.txt", Data("placeholder".utf8))])) == .clean)
+    }
+
+    /// R1-5: a ref named with a stored value (or an encoded form) never echoes it in the refusal or the alert.
+    @Test func refNamedWithValueNeverEchoed() throws {
+        let cf = try CollabFixture()
+        let hex = Data(Self.value.utf8).map { String(format: "%02x", $0) }.joined()
+        for name in ["src/\(Self.value).ts", "src/\(hex).ts"] {
+            do {
+                _ = try check(cf, Data("k = \(Self.value)\n".utf8), ext: "ts", canonical: name)
+                Issue.record("not refused")
+            } catch let e as WorkError {
+                #expect(e.message.hasPrefix("src/[redacted stored secret STRIPE_KEY].ts contains a stored secret"))
+                for piece in Self.pieces(Self.value) + Self.pieces(hex) { #expect(!e.message.contains(piece)) }
+            }
+        }
+        let cId = cf.c.id
+        let texts = try cf.store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT title || ' ' || summary FROM ask WHERE companyId = ? AND kind = 'engineAlert'", arguments: [cId])
+            + String.fetchAll(db, sql: "SELECT text FROM message WHERE companyId = ?", arguments: [cId])
+            + String.fetchAll(db, sql: "SELECT text FROM activityEvent WHERE companyId = ?", arguments: [cId])
+        }
+        #expect(texts.contains { $0.contains("[redacted stored secret STRIPE_KEY]") })
+        for text in texts { for piece in Self.pieces(Self.value) + Self.pieces(hex) { #expect(!text.contains(piece)) } }
+    }
+
+    /// R1-6: nested archives share one budget (bytes, entries, depth) across every level.
+    @Test func nestedArchivesShareOneBudget() throws {
+        let inner = try Self.packed([("a.txt", Data(repeating: 0x61, count: 600))], tag: "inner")
+        let outer = try Self.packed([("1.zip", inner), ("2.zip", inner), ("3.zip", inner)], tag: "outer")
+        struct Nested: ArchiveReader {
+            let inner: Data
+            func members(of data: Data, wanted: @Sendable (String) -> Bool, limits: ArchiveLimits) throws -> [(name: String, data: Data)] {
+                if data == inner { return [("a.txt", Data(repeating: 0x61, count: 600))] }
+                return [("1.zip", inner), ("2.zip", inner), ("3.zip", inner)]
+            }
+        }
+        let reader = Nested(inner: inner)
+        // Each level alone is under 1000 bytes; together they are not.
+        #expect(try ArchiveMemberScan.scan(outer, archives: reader, knownValues: [],
+                                           budget: ArchiveScanBudget(bytes: 10_000, entries: 200, depth: 3)).isEmpty)
+        #expect(throws: ArchiveMemberScan.overBudget) {
+            try ArchiveMemberScan.scan(outer, archives: reader, knownValues: [], budget: ArchiveScanBudget(bytes: 1000, entries: 200, depth: 3))
+        }
+        #expect(throws: ArchiveMemberScan.overBudget) {
+            try ArchiveMemberScan.scan(outer, archives: reader, knownValues: [], budget: ArchiveScanBudget(bytes: 10_000, entries: 5, depth: 3))
+        }
+        // Deeper than the depth budget: refused.
+        #expect(throws: ArchiveMemberScan.overBudget) {
+            try ArchiveMemberScan.scan(outer, archives: reader, knownValues: [], budget: ArchiveScanBudget(bytes: 10_000, entries: 200, depth: 1))
+        }
+    }
+
+    // MARK: R1-9 (Ruling 31): compressed streams inside PDFs and PNGs are decoded and scanned
+
+    /// zlib (RFC 1950) bytes of `data`: what a PDF's FlateDecode and a PNG's zTXt hold.
+    static func zlib(_ data: Data) throws -> Data {
+        let raw = try (data as NSData).compressed(using: .zlib) as Data
+        var a: UInt32 = 1, b: UInt32 = 0
+        for byte in data { a = (a + UInt32(byte)) % 65521; b = (b + a) % 65521 }
+        let adler: UInt32 = (b << 16) | a
+        var out = Data([0x78, 0x9C])
+        out.append(raw)
+        let trailer: [UInt8] = [UInt8(adler >> 24), UInt8((adler >> 16) & 0xFF), UInt8((adler >> 8) & 0xFF), UInt8(adler & 0xFF)]
+        out.append(contentsOf: trailer)
+        return out
+    }
+
+    /// A small PDF whose one content stream is `body` (already encoded) under `filter` (a PDF filter expression or nil).
+    static func pdf(_ body: Data, filter: String?, extraTrailer: String = "") -> Data {
+        var out = Data("%PDF-1.7\n%\u{E2}\u{E3}\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".utf8)
+        out += Data("4 0 obj\n<< /Length \(body.count)\(filter.map { " /Filter \($0)" } ?? "") >>\nstream\n".utf8)
+        out += body
+        out += Data("\nendstream\nendobj\ntrailer\n<< /Root 1 0 R\(extraTrailer) >>\n%%EOF\n".utf8)
+        return out
+    }
+
+    /// A PNG (signature, IHDR, `chunks`, IEND) with real CRCs.
+    static func png(_ chunks: [(type: String, data: Data)]) -> Data {
+        func chunk(_ type: String, _ data: Data) -> Data {
+            let typed = Data(type.utf8) + data
+            let crc = ZipBuilder.crc32(typed)
+            func be32(_ v: UInt32) -> [UInt8] { [UInt8(v >> 24), UInt8((v >> 16) & 0xFF), UInt8((v >> 8) & 0xFF), UInt8(v & 0xFF)] }
+            var out = Data(be32(UInt32(data.count)))
+            out.append(typed)
+            out.append(contentsOf: be32(crc))
+            return out
+        }
+        var out = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        out += chunk("IHDR", Data([0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0]))
+        for c in chunks { out += chunk(c.type, c.data) }
+        out += chunk("IEND", Data())
+        return out
+    }
+
+    @Test func pdfStreamsDecodedAndScanned() throws {
+        let cf = try CollabFixture()
+        let content = Data("BT /F1 12 Tf 72 700 Td (key \(Self.value)) Tj ET".utf8)
+        let flate = Self.pdf(try Self.zlib(content), filter: "/FlateDecode")
+        #expect(!String(decoding: flate, as: UTF8.self).contains(Self.value))
+        #expect(throws: Self.refusal("doc.pdf", line: nil)) { try check(cf, flate, ext: "pdf", canonical: "doc.pdf") }
+        // Split across TJ strings, behind a filter chain (hex over Flate).
+        let split = Data("BT [(sk_test_) -20 (51abcdefgh)] TJ ET".utf8)
+        let hex = Data((try Self.zlib(split)).map { String(format: "%02X", $0) }.joined().utf8) + Data(">".utf8)
+        let chained = Self.pdf(hex, filter: "[/ASCIIHexDecode /FlateDecode]")
+        #expect(throws: Self.refusal("chain.pdf", line: nil)) { try check(cf, chained, ext: "pdf", canonical: "chain.pdf") }
+        // Named anything: a PDF by its header.
+        #expect(throws: Self.refusal("notes.bin", line: nil)) { try check(cf, flate + Data(), ext: "bin", canonical: "notes.bin") }
+        // A clean compressed PDF passes.
+        let clean = Self.pdf(try Self.zlib(Data("BT (hello) Tj ET".utf8)), filter: "/FlateDecode")
+        #expect(try check(cf, clean, ext: "pdf", canonical: "clean.pdf") == .clean)
+        // Encrypted, an unknown filter, or a stream that does not decode: refused, never passed.
+        let encrypted = Self.pdf(Data("opaque".utf8), filter: nil, extraTrailer: " /Encrypt 5 0 R")
+        #expect(throws: WorkError.invalid("this PDF is encrypted, so it can't be scanned for secrets")) {
+            try check(cf, encrypted, ext: "pdf", canonical: "locked.pdf")
+        }
+        let unknown = Self.pdf(Data("opaque".utf8), filter: "/MadeUpDecode")
+        #expect(throws: WorkError.invalid("this PDF has a stream that can't be decoded for scanning (MadeUpDecode)")) {
+            try check(cf, unknown, ext: "pdf", canonical: "odd.pdf")
+        }
+        let broken = Self.pdf(Data("not a zlib stream at all".utf8), filter: "/FlateDecode")
+        #expect(throws: WorkError.invalid("this PDF has a stream that can't be decoded for scanning (FlateDecode)")) {
+            try check(cf, broken, ext: "pdf", canonical: "broken.pdf")
+        }
+        // LZW (the PDF Reference's own example) and a PNG "Up" predictor under Flate decode to the plain bytes.
+        #expect(try EmbeddedStreams.lzw(Data([0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01]), earlyChange: 1, cap: 1000)
+            == Data("-----A---B".utf8))
+        let rows = Array("key sk_test_".utf8), rows2 = Array("51abcdefgh  ".utf8)
+        var predicted: [UInt8] = [2] + rows + [2]
+        for (i, c) in rows2.enumerated() { predicted.append(c &- rows[i]) }
+        let up = Self.pdf(try Self.zlib(Data(predicted)), filter: "/FlateDecode /DecodeParms << /Predictor 12 /Columns 12 >>")
+        let lines = try EmbeddedStreams.pdfStreams(up, budget: ArchiveScanBudget())
+        #expect(lines == [Data(rows + rows2)])
+        // The decoding spends the same shared budget as nested archives.
+        let big = Self.pdf(try Self.zlib(Data(repeating: 0x20, count: 50_000)), filter: "/FlateDecode")
+        #expect(throws: ArchiveMemberScan.overBudget) {
+            try EmbeddedStreams.scan(big, ext: "pdf", expanded: [], budget: ArchiveScanBudget(bytes: 10_000), chunk: ContentScan.chunkBytes)
+        }
+    }
+
+    @Test func pngTextChunksDecodedAndScanned() throws {
+        let cf = try CollabFixture()
+        let ztxt = Self.png([("zTXt", Data("Comment".utf8) + Data([0, 0]) + (try Self.zlib(Data("key \(Self.value)".utf8))))])
+        #expect(!String(decoding: ztxt, as: UTF8.self).contains(Self.value))
+        #expect(throws: Self.refusal("logo.png", line: nil)) { try check(cf, ztxt, ext: "png", canonical: "logo.png") }
+        var itxtData = Data("Comment".utf8)
+        itxtData.append(contentsOf: [0, 1, 0] as [UInt8])
+        itxtData.append(Data("en".utf8))
+        itxtData.append(contentsOf: [0, 0] as [UInt8])
+        itxtData.append(try Self.zlib(Data("key \(Self.value)".utf8)))
+        let itxt = Self.png([("iTXt", itxtData)])
+        #expect(throws: Self.refusal("i.png", line: nil)) { try check(cf, itxt, ext: "png", canonical: "i.png") }
+        let fine = Self.png([("zTXt", Data("Comment".utf8) + Data([0, 0]) + (try Self.zlib(Data("made with care".utf8))))])
+        #expect(try check(cf, fine, ext: "png", canonical: "fine.png") == .clean)
+        let broken = Self.png([("zTXt", Data("Comment".utf8) + Data([0, 0]) + Data("garbage, not zlib".utf8))])
+        #expect(throws: WorkError.invalid("this PNG has a compressed chunk that can't be decoded for scanning")) {
+            try check(cf, broken, ext: "png", canonical: "broken.png")
+        }
+    }
+
+    @Test func svgzRefused() throws {
+        let cf = try CollabFixture()
+        let dir = try tempDir()
+        try Data("<svg><text>\(Self.value)</text></svg>".utf8).write(to: dir.appending(path: "a.svg"))
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+        p.currentDirectoryURL = dir
+        p.arguments = ["-n", "a.svg"]
+        try p.run(); p.waitUntilExit()
+        let svgz = try Data(contentsOf: dir.appending(path: "a.svg.gz"))
+        #expect(throws: WorkError.invalid("icon.svgz is compressed as gzip, which can't be scanned for secrets; share the files inside instead")) {
+            try check(cf, svgz, ext: "svgz", canonical: "icon.svgz")
+        }
     }
 
     @Test func laterSecretValueCaughtOnOpen() throws {

@@ -379,18 +379,29 @@ public struct SafeGit: Sendable {
         try output(["update-ref", "-d", "--end-of-options", try Self.shareRef(messageRefId)])
     }
 
-    /// Purges `purged` (full object ids the engine knows a deleted or moved share pinned): every reflog of the repository, the
-    /// worktrees' `HEAD` reflogs included (`reflog expire --expire=now --expire-unreachable=now --all`; item-branch reflog
-    /// entries go with it, said plainly), then every unreachable loose object (`prune --expire=now`), then `repack -a -d`
-    /// so a copy already in a pack dies too. Fail-closed: afterwards one `cat-file --batch-check` asks for every id, and any
-    /// object still present (reachable from a branch, an index, a worktree `HEAD`) is `.purgeIncomplete(remaining:)`; success
-    /// is never reported while a purged object survives.
+    /// Purges `purged` (full object ids the engine knows a deleted or moved share pinned): the reflogs of the share refs
+    /// only (`refs/brahma/shares/*`, listed with `for-each-ref`; `reflog expire --expire=now --expire-unreachable=now
+    /// <those refs>` — a deleted share ref's reflog went with it; C2b fix round 1, C1a ruling I4: no other branch's or
+    /// worktree's reflog is touched), then every unreachable loose object (`prune --expire=now`), then `repack -a -d` so a
+    /// copy already in a pack dies too. Fail-closed: afterwards one `cat-file --batch-check` asks for every id, and any object
+    /// still present (reachable from a branch, a branch's or a worktree's reflog, an index, another share) is
+    /// `.purgeIncomplete(remaining:)`; success is never reported while a purged object survives.
     ///
     /// Its only caller is the owner's purge, which must hold the engine's git lock and must refuse while any turn of the
     /// company is running: pruning while an agent writes the object store can orphan a commit that agent is making.
     public func expireAndPrune(purged: [String]) throws {
         for oid in purged { try Self.checkRevShape(oid); guard oid.utf8.count == 40 || oid.utf8.count == 64 else { throw SafeGitError.badRev } }
-        try output(["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"])
+        let shares = Self.lines(try output(["for-each-ref", "--format=%(refname)", Self.sharesPrefix]))
+            .filter { $0.hasPrefix(Self.sharesPrefix) }
+        var logged: [String] = []
+        for ref in shares {
+            _ = try Self.shareRef(String(ref.dropFirst(Self.sharesPrefix.count)))   // engine-shaped names only
+            // Only a share ref that has a reflog (`core.logAllRefUpdates=always`) can be expired.
+            if try run(["reflog", "exists", ref], allowFailure: true).status == 0 { logged.append(ref) }
+        }
+        if !logged.isEmpty {
+            try output(["reflog", "expire", "--expire=now", "--expire-unreachable=now"] + logged)
+        }
         try output(["prune", "--expire=now"])
         try output(["repack", "-a", "-d", "-q"])
         guard !purged.isEmpty else { return }

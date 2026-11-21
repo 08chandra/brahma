@@ -1869,8 +1869,20 @@ extension Store {
     }
 
     /// ready → running, a new in-progress turn and a `turnStarted` event, atomically. Nil if the agent is no
-    /// longer ready (or was paused) by the time the write runs.
+    /// longer ready (or was paused) by the time the write runs, or while the owner's purge holds the company's
+    /// `PurgeFence` (C2b fix round 1: the turn is recorded under the fence held shared, so a purge's running-turn check
+    /// and its git prune never race a turn start; the agent stays ready and starts on a later tick).
     func beginTurn(agentId: String, now: Date) throws -> (Agent, Turn)? {
+        guard let home = dataHome ?? refHooks.fenceHome else { return try beginTurnRecord(agentId: agentId, now: now) }
+        guard let companyId = try writer.read({ db in
+            try String.fetchOne(db, sql: "SELECT companyId FROM agent WHERE id = ?", arguments: [agentId])
+        }) else { return nil }
+        return try PurgeFence.withShared(home: home, companyId: companyId, wait: .zero) {
+            try beginTurnRecord(agentId: agentId, now: now)
+        } ?? nil
+    }
+
+    private func beginTurnRecord(agentId: String, now: Date) throws -> (Agent, Turn)? {
         try writer.write { db in
             guard let a = try Agent.fetchOne(db, key: agentId), a.state == .ready, !a.paused else { return nil }
             let agent = try Store.transition(db: db, agentId: agentId, to: .running, now: now)
