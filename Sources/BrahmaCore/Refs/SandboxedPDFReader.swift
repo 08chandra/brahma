@@ -46,8 +46,8 @@ public struct SandboxedPDFReader: Sendable {
     static let unreadable = ArchiveReadError.refused("this PDF can't be read, so it can't be scanned for secrets")
     static let encrypted = ArchiveReadError.refused("this PDF is encrypted, so it can't be scanned for secrets")
     static let undecodable = ArchiveReadError.refused("this PDF has a stream that can't be decoded for scanning")
-    static let unaccounted = ArchiveReadError.refused(
-        "this PDF holds data outside its objects (an earlier revision or a stray stream), so it can't be scanned for secrets")
+    /// Round 4 (R4-6, ruling 35): every structural anomaly the helper finds (exit 5) is this one refusal.
+    static let unaccounted = ArchiveReadError.refused("this PDF's structure couldn't be verified — ask the owner to vouch for or convert it")
     static let tooMany = ArchiveReadError.refused("this PDF has too many objects to scan for secrets")
     static let tooMuchMemory = ArchiveReadError.refused("this PDF needs too much memory to scan for secrets")
     /// The two that may pass on another try (not cached by the gate).

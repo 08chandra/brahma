@@ -935,4 +935,20 @@ struct StubArchiveReader: ArchiveReader {
         #expect(SecretGate.cacheVersion(store: cf.store, companyId: cf.c.id, ext: "txt", knownValues: Self.known)
                 != SecretGate.cacheVersion(store: cf.store, companyId: cf.c.id, ext: "docx", knownValues: Self.known))
     }
+
+    /// R4-7 (ruling 36): a deflate stream that decodes text holding a secret and THEN hits a data error is an archive: a
+    /// streaming reader (unzip, bsdtar) still prints what came before the error. The block's final bit cleared and an invalid
+    /// block after it; the declared size past the end. Caught (refused), never "plain bytes". An error before any output
+    /// stays plain bytes (`truncatedDeflateIsAnArchive`).
+    @Test func deflateThatFailsAfterOutputIsAnArchive() throws {
+        let cf = try CollabFixture()
+        let text = Data(("notes " + String(repeating: "lorem ipsum dolor ", count: 40) + "leak \(Self.aws) end\n").utf8)
+        var deflated = try (text as NSData).compressed(using: .zlib) as Data   // raw DEFLATE, one final block
+        deflated[deflated.startIndex] &= 0xFE                                  // not the last block: a next one is read
+        let corrupt = deflated + Data([6, 0, 0]) + Data(repeating: 0xFF, count: 32)
+        let bytes = Data("readme\n".utf8) + Self.deflateHeader(declared: 0xFFFF_FFFE, uncompressed: UInt32(text.count)) + corrupt
+        #expect(!String(decoding: bytes, as: UTF8.self).contains(Self.aws))
+        #expect(ArchiveMemberScan.isArchive(bytes, ext: "txt"))
+        #expect(throws: WorkError.self) { try check(cf, bytes, canonical: "partial.txt") }
+    }
 }

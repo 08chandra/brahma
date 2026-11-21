@@ -225,6 +225,10 @@ final class RefHooks: @unchecked Sendable {
     /// Runs between the purge's first running-turn check and its fence (a turn starting in that window).
     var afterPurgeTurnCheck: (@Sendable () throws -> Void)? { lock.withLock { afterTurnCheck } }
     func setFenceHome(_ home: URL?) { lock.withLock { fence = home } }
+    private var wait: Duration?
+    /// How long an item check or an extension trial waits for a purge holding the fence (R4-6); nil: `PurgeFence.defaultWait`.
+    var fenceWait: Duration? { lock.withLock { wait } }
+    func setFenceWait(_ wait: Duration?) { lock.withLock { self.wait = wait } }
     func setAfterPurgeTurnCheck(_ body: (@Sendable () throws -> Void)?) { lock.withLock { afterTurnCheck = body } }
     private var redaction: (@Sendable (Data) -> Data)?
     /// Makes the redacted copies the gate checks again (a redaction that misses something), in place of `RedactedCopy.make`.

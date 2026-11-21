@@ -291,3 +291,23 @@ import GRDB
         #expect(try Self.state(cf, "mr-n") == "purged")
     }
 }
+
+/// R4-6 (c): a purge holding a company's purge fence exclusively, on its own thread, until `release`.
+final class ExclusiveFence: @unchecked Sendable {
+    private let held = DispatchSemaphore(value: 0)
+    private let done = DispatchSemaphore(value: 0)
+    private let finished = DispatchSemaphore(value: 0)
+
+    init(home: URL, companyId: String) {
+        Thread.detachNewThread { [held, done, finished] in
+            _ = try? PurgeFence.withExclusive(home: home, companyId: companyId) { held.signal(); done.wait() }
+            finished.signal()
+        }
+        held.wait()
+    }
+
+    func release() {
+        done.signal()
+        finished.wait()
+    }
+}

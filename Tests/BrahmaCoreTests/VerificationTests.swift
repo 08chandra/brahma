@@ -221,6 +221,38 @@ import GRDB
         #expect(try v.fresh(i).verifiedCommit == sha)
     }
 
+    /// R4-6 (c), ruling 35: an item check reads the company's repository outside any recorded turn, so it takes the
+    /// company's purge fence shared, as a turn start does: while a purge holds it the check does not run (recorded as not
+    /// run, so it is retried; never charged to the item), and a check that runs holds it until it ends, so no purge prunes
+    /// under it.
+    @Test func checkTakesThePurgeFence() async throws {
+        let v = try V()
+        let home = v.world.paths.home, companyId = v.company.id
+        v.store.refHooks.setFenceHome(home)
+        v.store.refHooks.setFenceWait(.milliseconds(100))
+        let held = try v.item("Held")
+        try v.claimAndSubmit(held, v.eng)
+        let purge = ExclusiveFence(home: home, companyId: companyId)
+        try await v.cycle()
+        purge.release()
+        #expect(v.checks.calls.isEmpty, "no check ran while the purge held the fence")
+        let refused = try #require(try v.runs(held).first)
+        #expect(refused.exitCode == nil && (refused.outputTail ?? "").contains("purging"), "\(refused.outputTail ?? "")")
+        // A check that runs holds the fence: the purge can't take it meanwhile.
+        final class Seen: @unchecked Sendable { var purgeGotIn: Bool? }
+        let seen = Seen()
+        v.checks.onRun { _ in
+            seen.purgeGotIn = (try? PurgeFence.withExclusive(home: home, companyId: companyId, wait: .milliseconds(50)) { true }) ?? false
+            return nil
+        }
+        let running = try v.item("Running")
+        try v.claimAndSubmit(running, v.eng2, file: "src/other.txt")
+        try await v.cycle()
+        #expect(seen.purgeGotIn == false)
+        #expect((try? PurgeFence.withExclusive(home: home, companyId: companyId, wait: .milliseconds(50)) { true }) == true, "released after the check")
+        v.store.refHooks.setFenceWait(nil)
+    }
+
     @Test func realRunnerEndToEnd() async throws {
         var env = ProcessInfo.processInfo.environment
         env["FAKE_SECRET_TOKEN"] = "s3cret"; env["BRAHMA_DEV"] = "1"; env["ANTHROPIC_API_KEY"] = "sk-test"

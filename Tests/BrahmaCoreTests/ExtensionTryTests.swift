@@ -102,6 +102,36 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(ExtensionTry.summary(result).contains("demo@dev"))
     }
 
+    /// R4-6 (c), ruling 35: the trial turn writes no turn row, so a purge's running-turn check can't see it; it takes the
+    /// company's purge fence shared for its whole run instead. While a purge holds it the trial is refused (nothing runs);
+    /// while the trial runs a purge can't take it.
+    @Test func tryTakesThePurgeFence() async throws {
+        let w = try TryWorld()
+        let home = w.world.paths.home, companyId = w.company.id
+        w.store.refHooks.setFenceHome(home)
+        w.store.refHooks.setFenceWait(.milliseconds(100))
+        w.script()
+        let purge = ExclusiveFence(home: home, companyId: companyId)
+        let refused = await w.refusal(try PluginFixture())
+        purge.release()
+        #expect(refused?.contains("purging") == true, "\(refused ?? "ran")")
+        #expect(w.world.fake.requests.isEmpty)
+        final class Seen: @unchecked Sendable { var purgeGotIn: Bool? }
+        let seen = Seen()
+        let session = "try-session"
+        w.world.fake.defaultScript = FakeTurnRunner.Script(events: [
+            .initialized(sessionId: session, model: "haiku"),
+            .initInfo(InitInfo(sessionId: session, model: "haiku", tools: ["Bash", "Read", "Skill"], agents: [], skills: ["demo:demo"])),
+            .result(TurnResult(isError: false, subtype: "success", text: "ok", costUSD: 0.01, apiErrorStatus: nil, sessionId: session)),
+        ], sideEffect: { _ in
+            seen.purgeGotIn = (try? PurgeFence.withExclusive(home: home, companyId: companyId, wait: .milliseconds(50)) { true }) ?? false
+        })
+        _ = try await w.run(try PluginFixture())
+        #expect(seen.purgeGotIn == false)
+        #expect((try? PurgeFence.withExclusive(home: home, companyId: companyId, wait: .milliseconds(50)) { true }) == true)
+        w.store.refHooks.setFenceWait(nil)
+    }
+
     /// Plan L Task 14 fix round 2 (S1-ext): an owner's trial in an imported company the owner has not trusted runs tainted with
     /// the import's source (its flag file is in place for the turn's hooks), and the result says so.
     @Test func tryInAnImportedCompanyIsTainted() async throws {

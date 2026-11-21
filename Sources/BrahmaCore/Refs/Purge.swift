@@ -261,6 +261,23 @@ extension Store {
     }
 }
 
+extension Store {
+    /// The message of an item check or extension trial refused while the owner's purge holds the fence (R4-6).
+    static let purgingRefusal = "the owner is purging content in this company"
+
+    /// C2b fix round 4 (R4-6, ruling 35): the company's purge fence held shared for work that reads its repository outside
+    /// a recorded turn (an item check, an extension trial turn), waiting up to `PurgeFence.defaultWait` (tests: the hook's
+    /// wait) while a purge holds it; nil when the store has no data home (no fence, as for turns). Throws
+    /// `WorkError.conflict(purgingRefusal …)` past the wait.
+    func holdPurgeFence(companyId: String) throws -> PurgeFence.Hold? {
+        guard let home = dataHome ?? refHooks.fenceHome else { return nil }
+        guard let hold = try PurgeFence.holdShared(home: home, companyId: companyId, wait: refHooks.fenceWait ?? PurgeFence.defaultWait) else {
+            throw WorkError.conflict("\(Self.purgingRefusal); try again in a moment")
+        }
+        return hold
+    }
+}
+
 public enum PurgeFenceError: Error, Equatable, CustomStringConvertible {
     /// The fence stayed taken for the whole wait.
     case timeout
@@ -278,7 +295,8 @@ public enum PurgeFenceError: Error, Equatable, CustomStringConvertible {
 /// One company's purge fence (C2b fix round 1): an `flock` on `<home>/run/purge-<companyId>.lock`. A purge holds it
 /// exclusively while it checks that no turn runs and prunes git; every turn start holds it shared while it records the
 /// turn (`Store.beginTurn`, `Store.startTurn`), so a turn either is recorded before the purge's check (which then refuses)
-/// or starts after the purge. It lives under the data home, never in a workspace, so no agent can hold it.
+/// or starts after the purge. Round 4 (R4-6): an item check and an extension trial turn, which no turn row records, hold it
+/// shared for their whole run (`holdShared`). It lives under the data home, never in a workspace, so no agent can hold it.
 public enum PurgeFence {
     public static let defaultWait = Duration.seconds(30)
     static let pollInterval: TimeInterval = 0.02
@@ -300,6 +318,50 @@ public enum PurgeFence {
     /// `body`, while a purge holds it.
     public static func withShared<T>(home: URL, companyId: String, wait: Duration, _ body: () throws -> T) throws -> T? {
         try with(LOCK_SH, home: home, companyId: companyId, wait: wait, body)
+    }
+
+    /// C2b fix round 4 (R4-6, ruling 35): the fence held shared until `release` (or the hold's end), for work that reads the
+    /// company's repository outside a recorded turn and lasts across suspension points (an item check, an extension trial
+    /// turn). Waits up to `wait`; nil while a purge holds it.
+    public static func holdShared(home: URL, companyId: String, wait: Duration) throws -> Hold? {
+        guard let fd = try acquire(LOCK_SH, home: home, companyId: companyId, wait: wait) else { return nil }
+        return Hold(fd: fd)
+    }
+
+    /// A shared hold of the fence: released once (`release`, or when it is freed).
+    public final class Hold: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fd: Int32?
+        init(fd: Int32) { self.fd = fd }
+        public func release() {
+            lock.withLock {
+                guard let fd else { return }
+                flock(fd, LOCK_UN)
+                close(fd)
+                self.fd = nil
+            }
+        }
+        deinit { release() }
+    }
+
+    /// The fence file opened and locked with `operation`, waiting up to `wait`; nil past it.
+    private static func acquire(_ operation: Int32, home: URL, companyId: String, wait: Duration) throws -> Int32? {
+        let url = try lockURL(home: home, companyId: companyId)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch { throw PurgeFenceError.unavailable("\(error)") }
+        // Close-on-exec and no link followed, as `GitLock`.
+        let fd = open(url.path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw PurgeFenceError.unavailable("cannot open the fence file") }
+        let seconds = Double(wait.components.seconds) + Double(wait.components.attoseconds) / 1e18
+        let deadline = AwakeTime.uptime() + seconds
+        while flock(fd, operation | LOCK_NB) != 0 {
+            if errno != EWOULDBLOCK && errno != EINTR { close(fd); throw PurgeFenceError.unavailable("cannot take the fence") }
+            guard AwakeTime.uptime() < deadline else { close(fd); return nil }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+        return fd
     }
 
     private static func with<T>(_ operation: Int32, home: URL, companyId: String, wait: Duration, _ body: () throws -> T) throws -> T? {

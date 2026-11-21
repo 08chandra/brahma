@@ -119,8 +119,9 @@ public enum ArchiveMemberScan {
     /// bytes read in all (each probe at most `sliceBytes`), and nothing past `deadline`. Spent → an archive.
     struct ProbeBudget {
         static let maxHeaders = 64
-        static let maxBytes = 1 << 20
-        static let sliceBytes = 1 << 16
+        /// Round 4 (R4-7): the probe feeds one byte per decoder call, so its slice and total are kept small.
+        static let maxBytes = 1 << 18
+        static let sliceBytes = 1 << 14
         var headers = 0
         var bytes = 0
         let deadline: TimeInterval?
@@ -142,8 +143,9 @@ public enum ArchiveMemberScan {
     /// Whether a zip local header parses at `offset` (an index of `data`), as amended ruling 32 has it: a method a zip may
     /// use, the name and extra field inside the bytes, and data that stays inside them: a compressed size that fits in what
     /// is left (or zip64's marker, or 0 with a data descriptor), or, deflated, data that is not a deflate error. Round 4
-    /// (R4-3, the controller's ruling on truncated deflate): only a deflate DATA ERROR means "no archive"; data that decodes,
-    /// runs out before its stream ends, or runs past the probe's slice or output is an archive. The probe reads at most
+    /// (R4-3, the controller's ruling on truncated deflate; R4-7, ruling 36): only a deflate DATA ERROR before any output
+    /// means "no archive"; data that produces any output (whatever follows it), ends, or runs out before its stream ends
+    /// or past the probe's slice is an archive. The probe reads at most
     /// `ProbeBudget.sliceBytes` of the bytes in place (no copy) and is paid for from `budget`; a spent budget is an archive.
     /// The version and the name's length play no part (they only limit what a reader accepts). Every read is bounds-checked
     /// first.
@@ -163,7 +165,7 @@ public enum ArchiveMemberScan {
         let start = offset + 30 + nameLength + extraLength
         let slice = min(left, ProbeBudget.sliceBytes)
         guard budget.take(slice) else { return true }
-        return EmbeddedContent.deflateProbe(data[start..<(start + slice)], outputCap: 1 << 16) != .dataError
+        return EmbeddedContent.deflateProbe(data[start..<(start + slice)]) != .dataError
     }
 
     /// The compressed format whose magic `data` starts with, among those the engine can't open: gzip, bzip2, xz, zstd, 7z,

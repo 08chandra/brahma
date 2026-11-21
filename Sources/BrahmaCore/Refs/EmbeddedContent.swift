@@ -198,23 +198,27 @@ enum EmbeddedContent {
         return try inflateRaw(Data(b[2...]), cap: cap, failure: failure)
     }
 
-    /// What a deflate probe saw (R4-3).
+    /// What a deflate probe saw (R4-3, R4-7).
     enum ProbeResult: Equatable {
-        /// The stream ended (its last block decoded).
+        /// It produced output: an archive whatever follows (it ends, runs on, or fails: ruling 36, a streaming reader prints
+        /// what came before an error).
+        case output
+        /// The stream ended without producing anything (an empty member).
         case ended
-        /// A data error: not deflate.
+        /// A data error before any output: not deflate.
         case dataError
-        /// The input ran out before the stream ended (a cut stream, or the probe's slice).
+        /// The input ran out before the stream ended or produced anything (a cut stream, or the probe's slice).
         case needsInput
-        /// More output than `outputCap`.
-        case overOutput
     }
 
-    /// Raw DEFLATE `data` (read in place, never copied) decoded at most to `outputCap` bytes of output, which are thrown
-    /// away: whether it ends, fails with a data error, runs out of input, or passes the cap. No flush is asked for, so input
-    /// that stops mid-stream is told apart from data that is wrong. Where there is no `Compression` (Linux) every probe is a
-    /// data error (no zip is detected by its local header alone there; the end record and the extension still are).
-    static func deflateProbe(_ data: Data, outputCap: Int) -> ProbeResult {
+    /// Raw DEFLATE `data` (read in place, never copied), fed to the decoder ONE byte at a time so every byte of output is
+    /// reported before any error (Apple's decoder drops the output of the call that fails; with one byte per call that is at
+    /// most what one input byte decodes to, and a back-reference needs output before it). It stops at the first output
+    /// (`output`: an archive, R4-7), at a data error (`dataError`), at the stream's end, or when the input runs out
+    /// (`needsInput`). No flush is asked for, so input that stops mid-stream is told apart from data that is wrong. Where
+    /// there is no `Compression` (Linux) every probe is a data error (no zip is detected by its local header alone there;
+    /// the end record and the extension still are).
+    static func deflateProbe(_ data: Data) -> ProbeResult {
         #if canImport(Compression)
         guard !data.isEmpty else { return .needsInput }
         let chunk = 65_536
@@ -225,21 +229,21 @@ enum EmbeddedContent {
         defer { compression_stream_destroy(&stream) }
         return data.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> ProbeResult in
             guard let base = src.bindMemory(to: UInt8.self).baseAddress else { return .needsInput }
-            stream.src_ptr = base
-            stream.src_size = src.count
-            var total = 0
+            var fed = 0
             while true {
+                if stream.src_size == 0 {
+                    guard fed < src.count else { return .needsInput }
+                    stream.src_ptr = base + fed
+                    stream.src_size = 1
+                    fed += 1
+                }
                 stream.dst_ptr = dst
                 stream.dst_size = chunk
                 let status = compression_stream_process(&stream, 0)
-                let produced = chunk - stream.dst_size
-                total += max(0, produced)
-                if total > outputCap { return .overOutput }
+                if chunk - stream.dst_size > 0 { return .output }
                 switch status {
                 case COMPRESSION_STATUS_END: return .ended
-                case COMPRESSION_STATUS_OK:
-                    // No progress with all the input given: it needs more than there is.
-                    if produced == 0 && stream.src_size == 0 { return .needsInput }
+                case COMPRESSION_STATUS_OK: continue
                 default: return .dataError
                 }
             }
