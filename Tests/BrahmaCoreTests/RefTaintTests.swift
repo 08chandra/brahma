@@ -71,6 +71,18 @@ import GRDB
 
         func turns() throws -> [Turn] { try world.turns(eng) }
 
+        /// Synchronous store access (the async `read`/`write` would be picked inside an async test).
+        func exec(_ sql: String, _ arguments: [String]) throws {
+            try store.writer.write { db in try db.execute(sql: sql, arguments: StatementArguments(arguments)) }
+        }
+
+        /// The claim log's trusted heads for `item`, oldest first.
+        func claimHeads() throws -> [String?] {
+            try store.writer.read { db in
+                try String?.fetchAll(db, sql: "SELECT claimHead FROM leaseClaim WHERE itemId = ? ORDER BY id", arguments: [item.id])
+            }
+        }
+
         /// The holder's newest message (a synchronous read: the async `read` would be picked inside an async test).
         func lastMessage() throws -> Message? {
             try store.writer.read { db in
@@ -491,20 +503,30 @@ import GRDB
         #expect(Set(try h.rows().map(\.sha)).isSuperset(of: Set(shas.all)))
     }
 
-    /// R2-2 (ruling 6): a release and a re-claim in the same turn can't move the start past commits made before them.
+    /// R2-2 (ruling 6), R3-4: a release and a re-claim in the same turn can't move the start past commits made before them.
+    /// Both claims have a trusted head here (the engine recorded each), so a record starting at the last claim would miss the
+    /// first commit: only the first claim's head is the start.
     @Test func reclaimKeepsEarlierCommits() async throws {
         let h = try Holder(claim: false)
-        let (store, engId, companyId, key, wt) = (h.store, h.eng.id, h.company.id, h.item.key, h.worktree(h.item))
+        let (store, engId, companyId, key, itemId, wt) = (h.store, h.eng.id, h.company.id, h.item.key, h.item.id, h.worktree(h.item))
+        // The branch will start at main: the engine's recorded head, so the first claim's head is trusted.
+        let main = try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: h.root)
+        try h.exec("UPDATE workItem SET leaseHeadCommit = ? WHERE id = ?", [main, itemId])
         let shas = ShaBox()
         try await h.turn {
             try store.markTainted(agentId: engId, source: "docs.swift.org")
             let tools = CompanyTools(store: store, companyId: companyId, agentId: engId)
             _ = try tools.call(name: "claim_lease", arguments: ["key": .string(key)])
-            shas.append(try Holder.commit(wt, "src/one.ts", "1\n"))
+            let first = try Holder.commit(wt, "src/one.ts", "1\n")
+            shas.append(first)
+            // The engine records the new head (as an accepted submit does), so the re-claim's head is trusted too.
+            try store.recordLeaseHead(itemId: itemId, commit: first)
             _ = try tools.call(name: "release_lease", arguments: ["key": .string(key)])
             _ = try tools.call(name: "claim_lease", arguments: ["key": .string(key)])
             shas.append(try Holder.commit(wt, "src/two.ts", "2\n"))
         }
+        let claims = try h.claimHeads()
+        #expect(claims == [main, shas.all[0]])                 // both trusted: the test discriminates first from last
         #expect(Set(try h.rows().map(\.sha)).isSuperset(of: Set(shas.all)))
     }
 
@@ -561,6 +583,140 @@ import GRDB
         #expect(try other.store.events(afterId: 0, companyId: oId).contains { $0.kind == .error && $0.text.contains("could not all be recorded") })
     }
 
+
+    // MARK: Fix round 3
+
+    /// Sets up the partial rewrite of `partialRewriteKeepsTaint`: T (recorded) stays, T2 (recorded) is amended. Returns the
+    /// amended commit.
+    static func partialRewrite(_ cf: CollabFixture) throws -> String {
+        try Self.taintItemCommit(cf)
+        let t = try cf.fx.head("item/ENG-1")
+        let t2 = try cf.commit(["src/d.ts": Data("d\n".utf8)], on: "item/ENG-1", message: "second")
+        try cf.store.recordTaintedCommits(companyId: cf.c.id, itemId: cf.fx.item.id, agentId: cf.fx.eng3.id, turnId: nil,
+                                          headBefore: t, headAfter: t2, source: "docs.swift.org",
+                                          git: SafeGit(workspace: cf.workspace), now: cf.now)
+        try cf.fx.git.git(["checkout", "-q", "item/ENG-1"])
+        try cf.fx.git.write("src/d.ts", "d amended\n")
+        try cf.fx.git.git(["commit", "-q", "--amend", "-a", "-m", "second, amended"])
+        try cf.fx.git.git(["checkout", "-q", "main"])
+        return try cf.fx.head("item/ENG-1")
+    }
+
+    /// R3-1: a git failure while listing an item's branch is not "the branch is gone": `commit:` and key-less refs of the
+    /// rewritten commit read tainted.
+    @Test func branchListingFailureFailsClosed() throws {
+        let cf = try CollabFixture()
+        let amended = try Self.partialRewrite(cf)
+        cf.store.refHooks.setGitRunner(FailingItemRefRunner())
+        defer { cf.store.refHooks.setGitRunner(nil) }
+        #expect(try cf.store.refTaint(try cf.fx.ref("commit:\(amended)"), companyId: cf.c.id).tainted)
+        #expect(try cf.store.refTaint(try cf.fx.ref("src/d.ts@\(amended)"), companyId: cf.c.id).tainted)
+    }
+
+    /// R3-2: another item whose branch holds an orphaned item's rewritten commit reads tainted through its own item refs too.
+    @Test func otherItemHoldingRewrittenCommitIsTainted() throws {
+        let cf = try CollabFixture()
+        let amended = try Self.partialRewrite(cf)
+        let other = try cf.store.createWorkItem(companyId: cf.c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Other"))
+        #expect(other.key == "ENG-2")
+        try cf.fx.git.git(["branch", "item/ENG-2", amended])
+        let (otherId, cId) = (other.id, cf.c.id)
+        try cf.store.writer.write { db in try db.execute(sql: "UPDATE workItem SET status = 'inProgress' WHERE id = ?", arguments: [otherId]) }
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:diff"), companyId: cId).tainted)
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-2:src/d.ts"), companyId: cId).tainted)
+        #expect(try cf.fx.resolve(.qa2, try cf.fx.ref("ENG-2:src/d.ts")).tainted)
+    }
+
+    /// R3-3: when the company can't be read at a tainted turn's end, every item the turn touched is still marked (an
+    /// `unrecorded-…` marker and 5-lite's `taintedOrigin`), not only alerted.
+    @Test func companyReadFailureStillMarks() throws {
+        let cf = try CollabFixture()
+        cf.store.refHooks.setFailCompanyRead(true)
+        defer { cf.store.refHooks.setFailCompanyRead(false) }
+        cf.store.recordTurnTaints(companyId: cf.c.id, agentId: cf.fx.eng3.id, turnId: "t-z", heldAtStart: [cf.fx.item.id: "abc"],
+                                  leasedItemId: nil, source: "docs.swift.org", now: cf.now)
+        let cId = cf.c.id
+        let marker = try cf.store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT sha FROM taintedCommit WHERE companyId = ?", arguments: [cId])
+        }
+        #expect(marker.count == 1 && marker.first?.hasPrefix(TaintedCommit.unrecordedPrefix) == true)
+        #expect(try cf.store.workItem(id: cf.fx.item.id)?.taintedOrigin == true)
+        cf.store.refHooks.setFailCompanyRead(false)
+        #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:src/a.ts"), companyId: cId).tainted)
+    }
+
+    /// R3-5: the engine's auto-commit of a tainted session's leftover worktree edits (a reap, a sweep, a reassignment) is
+    /// recorded tainted; a clean session's is not; one nobody can attribute is (fail closed).
+    @Test func engineAutoCommitOfTaintedWorkIsTainted() throws {
+        func leftover(_ cf: CollabFixture, claimedBy agent: Agent?) throws -> String? {
+            let (itemId, cId, now) = (cf.fx.item.id, cf.c.id, cf.now)
+            if let agent {
+                let agentId = agent.id
+                try cf.store.writer.write { db in
+                    try db.execute(sql: "INSERT INTO leaseClaim (companyId, agentId, itemId, createdAt) VALUES (?, ?, ?, ?)",
+                                   arguments: [cId, agentId, itemId, now])
+                }
+            }
+            let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
+            try cf.fx.git.write("src/leftover.ts", "left\n", in: wt)
+            let git = cf.store.gitWorkspace(root: cf.workspace, companyId: cId)
+            let made = try #require(try cf.store.removeItemWorktree(git: git, companyId: cId, key: "ENG-1"))
+            return try cf.store.writer.read { db in
+                try String.fetchOne(db, sql: "SELECT source FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [cId, made.commit])
+            }
+        }
+        let tainted = try CollabFixture()
+        try tainted.store.markTainted(agentId: tainted.fx.eng1.id, source: "docs.swift.org")
+        #expect(try leftover(tainted, claimedBy: tainted.fx.eng1) == "docs.swift.org")
+        #expect(try tainted.store.refTaint(try tainted.fx.ref("ENG-1:src/leftover.ts"), companyId: tainted.c.id).tainted)
+        let clean = try CollabFixture()
+        #expect(try leftover(clean, claimedBy: clean.fx.eng1) == nil)
+        let unknown = try CollabFixture()
+        #expect(try leftover(unknown, claimedBy: nil) != nil)
+    }
+
+    /// R3-6 (ruling 9): a rev-less `.brahma/…` file read from disk takes the taint of the item it belongs to: a hand-off a
+    /// tainted session wrote, a progress file of an item a tainted session held; the company mirror is clean; anything else
+    /// that can't be placed is tainted.
+    @Test func onDiskBrahmaFilesCarryTheirItemsTaint() throws {
+        let cf = try CollabFixture()
+        try cf.store.markTainted(agentId: cf.fx.eng3.id, source: "docs.swift.org")
+        let handoff = try cf.store.writeHandoff(itemId: cf.fx.item.id, by: .agent(cf.fx.eng3.id), draft: HandoffDraft(goal: "finish it"))
+        #expect(handoff.taintedOrigin)
+        let relative = String(handoff.path.dropFirst(cf.workspace.standardizedFileURL.path.count + 1))
+        #expect(relative.hasPrefix(".brahma/handoffs/ENG-1/"))
+        let ref = try cf.fx.ref(relative)
+        #expect(try cf.store.refTaint(ref, companyId: cf.c.id).tainted)
+        let out = try cf.open(.qa2, relative)
+        #expect(out.tainted && out.text.hasPrefix("Untrusted content from"))
+        #expect(try cf.agent(cf.fx.qa2).sessionTainted)
+        // A progress file: tainted once a tainted session held the item (5-lite's sticky mark); clean before.
+        try cf.fx.git.write(".brahma/progress/ENG-1.md", "# progress\n")
+        let progress = try cf.fx.ref(".brahma/progress/ENG-1.md")
+        #expect(try cf.store.refTaint(progress, companyId: cf.c.id) == (false, nil))
+        let (itemId, cId) = (cf.fx.item.id, cf.c.id)
+        try cf.store.writer.write { db in try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE companyId = ? AND id = ?", arguments: [cId, itemId]) }
+        #expect(try cf.store.refTaint(progress, companyId: cId).tainted)
+        // The company mirror holds only clean resources; a place no item owns can't be judged: tainted.
+        try cf.fx.git.write(".brahma/resources/company/F-2.md", "brief\n")
+        #expect(try cf.store.refTaint(try cf.fx.ref(".brahma/resources/company/F-2.md"), companyId: cId) == (false, nil))
+        try cf.fx.git.write(".brahma/artifacts/page.html", "<p>x</p>\n")
+        #expect(try cf.store.refTaint(try cf.fx.ref(".brahma/artifacts/page.html"), companyId: cId).tainted)
+        try cf.fx.git.write(".brahma/progress/ENG-99.md", "# ?\n")
+        #expect(try cf.store.refTaint(try cf.fx.ref(".brahma/progress/ENG-99.md"), companyId: cId).tainted)
+    }
+
+}
+
+/// A git runner that fails (status 128, as a broken repository does) every call naming an item branch.
+struct FailingItemRefRunner: GitProcessRunning {
+    func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int) throws -> (status: Int32, stdout: Data, stderr: Data) {
+        try run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap, workTreeDescriptor: nil)
+    }
+    func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int, workTreeDescriptor: Int32?) throws -> (status: Int32, stdout: Data, stderr: Data) {
+        if args.contains(where: { $0.contains("refs/heads/item/") }) { return (128, Data(), Data("fatal: injected failure\n".utf8)) }
+        return try LiveGitRunner().run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap, workTreeDescriptor: workTreeDescriptor)
+    }
 }
 
 /// Shas a turn's side effect records, read by the test afterwards.
