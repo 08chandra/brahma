@@ -201,7 +201,7 @@ public actor Orchestrator {
         let previews = PreviewRunner(store: store, paths: paths, deps: previewDeps,
                                      sandboxLayout: { SandboxLayout(paths: paths, company: $0, agentHandle: "preview") },
                                      timeouts: PreviewTimeouts(), memory: { memory.current != .normal }, clock: clock,
-                                     blocking: engineBlocking, environment: checkBaseEnvironment)
+                                     blocking: engineBlocking, environment: checkBaseEnvironment, adapters: previewDeps.adapters)
         self.previewRunner = previews
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
         let checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths, ceiling: profile)
@@ -457,23 +457,51 @@ public actor Orchestrator {
         }
     }
 
-    /// Ticks until cancelled, then cancels in-flight turns and waits for them to record their outcome.
-    public func runForever(interval: Duration = .seconds(1)) async {
+    /// Ticks until cancelled, then the bounded shutdown (`shutdown`): in-flight turns are cancelled and record their outcome,
+    /// every preview is stopped alongside them, and nothing holds the exit past `shutdownBound`.
+    public func runForever(interval: Duration = .seconds(1), shutdownBound: Duration = EngineShutdown.bound) async {
         while !Task.isCancelled {
             await tick()
             try? await Task.sleep(for: interval)
         }
-        // The engine is stopping: litestream stops with it (SIGTERM, then SIGKILL after the grace).
+        _ = await shutdown(bound: shutdownBound)
+    }
+
+    /// The engine is stopping (Plan 4a Task 9c). Litestream stops first (SIGTERM, then SIGKILL after the grace) and the sleep
+    /// guard with it; then every task in flight is cancelled (a turn's `claude` gets SIGTERM and, after `killGrace`, SIGKILL)
+    /// and waited for, `previewRunner.stopAll()` runs at the same time (every preview's process group stopped, recorded
+    /// `engine stopped`; the next engine starts them again), and the runner's `waitForChildren` too, all under one bound
+    /// (`EngineShutdown.run`). Past the bound the shutdown returns anyway and logs what was still running, by engine-written
+    /// name (task kinds and engine ids only). Returns those names (tests read them).
+    @discardableResult
+    func shutdown(bound: Duration = EngineShutdown.bound) async -> [String] {
         stopWALShipping()
         await stopSleepPrevention()
-        let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values) + Array(timerTasks.values)
-            + Array(smokeTasks.values) + Array(releaseTasks.values)
-            + (secretsTask.map { [$0] } ?? []) + (pushTask.map { [$0] } ?? []) + (stopObserverTask.map { [$0] } ?? []) + (previewTask.map { [$0] } ?? [])
-        for t in inFlight { t.cancel() }
-        for t in inFlight { await t.value }
-        // Every preview's process group is stopped with the engine (the next engine starts them again).
-        await previewRunner.stopAll()
-        await runner.waitForChildren()
+        var steps: [EngineShutdown.Step] = []
+        func add(_ name: String, _ task: Task<Void, Never>?) {
+            guard let task else { return }
+            task.cancel()
+            steps.append(EngineShutdown.Step(name: name) { await task.value })
+        }
+        for (agentId, t) in tasks { add("turn of agent \(agentId)", t) }
+        for (key, t) in healthTasks { add("health \(key)", t) }
+        for (key, t) in gitTasks { add("git \(key)", t) }
+        for (runId, t) in checkTasks { add("check \(runId)", t) }
+        for (companyId, t) in mergeTasks { add("merge \(companyId)", t) }
+        for (timerId, t) in timerTasks { add("timer \(timerId)", t) }
+        for (companyId, t) in smokeTasks { add("smoke \(companyId)", t) }
+        for (companyId, t) in releaseTasks { add("release \(companyId)", t) }
+        add("secrets reload", secretsTask)
+        add("push", pushTask)
+        add("stop observers", stopObserverTask)
+        add("preview pass", previewTask)
+        steps.append(EngineShutdown.Step(name: "previews") { [previewRunner] in await previewRunner.stopAll() })
+        steps.append(EngineShutdown.Step(name: "turn children") { [runner] in await runner.waitForChildren() })
+        let left = await EngineShutdown.run(steps, bound: bound)
+        if !left.isEmpty {
+            log("shutdown bound of \(bound.components.seconds) s passed; still running: \(left.sorted().joined(separator: ", ")); exiting anyway")
+        }
+        return left
     }
 
     /// Synchronous on the actor (no suspension points), so ticks never interleave with each other.

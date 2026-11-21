@@ -6,8 +6,10 @@ import BrahmaAppModel
 
 /// A video artifact (Plan 4a Task 9b): an `AVPlayerView` with inline controls, started paused and muted, looping when the clip
 /// is shorter than `loopUnder`. The player is made only for a file URL inside the artifact's copy
-/// (`PreviewNavigationPolicy.allowsArtifact(url, root:)`); anything else is `CAN'T SHOW THIS FILE`. The first video track's
-/// `naturalSize` and `preferredTransform` (loaded with `RendererCaps.parseTimeout` as the bound) go through `VideoLayout`: a
+/// (`PreviewNavigationPolicy.allowsArtifact(url, root:)`) that is a regular file at that moment
+/// (`RendererCaps.regularFileProblem`, the readers' `O_NOFOLLOW` opener: AVFoundation would follow a link swapped in);
+/// anything else is `CAN'T SHOW THIS FILE`. The first video track's `naturalSize` and `preferredTransform` (loaded under
+/// `RendererCaps.race`, so a load that ignores its cancellation still cannot hold the stage past `parseTimeout`) go through `VideoLayout`: a
 /// phone clip sits in the theme's `PhoneFrame`, others play plain. The "PHONE FRAME" chip toggles that; the host keeps the
 /// owner's choice (`AppModel.phoneFrameOverride`, through `onPhoneFrame`), or this view does when no host does.
 struct VideoPreviewView: View {
@@ -22,6 +24,8 @@ struct VideoPreviewView: View {
     @State private var looper: AVPlayerLooper?
     @State private var clip: ClipInfo?
     @State private var localOverride: Bool?
+    /// Why the entry could not be handed to AVFoundation (engine-written), or nil.
+    @State private var refused: String?
 
     /// Clips shorter than this loop.
     static let loopUnder: Double = 60
@@ -58,6 +62,8 @@ struct VideoPreviewView: View {
         Group {
             if !allowed {
                 FileLoadFailure(title: PreviewBodies.cantShowTitle, detail: "the video isn't inside the artifact")
+            } else if let refused {
+                FileLoadFailure(title: PreviewBodies.cantShowTitle, detail: refused)
             } else {
                 VStack(spacing: 0) {
                     stage.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -111,14 +117,19 @@ struct VideoPreviewView: View {
         if let onPhoneFrame { onPhoneFrame(on) } else { localOverride = on }
     }
 
-    /// Inspects the asset (bounded), then makes the player: a looping `AVQueuePlayer` for a short clip, a plain `AVPlayer`
-    /// otherwise. Never plays by itself; the controls do.
+    /// Checks the entry is a regular file (no link followed), inspects the asset (bounded), then makes the player: a looping
+    /// `AVQueuePlayer` for a short clip, a plain `AVPlayer` otherwise. Never plays by itself; the controls do.
     private func run() async {
         player?.pause()
         player = nil
         looper = nil
         clip = nil
+        refused = nil
         guard allowed else { return }
+        if let problem = RendererCaps.regularFileProblem(url) {
+            refused = problem == .notRegular ? "it isn't a regular file" : "it couldn't be read"
+            return
+        }
         let box = AssetBox(AVURLAsset(url: url))
         let info = await Self.inspect(box)
         guard !Task.isCancelled else { return }
@@ -134,19 +145,11 @@ struct VideoPreviewView: View {
         player?.isMuted = true
     }
 
-    /// The first video track's size, rotation and the asset's duration, or nil after `RendererCaps.parseTimeout` or when the
-    /// asset has no video track (the player still shows, plain).
+    /// The first video track's size, rotation and the asset's duration, or nil after `RendererCaps.parseTimeout` (the
+    /// unstructured race of `RendererCaps.race`: a load that never honours its cancellation is left behind, not waited for)
+    /// or when the asset has no video track (the player still shows, plain).
     nonisolated static func inspect(_ box: AssetBox) async -> ClipInfo? {
-        await withTaskGroup(of: ClipInfo?.self) { group in
-            group.addTask { try? await Self.probe(box.asset) }
-            group.addTask {
-                try? await Task.sleep(for: RendererCaps.parseTimeout)
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
-        }
+        try? await RendererCaps.race { try await Self.probe(box.asset) }
     }
 
     private enum ProbeFailure: Error { case noVideoTrack }

@@ -116,6 +116,9 @@ public struct PreviewDependencies: Sendable {
     public var simulator: any SimulatorControlling = UnavailableSimulator()
     /// macOS app launching (Plan 4a; Task 7 provides the real one).
     public var macApps: any MacAppLaunching = UnavailableMacApps()
+    /// The adapter of each kind the engine's preview runner uses; nil: `PreviewAdapters.defaults` over these dependencies
+    /// (Task 9c: tests inject an adapter here to drive the engine's own runner).
+    public var adapters: [PreviewKind: any PreviewAdapter]? = nil
 
     public init(sandbox: any SandboxedRunner, http: any HTTPProbing, listen: any ListenProbing, processes: SpawnedProcesses,
                 unsandboxed: any SandboxedRunner = UnsandboxedPreviewRunner(), simulator: any SimulatorControlling = UnavailableSimulator(),

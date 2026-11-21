@@ -39,18 +39,39 @@ public enum RendererCaps {
         case notRegular, tooLarge, unreadable
     }
 
-    /// The whole content of `url` when it is a regular file of at most `maxBytes`. The one file opener of every preview
-    /// reader: `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` (a link swapped in is `.notRegular`; a FIFO cannot block the open),
-    /// then `fstat` on the descriptor requires `S_IFREG` and a size within `maxBytes` before any read (`.tooLarge`
-    /// otherwise), then `O_NONBLOCK` is cleared and the file is read. Public for the app's file renderers (Task 9a), which
-    /// call it inside `parse`.
-    public static func readRegularFile(_ url: URL, maxBytes: Int) throws -> Data {
+    /// The one file opener of every preview reader (and of "Open in…", Task 9c): `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`
+    /// (a link swapped in is `.notRegular`; a FIFO cannot block the open), then `fstat` on the descriptor, which must say
+    /// `S_IFREG` (`.notRegular` otherwise: the descriptor is closed). Returns the open descriptor (still non-blocking; the
+    /// caller closes it) and its stat, so what the caller reads or copies is the very file that was checked.
+    public static func openRegularFile(_ url: URL) throws -> (fd: Int32, stat: stat) {
         let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { throw errno == ELOOP ? FileReadFailure.notRegular : FileReadFailure.unreadable }
-        defer { close(fd) }
         var st = stat()
-        guard fstat(fd, &st) == 0 else { throw FileReadFailure.unreadable }
-        guard (st.st_mode & S_IFMT) == S_IFREG else { throw FileReadFailure.notRegular }
+        guard fstat(fd, &st) == 0 else { close(fd); throw FileReadFailure.unreadable }
+        guard (st.st_mode & S_IFMT) == S_IFREG else { close(fd); throw FileReadFailure.notRegular }
+        return (fd, st)
+    }
+
+    /// Why `url` is not a regular file the renderers may hand to a framework that resolves paths itself (AVFoundation follows
+    /// links): nil when it is one (Task 9c, the video body's check). Nothing is read.
+    public static func regularFileProblem(_ url: URL) -> FileReadFailure? {
+        do {
+            let (fd, _) = try openRegularFile(url)
+            close(fd)
+            return nil
+        } catch let failure as FileReadFailure {
+            return failure
+        } catch {
+            return .unreadable
+        }
+    }
+
+    /// The whole content of `url` when it is a regular file of at most `maxBytes`: `openRegularFile`, then the size within
+    /// `maxBytes` before any read (`.tooLarge` otherwise), then `O_NONBLOCK` is cleared and the file is read. Public for the
+    /// app's file renderers (Task 9a), which call it inside `parse`.
+    public static func readRegularFile(_ url: URL, maxBytes: Int) throws -> Data {
+        let (fd, st) = try openRegularFile(url)
+        defer { close(fd) }
         guard st.st_size <= maxBytes else { throw FileReadFailure.tooLarge }
         let flags = fcntl(fd, F_GETFL)
         guard flags >= 0, fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) >= 0 else { throw FileReadFailure.unreadable }
@@ -72,6 +93,19 @@ public enum RendererCaps {
     /// `parse` on an explicit clock (tests drive a manual one).
     public static func parse<T: Sendable, C: Clock>(clock: C, _ body: @escaping @Sendable () throws -> T) async throws -> T
     where C.Duration == Duration {
+        try await race(clock: clock) { try body() }
+    }
+
+    /// `parse` for an asynchronous body (an AVFoundation load, say; Task 9c): the same race, so a body that never honours
+    /// its cancellation still does not hold the caller past `parseTimeout`. A task group would wait for every child, and so
+    /// would not bound anything.
+    public static func race<T: Sendable>(_ body: @escaping @Sendable () async throws -> T) async throws -> T {
+        try await race(clock: SuspendingClock(), body)
+    }
+
+    /// `race` on an explicit clock.
+    public static func race<T: Sendable, C: Clock>(clock: C, _ body: @escaping @Sendable () async throws -> T) async throws -> T
+    where C.Duration == Duration {
         let race = ParseRace<T>()
         let timeout = parseTimeout
         return try await withTaskCancellationHandler {
@@ -86,8 +120,8 @@ public enum RendererCaps {
     }
 }
 
-/// One `RendererCaps.parse`: the continuation is resumed exactly once, by whichever of the body, the timer or the
-/// caller's cancellation comes first, and the other tasks are cancelled.
+/// One `RendererCaps.parse` or `race`: the continuation is resumed exactly once, by whichever of the body, the timer or
+/// the caller's cancellation comes first, and the other tasks are cancelled.
 private final class ParseRace<T: Sendable>: @unchecked Sendable {
     private enum State {
         /// `begin` has not run; a result that arrived first (the caller cancelled early) waits here.
@@ -100,7 +134,7 @@ private final class ParseRace<T: Sendable>: @unchecked Sendable {
     private var state = State.waiting(nil)
 
     /// `wait` sleeps for the timeout on the caller's clock; it throws when the timer task is cancelled.
-    func begin(continuation: CheckedContinuation<T, any Error>, body: @escaping @Sendable () throws -> T,
+    func begin(continuation: CheckedContinuation<T, any Error>, body: @escaping @Sendable () async throws -> T,
                wait: @escaping @Sendable () async throws -> Void) {
         let early: Result<T, any Error>? = lock.withLock {
             guard case .waiting(let early) = state else { return nil }
@@ -112,7 +146,7 @@ private final class ParseRace<T: Sendable>: @unchecked Sendable {
             return
         }
         let work = Task.detached(priority: .userInitiated) { [self] in
-            self.finish(with: Result { try body() })
+            do { self.finish(with: .success(try await body())) } catch { self.finish(with: .failure(error)) }
         }
         let timer = Task.detached { [self] in
             do { try await wait() } catch { return }

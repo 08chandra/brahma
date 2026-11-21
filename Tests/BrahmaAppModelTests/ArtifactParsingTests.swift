@@ -111,6 +111,43 @@ import Testing
         #expect(flag.cancelled)
     }
 
+    /// Task 9c: `race` bounds an asynchronous body (the video probe's AVFoundation loads) that never honours its
+    /// cancellation: the caller gets `timedOut` once the clock passes `parseTimeout`, and the body is simply left behind. And
+    /// the readers' opener, as a check: a link, a FIFO and a directory are not regular files; a regular file is.
+    @Test nonisolated func rendererRaceAndRegularFiles() async throws {
+        #expect(try await RendererCaps.race { 7 } == 7)
+        let clock = ManualClock()
+        let running = Gate()
+        let release = Gate()
+        let waiting = Task.detached { () async throws -> Int in   // scope-escape: awaits race off the main actor; makes no files
+            try await RendererCaps.race(clock: clock) { () async -> Int in
+                running.openUp()
+                await release.wait()   // ignores cancellation: a continuation nobody resumes until the test does
+                return 1
+            }
+        }
+        await running.wait()
+        let registered = SuspendingClock.now + .seconds(10)
+        while clock.sleepers < 1, SuspendingClock.now < registered { try await Task.sleep(for: .milliseconds(5)) }
+        #expect(clock.sleepers == 1, "the timer is asleep before the clock moves")
+        clock.advance(by: RendererCaps.parseTimeout)
+        await #expect(throws: RendererError.timedOut) { try await waiting.value }
+        release.openUp()
+
+        let dir = try tempDir()
+        let regular = dir.appending(path: "clip.mp4")
+        try Data([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70]).write(to: regular)
+        #expect(RendererCaps.regularFileProblem(regular) == nil)
+        let link = dir.appending(path: "link.mp4")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: regular)
+        #expect(RendererCaps.regularFileProblem(link) == .notRegular)
+        let fifo = dir.appending(path: "fifo.mp4")
+        #expect(mkfifo(fifo.path, 0o600) == 0)
+        #expect(RendererCaps.regularFileProblem(fifo) == .notRegular)
+        #expect(RendererCaps.regularFileProblem(dir) == .notRegular)
+        #expect(RendererCaps.regularFileProblem(dir.appending(path: "missing.mp4")) == .unreadable)
+    }
+
     /// A clock that moves only when told to; `Task.sleep(for:clock:)` on it waits for `advance`.
     final class ManualClock: Clock, @unchecked Sendable {
         struct Instant: InstantProtocol, Hashable {

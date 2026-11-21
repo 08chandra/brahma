@@ -107,16 +107,20 @@ echo "$OUT"
 [ "$STATUS" -eq 0 ] || fail "case D exit $STATUS"
 echo "$OUT" | grep -q '^SMOKE OK companies=3 agents=10 engine=embedded.* lifecycle=ok$' || fail "case D: expected lifecycle=ok"
 
-# (E) A second SIGTERM while the first quit is stopping the engine must not skip the bounded stop.
+# (E) A second SIGTERM while the first quit is stopping the engine forces the exit (Task 9c): the turn's process group is
+# killed (the engine's own records only), the turn is recorded interrupted, and the app is gone well inside the 10 s bound.
 "$CLI" say Acme @ceo "Status update, please." >/dev/null
 # Turns get an allowlisted environment, so the fake claude reads its settings from this file in the data home.
 printf 'export FAKE_CLAUDE_SLEEP=60\nexport FAKE_CLAUDE_PIDFILE=%q\n' "$TMP/turn-e.pid" >"$BRAHMA_HOME/fake-claude.env"
 $APP --smoke-test --smoke-hold=120 >"$TMP/app-e.out" 2>&1 &
 APP_PID=$!
-for _ in $(seq 1 100); do
-  "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running' && break
+# The fake turn records its pid once it is lingering (after its MCP DM); a SIGTERM before that would end it on the spot and
+# prove nothing about the stop.
+for _ in $(seq 1 300); do
+  [ -s "$TMP/turn-e.pid" ] && "$CLI" status | grep -Eq '^  @[a-z0-9_-]+  running' && break
   sleep 0.2
 done
+[ -s "$TMP/turn-e.pid" ] || fail "case E: fake turn recorded no pid"
 RUNNING="$("$CLI" status | grep -Eo '^  @[a-z0-9_-]+  running' | head -1 | awk '{print $1}')"
 [ -n "$RUNNING" ] || fail "case E: no turn in flight"
 kill -TERM "$APP_PID"
@@ -124,13 +128,12 @@ sleep 0.1
 kill -TERM "$APP_PID" 2>/dev/null || true
 START=$(date +%s)
 while kill -0 "$APP_PID" 2>/dev/null; do
-  [ $(( $(date +%s) - START )) -le 15 ] || fail "case E: app still running 15 s after SIGTERM"
+  [ $(( $(date +%s) - START )) -le 10 ] || fail "case E: app still running 10 s after the second SIGTERM"
   sleep 0.2
 done
 wait "$APP_PID" || true
 APP_PID=""
-# The bounded stop waits for the turn's process; an early exit would leave the fake claude still lingering.
-[ -s "$TMP/turn-e.pid" ] || fail "case E: fake turn recorded no pid"
+# The forced exit kills the turn's group first; the fake claude (its bash and its sleep) must be gone.
 while read -r pid; do
   if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null; fail "case E: app exited with claude child $pid alive"; fi
 done <"$TMP/turn-e.pid"

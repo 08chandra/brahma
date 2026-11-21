@@ -190,4 +190,21 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
         await h.stop()
         #expect(try store.company(id: acme.id)?.status == .running)
     }
+
+    /// Task 9c: a second quit request while `stop` waits on children that never go ends the wait at once (the groups the
+    /// engine recorded are killed first; the stub spawned none, so nothing is signalled) and the host is stopped.
+    @Test func forceStopEndsAPendingStopAtOnce() async throws {
+        let (store, paths) = try makeHome()
+        let h = host(paths, store, StubRunner(mode: .succeed, childrenNeverExit: true))
+        await h.start(tools: tools)
+        #expect(h.status == .embedded)
+        let stopping = Task { await h.stop(timeout: .seconds(60)) }
+        try await eventually(timeout: .seconds(10)) { h.status == .stopping }
+        let started = AwakeTime.now
+        let signalled = h.forceStop()
+        #expect(signalled.terminated.isEmpty)
+        await stopping.value
+        #expect(AwakeTime.now - started < .seconds(10))
+        #expect(h.status == .stopped)
+    }
 }

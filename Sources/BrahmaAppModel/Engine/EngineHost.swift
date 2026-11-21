@@ -65,6 +65,8 @@ public final class EngineHost {
     /// The running orchestrator, so `stop` can end its litestream directly.
     @ObservationIgnored private var engine: Orchestrator?
     @ObservationIgnored private var rememberedTools: Result<EngineTools, EngineSetupError>?
+    /// The bounded wait of the `stop` in progress, so a second quit request can end it at once (`forceStop`).
+    @ObservationIgnored private var pendingStop: ResumeOnce?
 
     /// The engine the app builds again after a restore (the model has a new store). It carries the same owner key store and
     /// the same secret vault as the first engine, so the restarted engine's redactor still loads the company's secrets and
@@ -161,19 +163,27 @@ public final class EngineHost {
         await start(tools: tools)
     }
 
-    /// Cancels the engine and waits for it to wind down, but never longer than `timeout`:
-    /// `runForever` ends in `waitForChildren()`, which a stuck child can keep from returning.
-    public func stop(timeout: Duration = .seconds(15)) async {
+    /// How long `stop` waits for the engine by default: the engine bounds its own shutdown at `EngineShutdown.bound` and logs
+    /// what was still running; this backstop sits 2 s behind it, so the engine's own log line comes first.
+    public static let stopTimeout: Duration = EngineShutdown.bound + .seconds(2)
+
+    /// Cancels the engine and waits for it to wind down, but never longer than `timeout`: the engine's shutdown is bounded
+    /// (`Orchestrator.shutdown`, Task 9c) and this wait is the backstop behind it.
+    public func stop(timeout: Duration = stopTimeout) async {
         switch status {
         case .embedded:
+            // Installed before anything is awaited, so a `forceStop` at any point of the stop ends the wait below.
+            let once = ResumeOnce()
+            pendingStop = once
             status = .stopping
             if let task = engineTask {
                 task.cancel()
                 // litestream stops even when a stuck child keeps `runForever` from returning within the timeout.
                 await engine?.stopWALShipping()
                 await engine?.stopSleepPrevention()
-                await Self.waitBounded(task, timeout: timeout)
+                await Self.waitBounded(task, timeout: timeout, once: once)
             }
+            pendingStop = nil
             engineTask = nil
             engine = nil
             lock = nil
@@ -185,10 +195,20 @@ public final class EngineHost {
         }
     }
 
-    /// Two unstructured tasks race into a resume-once continuation. A task group would wait for both children
-    /// at scope exit, so it would not bound anything.
-    private static func waitBounded(_ task: Task<Void, Never>, timeout: Duration) async {
-        let once = ResumeOnce()
+    /// A second quit request while `stop` runs (Task 9c, the owner's second SIGTERM or SIGINT): every process group the engine
+    /// recorded (turns, checks, merges, previews) is signalled with SIGKILL right behind SIGTERM, the in-progress turns are
+    /// recorded `interrupted` (`EngineShutdown.force`), and the pending `stop` returns at once instead of waiting out its
+    /// bound. Nothing the engine did not start is signalled. Returns what was signalled, for the caller's log.
+    @discardableResult
+    public func forceStop() -> EmergencyStop.Signalled {
+        let signalled = EngineShutdown.force(store: store, paths: paths)
+        pendingStop?.fire()
+        return signalled
+    }
+
+    /// Two unstructured tasks race into a resume-once continuation (`once`, which `forceStop` can fire too). A task group
+    /// would wait for both children at scope exit, so it would not bound anything.
+    private static func waitBounded(_ task: Task<Void, Never>, timeout: Duration, once: ResumeOnce) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             once.install(continuation)
             Task.detached {
@@ -202,35 +222,5 @@ public final class EngineHost {
             }
             once.onFire { timer.cancel() }
         }
-    }
-}
-
-/// Resumes its continuation exactly once, whichever caller fires first.
-private final class ResumeOnce: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<Void, Never>?
-    private var fired = false
-    private var cleanup: (@Sendable () -> Void)?
-
-    func install(_ c: CheckedContinuation<Void, Never>) { lock.withLock { continuation = c } }
-
-    func onFire(_ body: @escaping @Sendable () -> Void) {
-        let runNow = lock.withLock { () -> Bool in
-            if fired { return true }
-            cleanup = body
-            return false
-        }
-        if runNow { body() }
-    }
-
-    func fire() {
-        let (c, cleanup) = lock.withLock { () -> (CheckedContinuation<Void, Never>?, (@Sendable () -> Void)?) in
-            guard !fired else { return (nil, nil) }
-            fired = true
-            defer { continuation = nil; self.cleanup = nil }
-            return (continuation, self.cleanup)
-        }
-        c?.resume()
-        cleanup?()
     }
 }
