@@ -371,7 +371,8 @@ extension Store {
     /// Engine git over the company workspace; its captured output goes under the data home's `tmp` (never the process temp
     /// dir when the store has a data home).
     func refGit(_ workspace: URL) throws -> SafeGit {
-        SafeGit(workspace: workspace, runner: LiveGitRunner(tempRoot: try dataHomeTmp()))
+        if let fake = refHooks.gitRunner { return SafeGit(workspace: workspace, runner: fake) }
+        return SafeGit(workspace: workspace, runner: LiveGitRunner(tempRoot: try dataHomeTmp()))
     }
 
     func dataHomeTmp() throws -> URL? {

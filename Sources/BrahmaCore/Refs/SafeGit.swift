@@ -197,6 +197,17 @@ public struct SafeGit: Sendable {
         return sha
     }
 
+    /// Whether `branch` (`main`, `item/<KEY>`, or a fully qualified ref) exists. A git failure throws: it is not "no such
+    /// branch".
+    public func branchExists(_ branch: String) throws -> Bool {
+        let r = try run(["show-ref", "--verify", "--quiet", try Self.qualifiedRef(branch)], allowFailure: true)
+        switch r.status {
+        case 0: return true
+        case 1: return false
+        default: throw SafeGitError.git("git show-ref failed (\(r.status))")
+        }
+    }
+
     public func mergeBase(_ a: String, _ b: String) throws -> String {
         let r = try run(["merge-base", "--end-of-options", try Self.revArg(a), try Self.revArg(b)], allowFailure: true)
         guard r.status == 0, let sha = Self.fullSha(r.stdout) else { throw SafeGitError.git("no merge base of \(a) and \(b)") }

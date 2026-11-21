@@ -180,6 +180,20 @@ extension Store {
             try db.execute(sql: """
                 UPDATE workItem SET leaseHeadCommit = ? WHERE companyId = ? AND key = ? AND leaseHeadCommit = ? AND branchMoved = 0
                 """, arguments: [made.commit, companyId, key, made.parent])
+            // Plan C2a: the leftover edits are its last holder's work. Recorded tainted when that session is tainted now, when a
+            // tainted session held the item (5-lite's sticky mark), or when nobody can say who wrote them (fail closed).
+            guard let item = try WorkItem.fetchOne(db, sql: "SELECT * FROM workItem WHERE companyId = ? AND key = ?",
+                                                   arguments: [companyId, key]) else { return }
+            let writer = try String.fetchOne(db, sql: "SELECT agentId FROM leaseClaim WHERE itemId = ? ORDER BY id DESC LIMIT 1",
+                                             arguments: [item.id])
+            var source: String?
+            if let writer { source = try Self.currentTaint(db: db, agentId: writer, home: dataHome) } else { source = "an unknown session" }
+            if source == nil, item.taintedOrigin { source = "outside content" }
+            guard let source else { return }
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt)
+                VALUES (?, ?, ?, ?, NULL, ?, ?)
+                """, arguments: [companyId, made.commit, item.id, writer, Store.flat(source, max: 200), Store.now()])
         }
     }
 
