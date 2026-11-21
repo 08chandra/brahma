@@ -1,4 +1,5 @@
-// brahma-pdf: the PDF extraction helper (Plan C task C2b, fix rounds 2–5, controller rulings 33–35, 37 and 38).
+// brahma-pdf: the PDF extraction helper (Plan C task C2b, fix rounds 2–5 and the breaker fix, controller rulings 33–35, 37
+// and 38).
 //
 // The engine never parses a PDF. It runs this helper directly under Seatbelt (`SandboxedPDFReader`: a deny-default profile
 // that lets it read the system's libraries, this binary and the one input file, and nothing else: no other program, no
@@ -45,6 +46,17 @@
 //    stream object, and a member no revision's reader resolved are anomalies too. An anomaly no longer stops the read:
 //    everything readable is still read and written out in full, and the exit status is 5 (the engine refuses it unless
 //    the owner vouched for these exact bytes, ruling 38, and then scans every part as usual).
+//    Breaker (B-1; Ruling 35 b, the class of Ruling 37): no view may mix revisions, since a reader that meets a gap in its
+//    view rebuilds it by scanning the whole file (poppler) and so takes objects from other revisions. Detected, never
+//    modelled, each an anomaly: (a) a cross-reference section (a table with a row or a trailer; a cross-reference stream a
+//    walk read, or whose dictionary names `/XRef`) not on the one chain the final `startxref` starts (`/Prev`, a table's
+//    `/XRefStm`), a table without its trailer and `startxref`, a trailer no table on that chain owns, a revision whose
+//    `startxref` is not on it, a trailer or stream dictionary with a key twice or a `/Prev` that is no integer;
+//    (b) in every opened revision's view, a reference (`n g R`, read by the tokens and by the bytes alone) from an object
+//    the view holds, from a member of an object stream it holds, or from its trailers, that does not resolve in that view to
+//    an object in use with that generation (missing, free, out of range); (c) an object header or object-stream member
+//    inside the view's bytes that the view does not resolve to exactly that body; and, to see what the reader did, any
+//    number the view's sections and the reader's resolution disagree on (an object `null` in its own bytes aside).
 // 6. Adds the page text of the last revision as PDFKit extracts it.
 // A thread checks the process's own memory footprint every 20 ms and exits (status 9) past the limit (default 1 GiB);
 // the engine's watchdog kills the whole run at its own limit too.
@@ -56,8 +68,8 @@
 // included, stays within the byte cap, or the run fails.
 //
 // Exit status: 0 done; 2 usage; 3 encrypted; 4 a stream (or content stream) that can't be decoded; 5 a structural
-// anomaly (step 5; the output is complete when it parses, empty for a file with more than 64 revisions); 6 the output
-// cap; 7 not a PDF this reader can open; 8 too many objects; 9 the memory limit.
+// anomaly (step 5; the output is complete); 6 the output
+// cap; 7 not a PDF this reader can open; 8 too many objects; 9 the memory limit; 10 more than 64 revisions (nothing read).
 // Anything but 0 is a refusal.
 import Foundation
 #if canImport(PDFKit) && canImport(CoreGraphics)
@@ -65,7 +77,7 @@ import CoreGraphics
 import CryptoKit
 import PDFKit
 
-enum Status: Int32 { case usage = 2, encrypted = 3, undecodable = 4, unaccounted = 5, cap = 6, unreadable = 7, tooMany = 8, memory = 9 }
+enum Status: Int32 { case usage = 2, encrypted = 3, undecodable = 4, unaccounted = 5, cap = 6, unreadable = 7, tooMany = 8, memory = 9, tooManyRevisions = 10 }
 
 func fail(_ status: Status) -> Never { exit(status.rawValue) }
 
@@ -145,13 +157,232 @@ struct Entry: Hashable {
     let offset: Int
 }
 
-/// A lexed `<n> <g> obj` header: where it starts, where its object ends (its `endobj`, or the next header), and how many
-/// `stream` keywords lie between.
+/// A lexed `<n> <g> obj` header: where it starts, where its body starts (after `obj`), where its object ends (its
+/// `endobj`, or the next header), how many `stream` keywords lie between and where the first one is.
 struct Header {
     let key: ObjectKey
     let offset: Int
+    var bodyStart: Int
     var end: Int?
     var streams = 0
+    var streamAt: Int?
+}
+
+/// Breaker B-1: one row of a cross-reference section.
+enum Row: Equatable {
+    case free
+    case used(generation: Int, offset: Int)
+    case member(Compressed)
+}
+
+/// Breaker B-1: a classic cross-reference table (at its `xref` keyword): its rows, whether every row read and no number
+/// came twice, its trailer (`trailer` keyword offset; `/Prev`, `/XRefStm`; every reference in it) and whether a `startxref`
+/// follows the trailer; where it ends.
+struct Table {
+    var rows: [Int: Row] = [:]
+    var count = 0
+    var wellFormed = true
+    var trailerAt: Int?
+    var trailer: Dictionary?
+    var startxref = false
+    var end = 0
+}
+
+/// Breaker B-1: a cross-reference stream as a walk decoded it: its rows (nil when they don't read), its `/Prev` as the
+/// reader has it (`.some(nil)`: none; nil: present but not an integer).
+struct StreamSection: Equatable {
+    var rows: [Int: Row]?
+    var prev: Int??
+}
+
+/// Breaker B-1: a dictionary as the lexer reads it (`<< … >>`): every key's count (a key twice is an anomaly), the value of
+/// each key that is a plain integer, and where it ends.
+struct Dictionary {
+    var counts: [String: Int] = [:]
+    var integers: [String: Int] = [:]
+    var end = 0
+    func integer(_ key: String) -> Int?? {
+        guard counts[key] != nil else { return .some(nil) }
+        guard counts[key] == 1, let v = integers[key] else { return nil }
+        return .some(v)
+    }
+}
+
+/// Breaker B-1: a token, as far as the structure checks need one (PDF 32000-1, 7.2 and 7.3).
+enum Token: Equatable {
+    case integer(Int)      // digits, a sign allowed (readers take `+8 0 R` as a reference to 8)
+    case number            // any other number
+    case name(String)      // `#xx` escapes decoded
+    case string            // literal or hexadecimal
+    case dictOpen, dictClose, arrayOpen, arrayClose
+    case word(String)      // a keyword: `R`, `obj`, `trailer`, `null`, …
+    case junk              // a byte no token starts with, or a string that never ends
+}
+
+func hexValue(_ c: UInt8) -> UInt8? {
+    switch c {
+    case 0x30...0x39: return c - 0x30
+    case 0x41...0x46: return c - 0x41 + 10
+    case 0x61...0x66: return c - 0x61 + 10
+    default: return nil
+    }
+}
+
+/// Breaker B-1: the tokens of `b[from..<to]`; white space and comments skipped.
+struct Tokenizer {
+    let b: [UInt8]
+    var i: Int
+    let end: Int
+
+    init(_ b: [UInt8], from: Int, to: Int) { self.b = b; i = from; end = min(to, b.count) }
+
+    mutating func skipSpace() {
+        while i < end {
+            if isWhite(b[i]) { i += 1 } else if b[i] == 0x25 {
+                while i < end, b[i] != 0x0A, b[i] != 0x0D { i += 1 }
+            } else { break }
+        }
+    }
+
+    /// The next token and where it starts; nil at the end.
+    mutating func next() -> (token: Token, at: Int)? {
+        skipSpace()
+        guard i < end else { return nil }
+        let start = i, c = b[i]
+        switch c {
+        case 0x28:   // a literal string: balanced parentheses, `\` escaping the next byte
+            var depth = 0
+            while i < end {
+                let x = b[i]
+                i += 1
+                if x == 0x5C { i += 1 } else if x == 0x28 { depth += 1 } else if x == 0x29 {
+                    depth -= 1
+                    if depth == 0 { return (.string, start) }
+                }
+            }
+            return (.junk, start)
+        case 0x3C:
+            if i + 1 < end, b[i + 1] == 0x3C { i += 2; return (.dictOpen, start) }
+            i += 1
+            while i < end, b[i] != 0x3E {
+                guard isWhite(b[i]) || hexValue(b[i]) != nil else { return (.junk, start) }
+                i += 1
+            }
+            guard i < end else { return (.junk, start) }
+            i += 1
+            return (.string, start)
+        case 0x3E:
+            if i + 1 < end, b[i + 1] == 0x3E { i += 2; return (.dictClose, start) }
+            i += 1
+            return (.junk, start)
+        case 0x5B: i += 1; return (.arrayOpen, start)
+        case 0x5D: i += 1; return (.arrayClose, start)
+        case 0x2F:
+            i += 1
+            var name: [UInt8] = []
+            while i < end, isRegular(b[i]) {
+                if b[i] == 0x23, i + 2 < end, let h = hexValue(b[i + 1]), let l = hexValue(b[i + 2]) {
+                    name.append(h << 4 | l)
+                    i += 3
+                } else {
+                    name.append(b[i])
+                    i += 1
+                }
+            }
+            return (.name(String(decoding: name, as: UTF8.self)), start)
+        default:
+            guard isRegular(c) else { i += 1; return (.junk, start) }
+            while i < end, isRegular(b[i]) { i += 1 }
+            let text = b[start..<i]
+            let signed = text.first == 0x2B || text.first == 0x2D
+            let digits = signed ? text.dropFirst() : text[...]
+            if !digits.isEmpty, digits.allSatisfy(isDigit) {
+                guard digits.count <= 12 else { return (.number, start) }
+                var v = 0
+                for d in digits { v = v * 10 + Int(d - 0x30) }
+                return (.integer(text.first == 0x2D ? -v : v), start)
+            }
+            if text.allSatisfy({ isDigit($0) || $0 == 0x2B || $0 == 0x2D || $0 == 0x2E }) { return (.number, start) }
+            return (.word(String(decoding: text, as: UTF8.self)), start)
+        }
+    }
+
+    /// Past one container whose opening token was just read; false when it does not close.
+    mutating func skipContainer() -> Bool {
+        var depth = 1
+        while depth > 0 {
+            guard let (token, _) = next() else { return false }
+            switch token {
+            case .dictOpen, .arrayOpen: depth += 1
+            case .dictClose, .arrayClose: depth -= 1
+            case .junk: return false
+            default: break
+            }
+        }
+        return true
+    }
+
+    /// A dictionary starting at the next token; nil when there is none, or it does not read.
+    mutating func dictionary() -> Dictionary? {
+        guard let (open, _) = next(), open == .dictOpen else { return nil }
+        var d = Dictionary()
+        while true {
+            guard let (token, _) = next() else { return nil }
+            if token == .dictClose { d.end = i; return d }
+            guard case .name(let key) = token else { return nil }
+            d.counts[key, default: 0] += 1
+            guard let (value, _) = next() else { return nil }
+            switch value {
+            case .integer(let n):
+                // `n g R` is a reference, not an integer.
+                let mark = i
+                if let (g, _) = next(), case .integer = g, let (r, _) = next(), r == .word("R") { break }
+                i = mark
+                d.integers[key] = n
+            case .dictOpen, .arrayOpen:
+                guard skipContainer() else { return nil }
+            case .dictClose, .arrayClose, .junk:
+                return nil
+            default:
+                break
+            }
+        }
+    }
+}
+
+/// Breaker B-1: every indirect reference (`n g R`) in `b[from..<to]` and where its number starts, read two ways and
+/// joined: by the tokens (strings and comments as the format has them), and by the bytes alone (any `<digits> <digits> R`
+/// with white space between, each number perhaps signed, wherever it stands). A reference either way must resolve: reading more is only ever stricter.
+func references(_ b: [UInt8], from: Int, to: Int) -> [(key: ObjectKey, at: Int)] {
+    var found: [(key: ObjectKey, at: Int)] = []
+    var t = Tokenizer(b, from: from, to: to)
+    var last: (value: Int, at: Int)? = nil, before: (value: Int, at: Int)? = nil
+    while let (token, at) = t.next() {
+        if token == .word("R"), let n = before, let g = last { found.append((ObjectKey(number: n.value, generation: g.value), n.at)) }
+        if case .integer(let v) = token { before = last; last = (v, at) } else { before = nil; last = nil }
+    }
+    let end = min(to, b.count)
+    var k = from
+    while k < end {
+        defer { k += 1 }
+        guard b[k] == 0x52, k > from, isWhite(b[k - 1]), k + 1 == end || !isRegular(b[k + 1]) else { continue }
+        var j = k - 1
+        while j >= from, isWhite(b[j]) { j -= 1 }
+        var g = 0, scale = 1, gd = 0
+        while j >= from, isDigit(b[j]), gd < 12 { g += Int(b[j] - 0x30) * scale; scale *= 10; j -= 1; gd += 1 }
+        if j >= from, b[j] == 0x2D { g = -g }
+        if j >= from, b[j] == 0x2B || b[j] == 0x2D { j -= 1 }
+        guard gd > 0, j >= from, isWhite(b[j]) else { continue }
+        while j >= from, isWhite(b[j]) { j -= 1 }
+        var n = 0, nd = 0
+        scale = 1
+        while j >= from, isDigit(b[j]), nd < 12 { n += Int(b[j] - 0x30) * scale; scale *= 10; j -= 1; nd += 1 }
+        if j >= from, b[j] == 0x2D { n = -n }
+        if j >= from, b[j] == 0x2B || b[j] == 0x2D { j -= 1 }
+        guard nd > 0, nd < 12, gd < 12, j < from || !isRegular(b[j]) else { continue }
+        found.append((ObjectKey(number: n, generation: g), j + 1))
+    }
+    return found
 }
 
 /// One run over one file (steps 1–6 above).
@@ -195,8 +426,38 @@ final class Extraction {
     var objectStreamHeaders: [Data: [Int]?] = [:]
     /// Every digest each listed object (generation 0) decoded to as a stream, in any revision.
     var streamDigests: [Int: Set<Data>] = [:]
+    /// Breaker B-1: every classic table, by its `xref` keyword's offset (one with at least one row).
+    var tables: [Int: Table] = [:]
+    /// Every `trailer` keyword a reader could take for a trailer: outside every object, or first on its line.
+    var trailerKeywords: [Int] = []
+    /// Every cross-reference stream a walk decoded, by its object number.
+    var xrefStreams: [Int: StreamSection] = [:]
+    /// Each object stream a walk decoded, by its digest: the members its header lists, and each member's bytes.
+    var objectStreams: [Data: [(number: Int, text: Data)]] = [:]
+    /// Every reference in each header's object (by the header's index): from its body to its `stream` keyword, or to the
+    /// next header (so a reference after a string holding `endobj` is still read).
+    var headerReferences: [[(key: ObjectKey, at: Int)]] = []
+    /// The headers whose dictionary names `/XRef`: cross-reference streams, whether or not a walk read them as one.
+    var xrefNamed = Set<Int>()
+    /// The offsets of the headers whose whole object is `null` (`<n> <g> obj null endobj`): every reader takes that
+    /// object as null, so the reader resolving it to null is no gap in its view.
+    var nullBodies = Set<Int>()
+    /// The views the walks opened: each revision's end, the section its `startxref` names, what it resolved, and the digest
+    /// each listed object decoded to.
+    struct View {
+        let end: Int
+        let previous: Int
+        let resolved: Set<ObjectKey>
+        let byKey: [ObjectKey: Data]
+    }
+    var views: [View] = []
 
-    func anomaly() { anomalous = true }
+    /// What was found (each reason once, on standard error: the engine keeps it out of everything it scans).
+    var reasons = Set<String>()
+    func anomaly(_ reason: String) {
+        anomalous = true
+        if reasons.insert(reason).inserted { FileHandle.standardError.write(Data("brahma-pdf: anomaly: \(reason)\n".utf8)) }
+    }
 
     init(original: Data, cap: Int) {
         self.original = original
@@ -206,16 +467,18 @@ final class Extraction {
 
     func run() -> Never {
         lex()
+        readRegions()
         guard highest < Self.maxObjects else { fail(.tooMany) }
         var ends = revisionEnds.sorted()
         if ends.last != bytes.count { ends.append(bytes.count) }
-        // More revisions than the reader could ever walk: refused outright (nothing is read).
-        guard ends.count <= Self.maxWalks else { fail(.unaccounted) }
-        if ends.count > Self.maxRevisions { anomaly() }
+        // More revisions than the reader could ever walk: refused outright, nothing read (breaker B-3: its own status, which
+        // the engine reports as a refusal no vouch lifts).
+        guard ends.count <= Self.maxWalks else { fail(.tooManyRevisions) }
+        if ends.count > Self.maxRevisions { anomaly("more than 8 revisions") }
         // R4-6 (ruling 35): one object number with two bodies (an object rewritten across revisions, or twice in one) is
         // an anomaly, refused without modelling which body a reader would take.
         var numbers = Set<Int>()
-        if !headers.allSatisfy({ numbers.insert($0.key.number).inserted }) { anomaly() }
+        if !headers.allSatisfy({ numbers.insert($0.key.number).inserted }) { anomaly("one object number with two bodies") }
         let bodies = headers.filter { $0.streams == 1 }
         var placed = Set<Int>()   // the header offsets of the stream bodies some revision placed
         var resolved = Set<ObjectKey>()   // every listed object some revision's reader resolved to something (not null)
@@ -235,6 +498,7 @@ final class Extraction {
             guard let revision = Revision(of: self, prefix: prefix, pins: pins) else { unopened.append(index); continue }
             let walked = revision.read()
             opened = true
+            views.append(View(end: end, previous: revision.previous, resolved: walked.resolved, byKey: walked.byKey))
             resolved.formUnion(walked.resolved)
             for pin in pins {
                 if let digest = walked.pinned[pin.offset], walked.byKey[pin.key] == digest { placed.insert(pin.offset) }
@@ -244,18 +508,21 @@ final class Extraction {
             }
         }
         guard opened else { fail(.unreadable) }
-        if !unopened.isEmpty && !(unopened == [0] && linearized) { anomaly() }
+        if !unopened.isEmpty && !(unopened == [0] && linearized) { anomaly("a revision the reader could not open") }
+        // Breaker B-1: one chain of sections, and every view consistent with its own.
+        checkChain()
+        for view in views { check(view) }
         // Step 5 (after the walks, so a stream that can't be decoded says so first): every `stream` keyword in one object,
         // one per object; every stream body named exactly and placed by some revision's walk; every in-use entry exactly a
         // header.
-        if stray || !headers.allSatisfy({ $0.streams <= 1 }) { anomaly() }
+        if stray || !headers.allSatisfy({ $0.streams <= 1 }) { anomaly("a stream keyword outside an object, or two in one") }
         // R4-6: every object header, stream or not, named exactly by an in-use entry (an unknown object is an anomaly).
-        if headers.contains(where: { !entries.contains(Entry(key: $0.key, offset: $0.offset)) }) { anomaly() }
+        if headers.contains(where: { !entries.contains(Entry(key: $0.key, offset: $0.offset)) }) { anomaly("an object no in-use entry names exactly") }
         for body in bodies where !placed.contains(body.offset) || !entries.contains(Entry(key: body.key, offset: body.offset)) {
-            anomaly()
+            anomaly("a stream body not placed")
         }
         for entry in entries {
-            guard let i = headerAt[entry.offset], headers[i].key == entry.key else { anomaly(); break }
+            guard let i = headerAt[entry.offset], headers[i].key == entry.key else { anomaly("an in-use entry that is not exactly a header"); break }
         }
         // Round 5 (R5-2, ruling 35 b): an object in an object stream is accounted like a header. No number both a header
         // and a type-2 row (an object rewritten from one into the other); every type-2 row of one number names the same
@@ -265,15 +532,15 @@ final class Extraction {
             let container = headers.first { $0.key == ObjectKey(number: place.stream, generation: 0) }
             if numbers.contains(number) || place.stream == number || container?.streams != 1
                 || !resolved.contains(ObjectKey(number: number, generation: 0)) {
-                anomaly()
+                anomaly("an object-stream member not accounted")
             }
             // The object stream's own header (as every revision decoded it) lists this number exactly once, at the row's
             // index: readers that go by the index and readers that go by the number find the same member.
             let decodedAs = streamDigests[place.stream] ?? []
-            if decodedAs.isEmpty { anomaly() }
+            if decodedAs.isEmpty { anomaly("an object stream never decoded") }
             for digest in decodedAs {
                 guard let listed = objectStreamHeaders[digest] ?? nil, place.index < listed.count, listed[place.index] == number,
-                      listed.filter({ $0 == number }).count == 1 else { anomaly(); break }
+                      listed.filter({ $0 == number }).count == 1 else { anomaly("an object-stream header that does not list its member at its index"); break }
             }
         }
         // The page text of the last revision (none when that revision is itself what can't be verified).
@@ -296,6 +563,176 @@ final class Extraction {
 
     var pageText = Data()
     func keepPages(_ data: Data) { pageText = data }
+
+    // MARK: Breaker B-1: one chain, and every view resolves what it refers to
+
+    /// Every reference in each header's object, and which headers' dictionaries name `/XRef`. An object runs from its body
+    /// to its `stream` keyword (a stream's data is never read here: an object stream's members are read decoded), else to
+    /// the next header (past an `endobj` that may sit inside a string). Each cross-reference stream's dictionary is read
+    /// too: a key twice, or a `/Prev` that is not an integer, is an anomaly.
+    func readRegions() {
+        let order = headers.indices.sorted { headers[$0].offset < headers[$1].offset }
+        headerReferences = Array(repeating: [], count: headers.count)
+        for (rank, index) in order.enumerated() {
+            let header = headers[index]
+            let next = rank + 1 < order.count ? headers[order[rank + 1]].offset : bytes.count
+            let stop = header.streamAt.map { min($0, next) } ?? next
+            guard stop > header.bodyStart else { continue }
+            headerReferences[index] = references(bytes, from: header.bodyStart, to: stop)
+            guard header.streamAt != nil else {
+                var t = Tokenizer(bytes, from: header.bodyStart, to: stop)
+                if let (value, _) = t.next(), value == .word("null"), let (close, _) = t.next(), close == .word("endobj") {
+                    nullBodies.insert(header.offset)
+                }
+                continue
+            }
+            var t = Tokenizer(bytes, from: header.bodyStart, to: stop)
+            while let (token, _) = t.next() {
+                if token == .name("XRef") { xrefNamed.insert(index); break }
+            }
+        }
+    }
+
+    /// A cross-reference stream a walk decoded, kept by its number; read differently in two views, an anomaly.
+    func register(number: Int, _ section: StreamSection) {
+        if let known = xrefStreams[number], known != section { anomaly("a cross-reference stream read two ways") }
+        xrefStreams[number] = section
+    }
+
+    /// One node of the chain: a classic table (and the cross-reference stream its `/XRefStm` names), or a cross-reference
+    /// stream; its rows, the next section (`/Prev`), where it ends, and the references its trailer or dictionary holds.
+    struct Node {
+        let offset: Int
+        let rows: [Int: Row]
+        let prev: Int?
+        let end: Int
+        let references: [ObjectKey]
+        let xrefStm: Int?
+    }
+
+    /// The node at `offset`: a well-formed table with a trailer and a `startxref`, or the header of a cross-reference
+    /// stream a walk decoded (its `/Prev` the same as its dictionary has it); nil for anything else.
+    func node(at offset: Int) -> Node? {
+        if let table = tables[offset] {
+            guard table.wellFormed, let trailer = table.trailer, table.startxref, let trailerAt = table.trailerAt,
+                  let prev = trailer.integer("Prev"), let xrefStm = trailer.integer("XRefStm"), trailer.counts.values.allSatisfy({ $0 == 1 })
+            else { return nil }
+            return Node(offset: offset, rows: table.rows, prev: prev, end: table.end,
+                        references: references(bytes, from: trailerAt, to: trailer.end).map(\.key), xrefStm: xrefStm)
+        }
+        guard let index = headerAt[offset], headers[index].key.generation == 0, headers[index].streams == 1,
+              let section = xrefStreams[headers[index].key.number], let rows = section.rows, let prev = section.prev,
+              let streamAt = headers[index].streamAt else { return nil }
+        var t = Tokenizer(bytes, from: headers[index].bodyStart, to: streamAt)
+        guard let dictionary = t.dictionary(), dictionary.counts.values.allSatisfy({ $0 == 1 }),
+              let lexed = dictionary.integer("Prev"), lexed == prev else { return nil }
+        return Node(offset: offset, rows: rows, prev: prev, end: headers[index].end ?? bytes.count,
+                    references: headerReferences[index].map(\.key), xrefStm: nil)
+    }
+
+    /// The chain from `start`: each node, then (for a table) the stream its `/XRefStm` names (which names no `/Prev` of its
+    /// own), then the node its `/Prev` names. Nil when any node is not one, or a node comes twice.
+    func chain(from start: Int) -> [Node]? {
+        var out: [Node] = [], seen = Set<Int>()
+        var at: Int? = start
+        while let offset = at {
+            guard seen.insert(offset).inserted, out.count <= 2 * Self.maxWalks, let node = node(at: offset) else { return nil }
+            out.append(node)
+            if let x = node.xrefStm {
+                guard tables[x] == nil, seen.insert(x).inserted, let stream = self.node(at: x), stream.prev == nil else { return nil }
+                out.append(stream)
+            }
+            at = node.prev
+        }
+        return out
+    }
+
+    var finalChain: [Node] = []
+
+    /// Rule (a): every cross-reference section in the file (every table with a row; every cross-reference stream a walk
+    /// read, or whose dictionary names `/XRef`) is on the one chain the final `startxref` starts; every table has its
+    /// trailer and `startxref`; every `trailer` a reader could find is the trailer of a table on that chain.
+    func checkChain() {
+        guard let last = startxrefs.last, let chain = chain(from: last) else {
+            anomaly("cross-reference sections that don't chain from the final startxref")
+            return
+        }
+        finalChain = chain
+        let on = Set(chain.map(\.offset))
+        if tables.contains(where: { !on.contains($0.key) }) { anomaly("a cross-reference table off the chain") }
+        for (number, _) in xrefStreams {
+            guard let index = headers.firstIndex(where: { $0.key == ObjectKey(number: number, generation: 0) }), on.contains(headers[index].offset) else {
+                anomaly("a cross-reference stream off the chain")
+                continue
+            }
+        }
+        if xrefNamed.contains(where: { !on.contains(headers[$0].offset) }) { anomaly("a cross-reference stream off the chain") }
+        let trailers = Set(chain.compactMap { tables[$0.offset]?.trailerAt })
+        if trailerKeywords.contains(where: { !trailers.contains($0) }) { anomaly("a trailer no table on the chain owns") }
+    }
+
+    /// Rules (b) and (c) in one opened view (its own chain, from the section its `startxref` names, which must be on the
+    /// final chain and lie inside the view): what the view's sections say (newest first) must be what the reader resolved,
+    /// number for number; every header inside the view, and every member of every object stream inside it, resolves in
+    /// the view to exactly that body; and every reference from them (and from the view's trailers) resolves in the view to
+    /// an object in use with that generation.
+    func check(_ view: View) {
+        guard finalChain.contains(where: { $0.offset == view.previous }), let chain = chain(from: view.previous),
+              chain.allSatisfy({ $0.end <= view.end }) else {
+            anomaly("a revision whose startxref is not on the chain")
+            return
+        }
+        var says: [Int: Row] = [:]
+        for node in chain { for (number, row) in node.rows where says[number] == nil { says[number] = row } }
+        func isNull(_ row: Row) -> Bool {
+            if case .used(_, let offset) = row { return nullBodies.contains(offset) }
+            return false
+        }
+        func resolves(_ key: ObjectKey) -> Bool {
+            guard key.number >= 1, key.number <= highest,
+                  view.resolved.contains(key) || says[key.number].map(isNull) == true else { return false }
+            switch says[key.number] {
+            case .used(let generation, _)?: return generation == key.generation
+            case .member?: return key.generation == 0
+            default: return false
+            }
+        }
+        let resolvedNumbers = Set(view.resolved.map(\.number))
+        for (number, row) in says where number != 0 {
+            if case .free = row {
+                if resolvedNumbers.contains(number) { anomaly("the reader resolved an object its view marks free") }
+            } else if number > highest || !(resolvedNumbers.contains(number) || isNull(row)) {
+                anomaly("an object its view has in use that the reader did not resolve")
+            }
+        }
+        for number in resolvedNumbers where says[number] == nil {
+            anomaly("the reader resolved an object its view does not hold")
+        }
+        for (index, header) in headers.enumerated() where header.offset < view.end {
+            guard case .used(let generation, let offset)? = says[header.key.number], generation == header.key.generation,
+                  offset == header.offset, view.resolved.contains(header.key) || nullBodies.contains(header.offset) else {
+                anomaly("an object inside a revision that its view does not resolve")
+                continue
+            }
+            if headerReferences[index].contains(where: { $0.at < view.end && !resolves($0.key) }) {
+                anomaly("a reference that does not resolve in its view")
+            }
+            // The members of an object stream inside the view.
+            guard header.streams == 1, header.key.generation == 0, let digest = view.byKey[header.key],
+                  let members = objectStreams[digest] else { continue }
+            for (position, member) in members.enumerated() {
+                guard case .member(let place)? = says[member.number], place == Compressed(stream: header.key.number, index: position),
+                      view.resolved.contains(ObjectKey(number: member.number, generation: 0)) else {
+                    anomaly("an object-stream member its view does not resolve")
+                    continue
+                }
+                if references([UInt8](member.text), from: 0, to: member.text.count).contains(where: { !resolves($0.key) }) {
+                    anomaly("a reference that does not resolve in its view")
+                }
+            }
+        }
+        if chain.contains(where: { $0.references.contains { !resolves($0) } }) { anomaly("a trailer reference that does not resolve in its view") }
+    }
 
     /// Round 5 (R5-1, ruling 37): whether the file is positively linearized (PDF 32000-1, Annex F), so that its first
     /// section, which the reader can't open on its own (its `startxref` is 0), is walked through the whole file's view
@@ -351,6 +788,7 @@ final class Extraction {
     func lex() {
         let streamWord = Array("stream".utf8), objWord = Array("obj".utf8), sizeWord = Array("/Size".utf8), eofWord = Array("%%EOF".utf8)
         let xrefWord = Array("xref".utf8), endobjWord = Array("endobj".utf8), startxrefWord = Array("startxref".utf8)
+        let trailerWord = Array("trailer".utf8)
         var open: Int?   // the header whose object the lexer is in
         func endsToken(_ k: Int) -> Bool { k == bytes.count || !isRegular(bytes[k]) }
         var i = 0
@@ -359,7 +797,10 @@ final class Extraction {
             let starts = i == 0 || !isRegular(bytes[i - 1])
             if c == 0x73, starts, matches(streamWord, at: i, in: bytes) {
                 // Round 3 (m-B): whatever follows it, data straight after the keyword included.
-                if let open { headers[open].streams += 1 } else { stray = true }
+                if let open {
+                    headers[open].streams += 1
+                    if headers[open].streamAt == nil { headers[open].streamAt = i }
+                } else { stray = true }
             } else if c == 0x73, starts, matches(startxrefWord, at: i, in: bytes), endsToken(i + startxrefWord.count) {
                 // Round 4 (R4-1): a revision ends after `startxref <offset>` (and after its `%%EOF`, when one follows).
                 var j = i + startxrefWord.count
@@ -392,7 +833,7 @@ final class Extraction {
                     if let o = open { headers[o].end = j + 1 }
                     let key = ObjectKey(number: number, generation: generation)
                     headerAt[j + 1] = headers.count
-                    headers.append(Header(key: key, offset: j + 1))
+                    headers.append(Header(key: key, offset: j + 1, bodyStart: i + objWord.count))
                     open = headers.count - 1
                     if generation != 0 { generations.insert(key) }
                 }
@@ -406,12 +847,23 @@ final class Extraction {
                 }
             } else if c == 0x78, starts, matches(xrefWord, at: i, in: bytes),
                       i + xrefWord.count < bytes.count, isWhite(bytes[i + xrefWord.count]) {
-                classicSection(at: i + xrefWord.count)
+                classicSection(keyword: i, at: i + xrefWord.count)
             } else if c == 0x25, matches(eofWord, at: i, in: bytes) {
                 revisionEnds.insert(afterEOF(i + eofWord.count))
+            } else if c == 0x74, starts, matches(trailerWord, at: i, in: bytes), endsToken(i + trailerWord.count),
+                      open == nil || firstOnLine(i) {
+                // Breaker B-1: a trailer a reader could find (poppler's rebuild takes one from any line it starts).
+                trailerKeywords.append(i)
             }
             i += 1
         }
+    }
+
+    /// Whether only spaces and tabs come between the previous line end (or the file's start) and `i`.
+    func firstOnLine(_ i: Int) -> Bool {
+        var j = i - 1
+        while j >= 0, bytes[j] == 0x20 || bytes[j] == 0x09 || bytes[j] == 0x0C || bytes[j] == 0x00 { j -= 1 }
+        return j < 0 || bytes[j] == 0x0A || bytes[j] == 0x0D
     }
 
     /// Where a revision ends after a `%%EOF` ending at `end`: past its line ends.
@@ -423,7 +875,10 @@ final class Extraction {
 
     /// The rows of a classic cross-reference section starting at `i` (after `xref`): `<first> <count>` subsections of
     /// `<offset> <generation> n|f` entries, read until anything else. Each in-use entry records which number its offset is.
-    func classicSection(at start: Int) {
+    /// Breaker B-1: the table (at `keyword`) is kept with its rows, then its trailer (the `trailer` keyword, a dictionary
+    /// whose `/Prev` and `/XRefStm` are read, and every reference in it) and whether `startxref` follows; a row that does
+    /// not read, or a number twice, leaves it ill-formed.
+    func classicSection(keyword: Int, at start: Int) {
         var i = start
         func skipWhite() { while i < bytes.count, isWhite(bytes[i]) { i += 1 } }
         func number() -> Int? {
@@ -431,26 +886,53 @@ final class Extraction {
             while i < bytes.count, isDigit(bytes[i]), digits < 12 { n = n * 10 + Int(bytes[i] - 0x30); i += 1; digits += 1 }
             return digits > 0 ? n : nil
         }
+        var table = Table()
         var rows = 0
-        while true {
+        sections: while true {
             skipWhite()
-            guard let first = number() else { return }
+            guard let first = number() else { break }
             skipWhite()
-            guard let count = number(), count <= Self.maxObjects * 4 else { return }
+            guard let count = number(), count <= Self.maxObjects * 4 else { table.wellFormed = false; break }
             for k in 0..<count {
                 skipWhite()
-                guard let offset = number() else { return }
+                guard let offset = number() else { table.wellFormed = false; break sections }
                 skipWhite()
-                guard let generation = number() else { return }
+                guard let generation = number() else { table.wellFormed = false; break sections }
                 skipWhite()
-                guard i < bytes.count else { return }
-                if bytes[i] == 0x6E { record(number: first + k, generation: generation, offset: offset) }   // n
-                if bytes[i] == 0x66 { freed.insert(first + k) }   // f
+                guard i < bytes.count else { table.wellFormed = false; break sections }
+                let n = first + k
+                if table.rows[n] != nil { table.wellFormed = false }
+                if bytes[i] == 0x6E {   // n
+                    record(number: n, generation: generation, offset: offset)
+                    table.rows[n] = .used(generation: generation, offset: offset)
+                } else if bytes[i] == 0x66 {   // f
+                    freed.insert(n)
+                    table.rows[n] = .free
+                } else {
+                    table.wellFormed = false
+                }
                 i += 1
                 rows += 1
                 guard rows <= Self.maxObjects * 4 else { fail(.tooMany) }
             }
         }
+        table.count = rows
+        // The trailer, then `startxref`.
+        var t = Tokenizer(bytes, from: i, to: bytes.count)
+        t.skipSpace()
+        let at = t.i
+        table.end = at
+        if let (word, _) = t.next(), word == .word("trailer") {
+            table.trailerAt = at
+            table.trailer = t.dictionary()
+            if table.trailer != nil {
+                table.end = t.i
+                if let (next, _) = t.next(), next == .word("startxref") { table.startxref = true; table.end = t.i }
+            }
+        }
+        // A table: at least one row, or (an empty section) a trailer after it.
+        guard rows > 0 || table.trailerAt != nil else { return }
+        tables[keyword] = table
     }
 
     func record(number: Int, generation: Int, offset: Int) {
@@ -459,7 +941,7 @@ final class Extraction {
 
     /// Round 5 (R5-2): a type-2 row. Two rows for one number that name different places are an anomaly.
     func recordCompressed(number: Int, _ place: Compressed) {
-        if let known = compressed[number], known != place { anomaly() }
+        if let known = compressed[number], known != place { anomaly("two type-2 rows naming different places") }
         compressed[number] = place
     }
 
@@ -510,14 +992,18 @@ final class Revision {
 
     var pending: [Item] = []
     let lock = NSLock()
+    /// Breaker B-1: the offset this revision's own `startxref` names (its newest section).
+    let previous: Int
+    /// Every cross-reference stream this walk decoded, by the stream.
+    var sections: [Int: StreamSection] = [:]
 
     /// The revision `prefix` with the update that lists every object and pins every body in `pins`; nil when the reader
     /// can't open that.
     init?(of owner: Extraction, prefix: Data, pins: [Header]) {
         self.owner = owner
         self.pins = pins
-        guard let augmented = Self.augmented(prefix, highest: owner.highest, generations: owner.generationList,
-                                             pins: pins.map { ($0.offset, $0.key.generation) }),
+        guard let (augmented, previous) = Self.augmented(prefix, highest: owner.highest, generations: owner.generationList,
+                                                         pins: pins.map { ($0.offset, $0.key.generation) }),
               let provider = CGDataProvider(data: augmented as CFData), let document = CGPDFDocument(provider),
               let catalog = document.catalog else { return nil }
         if document.isEncrypted { fail(.encrypted) }
@@ -525,12 +1011,13 @@ final class Revision {
         guard CGPDFDictionaryGetArray(catalog, "BrahmaAll", &listed), let listed else { return nil }
         self.document = document
         self.listed = listed
+        self.previous = previous
     }
 
     /// The prefix plus an update whose catalog (`/BrahmaAll`) lists objects 1…`highest`, every non-zero generation seen,
     /// and then fresh numbers whose entries name exactly each pinned body's offset (with its generation), in the same kind
     /// of cross-reference section as the prefix's last; nil when it ends with no `startxref`.
-    static func augmented(_ prefix: Data, highest: Int, generations: [ObjectKey], pins: [(offset: Int, generation: Int)]) -> Data? {
+    static func augmented(_ prefix: Data, highest: Int, generations: [ObjectKey], pins: [(offset: Int, generation: Int)]) -> (Data, Int)? {
         let bytes = [UInt8](prefix)
         let tail = Array(bytes.suffix(1024))
         let key = Array("startxref".utf8)
@@ -580,7 +1067,7 @@ final class Revision {
             update += rows
             update += Data("\nendstream\nendobj\nstartxref\n\(xref)\n%%EOF\n".utf8)
         }
-        return prefix + update
+        return (prefix + update, previous)
     }
 
     /// Walks every listed object, then scans every content stream; returns the digest of the stream each listed object
@@ -607,6 +1094,10 @@ final class Revision {
             let root = CGPDFObjectGetValue(o, .stream, &s) ? s : nil
             walk(o, digests: &digestOf)
             guard let root, let digest = digestOf[unsafeBitCast(root, to: Int.self)] else { continue }
+            // Breaker B-1: a cross-reference stream, kept by its number with its rows and its `/Prev` as the reader has it.
+            if i < owner.highest, let section = sections[unsafeBitCast(root, to: Int.self)] {
+                owner.register(number: i + 1, section)
+            }
             if i < owner.highest {
                 byKey[ObjectKey(number: i + 1, generation: 0)] = digest
                 owner.streamDigests[i + 1, default: []].insert(digest)
@@ -619,7 +1110,7 @@ final class Revision {
         for key in contentStreams.sorted() {
             // Round 4: a content stream marked but never decoded is refused, never skipped (round 5: an anomaly; the rest is
             // still read).
-            guard let stream = streams[key] else { owner.anomaly(); continue }
+            guard let stream = streams[key] else { owner.anomaly("a content stream never decoded"); continue }
             scanContent(stream)
         }
         return (byKey, pinned, resolved)
@@ -724,12 +1215,19 @@ final class Revision {
 
     /// A cross-reference stream may only describe objects up to the highest number the update listed.
     /// Its rows (decoded) record which object (number, generation) each in-use (type 1) entry says starts at its offset.
-    func checkCrossReference(_ d: CGPDFDictionaryRef, rows: Data) {
+    func checkCrossReference(_ d: CGPDFDictionaryRef, rows: Data) -> StreamSection? {
         var type: UnsafePointer<CChar>? = nil
-        guard CGPDFDictionaryGetName(d, "Type", &type), let type, String(cString: type) == "XRef" else { return }
+        guard CGPDFDictionaryGetName(d, "Type", &type), let type, String(cString: type) == "XRef" else { return nil }
+        // Breaker B-1: the section as the reader has it: its `/Prev` (an integer, or absent) and its rows.
+        var section = StreamSection(rows: nil, prev: .some(nil))
+        var prevObject: CGPDFObjectRef? = nil
+        if CGPDFDictionaryGetObject(d, "Prev", &prevObject) {
+            var prev: CGPDFInteger = 0
+            section.prev = CGPDFDictionaryGetInteger(d, "Prev", &prev) ? .some(prev) : nil
+        }
         // Round 5: a section that can't be read is an anomaly (the rest of the file is still read).
         var size: CGPDFInteger = 0
-        guard CGPDFDictionaryGetInteger(d, "Size", &size), size >= 0, size - 1 <= owner.highest else { owner.anomaly(); return }
+        guard CGPDFDictionaryGetInteger(d, "Size", &size), size >= 0, size - 1 <= owner.highest else { owner.anomaly("a cross-reference stream with a bad /Size"); return section }
         var ranges: [(start: Int, count: Int)] = []
         var index: CGPDFArrayRef? = nil
         if CGPDFDictionaryGetArray(d, "Index", &index), let index {
@@ -737,8 +1235,8 @@ final class Revision {
             while k + 1 < CGPDFArrayGetCount(index) {
                 var start: CGPDFInteger = 0, count: CGPDFInteger = 0
                 guard CGPDFArrayGetInteger(index, k, &start), CGPDFArrayGetInteger(index, k + 1, &count), start >= 0, count >= 0,
-                      count <= Extraction.maxObjects * 4 else { owner.anomaly(); return }
-                if count > 0, start.addingReportingOverflow(count - 1).partialValue > owner.highest { owner.anomaly(); return }
+                      count <= Extraction.maxObjects * 4 else { owner.anomaly("a cross-reference stream with a bad /Index"); return section }
+                if count > 0, start.addingReportingOverflow(count - 1).partialValue > owner.highest { owner.anomaly("a cross-reference stream naming objects past the highest number"); return section }
                 ranges.append((start, count))
                 k += 2
             }
@@ -747,15 +1245,15 @@ final class Revision {
         }
         // The field widths: each at most 8 bytes; a row is their sum.
         var widths: CGPDFArrayRef? = nil
-        guard CGPDFDictionaryGetArray(d, "W", &widths), let widths, CGPDFArrayGetCount(widths) == 3 else { owner.anomaly(); return }
+        guard CGPDFDictionaryGetArray(d, "W", &widths), let widths, CGPDFArrayGetCount(widths) == 3 else { owner.anomaly("a cross-reference stream with a bad /W"); return section }
         var w = [0, 0, 0]
         for k in 0..<3 {
             var v: CGPDFInteger = 0
-            guard CGPDFArrayGetInteger(widths, k, &v), v >= 0, v <= 8 else { owner.anomaly(); return }
+            guard CGPDFArrayGetInteger(widths, k, &v), v >= 0, v <= 8 else { owner.anomaly("a cross-reference stream with a bad /W"); return section }
             w[k] = v
         }
         let row = w[0] + w[1] + w[2]
-        guard row > 0 else { owner.anomaly(); return }
+        guard row > 0 else { owner.anomaly("a cross-reference stream with a bad /W"); return section }
         let b = [UInt8](rows)
         var at = 0
         func field(_ width: Int) -> Int {
@@ -763,28 +1261,39 @@ final class Revision {
             for _ in 0..<width { v = v << 8 | Int(b[at]); at += 1 }
             return v
         }
+        var parsed: [Int: Row] = [:]
         for range in ranges {
             for k in 0..<range.count {
-                guard b.count - at >= row else { owner.anomaly(); return }
+                guard b.count - at >= row else { owner.anomaly("a cross-reference stream with too few rows"); return section }
                 let kind = w[0] == 0 ? 1 : field(w[0])
                 let offset = field(w[1])
                 let generation = field(w[2])
+                // Breaker B-1: a number twice in one section is two answers to one question.
+                if parsed[range.start + k] != nil { owner.anomaly("a number twice in one cross-reference section") }
                 switch kind {
-                case 0: owner.freed.insert(range.start + k)
-                case 1: owner.record(number: range.start + k, generation: generation, offset: offset)
+                case 0:
+                    owner.freed.insert(range.start + k)
+                    parsed[range.start + k] = .free
+                case 1:
+                    owner.record(number: range.start + k, generation: generation, offset: offset)
+                    parsed[range.start + k] = .used(generation: generation, offset: offset)
                 // Round 5 (R5-2): an object in an object stream (field 2 the stream's number, field 3 the index).
-                case 2: owner.recordCompressed(number: range.start + k, Compressed(stream: offset, index: generation))
+                case 2:
+                    owner.recordCompressed(number: range.start + k, Compressed(stream: offset, index: generation))
+                    parsed[range.start + k] = .member(Compressed(stream: offset, index: generation))
                 // A row of a type the format does not define: nothing a reader agrees on (fail closed).
-                default: owner.anomaly()
+                default: owner.anomaly("a cross-reference row of an undefined type")
                 }
             }
         }
+        section.rows = parsed
+        return section
     }
 
     /// Round 5 (R5-2): for an object stream (`/Type /ObjStm`), the object numbers its header lists, in order: `/N` pairs of
     /// non-negative integers (number, offset) in the decoded bytes before `/First`; `.some(nil)` when that does not parse.
     /// Nil for any other stream.
-    func objectStreamHeader(_ d: CGPDFDictionaryRef, _ decoded: Data) -> [Int]?? {
+    func objectStreamHeader(_ d: CGPDFDictionaryRef, _ decoded: Data) -> [(number: Int, offset: Int)]?? {
         var type: UnsafePointer<CChar>? = nil
         guard CGPDFDictionaryGetName(d, "Type", &type), let type, String(cString: type) == "ObjStm" else { return nil }
         var count: CGPDFInteger = 0, first: CGPDFInteger = 0
@@ -799,7 +1308,7 @@ final class Revision {
             guard digits > 0, i == b.count || isWhite(b[i]) else { return .some(nil) }
             values.append(v)
         }
-        return .some(stride(from: 0, to: values.count, by: 2).map { values[$0] })
+        return .some(stride(from: 0, to: values.count, by: 2).map { (values[$0], values[$0 + 1]) })
     }
 
     /// Form XObjects and tiling patterns are content streams whatever refers to them.
@@ -832,12 +1341,26 @@ final class Revision {
                 _ = CGPDFDictionaryGetInteger(d, "Length", &length)
                 var filter: CGPDFObjectRef? = nil
                 if CGPDFDictionaryGetObject(d, "Filter", &filter), decoded.isEmpty, length > 8 { fail(.undecodable) }
-                checkCrossReference(d, rows: decoded)
                 let key = unsafeBitCast(s, to: Int.self)
+                if let section = checkCrossReference(d, rows: decoded) { sections[key] = section }
                 let digest = owner.keepStream(decoded, format: format)
                 digests[key] = digest
                 if owner.objectStreamHeaders[digest] == nil, let header = objectStreamHeader(d, decoded) {
-                    owner.objectStreamHeaders[digest] = .some(header)
+                    owner.objectStreamHeaders[digest] = .some(header.map { $0.map(\.number) })
+                    // Breaker B-1: each member's bytes (from its offset to the next member's, or the end), for its references.
+                    if let members = header {
+                        var first: CGPDFInteger = 0
+                        _ = CGPDFDictionaryGetInteger(d, "First", &first)
+                        let starts = members.map { first + $0.offset }
+                        let sorted = Set(starts + [decoded.count]).sorted()
+                        owner.objectStreams[digest] = zip(members, starts).map { member, start in
+                            let stop = sorted.first { $0 > start } ?? decoded.count
+                            let range = min(start, decoded.count)..<min(max(stop, start), decoded.count)
+                            return (member.number, Data(decoded[decoded.startIndex + range.lowerBound..<decoded.startIndex + range.upperBound]))
+                        }
+                    } else {
+                        owner.anomaly("an object stream whose header does not read")
+                    }
                 }
                 streams[key] = s
                 if format == .raw, isContentByType(d) { contentStreams.insert(key) }

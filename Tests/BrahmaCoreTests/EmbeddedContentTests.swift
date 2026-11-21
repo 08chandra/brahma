@@ -838,20 +838,27 @@ struct SeededBytes {
             }
         }
         #expect(!FileManager.default.fileExists(atPath: home.appending(path: "written.txt").path))
-        // Real PDFs on this Mac still read under it.
+        // Real PDFs on this Mac still read under it: each clean, or (breaker B-1) refused for its structure, which the helper
+        // can only say once it has read the whole file under the profile (`ENERGY STAR.pdf`: CoreGraphics can't parse its
+        // structure elements, whose `/Pg` references overflow, so its view holds in-use objects the reader never resolved).
         guard Self.helperReady else { return }
         let reader = try Self.reader(cf)
         let places = ["/System/Library/ProductDocuments/ProductGuides", "/System/Library/Audio/MIDI Devices/Generic/Images",
                       "/System/Library/CoreServices/OSDUIHelper.app/Contents/Resources", "/System/Library/CoreServices/ScriptMonitor.app/Contents/Resources",
                       "/System/Library/CoreServices/SystemUIServer.app/Contents/Resources", "/System/Library/QuickLook/iWork.qlgenerator/Contents/Resources"]
-        var read = 0
+        var read = 0, clean = 0
         for place in places {
             for name in ((try? FileManager.default.contentsOfDirectory(atPath: place)) ?? []).sorted() where name.hasSuffix(".pdf") && read < 30 {
                 guard let data = FileManager.default.contents(atPath: place + "/" + name) else { continue }
-                #expect(try check(cf, data, canonical: name, archives: reader) == .clean, "\(name)")
+                let outcome: String
+                do { outcome = "\(try check(cf, data, canonical: name, archives: reader))" } catch let e as WorkError { outcome = e.message }
+                let structure = outcome == Self.unaccounted.message || outcome.hasPrefix(Self.unaccounted.message + " — the owner can vouch")
+                #expect(outcome == "clean" || structure, "\(name): \(outcome)")
+                if outcome == "clean" { clean += 1 }
                 read += 1
             }
         }
+        #expect(read == 0 || clean * 10 >= read * 9, "\(clean) of \(read) real PDFs read clean")
     }
 
     // MARK: Fix round 4

@@ -115,6 +115,262 @@ import Foundation
         #expect(outcome { try check(cf, PDFBuild.objectStreams(), canonical: "objstm.pdf", archives: reader) } == "clean")
         #expect(outcome { try check(cf, R37Build.compressedOnce(), canonical: "objstm2.pdf", archives: reader) } == "clean")
     }
+
+    /// Breaker B-1 (Ruling 35 b; the class of Ruling 37): a view that mixes revisions. Each revision was walked on its own,
+    /// but nothing required an object to resolve in the view that refers to it, so a reader that rebuilds a broken view by
+    /// scanning the file (poppler) takes an object from another revision. The reviewer's files (re-review 5, `mk4.py`,
+    /// `mk.py`) are rebuilt here:
+    /// - `split.pdf`: revision A is a complete document holding object 8 (`/FlateDecode`); revision C (no `/Prev`) adds a
+    ///   page whose content (the key, Flate) says `/Filter 8 0 R`, and its table leaves 8 out. `split_free.pdf`: C marks 8
+    ///   free. Both read clean before (the key stayed compressed), while `pdftotext` prints it.
+    /// - `norev.pdf` / `norev_notrailer.pdf`: a table naming 8 (with or without a trailer) that no `startxref` names, then the
+    ///   only revision, whose table leaves 8 out.
+    /// - `norev_chained.pdf` (the reviewer's `norev_ctrl.pdf`): that table reached by `/Prev` but still with no `startxref`
+    ///   of its own: refused too (a table with no `startxref` is an anomaly, whatever names it).
+    /// All refused with Ruling 35's refusal. Controls, the same files with a consistent chain (C's `/Prev` naming A; A ending
+    /// with its own `startxref`): the key is caught.
+    @Test func mixedRevisionViewsRefused() throws {
+        guard EmbeddedContentTests.helperReady else { return }
+        let cf = try CollabFixture()
+        let reader = try EmbeddedContentTests.reader(cf)
+        for (name, file) in [("split.pdf", SplitBuild.split(.split)), ("split_free.pdf", SplitBuild.split(.free)),
+                             ("norev.pdf", SplitBuild.norev(.trailer)), ("norev_notrailer.pdf", SplitBuild.norev(.noTrailer)),
+                             ("norev_chained.pdf", SplitBuild.norev(.chainedWithoutStartxref))] {
+            #expect(!String(decoding: file, as: UTF8.self).contains(Self.aws))
+            #expect(unverifiable { try check(cf, file, canonical: name, archives: reader) },
+                    "\(name): \(outcome { try check(cf, file, canonical: name, archives: reader) })")
+        }
+        for (name, file) in [("split_ctrl.pdf", SplitBuild.split(.control)), ("norev_ctrl.pdf", SplitBuild.norev(.control))] {
+            let caught = outcome { try check(cf, file, canonical: name, archives: reader) }
+            #expect(caught.contains("looks like it contains a secret"), "\(name): \(caught)")
+        }
+    }
+
+    /// Breaker B-1, rule by rule. Refused (Ruling 35's refusal), each read clean before:
+    /// - a reference to an object past every number the file uses; to an object its view marks free; with the wrong
+    ///   generation; one hidden after an `endobj` inside a string; one whose three tokens are split by comments; one with a
+    ///   signed number (`+7 0 R`, which readers take as 7);
+    /// - a cross-reference stream's update with no `/Prev` (the first stream off the chain);
+    /// - a reference inside an object-stream member that resolves nowhere;
+    /// - an object a later revision frees while its bytes stay (its revision's prefix holds a header that view doesn't
+    ///   resolve); an object-stream member no cross-reference row names;
+    /// - a `trailer` that belongs to no table on the chain.
+    /// Controls read clean: three additive revisions; two additive cross-reference-stream revisions; a hybrid file (a
+    /// table with `/XRefStm`); an object-stream file.
+    @Test func everyReferenceResolvesInItsView() throws {
+        guard EmbeddedContentTests.helperReady else { return }
+        let cf = try CollabFixture()
+        let reader = try EmbeddedContentTests.reader(cf)
+        let refused: [(String, Data)] = [
+            ("past.pdf", SplitBuild.referring("<< /See 12 0 R >>")),
+            ("free.pdf", SplitBuild.referring("<< /See 7 0 R >>")),
+            ("generation.pdf", SplitBuild.referring("<< /See 5 1 R >>")),
+            ("endobj.pdf", SplitBuild.referring("<< /T (a endobj b) /See 7 0 R >>")),
+            ("comments.pdf", SplitBuild.referring("<< /See 7 % one\n0 % two\nR >>")),
+            ("signed.pdf", SplitBuild.referring("<< /See +7 0 R >>")),
+            ("streams_split.pdf", SplitBuild.additiveStreams(chained: false)),
+            ("member.pdf", PDFBuild.objectStreams(hidden: "<< /See 12 0 R >>")),
+            ("freed.pdf", SplitBuild.freedButLeft()),
+            ("orphan.pdf", SplitBuild.orphanMember()),
+            ("trailer.pdf", SplitBuild.strayTrailer()),
+        ]
+        for (name, file) in refused {
+            #expect(unverifiable { try check(cf, file, canonical: name, archives: reader) },
+                    "\(name): \(outcome { try check(cf, file, canonical: name, archives: reader) })")
+        }
+        let clean: [(String, Data)] = [
+            ("three.pdf", SplitBuild.additive(3)),
+            ("streams.pdf", SplitBuild.additiveStreams()),
+            ("hybrid.pdf", SplitBuild.hybridOnce()),
+            ("objstm.pdf", PDFBuild.objectStreams()),
+            ("seen.pdf", SplitBuild.referring("<< /See 5 0 R >>")),
+        ]
+        for (name, file) in clean {
+            #expect(outcome { try check(cf, file, canonical: name, archives: reader) } == "clean", "\(name)")
+        }
+    }
+}
+
+/// Breaker B-1: the reviewer's `mk4.py` (split) and `mk.py` (norev) of re-review 5, and the rule-by-rule files.
+enum SplitBuild {
+    /// A file written object by object, with the offsets kept.
+    struct Writer {
+        var out = R37Build.head
+        var offsets: [Int: Int] = [:]
+
+        mutating func obj(_ n: Int, _ body: String, stream: Data? = nil) {
+            offsets[n] = out.count
+            if let stream {
+                out += Data("\(n) 0 obj\n\(body)\nstream\n".utf8) + stream + Data("\nendstream\nendobj\n".utf8)
+            } else {
+                out += Data("\(n) 0 obj\n\(body)\nendobj\n".utf8)
+            }
+        }
+
+        /// A classic table, one subsection per number (`free` marked free), then the trailer and `startxref` (each left
+        /// out when asked). Returns the table's offset.
+        @discardableResult
+        mutating func table(_ numbers: [Int], size: Int, free: [Int] = [], prev: Int? = nil, root: Int = 1, trailer: Bool = true,
+                            startxref: Bool = true) -> Int {
+            let x = out.count
+            var t = "xref\n0 1\n0000000000 65535 f \n"
+            for n in Set(numbers).union(free).sorted() {
+                t += free.contains(n) ? "\(n) 1\n0000000000 00001 f \n" : "\(n) 1\n\(PDFBuild.pad10(offsets[n]!)) 00000 n \n"
+            }
+            if trailer { t += "trailer\n<< /Size \(size) /Root \(root) 0 R" + (prev.map { " /Prev \($0)" } ?? "") + " >>\n" }
+            if startxref { t += "startxref\n\(x)\n%%EOF\n" }
+            out += Data(t.utf8)
+            return x
+        }
+    }
+
+    enum Split { case split, free, control }
+
+    /// `split.pdf`: revision A a complete document (a blank page, object 8 `/FlateDecode`); revision C a new catalog,
+    /// pages and page 7 whose content 4 (the key, Flate) says `/Filter 8 0 R`, its table without 8 and without `/Prev`
+    /// (`free`: 8 marked free; `control`: `/Prev` naming A).
+    static func split(_ variant: Split) -> Data {
+        let secret = PDFBuild.zlib(Data("BT /F1 24 Tf 20 100 Td (\(SecretGateTests.aws)) Tj ET".utf8))
+        var w = Writer()
+        w.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        w.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        w.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 200] /Contents 6 0 R /Resources << /Font << /F1 5 0 R >> >> >>")
+        w.obj(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        w.obj(6, "<< /Length 0 >>", stream: Data())
+        w.obj(8, "/FlateDecode")
+        let a = w.table([1, 2, 3, 5, 6, 8], size: 9)
+        w.obj(4, "<< /Length \(secret.count) /Filter 8 0 R >>", stream: secret)
+        w.obj(7, "<< /Type /Page /Parent 9 0 R /MediaBox [0 0 600 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>")
+        w.obj(9, "<< /Type /Pages /Kids [7 0 R] /Count 1 >>")
+        w.obj(10, "<< /Type /Catalog /Pages 9 0 R >>")
+        w.table([4, 5, 7, 9, 10], size: 11, free: variant == .free ? [8] : [], prev: variant == .control ? a : nil, root: 10)
+        return w.out
+    }
+
+    enum Norev { case trailer, noTrailer, chainedWithoutStartxref, control }
+
+    /// `norev.pdf`: one page whose content 4 (the key, Flate) says `/Filter 8 0 R`; a first table naming 8 that no
+    /// `startxref` names (with a trailer, or none), then the file's only revision, its table without 8.
+    /// `chainedWithoutStartxref`: the last table's `/Prev` names the first, which still has no `startxref` of its own (the
+    /// reviewer's `norev_ctrl.pdf`). `control`: the first table ends with its own `startxref`, and the last names it.
+    static func norev(_ variant: Norev) -> Data {
+        let secret = PDFBuild.zlib(Data("BT /F1 24 Tf 20 100 Td (\(SecretGateTests.aws)) Tj ET".utf8))
+        var w = Writer()
+        w.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        w.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        w.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>")
+        w.obj(4, "<< /Length \(secret.count) /Filter 8 0 R >>", stream: secret)
+        w.obj(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        w.obj(8, "/FlateDecode")
+        let a = w.table([1, 2, 3, 4, 5, 8], size: 9, trailer: variant != .noTrailer, startxref: variant == .control)
+        let chained = variant == .control || variant == .chainedWithoutStartxref
+        w.table([1, 2, 3, 4, 5], size: chained ? 9 : 6, prev: chained ? a : nil)
+        return w.out
+    }
+
+    /// One revision: catalog, pages, a page (content 4, font 5) and object 6 `body`; its table names 1–6 and marks 7 free.
+    static func referring(_ body: String) -> Data {
+        var w = Writer()
+        w.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        w.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        w.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>")
+        let clean = PDFBuild.zlib(PDFBuild.text("hello"))
+        w.obj(4, "<< /Length \(clean.count) /Filter /FlateDecode >>", stream: clean)
+        w.obj(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        w.obj(6, body)
+        w.table([1, 2, 3, 4, 5, 6], size: 8, free: [7])
+        return w.out
+    }
+
+    /// `referring` with a clean object 6, then an update that marks 6 free and leaves its bytes.
+    static func freedButLeft() -> Data {
+        var w = Writer()
+        w.out = Data()
+        let first = referring("<< /Note (soon freed) >>")
+        w.out = first
+        let previous = PDFBuild.lastStartxref(first)
+        w.table([], size: 8, free: [6], prev: previous)
+        return w.out
+    }
+
+    /// `n` additive revisions (`RevisionBuild`), each after the first adding one note.
+    static func additive(_ n: Int) -> Data {
+        typealias B = RevisionBuild
+        var file = B.build(B.base(B.stream(4, PDFBuild.zlib(PDFBuild.text("hello")))))
+        for k in 1..<n {
+            file = B.update(file, objects: [B.obj(5 + k, "<< /Note (revision \(k)) >>")], entries: [(5 + k, 0, { $0[0] })], size: 6 + k)
+        }
+        return file.data
+    }
+
+    /// Two revisions of cross-reference streams: `R37Build.compressedBase`, then an update adding object 9 (`chained`: its
+    /// cross-reference stream's `/Prev` names the first; else it has none, and the first is off the chain).
+    static func additiveStreams(chained: Bool = true) -> Data {
+        let a = R37Build.compressedBase()
+        var out = a.data
+        let o9 = out.count
+        out += R37Build.obj(9, "<< /Note (two) >>")
+        let o11 = out.count
+        out += R37Build.xrefStream(11, [9: R37Build.row(1, o9, 0), 11: R37Build.row(1, o11, 0)], size: 12, prev: chained ? a.xref : nil)
+        out += Data("startxref\n\(o11)\n%%EOF\n".utf8)
+        return out
+    }
+
+    /// One revision, hybrid: a classic table naming 1–5, object stream 6 and cross-reference stream 7 (the trailer's
+    /// `/XRefStm`), which names 8 as a member of 6 and 6 and 7 themselves; 3 refers to 8.
+    static func hybridOnce() -> Data {
+        var w = Writer()
+        w.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        w.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        w.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Note 8 0 R >>")
+        let clean = PDFBuild.zlib(PDFBuild.text("hello"))
+        w.obj(4, "<< /Length \(clean.count) /Filter /FlateDecode >>", stream: clean)
+        w.obj(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        w.offsets[6] = w.out.count
+        w.out += R37Build.objectStream(6, [(8, "<< /Note (member) >>")])
+        let o7 = w.out.count
+        w.offsets[7] = o7
+        w.out += R37Build.xrefStream(7, [6: R37Build.row(1, w.offsets[6]!, 0), 7: R37Build.row(1, o7, 0), 8: R37Build.row(2, 6, 0)],
+                                     size: 9, prev: nil)
+        let x = w.out.count
+        var t = "xref\n0 6\n0000000000 65535 f \n"
+        for n in 1...5 { t += PDFBuild.pad10(w.offsets[n]!) + " 00000 n \n" }
+        t += "trailer\n<< /Size 9 /Root 1 0 R /XRefStm \(o7) >>\nstartxref\n\(x)\n%%EOF\n"
+        w.out += Data(t.utf8)
+        return w.out
+    }
+
+    /// `R37Build.compressedBase` with its object stream also holding object 9, which no row names.
+    static func orphanMember() -> Data {
+        let clean = R37Build.content("hello")
+        var out = R37Build.head, offsets: [Int: Int] = [:]
+        for (n, body) in R37Build.page { offsets[n] = out.count; out += R37Build.obj(n, body) }
+        offsets[4] = out.count
+        out += R37Build.obj(4, Data("<< /Filter /FlateDecode /Length \(clean.count) >>\nstream\n".utf8) + clean + Data("\nendstream".utf8))
+        offsets[6] = out.count
+        out += R37Build.objectStream(6, [(8, "<< /Note (named) >>"), (9, "<< /Note (orphan) >>")])
+        let xref = out.count
+        var entries: [Int: Data] = [8: R37Build.row(2, 6, 0), 7: R37Build.row(1, xref, 0)]
+        for (n, o) in offsets { entries[n] = R37Build.row(1, o, 0) }
+        out += R37Build.xrefStream(7, entries, size: 10, prev: nil)
+        out += Data("startxref\n\(xref)\n%%EOF\n".utf8)
+        return out
+    }
+
+    /// `referring` (a clean object 6) with a `trailer` naming another root between objects 5 and 6 (no table owns it).
+    static func strayTrailer() -> Data {
+        var w = Writer()
+        w.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        w.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        w.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>")
+        let clean = PDFBuild.zlib(PDFBuild.text("hello"))
+        w.obj(4, "<< /Length \(clean.count) /Filter /FlateDecode >>", stream: clean)
+        w.obj(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        w.out += Data("trailer\n<< /Size 8 /Root 6 0 R >>\n".utf8)
+        w.obj(6, "<< /Type /Catalog /Pages 2 0 R >>")
+        w.table([1, 2, 3, 4, 5, 6], size: 7)
+        return w.out
+    }
 }
 
 /// The reviewer's `r37*.py` (re-review 4) in Swift.
