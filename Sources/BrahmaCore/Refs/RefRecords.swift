@@ -226,7 +226,8 @@ final class RefHooks: @unchecked Sendable {
     var afterPurgeTurnCheck: (@Sendable () throws -> Void)? { lock.withLock { afterTurnCheck } }
     func setFenceHome(_ home: URL?) { lock.withLock { fence = home } }
     private var wait: Duration?
-    /// How long an item check or an extension trial waits for a purge holding the fence (R4-6); nil: `PurgeFence.defaultWait`.
+    /// How long an item check or an extension trial waits for a purge holding the fence (R4-6), and (round 5) a purge for
+    /// the fence; nil: `PurgeFence.defaultWait`.
     var fenceWait: Duration? { lock.withLock { wait } }
     func setFenceWait(_ wait: Duration?) { lock.withLock { self.wait = wait } }
     func setAfterPurgeTurnCheck(_ body: (@Sendable () throws -> Void)?) { lock.withLock { afterTurnCheck = body } }

@@ -1,4 +1,4 @@
-// brahma-pdf: the PDF extraction helper (Plan C task C2b, fix rounds 2–4, controller rulings 33 and 34).
+// brahma-pdf: the PDF extraction helper (Plan C task C2b, fix rounds 2–5, controller rulings 33–35, 37 and 38).
 //
 // The engine never parses a PDF. It runs this helper directly under Seatbelt (`SandboxedPDFReader`: a deny-default profile
 // that lets it read the system's libraries, this binary and the one input file, and nothing else: no other program, no
@@ -19,7 +19,9 @@
 //    each pinned at its header's exact offset; in the same kind of cross-reference section as the revision's last one;
 //    then opens that. The reader's own parse then reaches every object that revision holds, used or not (objects in object
 //    streams, the cross-reference and object streams themselves, objects nothing refers to), and every stream body by its
-//    place in the file. A revision the reader can't open adds nothing (step 5 still has to place its streams).
+//    place in the file. Round 5 (R5-1, ruling 37): a revision the reader can't open is an anomaly, unless the file is
+//    positively linearized (`positivelyLinearized`: its first-page section, which ends `startxref 0`, holds only the
+//    linearization dictionary and its cross-reference, and the whole file's view reaches every object any section names).
 // 3. Walks every object from that list: every stream decoded (`CGPDFStreamCopyData`; a stream that does not decode is
 //    refused), every string (its bytes, and as text), every name. A cross-reference stream naming objects past the
 //    highest number is refused; its in-use rows (number, generation, offset) are kept. Each decoded stream is written once,
@@ -35,9 +37,14 @@
 //    section must name exactly the offset of a header with its own number and generation (an offset one byte off, offset
 //    0, another number or generation: refused). Anything else is data no walk is known to reach: refused.
 //    Round 4 (R4-6, ruling 35): the rule is detection only, never a model of what a reader would do. Every anomaly refuses
-//    the same way (exit 5, which the engine reports as "this PDF's structure couldn't be verified — ask the owner to vouch
-//    for or convert it"): besides the above, more than 8 revisions, one object number with two bodies (an object rewritten
+//    the same way (exit 5, which the engine reports as "this PDF's structure couldn't be verified", round 5 adding the
+//    owner's vouch command): besides the above, more than 8 revisions, one object number with two bodies (an object rewritten
 //    across revisions, or twice in one), and any object header (stream or not) no in-use entry names exactly.
+//    Round 5 (R5-2, ruling 35 b): every type-2 row (an object in an object stream) is kept per number with its stream and
+//    index; a number that has a header and a type-2 row, rows that name two places, a row whose object stream is no
+//    stream object, and a member no revision's reader resolved are anomalies too. An anomaly no longer stops the read:
+//    everything readable is still read and written out in full, and the exit status is 5 (the engine refuses it unless
+//    the owner vouched for these exact bytes, ruling 38, and then scans every part as usual).
 // 6. Adds the page text of the last revision as PDFKit extracts it.
 // A thread checks the process's own memory footprint every 20 ms and exits (status 9) past the limit (default 1 GiB);
 // the engine's watchdog kills the whole run at its own limit too.
@@ -49,7 +56,8 @@
 // included, stays within the byte cap, or the run fails.
 //
 // Exit status: 0 done; 2 usage; 3 encrypted; 4 a stream (or content stream) that can't be decoded; 5 a structural
-// anomaly (step 5); 6 the output cap; 7 not a PDF this reader can open; 8 too many objects; 9 the memory limit.
+// anomaly (step 5; the output is complete when it parses, empty for a file with more than 64 revisions); 6 the output
+// cap; 7 not a PDF this reader can open; 8 too many objects; 9 the memory limit.
 // Anything but 0 is a refusal.
 import Foundation
 #if canImport(PDFKit) && canImport(CoreGraphics)
@@ -125,6 +133,12 @@ struct ObjectKey: Hashable, Comparable {
     static func < (a: ObjectKey, b: ObjectKey) -> Bool { (a.number, a.generation) < (b.number, b.generation) }
 }
 
+/// Where a type-2 cross-reference row says an object lives: the object stream's number and the index in it.
+struct Compressed: Equatable {
+    let stream: Int
+    let index: Int
+}
+
 /// An in-use cross-reference entry: which object it says starts at `offset`.
 struct Entry: Hashable {
     let key: ObjectKey
@@ -148,6 +162,8 @@ final class Extraction {
     static let maxVisits = 5_000_000
     /// Round 4 (R4-6, ruling 35): more revisions than this is itself an anomaly (refused as unverifiable).
     static let maxRevisions = 8
+    /// Round 5: at most this many revisions are walked at all; a file with more is refused with nothing read.
+    static let maxWalks = 64
 
     let original: Data
     let bytes: [UInt8]
@@ -164,6 +180,23 @@ final class Extraction {
     var keptEntries = Set<Data>()    // every string, text and name kept once
     var digests = Set<Data>()        // every decoded stream, across every revision, written once
     var entries = Set<Entry>()       // every in-use entry of every cross-reference section (classic and stream)
+    /// Round 5 (R5-2, ruling 35 b): every object a cross-reference stream says lives in an object stream (a type-2 row):
+    /// its number → the object stream's number and its index there (its generation is 0).
+    var compressed: [Int: Compressed] = [:]
+    /// Every `startxref` value, in file order (the last one names the whole file's newest section).
+    var startxrefs: [Int] = []
+    /// Round 5: a structural anomaly was found. The helper still reads everything it can and writes it out in full, then
+    /// exits 5 (`unaccounted`): the engine refuses it, unless the owner vouched for these exact bytes (ruling 38).
+    var anomalous = false
+    /// Every number some cross-reference section marks free (classic `f`, type-0 rows).
+    var freed = Set<Int>()
+    /// Round 5 (R5-2): the object numbers each decoded object stream's header lists, in order, by the stream's digest (nil:
+    /// a header that doesn't parse).
+    var objectStreamHeaders: [Data: [Int]?] = [:]
+    /// Every digest each listed object (generation 0) decoded to as a stream, in any revision.
+    var streamDigests: [Int: Set<Data>] = [:]
+
+    func anomaly() { anomalous = true }
 
     init(original: Data, cap: Int) {
         self.original = original
@@ -176,15 +209,20 @@ final class Extraction {
         guard highest < Self.maxObjects else { fail(.tooMany) }
         var ends = revisionEnds.sorted()
         if ends.last != bytes.count { ends.append(bytes.count) }
-        guard ends.count <= Self.maxRevisions else { fail(.unaccounted) }
+        // More revisions than the reader could ever walk: refused outright (nothing is read).
+        guard ends.count <= Self.maxWalks else { fail(.unaccounted) }
+        if ends.count > Self.maxRevisions { anomaly() }
         // R4-6 (ruling 35): one object number with two bodies (an object rewritten across revisions, or twice in one) is
         // an anomaly, refused without modelling which body a reader would take.
         var numbers = Set<Int>()
-        guard headers.allSatisfy({ numbers.insert($0.key.number).inserted }) else { fail(.unaccounted) }
+        if !headers.allSatisfy({ numbers.insert($0.key.number).inserted }) { anomaly() }
         let bodies = headers.filter { $0.streams == 1 }
         var placed = Set<Int>()   // the header offsets of the stream bodies some revision placed
+        var resolved = Set<ObjectKey>()   // every listed object some revision's reader resolved to something (not null)
+        var unopened: [Int] = []          // the revisions (indices into `ends`) the reader could not open
+        var linearized = false            // the whole file is positively linearized (Ruling 37's exception)
         var opened = false
-        for end in ends {
+        for (index, end) in ends.enumerated() {
             let prefix = original.prefix(end)
             if let provider = CGDataProvider(data: prefix as CFData), let document = CGPDFDocument(provider), document.isEncrypted {
                 fail(.encrypted)
@@ -192,39 +230,120 @@ final class Extraction {
             // Every stream body wholly inside this revision, pinned at its offset (a generation a cross-reference row
             // can't carry is never pinned, so it is never placed).
             let pins = bodies.filter { ($0.end ?? bytes.count) <= end && $0.key.generation <= 65_535 }
-            // A revision the reader can't open (a linearized file's first part, ending `startxref 0`) adds nothing; its
-            // streams must still be placed by another revision's walk.
-            guard let walked = Revision(of: self, prefix: prefix, pins: pins)?.read() else { continue }
+            // Round 5 (R5-1, ruling 37): a revision the reader can't open is never skipped: unless the file is positively
+            // linearized and this is its first-page section (below), the file is unverifiable.
+            guard let revision = Revision(of: self, prefix: prefix, pins: pins) else { unopened.append(index); continue }
+            let walked = revision.read()
             opened = true
+            resolved.formUnion(walked.resolved)
             for pin in pins {
                 if let digest = walked.pinned[pin.offset], walked.byKey[pin.key] == digest { placed.insert(pin.offset) }
             }
+            if index == ends.count - 1, index == 1, unopened == [0] {
+                linearized = positivelyLinearized(revision, resolved: walked.resolved, firstEnd: ends[0])
+            }
         }
         guard opened else { fail(.unreadable) }
+        if !unopened.isEmpty && !(unopened == [0] && linearized) { anomaly() }
         // Step 5 (after the walks, so a stream that can't be decoded says so first): every `stream` keyword in one object,
         // one per object; every stream body named exactly and placed by some revision's walk; every in-use entry exactly a
         // header.
-        guard !stray, headers.allSatisfy({ $0.streams <= 1 }) else { fail(.unaccounted) }
+        if stray || !headers.allSatisfy({ $0.streams <= 1 }) { anomaly() }
         // R4-6: every object header, stream or not, named exactly by an in-use entry (an unknown object is an anomaly).
-        for header in headers where !entries.contains(Entry(key: header.key, offset: header.offset)) { fail(.unaccounted) }
-        for body in bodies {
-            guard placed.contains(body.offset), entries.contains(Entry(key: body.key, offset: body.offset)) else { fail(.unaccounted) }
+        if headers.contains(where: { !entries.contains(Entry(key: $0.key, offset: $0.offset)) }) { anomaly() }
+        for body in bodies where !placed.contains(body.offset) || !entries.contains(Entry(key: body.key, offset: body.offset)) {
+            anomaly()
         }
         for entry in entries {
-            guard let i = headerAt[entry.offset], headers[i].key == entry.key else { fail(.unaccounted) }
+            guard let i = headerAt[entry.offset], headers[i].key == entry.key else { anomaly(); break }
         }
-        // The page text of the last revision.
-        guard let pdf = PDFDocument(data: original) else { fail(.unreadable) }
-        if pdf.isEncrypted || pdf.isLocked { fail(.encrypted) }
-        var pages = Data()
-        for i in 0..<pdf.pageCount {
-            if let text = pdf.page(at: i)?.string, !text.isEmpty { pages += Data(text.utf8); pages.append(0x0A) }
+        // Round 5 (R5-2, ruling 35 b): an object in an object stream is accounted like a header. No number both a header
+        // and a type-2 row (an object rewritten from one into the other); every type-2 row of one number names the same
+        // place (checked as rows are read); its object stream a lexed stream object of generation 0, not itself; and the
+        // member decoded by the reader in some revision.
+        for (number, place) in compressed {
+            let container = headers.first { $0.key == ObjectKey(number: place.stream, generation: 0) }
+            if numbers.contains(number) || place.stream == number || container?.streams != 1
+                || !resolved.contains(ObjectKey(number: number, generation: 0)) {
+                anomaly()
+            }
+            // The object stream's own header (as every revision decoded it) lists this number exactly once, at the row's
+            // index: readers that go by the index and readers that go by the number find the same member.
+            let decodedAs = streamDigests[place.stream] ?? []
+            if decodedAs.isEmpty { anomaly() }
+            for digest in decodedAs {
+                guard let listed = objectStreamHeaders[digest] ?? nil, place.index < listed.count, listed[place.index] == number,
+                      listed.filter({ $0 == number }).count == 1 else { anomaly(); break }
+            }
         }
-        for (kind, data) in [(UInt8(0x53), strings), (0x55, texts), (0x4E, names), (0x54, pages)] where !data.isEmpty {
+        // The page text of the last revision (none when that revision is itself what can't be verified).
+        if let pdf = PDFDocument(data: original) {
+            if pdf.isEncrypted || pdf.isLocked { fail(.encrypted) }
+            var pages = Data()
+            for i in 0..<pdf.pageCount {
+                if let text = pdf.page(at: i)?.string, !text.isEmpty { pages += Data(text.utf8); pages.append(0x0A) }
+            }
+            keepPages(pages)
+        } else if !anomalous {
+            fail(.unreadable)
+        }
+        for (kind, data) in [(UInt8(0x53), strings), (0x55, texts), (0x4E, names), (0x54, pageText)] where !data.isEmpty {
             output.record(kind, data)
         }
         output.finish()
-        exit(0)
+        exit(anomalous ? Status.unaccounted.rawValue : 0)
+    }
+
+    var pageText = Data()
+    func keepPages(_ data: Data) { pageText = data }
+
+    /// Round 5 (R5-1, ruling 37): whether the file is positively linearized (PDF 32000-1, Annex F), so that its first
+    /// section, which the reader can't open on its own (its `startxref` is 0), is walked through the whole file's view
+    /// (`whole`, the last revision's walk; `resolved` what it resolved). All of:
+    /// - exactly two revisions, the first ending at `firstEnd`;
+    /// - the first object of the file (within its first 1024 bytes, holding no stream, wholly in the first section) a
+    ///   dictionary with `/Linearized`, whose `/L` is the file's exact length, and whose `/H` names 1 or 2 hint streams,
+    ///   each exactly: an object header at that offset holding one stream, after the first section, its length running to
+    ///   the end of line after its `endobj`;
+    /// - the first section holds nothing but that dictionary and its cross-reference: a classic table, or one
+    ///   cross-reference stream; the file's final `startxref` names exactly that table (or stream);
+    /// - the whole file's view reaches every object any section names in use (classic, type 1 or type 2): no section can
+    ///   hide what another holds, so the walk of the whole file is a walk of every view.
+    func positivelyLinearized(_ whole: Revision, resolved: Set<ObjectKey>, firstEnd: Int) -> Bool {
+        guard let first = headers.min(by: { $0.offset < $1.offset }), first.offset < 1024, first.streams == 0,
+              let firstObjectEnd = first.end, firstObjectEnd <= firstEnd,
+              let dictionary = whole.dictionary(number: first.key.number), first.key.generation == 0 else { return false }
+        var version: CGPDFReal = 0, length: CGPDFInteger = 0
+        guard CGPDFDictionaryGetNumber(dictionary, "Linearized", &version), CGPDFDictionaryGetInteger(dictionary, "L", &length),
+              length == bytes.count else { return false }
+        var hints: CGPDFArrayRef? = nil
+        guard CGPDFDictionaryGetArray(dictionary, "H", &hints), let hints else { return false }
+        let count = CGPDFArrayGetCount(hints)
+        guard count == 2 || count == 4 else { return false }
+        for pair in stride(from: 0, to: count, by: 2) {
+            var offset: CGPDFInteger = 0, size: CGPDFInteger = 0
+            guard CGPDFArrayGetInteger(hints, pair, &offset), CGPDFArrayGetInteger(hints, pair + 1, &size), offset >= firstEnd, size > 0,
+                  let i = headerAt[offset], headers[i].streams == 1, let end = headers[i].end else { return false }
+            let (stop, overflow) = offset.addingReportingOverflow(size)
+            guard !overflow, stop >= end, stop <= end + 2 else { return false }
+        }
+        let inFirst = headers.filter { $0.offset < firstEnd }
+        guard let finalStart = startxrefs.last else { return false }
+        switch inFirst.count {
+        case 1:
+            guard finalStart >= firstObjectEnd, finalStart < firstEnd, matches(Array("xref".utf8), at: finalStart, in: bytes) else { return false }
+        case 2:
+            guard let table = inFirst.first(where: { $0.offset != first.offset }), table.streams == 1, table.offset == finalStart,
+                  (table.end ?? bytes.count) <= firstEnd, whole.isCrossReferenceStream(number: table.key.number) else { return false }
+        default:
+            return false
+        }
+        if entries.contains(where: { !resolved.contains($0.key) }) { return false }
+        // No section frees what another uses (object 0 aside): every view agrees on what exists.
+        if entries.contains(where: { $0.key.number != 0 && freed.contains($0.key.number) })
+            || compressed.keys.contains(where: freed.contains) { return false }
+        if compressed.keys.contains(where: { !resolved.contains(ObjectKey(number: $0, generation: 0)) }) { return false }
+        return true
     }
 
     /// Step 1: the object headers and their ends, the `stream` keywords and their objects, the `/Size` values, the classic
@@ -245,9 +364,10 @@ final class Extraction {
                 // Round 4 (R4-1): a revision ends after `startxref <offset>` (and after its `%%EOF`, when one follows).
                 var j = i + startxrefWord.count
                 while j < bytes.count, isWhite(bytes[j]) { j += 1 }
-                var digits = 0
-                while j < bytes.count, isDigit(bytes[j]), digits < 12 { j += 1; digits += 1 }
+                var digits = 0, value = 0
+                while j < bytes.count, isDigit(bytes[j]), digits < 12 { value = value * 10 + Int(bytes[j] - 0x30); j += 1; digits += 1 }
                 if digits > 0 {
+                    startxrefs.append(value)
                     var k = j
                     while k < bytes.count, isWhite(bytes[k]) { k += 1 }
                     revisionEnds.insert(matches(eofWord, at: k, in: bytes) ? afterEOF(k + eofWord.count) : j)
@@ -325,6 +445,7 @@ final class Extraction {
                 skipWhite()
                 guard i < bytes.count else { return }
                 if bytes[i] == 0x6E { record(number: first + k, generation: generation, offset: offset) }   // n
+                if bytes[i] == 0x66 { freed.insert(first + k) }   // f
                 i += 1
                 rows += 1
                 guard rows <= Self.maxObjects * 4 else { fail(.tooMany) }
@@ -334,6 +455,12 @@ final class Extraction {
 
     func record(number: Int, generation: Int, offset: Int) {
         entries.insert(Entry(key: ObjectKey(number: number, generation: generation), offset: offset))
+    }
+
+    /// Round 5 (R5-2): a type-2 row. Two rows for one number that name different places are an anomaly.
+    func recordCompressed(number: Int, _ place: Compressed) {
+        if let known = compressed[number], known != place { anomaly() }
+        compressed[number] = place
     }
 
     /// Strings, texts and names, each kept once.
@@ -458,20 +585,31 @@ final class Revision {
 
     /// Walks every listed object, then scans every content stream; returns the digest of the stream each listed object
     /// (number, generation) names, and of the body pinned at each offset.
-    func read() -> (byKey: [ObjectKey: Data], pinned: [Int: Data]) {
+    func read() -> (byKey: [ObjectKey: Data], pinned: [Int: Data], resolved: Set<ObjectKey>) {
         var byKey: [ObjectKey: Data] = [:], pinned: [Int: Data] = [:]
+        var resolved = Set<ObjectKey>()
         var digestOf: [Int: Data] = [:]
         let generations = owner.generationList
         let count = CGPDFArrayGetCount(listed)
         for i in 0..<count {
             var o: CGPDFObjectRef? = nil
             guard CGPDFArrayGetObject(listed, i, &o), let o else { continue }
+            // Round 5: which listed objects this revision's reader resolved to something (an object it has no place for
+            // reads as null).
+            if CGPDFObjectGetType(o) != .null {
+                if i < owner.highest {
+                    resolved.insert(ObjectKey(number: i + 1, generation: 0))
+                } else if i - owner.highest < generations.count {
+                    resolved.insert(generations[i - owner.highest])
+                }
+            }
             var s: CGPDFStreamRef? = nil
             let root = CGPDFObjectGetValue(o, .stream, &s) ? s : nil
             walk(o, digests: &digestOf)
             guard let root, let digest = digestOf[unsafeBitCast(root, to: Int.self)] else { continue }
             if i < owner.highest {
                 byKey[ObjectKey(number: i + 1, generation: 0)] = digest
+                owner.streamDigests[i + 1, default: []].insert(digest)
             } else if i - owner.highest < generations.count {
                 byKey[generations[i - owner.highest]] = digest
             } else if i - owner.highest - generations.count < pins.count {
@@ -479,11 +617,28 @@ final class Revision {
             }
         }
         for key in contentStreams.sorted() {
-            // Round 4: a content stream marked but never decoded is refused, never skipped.
-            guard let stream = streams[key] else { fail(.unaccounted) }
+            // Round 4: a content stream marked but never decoded is refused, never skipped (round 5: an anomaly; the rest is
+            // still read).
+            guard let stream = streams[key] else { owner.anomaly(); continue }
             scanContent(stream)
         }
-        return (byKey, pinned)
+        return (byKey, pinned, resolved)
+    }
+
+    /// The dictionary object `number` (generation 0) is in this revision, if it is one.
+    func dictionary(number: Int) -> CGPDFDictionaryRef? {
+        guard number >= 1, number <= owner.highest else { return nil }
+        var d: CGPDFDictionaryRef? = nil
+        return CGPDFArrayGetDictionary(listed, number - 1, &d) ? d : nil
+    }
+
+    /// Whether object `number` (generation 0) is a cross-reference stream in this revision.
+    func isCrossReferenceStream(number: Int) -> Bool {
+        guard number >= 1, number <= owner.highest else { return false }
+        var s: CGPDFStreamRef? = nil, type: UnsafePointer<CChar>? = nil
+        guard CGPDFArrayGetStream(listed, number - 1, &s), let s, let d = CGPDFStreamGetDictionary(s),
+              CGPDFDictionaryGetName(d, "Type", &type), let type else { return false }
+        return String(cString: type) == "XRef"
     }
 
     // MARK: The walk
@@ -572,9 +727,9 @@ final class Revision {
     func checkCrossReference(_ d: CGPDFDictionaryRef, rows: Data) {
         var type: UnsafePointer<CChar>? = nil
         guard CGPDFDictionaryGetName(d, "Type", &type), let type, String(cString: type) == "XRef" else { return }
+        // Round 5: a section that can't be read is an anomaly (the rest of the file is still read).
         var size: CGPDFInteger = 0
-        guard CGPDFDictionaryGetInteger(d, "Size", &size), size >= 0 else { fail(.unaccounted) }
-        if size - 1 > owner.highest { fail(.unaccounted) }
+        guard CGPDFDictionaryGetInteger(d, "Size", &size), size >= 0, size - 1 <= owner.highest else { owner.anomaly(); return }
         var ranges: [(start: Int, count: Int)] = []
         var index: CGPDFArrayRef? = nil
         if CGPDFDictionaryGetArray(d, "Index", &index), let index {
@@ -582,8 +737,8 @@ final class Revision {
             while k + 1 < CGPDFArrayGetCount(index) {
                 var start: CGPDFInteger = 0, count: CGPDFInteger = 0
                 guard CGPDFArrayGetInteger(index, k, &start), CGPDFArrayGetInteger(index, k + 1, &count), start >= 0, count >= 0,
-                      count <= Extraction.maxObjects * 4 else { fail(.unaccounted) }
-                if count > 0, start.addingReportingOverflow(count - 1).partialValue > owner.highest { fail(.unaccounted) }
+                      count <= Extraction.maxObjects * 4 else { owner.anomaly(); return }
+                if count > 0, start.addingReportingOverflow(count - 1).partialValue > owner.highest { owner.anomaly(); return }
                 ranges.append((start, count))
                 k += 2
             }
@@ -592,15 +747,15 @@ final class Revision {
         }
         // The field widths: each at most 8 bytes; a row is their sum.
         var widths: CGPDFArrayRef? = nil
-        guard CGPDFDictionaryGetArray(d, "W", &widths), let widths, CGPDFArrayGetCount(widths) == 3 else { fail(.unaccounted) }
+        guard CGPDFDictionaryGetArray(d, "W", &widths), let widths, CGPDFArrayGetCount(widths) == 3 else { owner.anomaly(); return }
         var w = [0, 0, 0]
         for k in 0..<3 {
             var v: CGPDFInteger = 0
-            guard CGPDFArrayGetInteger(widths, k, &v), v >= 0, v <= 8 else { fail(.unaccounted) }
+            guard CGPDFArrayGetInteger(widths, k, &v), v >= 0, v <= 8 else { owner.anomaly(); return }
             w[k] = v
         }
         let row = w[0] + w[1] + w[2]
-        guard row > 0 else { fail(.unaccounted) }
+        guard row > 0 else { owner.anomaly(); return }
         let b = [UInt8](rows)
         var at = 0
         func field(_ width: Int) -> Int {
@@ -610,13 +765,41 @@ final class Revision {
         }
         for range in ranges {
             for k in 0..<range.count {
-                guard b.count - at >= row else { fail(.unaccounted) }
+                guard b.count - at >= row else { owner.anomaly(); return }
                 let kind = w[0] == 0 ? 1 : field(w[0])
                 let offset = field(w[1])
                 let generation = field(w[2])
-                if kind == 1 { owner.record(number: range.start + k, generation: generation, offset: offset) }
+                switch kind {
+                case 0: owner.freed.insert(range.start + k)
+                case 1: owner.record(number: range.start + k, generation: generation, offset: offset)
+                // Round 5 (R5-2): an object in an object stream (field 2 the stream's number, field 3 the index).
+                case 2: owner.recordCompressed(number: range.start + k, Compressed(stream: offset, index: generation))
+                // A row of a type the format does not define: nothing a reader agrees on (fail closed).
+                default: owner.anomaly()
+                }
             }
         }
+    }
+
+    /// Round 5 (R5-2): for an object stream (`/Type /ObjStm`), the object numbers its header lists, in order: `/N` pairs of
+    /// non-negative integers (number, offset) in the decoded bytes before `/First`; `.some(nil)` when that does not parse.
+    /// Nil for any other stream.
+    func objectStreamHeader(_ d: CGPDFDictionaryRef, _ decoded: Data) -> [Int]?? {
+        var type: UnsafePointer<CChar>? = nil
+        guard CGPDFDictionaryGetName(d, "Type", &type), let type, String(cString: type) == "ObjStm" else { return nil }
+        var count: CGPDFInteger = 0, first: CGPDFInteger = 0
+        guard CGPDFDictionaryGetInteger(d, "N", &count), CGPDFDictionaryGetInteger(d, "First", &first), count >= 0,
+              count <= Extraction.maxObjects, first >= 0, first <= decoded.count else { return .some(nil) }
+        let b = [UInt8](decoded.prefix(first))
+        var values: [Int] = [], i = 0
+        while values.count < 2 * count {
+            while i < b.count, isWhite(b[i]) { i += 1 }
+            var v = 0, digits = 0
+            while i < b.count, isDigit(b[i]), digits < 12 { v = v * 10 + Int(b[i] - 0x30); i += 1; digits += 1 }
+            guard digits > 0, i == b.count || isWhite(b[i]) else { return .some(nil) }
+            values.append(v)
+        }
+        return .some(stride(from: 0, to: values.count, by: 2).map { values[$0] })
     }
 
     /// Form XObjects and tiling patterns are content streams whatever refers to them.
@@ -651,7 +834,11 @@ final class Revision {
                 if CGPDFDictionaryGetObject(d, "Filter", &filter), decoded.isEmpty, length > 8 { fail(.undecodable) }
                 checkCrossReference(d, rows: decoded)
                 let key = unsafeBitCast(s, to: Int.self)
-                digests[key] = owner.keepStream(decoded, format: format)
+                let digest = owner.keepStream(decoded, format: format)
+                digests[key] = digest
+                if owner.objectStreamHeaders[digest] == nil, let header = objectStreamHeader(d, decoded) {
+                    owner.objectStreamHeaders[digest] = .some(header)
+                }
                 streams[key] = s
                 if format == .raw, isContentByType(d) { contentStreams.insert(key) }
                 if seen.insert(unsafeBitCast(d, to: Int.self)).inserted { entries(d) }

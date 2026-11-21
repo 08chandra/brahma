@@ -213,7 +213,7 @@ extension Orchestrator {
         let fence: PurgeFence.Hold?
         do {
             let store = self.store
-            fence = try await blocking.tryRun { try store.holdPurgeFence(companyId: company.id) }
+            fence = try await blocking.tryRun { try store.holdPurgeFence(companyId: company.id, kind: .trial) }
         } catch let e as WorkError {
             throw ExtensionError.message("the trial did not run: \(e.message)")
         }

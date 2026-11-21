@@ -249,6 +249,64 @@ import GRDB
         cf.store.refHooks.setAfterPurgeTurnCheck(nil)
     }
 
+    /// R5-4: a purge waiting for the fence goes ahead of new holders (writer preference), so back-to-back checks can't starve
+    /// it: while an item check holds the fence and a purge waits, a new turn start or check waits behind the purge. A purge
+    /// that times out names what holds the fence (a check here, not "a turn is starting"), through `Store.purge` too; once
+    /// the check ends, a waiting purge gets in.
+    @Test func purgeWaitsAheadOfNewHolders() throws {
+        let cf = try CollabFixture()
+        let home = cf.paths.home, cId = cf.c.id
+        let check = try #require(try PurgeFence.holdShared(home: home, companyId: cId, wait: .zero, kind: .check))
+        final class Outcome: @unchecked Sendable { var error: (any Error)?; var ran = false }
+        func purgeInBackground(wait: Duration) -> (Outcome, DispatchSemaphore) {
+            let outcome = Outcome(), done = DispatchSemaphore(value: 0)
+            Thread.detachNewThread {   // scope-escape: holds the fence lock only; no scratch dirs
+                do { try PurgeFence.withExclusive(home: home, companyId: cId, wait: wait) { outcome.ran = true } } catch { outcome.error = error }
+                done.signal()
+            }
+            return (outcome, done)
+        }
+        let (first, firstDone) = purgeInBackground(wait: .seconds(3))
+        // Once the purge waits, a new shared holder can't get in (before R5-4 it could, for as long as checks overlapped).
+        var blocked = false
+        let until = Date().addingTimeInterval(2)
+        while Date() < until {
+            if (try PurgeFence.withShared(home: home, companyId: cId, wait: .zero) { true }) == nil { blocked = true; break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        #expect(blocked, "a new turn start got the fence while a purge was waiting")
+        #expect(try PurgeFence.holdShared(home: home, companyId: cId, wait: .milliseconds(100), kind: .check) == nil,
+                "a new check got the fence while a purge was waiting")
+        firstDone.wait()
+        #expect(!first.ran)
+        let message = first.error.map { "\($0)" } ?? ""
+        #expect(message.contains("an item check is running"), "\(message)")
+        #expect(!message.contains("a turn is starting"), "\(message)")
+        // Through the owner's purge: the refusal names the holder too.
+        let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
+        try cf.fx.git.write("src/a.ts", "pinned\n", in: wt)
+        let pinned = try cf.store.pinRef(try cf.fx.ref("ENG-1:src/a.ts@worktree"), for: .agent(cf.fx.eng1.id), companyId: cId,
+                                         messageRefId: "mr-w", knownValues: [], paths: cf.paths)
+        try Self.record(cf, pinned, id: "mr-w", at: cf.now)
+        cf.store.refHooks.setFenceHome(home)
+        cf.store.refHooks.setFenceWait(.milliseconds(300))
+        do {
+            _ = try purge(cf, pinned, now: cf.now)
+            Issue.record("the purge ran while a check held the fence")
+        } catch let e as WorkError {
+            #expect(e.message.contains("an item check is running"), "\(e.message)")
+        }
+        #expect(try Self.state(cf, "mr-w") == "ok")
+        // A purge waiting when the check ends gets in.
+        let (second, secondDone) = purgeInBackground(wait: .seconds(5))
+        Thread.sleep(forTimeInterval: 0.2)
+        check.release()
+        secondDone.wait()
+        #expect(second.ran && second.error == nil, "\(second.error.map { "\($0)" } ?? "")")
+        #expect(try PurgeFence.withShared(home: home, companyId: cId, wait: .milliseconds(100)) { true } == true)
+        cf.store.refHooks.setFenceWait(nil)
+    }
+
     @Test func purgeIncompleteAlertsOwner() throws {
         let cf = try CollabFixture()
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
