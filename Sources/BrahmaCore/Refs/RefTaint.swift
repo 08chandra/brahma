@@ -211,7 +211,8 @@ extension Store {
     ///   uncleared tainted commit on its branch). `itemId` is the publisher's word: it only ever adds taint;
     /// - `sourcePath` (4a's `realpath` at publish) is not a clean path under the workspace's real path (empty, relative,
     ///   outside, the workspace itself, in `.git`, in `.brahma` outside a worktree): no usable provenance;
-    /// - it is under `.brahma/wt/<KEY>/`: that item's taint, as above (an unknown item: tainted);
+    /// - it is under `.brahma/wt/<KEY>/`: that item is tainted now (as above), or was when the artifact was published, or that
+    ///   can't be determined (`itemTaintAtPublish`, ruling 17); an unknown item: tainted;
     /// - it is in the main checkout: unless main's engine-recorded head (`company.mainCommit`) holds it (a file, or a folder),
     ///   its key-less history there is clean (ruling 1), and every file of the copy is main's committed blob at the matching
     ///   path (git's blob id of the copy's bytes, read through SafeFS, at most `SafeGit.maxBinaryBytes` in all);
@@ -234,7 +235,8 @@ extension Store {
             if parts[0].lowercased() == ".brahma" {
                 guard parts.count >= 4, parts[1] == "wt", let item = try writer.read({ db in try RefAccess.item(db, a.companyId, parts[2]) })
                 else { return unverified }
-                return try itemTaintSource(item).map { (true, Self.sessionReason($0)) } ?? (false, nil)
+                if let source = try itemTaintSource(item) { return (true, Self.sessionReason(source)) }
+                return try itemTaintAtPublish(item, publishedAt: a.createdAt)
             }
             return try mainSourceTaint(a, rel: rel, company: company)
         } catch {
@@ -248,6 +250,39 @@ extension Store {
         if let source = try holderSource(item: item) { return source }
         if item.taintedOrigin { return "outside content" }
         return try commitSource(WorkRef(kind: .diff, id: item.key), item: item)
+    }
+
+    /// Ruling 17: whether `item` was tainted when an artifact of its worktree was published (`publishedAt`, the row's
+    /// `createdAt`), from what the store keeps: tainted-commit rows are never deleted, a clearing records `clearedAt`. Tainted
+    /// (with the row's source) when a row of the item was not cleared strictly before the publish: a row recorded later may
+    /// still name an earlier commit (taint is recorded at turn end and release), and equal times count as tainted.
+    /// Undeterminable, so tainted (`artifactSourceReason`):
+    /// - a row marked cleared without a time;
+    /// - a row of the company with no item (its item couldn't be recorded), not cleared before the publish;
+    /// - the item is done now, or its status changed since the publish (a `statusChanged` or `merged` event at or after it):
+    ///   5-lite's sticky mark has no history and may drop when an item reaches done, so a clear mark now says nothing then;
+    /// - any lookup fails (the caller's catch).
+    /// Clean otherwise. No other clearing path exists (a content match against a reviewed blob is Plan S's).
+    private func itemTaintAtPublish(_ item: WorkItem, publishedAt: Date) throws -> (tainted: Bool, reason: String?) {
+        let unverified = (true, Optional(Self.artifactSourceReason))
+        return try writer.read { db in
+            let rows = try TaintedCommit.fetchAll(db, sql: """
+                SELECT * FROM taintedCommit WHERE companyId = ? AND (itemId = ? OR itemId IS NULL) ORDER BY createdAt DESC, rowid DESC
+                """, arguments: [item.companyId, item.id])
+            for row in rows {
+                guard let cleared = row.clearedAt else {
+                    if row.clearedBy != nil { return unverified }
+                    return row.itemId == nil ? unverified : (true, Self.sessionReason(row.source))
+                }
+                if cleared >= publishedAt { return row.itemId == nil ? unverified : (true, Self.sessionReason(row.source)) }
+            }
+            guard let now = try WorkItem.fetchOne(db, sql: "SELECT * FROM workItem WHERE companyId = ? AND id = ?",
+                                                  arguments: [item.companyId, item.id]), now.status != .done else { return unverified }
+            let changed = try WorkItemEvent.filter(Column("companyId") == item.companyId && Column("itemId") == item.id
+                                                   && [WorkEventKind.statusChanged.rawValue, WorkEventKind.merged.rawValue].contains(Column("kind"))
+                                                   && Column("createdAt") >= publishedAt).fetchCount(db)
+            return changed > 0 ? unverified : (false, nil)
+        }
     }
 
     /// Ruling 16 for a source in the main checkout (`rel`, workspace-relative): see `artifactTaint`.
@@ -759,11 +794,18 @@ struct TaintedCommitObserver: WorkItemObserver {
 enum ArtifactCopyListing {
     static let maxDepth = 16
 
+    /// Opens `<real workspace>/.brahma/artifacts/<folder>` one part at a time with `O_NOFOLLOW` and creates nothing (a read
+    /// path never writes): a part that is missing, a link or not a directory throws.
     static func files(workspace: URL, folder: String) throws -> [String] {
-        let top = try EngineFiles.openDirectory(workspace: workspace, ".brahma/artifacts")
-        defer { close(top) }
-        let fd = openat(top, folder, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard let root = Store.realPath(workspace.path) else { throw VaultError.missing }
+        var fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard fd >= 0 else { throw VaultError.missing }
+        for part in [".brahma", "artifacts", folder] {
+            let next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            close(fd)
+            guard next >= 0 else { throw VaultError.missing }
+            fd = next
+        }
         var out: [String] = []
         try walk(fd, prefix: "", depth: 0, into: &out)
         return out.sorted()
