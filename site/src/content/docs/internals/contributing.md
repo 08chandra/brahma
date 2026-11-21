@@ -20,13 +20,13 @@ BRAHMA_LIVE=1 swift test --filter LiveSmokeTests   # real claude turns (haiku), 
 The binary is `.build/debug/brahma` (or `swift run brahma ...`). The Mac app is built with `scripts/make-app.sh`, which produces `.build/Brahma.app`.
 
 :::note
-The live smoke tests run real `claude` turns and spend some of your plan's quota. Everything else runs offline.
+The live smoke tests run real `claude` turns and use subscription quota. Everything else runs offline.
 :::
 
 ## Conventions
 
 - **Plans and specs** live under `docs/superpowers/`: design specs in `docs/superpowers/specs/`, implementation plans in `docs/superpowers/plans/`. The [Decisions](/internals/decisions/) pages distil the specs; the specs themselves are the source of truth.
-- **`.superpowers/`** at the repository root is local and private. It is never committed and nothing in it is documented here.
+- **`.superpowers/`** is local and private.
 - **`BrahmaCore` stays portable.** Mac-only behaviour (Keychain, Seatbelt, AppKit, SpriteKit) lives in the other targets or behind protocols; see the [architecture](/internals/architecture/) page for which target owns what.
 - **Public API** is what the [API reference](/api/) shows. Types that the app or the CLI do not need stay internal.
 
