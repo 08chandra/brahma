@@ -344,13 +344,30 @@ extension Store {
             return Content(body: .text("\(ask.title)\n\n\(ask.summary)"), rev: nil, makeCard: { _ in "[ask \(bare) · \(r.resolved.subtitle)]" }, ext: "txt")
         case .run(let run, _):
             return Content(body: .text(run.outputTail ?? ""), rev: run.commit, makeCard: { _ in "[run \(bare) · \(r.resolved.subtitle)]" }, ext: "log")
+        case .artifact(let a):
+            // 4a's engine-written copy (write-denied to every turn), opened at its entry file through SafeFS (a descriptor walk
+            // that follows no link), and only where 4a puts it: `.brahma/artifacts/<folder>/<entry>`. 4a records no hash.
+            let folder = (a.storedPath as NSString).lastPathComponent
+            let entry = a.entryFile.split(separator: "/", omittingEmptySubsequences: false)
+            guard a.storedPath == ".brahma/artifacts/\(folder)", !folder.isEmpty, !folder.hasPrefix("."), !entry.isEmpty,
+                  entry.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { throw VaultError.missing }
+            let ext = ArtifactKind.ext(of: a.entryFile)
+            let fs = try SafeFS(workspace: workspace, ownHandle: nil)
+            let file: SafeFile
+            do {
+                file = try fs.open(workspacePath: "\(a.storedPath)/\(a.entryFile)", maxBytes: cap)
+            } catch SafeFSError.tooLarge(let size) {
+                let kind = ArtifactKind.from(ext: ext)
+                if whole || kind?.isText ?? true { return try tooLarge(a.ref, size) }
+                return metadata(TextExtract.metadata(kind: kind, bytes: size))
+            }
+            let size = file.size
+            return Content(body: .bytes(try file.readAll(), ext: ext), rev: nil,
+                           makeCard: { _ in "[artifact \(a.ref) · \(title) · \(a.kind.rawValue) · \(ResourceText.size(Int64(size)))]" }, ext: ext)
         case .preview, .release, .agent, .channel, .sprint, .fact:
             // Their metadata is the content (the renderers are C6's).
             return metadata(r.resolved.subtitle)
         }
-        // 4a-gap: Artifact (4a Task 6). `AR-<n>` has no subject until 4a's artifact rows exist (`RefAccess.subject`), so it
-        // resolves `.missing` and never reaches here; its bytes will come from 4a's artifact store, read like a vault resource
-        // (hash checked), with `MaterializeName` already naming its copies `AR-<n>-<k>.<ext>`.
     }
 
     /// The patch of `base..head` (one path, or all), from the vault's diff cache when it holds it with a matching hash; else
