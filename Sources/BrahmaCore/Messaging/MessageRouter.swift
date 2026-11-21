@@ -104,10 +104,15 @@ public struct MessageRouter: Sendable {
         let text = try store.redact(text)
         // Task 10: agent text that claims to be the owner is flagged (digest prefix, activity, the app's chip); it never acts.
         let impersonates = OwnerImpersonation.flags(text: text, sender: from)
+        // Plan C: every agent-authored message carries its session's taint as it stands now (ML's `currentTaint`; an agent row
+        // that can't be read counts as tainted).
+        var sessionTaint: String?
+        if case .agent(let id) = from { sessionTaint = try Store.currentTaint(db: db, agentId: id, home: store.dataHome) }
         let message = Message(id: UUID().uuidString, companyId: channel.companyId, channelId: channel.id,
                               senderId: from.id, text: text, createdAt: now,
                               flag: impersonates ? OwnerImpersonation.flag : nil,
-                              taintedOrigin: try store.writesTainted(db: db, actorId: from.id))
+                              taintedOrigin: try store.writesTainted(db: db, actorId: from.id),
+                              fromTaintedSession: sessionTaint != nil, taintSource: sessionTaint)
         try message.insert(db)
 
         var recipientIds = try String.fetchAll(db, sql: "SELECT member FROM channelMember WHERE channelId = ? ORDER BY rowid",

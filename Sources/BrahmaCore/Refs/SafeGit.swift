@@ -230,6 +230,29 @@ public struct SafeGit: Sendable {
         return data
     }
 
+    /// The bytes of the blob `sha` (a full object id), after its type (`blob`) and size (≤ `maxTextBytes`, or ≤ `maxBinaryBytes`)
+    /// are checked: a pinned worktree file, read by the id its share ref holds.
+    public func catBlob(_ sha: String, binary: Bool) throws -> Data {
+        try Self.checkRevShape(sha)
+        guard sha.utf8.count == 40 || sha.utf8.count == 64 else { throw SafeGitError.badRev }
+        let type = try run(["cat-file", "-t", "--end-of-options", sha], allowFailure: true)
+        guard type.status == 0, Self.text(type.stdout) == "blob" else { throw SafeGitError.git("\(sha.prefix(7)) is not a blob") }
+        let sized = try run(["cat-file", "-s", "--end-of-options", sha], allowFailure: true)
+        guard sized.status == 0, let size = Int(Self.text(sized.stdout)) else { throw SafeGitError.git("\(sha.prefix(7)) has no size") }
+        let cap = binary ? Self.maxBinaryBytes : Self.maxTextBytes
+        guard size <= cap else { throw SafeGitError.tooLarge(size) }
+        let data = try output(["cat-file", "-p", "--end-of-options", sha], outputCap: max(Self.outputCap, cap + 1))
+        guard data.count <= cap else { throw SafeGitError.tooLarge(data.count) }
+        return data
+    }
+
+    /// The object `refs/brahma/shares/<messageRefId>` points at (any type: a commit or a pinned blob).
+    public func shareTarget(_ messageRefId: String) throws -> String {
+        let r = try run(["rev-parse", "--verify", "--quiet", "--end-of-options", try Self.shareRef(messageRefId)], allowFailure: true)
+        guard r.status == 0, let sha = Self.fullSha(r.stdout) else { throw SafeGitError.badRef }
+        return sha
+    }
+
     public func lsTree(rev: String, cap: Int) throws -> (entries: [TreeEntry], truncated: Bool) {
         let out = try output(["ls-tree", "-r", "-l", "-z", "--end-of-options", try Self.sha(rev)])
         var entries: [TreeEntry] = []
@@ -295,8 +318,8 @@ public struct SafeGit: Sendable {
 
     // MARK: Share refs (the only writes)
 
-    /// Points `refs/brahma/shares/<id>` at `sha`, which must be a full commit id the caller has `verifyRev`ed (an
-    /// abbreviation is `.badRev`).
+    /// Points `refs/brahma/shares/<id>` at `sha`, which must be a full object id: a commit the caller has `verifyRev`ed, or a
+    /// blob it wrote with `hashObject` (a pinned worktree file). An abbreviation is `.badRev`.
     public func updateShareRef(_ messageRefId: String, to sha: String) throws {
         try Self.checkRevShape(sha)
         guard sha.utf8.count == 40 || sha.utf8.count == 64 else { throw SafeGitError.badRev }

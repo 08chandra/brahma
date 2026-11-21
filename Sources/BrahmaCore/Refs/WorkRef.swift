@@ -34,7 +34,9 @@ public struct WorkRef: Codable, Hashable, Sendable {
     public var rev: String?
     /// file only.
     public var range: LineRange?
-    /// preview: `path`, `viewport`; diff: `file`; kb: `section`; run: `item` (its latest run); pins: `was`, `main`.
+    /// preview: `path`, `viewport`; diff: `file`; kb: `section`; run: `item` (its latest run); pins: `was`, `main`, and (C2a)
+    /// `share` (the share ref holding a pinned blob), `snapshot` (a pinned worktree diff's vault snapshot), `taint` (the source
+    /// of the pinning session's taint).
     public var params: [String: String]
 
     public init(kind: WorkRefKind, id: String, branch: String? = nil, rev: String? = nil, range: LineRange? = nil,
@@ -42,7 +44,8 @@ public struct WorkRef: Codable, Hashable, Sendable {
         self.kind = kind; self.id = id; self.branch = branch; self.rev = rev; self.range = range; self.params = params
     }
 
-    /// The text form; `parse(canonical)` gives this ref back (pin-only params, `was` and `main`, are not part of it).
+    /// The text form; `parse(canonical)` gives this ref back (pin-only params, `was`, `main`, `share`, `snapshot` and `taint`,
+    /// and a pinned blob's `rev` on an `@worktree` file, are not part of it).
     public var canonical: String { RefGrammar.canonical(self) }
 
     /// The ref `s` names, or nil. The text is NFC-normalized and refused whole when it holds a control, bidi or zero-width
