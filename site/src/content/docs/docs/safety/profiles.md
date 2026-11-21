@@ -31,9 +31,9 @@ The engine (`brahma run`, or the app) applies the profile to every turn it start
 
 **Checks follow the profile.** An item's check runs under Brahma's own Seatbelt policy, not the turn's, for Sandboxed and Workspace companies. A check runs unconfined as your user only when its company's profile, and the profile of the item holder's role when there is one, are still Full after the `brahma run --profile` ceiling.
 
-**Every profile.** Each turn ignores your personal `claude` settings, plugins, MCP servers and `CLAUDE.md` files (`--setting-sources ""`). A `CLAUDE.md` in the workspace is not loaded either. Each turn gets an allowlisted environment: `PATH, HOME, LANG, LC_*, TERM, USER, LOGNAME, SHELL, DEVELOPER_DIR, TMPDIR`, minus anything named like a token, secret or key, plus `BRAHMA_AGENT_ID`; never `BRAHMA_DEV`.
+**Every profile.** Each turn ignores your personal `claude` settings, plugins, MCP servers and `CLAUDE.md` files (`--setting-sources ""`). A `CLAUDE.md` in the workspace is not loaded either. Each turn gets an allowlisted environment: `PATH, HOME, LANG, LC_*, TERM, USER, LOGNAME, SHELL, DEVELOPER_DIR, TMPDIR`, the proxy and certificate variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` and their lowercase forms, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`) and `CLAUDE_CONFIG_DIR`, minus anything named like a token, secret or key (`AWS_*` and `SSH_AUTH_SOCK` included), plus `BRAHMA_AGENT_ID`; never `BRAHMA_DEV`.
 
-**Sub-agents and Ultra.** Sub-agents and the Ultra work mode run only on Sandboxed companies, and only once their probe gates pass. See [Modes and pacing](/docs/concepts/modes-and-pacing/).
+**Sub-agents and Ultra.** The sub-agent gate passes only on the `sandboxed` profile, and only once its probe gates pass; on Workspace and Full it never passes, because their Bash is unsandboxed. The Ultra work mode is gated the same way. See [Modes and pacing](/docs/concepts/modes-and-pacing/).
 
 ## In the app
 

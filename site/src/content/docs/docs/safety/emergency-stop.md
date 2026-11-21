@@ -27,7 +27,7 @@ The emergency stop holds every company at once. Nothing new starts until you res
 | --- | --- |
 | `brahma company pause <company>` | No new turns for that company; its clock stops. `brahma company resume` undoes it. |
 | `brahma pause <company> <agent>` | A running agent finishes its turn first, then sleeps. `brahma wake` undoes it. |
-| `brahma kill <company> <agent>` | The agent stays killed. A running turn finishes in the orchestrator; its leases are reaped without losing work. |
+| `brahma kill <company> <agent>` | The agent stays killed. A running turn finishes in the orchestrator; its leases are reaped and its items handed off. |
 | `brahma company profile <company> sandboxed` | Narrows future turns; does nothing to running ones. |
 
 ## In the app
@@ -43,7 +43,7 @@ The emergency stop holds every company at once. Nothing new starts until you res
 
 ## What it does not do
 
-- **It signals only what the database records.** Probe-gate, canary and `ext try` processes are not in that record, so `brahma stop` with no engine running does not signal them. A probe gate already running when you press stop finishes that gate.
+- **It signals only what the engine recorded.** Turns come from the database; check and merge children from the engine's run-dir records. Probe-gate, canary and `ext try` processes are in neither, so `brahma stop` with no engine running does not signal them. A probe gate already running when you press stop finishes that gate.
 - **It does not find strays.** A process an earlier Workspace or Full turn left running outside the recorded process groups is not signalled. Check `ps`.
 - **It does not revoke grants, clear taint or undo merges.** It holds the future; it does not rewind the past. Use `brahma grants revoke`, `brahma lab clear-taint` and a restore for those.
 - **It does not stop the `claude` CLI's own processes outside Brahma,** such as a `claude` session you started yourself.
