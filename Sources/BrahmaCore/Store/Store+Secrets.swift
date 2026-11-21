@@ -209,27 +209,47 @@ extension Store {
         }
     }
 
-    /// `recordEngineAutoCommit` failed: who wrote the leftover work can't be told, so its commit is recorded tainted and the
-    /// item gets 5-lite's sticky mark; the owner gets an engine alert (stderr when even the write fails). Never throws.
+    /// The reason that keys the owner's alert about an engine auto-commit whose taint record failed (its own, so it never merges
+    /// with or is suppressed by a turn's `taint-record:<itemId>` alert).
+    static func autoCommitTaintAlertReason(companyId: String, key: String) -> String { "taint-autocommit:\(companyId):\(key)" }
+
+    /// `recordEngineAutoCommit` failed: who wrote the leftover work can't be told, so its commit is recorded tainted — the
+    /// sha-keyed row first, written even when the item can't be looked up (it taints by sha alone) — and the item gets 5-lite's
+    /// sticky mark in a write of its own; the owner gets an engine alert either way (stderr when even that fails). Never throws.
     private func recordEngineAutoCommitFailClosed(companyId: String, key: String, _ made: GitWorkspace.AutoCommit, error: any Error) {
         let now = Store.now()
-        var itemId: String?
+        var failures: [String] = []
         do {
-            itemId = try writer.write { db -> String? in
-                let itemId = try String.fetchOne(db, sql: "SELECT id FROM workItem WHERE companyId = ? AND key = ?", arguments: [companyId, key])
+            try writer.write { db in
+                let itemId = (try? String.fetchOne(db, sql: "SELECT id FROM workItem WHERE companyId = ? AND key = ?",
+                                                   arguments: [companyId, key])) ?? nil
                 try db.execute(sql: """
                     INSERT OR IGNORE INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt)
                     VALUES (?, ?, ?, NULL, NULL, ?, ?)
                     """, arguments: [companyId, made.commit, itemId, Self.taintCheckFailedSource, now])
+            }
+        } catch let rowError {
+            failures.append("the commit could not be recorded (\(rowError))")
+        }
+        do {
+            try writer.write { db in
                 try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE companyId = ? AND key = ?", arguments: [companyId, key])
-                return itemId
             }
         } catch let markError {
-            FileHandle.standardError.write(Data("brahma: could not mark \(key)'s auto-commit \(made.commit) tainted: \(markError)\n".utf8))
+            failures.append("the item could not be marked (\(markError))")
         }
-        alertTaintRecord(companyId: companyId, itemId: itemId,
-                         what: "the engine's commit \(made.commit.prefix(7)) of \(key)'s leftover work could not be attributed (\(error))",
-                         now: now)
+        let sha = made.commit.prefix(7)
+        let text = "Brahma could not record the taint of its own commit \(sha) of \(key)'s leftover work (\(Store.flat("\(error)", max: 300))). "
+            + (failures.isEmpty
+                ? "It recorded that commit as tainted instead: \(key) is treated as tainted until it is merged or you vouch for it."
+                : "Recording it as tainted failed too: \(failures.joined(separator: "; ")). Treat \(key)'s changes as tainted until it "
+                  + "is merged or you vouch for it.")
+        do {
+            try EngineAlerts.raise(store: self, text: text, now: now, reason: Self.autoCommitTaintAlertReason(companyId: companyId, key: key),
+                                   companyId: companyId)
+        } catch let alertError {
+            FileHandle.standardError.write(Data("brahma: \(text) (the alert failed too: \(alertError))\n".utf8))
+        }
     }
 
     /// At claim (4-wire fix round 3, R2): the branch head becomes the recorded head, unless the item already has a recorded

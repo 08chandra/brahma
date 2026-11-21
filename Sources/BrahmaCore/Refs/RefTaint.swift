@@ -206,18 +206,71 @@ extension Store {
         guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
         let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
         var out: [String: (source: String, commits: Set<String>)] = [:]
+        var failure: (any Error)?, readable: [String] = []
         for (itemId, itemRows) in byItem {
             guard let item = try workItem(id: itemId), item.companyId == companyId, let newest = itemRows.first else { continue }
             let branch: Set<String>
-            if try git.branchExists("item/\(item.key)") {
-                let head = try git.head("item/\(item.key)")
-                branch = Set(try git.revList(try git.mergeBase("main", head), head))
-            } else {
-                branch = []      // no branch (gone): nothing of it is on one. A git failure throws instead (fail closed).
+            do {
+                if try git.branchExists("item/\(item.key)") {
+                    let head = try git.head("item/\(item.key)")
+                    branch = Set(try git.revList(try git.mergeBase("main", head), head))
+                } else {
+                    branch = []      // no branch (gone): nothing of it is on one. A git failure throws instead (fail closed).
+                }
+            } catch {
+                // Every other branch is still listed (each unreadable one gets its alert); the query then fails closed.
+                noteUnreadableBranch(companyId: companyId, item: item, error: error)
+                failure = failure ?? error
+                continue
             }
+            readable.append(itemId)
             if itemRows.contains(where: { !branch.contains($0.sha) }) { out[itemId] = (newest.source, branch) }
         }
+        noteReadableBranches(companyId: companyId, itemIds: readable)
+        if let failure { throw failure }
         return out
+    }
+
+    /// The reason that keys the owner's alert about an item branch the taint check can't read (ruling 12).
+    static func unreadableBranchAlertReason(_ itemId: String) -> String { "taint-branch:\(itemId)" }
+
+    /// Ruling 12: an item branch the orphan check can't read makes every item ref in the company read tainted (fail closed);
+    /// the owner gets one alert naming it per break, not one per resolve: none while the newest alert for it is open or was
+    /// answered by the owner, a new one only after it answered itself ("resolved") when the branch read again. Never throws.
+    private func noteUnreadableBranch(companyId: String, item: WorkItem, error: any Error) {
+        let reason = Self.unreadableBranchAlertReason(item.id)
+        @Sendable func alerted(_ db: Database) throws -> Bool {
+            let newest = try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.engineAlert
+                                        && Column("subjectId") == Store.engineAlertKey(reason))
+                .order(Column("number").desc).fetchOne(db)
+            guard let newest else { return false }
+            return newest.status == .pendingOwner || newest.decidedBy != "system"
+        }
+        do {
+            if try writer.read(alerted) { return }      // the usual case on a later resolve: no write
+            try writer.write { db in
+                guard let company = try Company.fetchOne(db, key: companyId), try !alerted(db) else { return }
+                let text = "Brahma can't read the branch item/\(item.key) in \(company.name) (\(Store.flat("\(error)", max: 300))), so "
+                    + "every item's changes there are treated as outside content until it can. Something may have reset it onto "
+                    + "unrelated history; run `git log item/\(item.key)` in \(Store.flat(company.workspacePath, max: 200)) to check."
+                try EngineAlerts.raise(store: self, db: db, text: text, now: Store.now(), reason: reason, companyId: companyId)
+            }
+        } catch {
+            FileHandle.standardError.write(Data("brahma: item/\(item.key) can't be read for the taint check (\(error)); the alert failed too\n".utf8))
+        }
+    }
+
+    /// Branches that read again: their open ruling-12 alerts answer themselves. One read when none is open. Never throws.
+    private func noteReadableBranches(companyId: String, itemIds: [String]) {
+        guard !itemIds.isEmpty else { return }
+        let reasons = itemIds.map(Self.unreadableBranchAlertReason)
+        let keys = reasons.map(Store.engineAlertKey)
+        let open = (try? writer.read { db in
+            try Ask.filter(Column("companyId") == companyId && Column("kind") == AskKind.engineAlert
+                           && Column("status") == AskStatus.pendingOwner.rawValue && keys.contains(Column("subjectId"))).fetchCount(db)
+        }) ?? 0
+        guard open > 0 else { return }
+        try? writer.write { db in try resolveEngineAlerts(db, reasons: reasons, now: Store.now()) }
     }
 
     /// An uncleared row's source for `sha`, or for any sha it prefixes (7–64 lowercase hex; anything else names no row); else
@@ -418,7 +471,7 @@ extension Store {
     }
 
     /// The owner's engine alert for a taint record that could not be made as it should (stderr when even that fails).
-    func alertTaintRecord(companyId: String, itemId: String?, what: String, now: Date) {
+    private func alertTaintRecord(companyId: String, itemId: String?, what: String, now: Date) {
         let key = (try? itemId.flatMap { try workItem(id: $0)?.key }) ?? nil
         let text = "The commits a session that read outside content made\(key.map { " on \($0)" } ?? "") could not all be recorded: \(what). "
             + (key.map { "\($0) is treated as tainted until it is merged or you vouch for it." } ?? "Check the items this agent worked on.")
