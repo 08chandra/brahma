@@ -85,16 +85,38 @@ extension PreviewPolicy {
                       network: .outbound(allow: allowedDomains(company)), toolchain: true)
     }
 
-    /// A built macOS app, running: writes only its own app-data place `sharedCache/apps/<surface>` (nothing else writes
-    /// the shared cache), reads only `run` (its bundle is there), reaches the allowed domains through the proxy.
+    /// A built macOS app, running: writes only its own app-data place (`appData`), reads only `run` (its bundle is there),
+    /// reaches the allowed domains through the proxy. The place is engine-only (`.brahma/preview` is write-denied to every
+    /// turn and in no check's, build's or server's writable set), the engine makes it without following a link before each
+    /// start (`prepareAppData`), and the policy names it logically, never resolved, so a link the app's previous run (the one
+    /// thing that can write there) left at it or on its way fails `SandboxPolicyCheck` instead of widening the grant (fix
+    /// round 1, I1). `sandbox` is kept for the plan's signature; nothing of it is used.
     public static func guiApp(_ l: EngineLayout, run: URL, company: Company, sandbox: SandboxLayout, surface: String) -> SandboxPolicy {
-        SandboxPolicy(writable: [appData(sandbox: sandbox, surface: surface).resolvedForSandbox], readable: [run.resolvedForSandbox],
+        SandboxPolicy(writable: [appData(l, surface: surface)], readable: [run.resolvedForSandbox],
                       network: .outbound(allow: allowedDomains(company)), toolchain: true)
     }
 
-    /// `sharedCache/apps/<surface>` (a surface name is one safe path component).
-    public static func appData(sandbox: SandboxLayout, surface: String) -> URL {
-        sandbox.sharedCache.appending(path: "apps/\(surface)", directoryHint: .isDirectory)
+    /// Where every macOS app's data lives, relative to the workspace (under L's engine-only `.brahma/preview`).
+    public static let appDataRelative = ".brahma/preview/apps"
+
+    /// `<resolved workspace>/.brahma/preview/apps/<surface>`: only the workspace is resolved (the owner may keep it behind a
+    /// link); every part under it is named as it is, never resolved (a surface name is one safe path component).
+    public static func appData(_ l: EngineLayout, surface: String) -> URL {
+        l.workspace.resolvedForSandbox.appending(path: "\(appDataRelative)/\(surface)", directoryHint: .notDirectory)
+    }
+
+    /// Makes the app-data place before a start: every part a real directory, opened one at a time with `O_NOFOLLOW`
+    /// (`EngineFiles`), mode 0700. A link or anything else at the place itself (only the app's previous run can put one
+    /// there) is removed by descriptor, never followed, and the directory made again; a link or odd file on a parent
+    /// throws (`UnsafeEngineFile`), and the start is refused.
+    static func prepareAppData(_ l: EngineLayout, surface: String) throws {
+        let relative = "\(appDataRelative)/\(surface)"
+        do {
+            _ = try EngineFiles.directory(workspace: l.workspace, relative, mode: 0o700)
+        } catch is UnsafeEngineFile {
+            try EngineFiles.remove(workspace: l.workspace, dir: appDataRelative, name: surface)
+            _ = try EngineFiles.directory(workspace: l.workspace, relative, mode: 0o700)
+        }
     }
 
     /// `<run>/.build/DerivedData`: an Apple build's derived data, thrown away with its export.
@@ -192,6 +214,8 @@ public enum PreviewAdapters {
 /// The owner ask an iOS preview waits for: the Simulator installs and runs the app outside Brahma's sandbox (fix 4).
 public enum SimulatorApproval {
     public static let waitingMessage = "waiting for the owner to allow a Simulator preview (it runs outside the sandbox)"
+    /// The next `set_preview_command` or `brahma preview set` of the surface, even with unchanged values, files one fresh ask
+    /// (`upsertPreviewSurface`); the engine never asks again by itself.
     public static let declinedMessage = "the owner did not allow a Simulator preview; set the preview again to ask again"
     public static let summary = "The iOS Simulator installs and runs the app outside Brahma's sandbox: it can read and write the "
         + "Simulator's own data and reach the network. Approve only if you trust this company's code."

@@ -51,6 +51,7 @@ public actor PreviewRunner: EmergencyStopObserver {
     static let pressureMessage = "waiting: memory pressure"
     static let pausedMessage = "company paused"
     static let engineRestartedMessage = "engine restarted"
+    static let unsafeAppDataMessage = "its app data directory is not safe to use"
     /// A kind this engine has no adapter for.
     static func noAdapterMessage(_ kind: PreviewKind) -> String { "\(kind.title) previews are not available on this engine yet" }
     public static let shutdownMessage = "engine stopped"
@@ -254,8 +255,7 @@ public actor PreviewRunner: EmergencyStopObserver {
         } else {
             do {
                 let ask = try store.requestSimulatorApproval(surfaceId: id, now: now)
-                message = ask.map { $0.status.isPending || $0.status == .approved } == false
-                    ? SimulatorApproval.declinedMessage : SimulatorApproval.waitingMessage
+                message = ask.map { !$0.status.isPending } == true ? SimulatorApproval.declinedMessage : SimulatorApproval.waitingMessage
             } catch {
                 message = SimulatorApproval.waitingMessage
             }
@@ -386,6 +386,16 @@ public actor PreviewRunner: EmergencyStopObserver {
                 return
             }
             surface = current
+        }
+        // A macOS app's data place, made (link-safe) before its policy names it (fix round 1, I1).
+        if kind == .macos {
+            let name = surface.name
+            let prepared = await blocking.run { (try? PreviewPolicy.prepareAppData(layout, surface: name)) != nil }
+            guard prepared else {
+                await stopRun(id)
+                finish(.failed, Self.unsafeAppDataMessage)
+                return
+            }
         }
         let policies = PreviewPolicy.forKind(kind, layout: layout, run: run, company: company, sandbox: sandbox, port: port,
                                              surface: surface.name)

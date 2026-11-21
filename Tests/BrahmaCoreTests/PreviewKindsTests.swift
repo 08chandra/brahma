@@ -350,7 +350,8 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
         let mac = try #require(x.adapters[.macos]?.starts.first)
         let macRun = mac.run.resolvedForSandbox
         #expect(mac.policy == SandboxPolicy(writable: [macRun], readable: [macRun], network: .outbound(allow: allow), toolchain: true))
-        let appData = x.sandboxLayout.sharedCache.appending(path: "apps/mac").resolvedForSandbox
+        // The app-data place is engine-only, named logically under the resolved workspace (fix round 1, I1).
+        let appData = URL(fileURLWithPath: x.company.workspacePath).resolvedForSandbox.appending(path: ".brahma/preview/apps/mac")
         #expect(mac.appPolicy == SandboxPolicy(writable: [appData], readable: [macRun], network: .outbound(allow: allow), toolchain: true))
         #expect(mac.environment["BRAHMA_DERIVED_DATA"] == mac.run.appending(path: ".build/DerivedData").path)
         // backend → L's server on its allocated port.
@@ -487,13 +488,102 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
         await x.settle()
         let approvedStatus = try x.state("phone").status
         #expect(ios.starts.count == 2 && approvedStatus == .running)
+        let stopsBeforeRescind = ios.stops.count
         try x.store.ownerRescind(askId: fourth.id)
         #expect(try x.surface("phone").outsideSandboxApprovedAt == nil)
         await x.settle()
         state = try x.state("phone")
         #expect(state.status == .unavailable && state.message == SimulatorApproval.declinedMessage, "\(state)")
         #expect(ios.starts.count == 2)
+        // The rescind stopped the Simulator app it had allowed.
+        #expect(ios.stops.count == stopsBeforeRescind + 1 && ios.stops.last?.1.simulatorId == "SIM-1")
         await x.runner.stopAll()
+    }
+
+    /// Fix round 1, I2: a Simulator ask closed without approval (rejected, rescinded) is asked again by the next set, even
+    /// with unchanged values: one fresh ask, never two open ones; the engine's own passes never re-ask.
+    @Test func declinedAskReaskedOnUnchangedSet() async throws {
+        let x = try Fx(results: [.ios: PreviewUpdate(status: .running, message: nil, simulatorId: "SIM-1")])
+        #expect(x.ios().ok)
+        await x.settle()
+        func systemAsks() throws -> [Ask] { try x.asks().filter { $0.requesterId == "system" } }
+        let first = try #require(try systemAsks().first)
+        try x.store.ownerDecide(askId: first.id, approve: false)
+        await x.settle()
+        #expect(try x.state("phone").message == SimulatorApproval.declinedMessage)
+        // The engine alone never asks again.
+        x.w.clock.advance(3600)
+        await x.settle()
+        #expect(try systemAsks().count == 1)
+        // The same values, set again: one fresh ask.
+        #expect(x.ios().ok)
+        await x.settle()
+        var asks = try systemAsks()
+        #expect(asks.count == 2 && asks.filter { $0.status.isPending }.count == 1)
+        let second = try #require(asks.first { $0.status.isPending })
+        #expect(try x.surface("phone").outsideSandboxAskId == second.id)
+        #expect(try x.state("phone").message == SimulatorApproval.waitingMessage)
+        // Set again while it is open: still that one ask.
+        #expect(x.ios().ok)
+        await x.settle()
+        asks = try systemAsks()
+        let stillAsked = try x.surface("phone").outsideSandboxAskId
+        #expect(asks.count == 2 && stillAsked == second.id)
+        #expect(try x.store.ask(id: second.id)?.status == .pendingOwner)
+        // Approved, then rescinded: the same values re-ask once more.
+        try x.store.ownerDecide(askId: second.id, approve: true, now: x.now)
+        await x.settle()
+        #expect(try x.state("phone").status == .running)
+        #expect(x.ios().ok)                                  // unchanged values keep an approval that stands
+        #expect(try x.surface("phone").outsideSandboxApprovedAt != nil && x.surface("phone").outsideSandboxAskId == second.id)
+        try x.store.ownerRescind(askId: second.id)
+        await x.settle()
+        #expect(x.ios().ok)
+        await x.settle()
+        asks = try systemAsks()
+        #expect(asks.count == 3 && asks.filter { $0.status.isPending }.count == 1)
+        await x.runner.stopAll()
+    }
+
+    /// Fix round 1, I1: the GUI app's writable app-data place is engine-only (`.brahma/preview/apps/<surface>`), made by the
+    /// engine without following a link, and the policy names it logically: a link planted there, or at a parent, never
+    /// widens what the app may write.
+    @Test func appDataLinkNeverWidensWrites() async throws {
+        let x = try Fx(results: [.macos: PreviewUpdate(status: .running, message: nil)])
+        let ws = URL(fileURLWithPath: x.company.workspacePath, isDirectory: true)
+        let wsReal = ws.resolvedForSandbox
+        let outside = try tempDir()
+        let apps = ws.appending(path: ".brahma/preview/apps")
+        try FileManager.default.createDirectory(at: apps, withIntermediateDirectories: true)
+        // A link at the app-data place itself (what the app's previous run could leave): replaced, never followed.
+        try FileManager.default.createSymbolicLink(at: apps.appending(path: "mac"), withDestinationURL: ws.appending(path: ".brahma/hooks"))
+        #expect(x.set(["name": .string("mac"), "kind": .string("macos"), "build": .string("xcodebuild"), "app_path": .string("build/Mac.app")]).ok)
+        await x.settle()
+        let mac = try #require(x.adapters[.macos])
+        let c = try #require(mac.starts.first)
+        let logical = wsReal.appending(path: ".brahma/preview/apps/mac")
+        #expect(c.appPolicy?.writable == [logical], "\(String(describing: c.appPolicy))")
+        #expect(c.appPolicy?.writable.contains(ws.appending(path: ".brahma/hooks").resolvedForSandbox) == false)
+        var st = stat()
+        #expect(lstat(logical.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR)
+        #expect(SandboxPath.resolve(logical.path) == logical.path)
+        #expect(PreviewPolicy.guiApp(x.layout, run: c.run, company: x.company, sandbox: x.sandboxLayout, surface: "mac").writable == [logical])
+        // Nothing under the shared cache is writable any more.
+        #expect(c.appPolicy?.writable.contains { $0.path.hasPrefix(x.sandboxLayout.sharedCache.resolvedForSandbox.path) } == false)
+        await x.runner.stopAll()
+        // A link at a parent: the start is refused; nothing is made in, or granted on, the link's target.
+        try FileManager.default.removeItem(at: apps)
+        try FileManager.default.createSymbolicLink(at: apps, withDestinationURL: outside)
+        x.w.clock.advance(1)
+        try x.store.requestPreviewRestart(surfaceId: try x.surface("mac").id, by: .owner, now: x.now)
+        await x.settle()
+        #expect(mac.starts.count == 1)
+        let state = try x.state("mac")
+        #expect(state.status == .failed && state.message == "its app data directory is not safe to use", "\(state)")
+        #expect(!FileManager.default.fileExists(atPath: outside.appending(path: "mac").path))
+        // The policy itself names the logical path, so the sandbox's own check refuses a linked parent.
+        let linked = PreviewPolicy.guiApp(x.layout, run: c.run, company: x.company, sandbox: x.sandboxLayout, surface: "mac")
+        #expect(linked.writable == [logical] && SandboxPath.resolve(logical.path) != logical.path)
     }
 
     @Test func stopAllStopsNonWebKinds() async throws {

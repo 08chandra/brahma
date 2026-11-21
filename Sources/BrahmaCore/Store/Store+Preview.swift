@@ -62,7 +62,9 @@ extension Store {
     ///
     /// The owner's Simulator approval (Plan 4a fix 4) belongs to the exact iOS build it was asked for: a change of the kind,
     /// `build`, `appPath` or `bundleId` clears `outsideSandboxApprovedAt` and `outsideSandboxAskId` (a still-open ask for the
-    /// old build is `superseded`), so the engine asks again. Nothing here ever sets either field.
+    /// old build is `superseded`), so the engine asks again. A set with unchanged values keeps an open ask or a standing
+    /// approval, but drops an ask that was closed without one (rejected, expired, superseded, rescinded): the engine then files
+    /// one fresh ask (fix round 1, I2). Nothing here ever sets either field.
     public func upsertPreviewSurface(companyId: String, by: Sender, _ draft: PreviewDraft, now: Date = Store.now()) throws -> PreviewSurface {
         let smoke = try draft.smoke.map { try SmokeRequest.parse(try redact($0)) }
         func field(_ s: String?) throws -> String? {
@@ -82,6 +84,13 @@ extension Store {
                     try Self.supersedeSimulatorAsk(db, surface: current, now: now)
                     current.outsideSandboxAskId = nil
                     current.outsideSandboxApprovedAt = nil
+                } else if let askId = current.outsideSandboxAskId {
+                    let ask = try Ask.fetchOne(db, key: askId)
+                    let stands = ask.map { $0.status.isPending || ($0.status == .approved && current.outsideSandboxApprovedAt != nil) } ?? false
+                    if !stands {
+                        current.outsideSandboxAskId = nil
+                        current.outsideSandboxApprovedAt = nil
+                    }
                 }
                 current.kind = draft.kind; current.build = build; current.run = run; current.url = url; current.smoke = smoke
                 current.demo = demo; current.openapiPath = openapiPath; current.appPath = appPath; current.bundleId = bundleId
@@ -215,12 +224,23 @@ extension Store {
     // MARK: The iOS owner gate (Plan 4a fix 4)
 
     /// The engine's owner ask for an iOS surface without the owner's approval: the one it filed (whatever its status now),
-    /// or, the first time, a new one filed by the system straight to the owner (`other`, `permissions` — a reserved matter
-    /// no preset approves — risk high, `SimulatorApproval`'s title and summary), recorded on the surface in the same
-    /// transaction. Nil when the surface is gone, not iOS, or already approved. Called only by the engine's runner.
+    /// or, when none is recorded, a new one filed by the system straight to the owner (`other`, `permissions` — a reserved
+    /// matter no preset approves — risk high, `SimulatorApproval`'s title and summary), recorded on the surface in the same
+    /// transaction. Nil when the surface is gone, not iOS, or already approved. Called only by the engine's runner, on every
+    /// pass: a recorded ask is only read (no write transaction).
     @discardableResult
     func requestSimulatorApproval(surfaceId: String, now: Date) throws -> Ask? {
-        try writer.write { db in
+        enum Seen { case answer(Ask?), file }
+        let seen: Seen = try writer.read { db in
+            guard let surface = try PreviewSurface.fetchOne(db, key: surfaceId), surface.previewKind == .ios,
+                  surface.outsideSandboxApprovedAt == nil else { return .answer(nil) }
+            if let id = surface.outsideSandboxAskId, let ask = try Ask.fetchOne(db, key: id), ask.companyId == surface.companyId {
+                return .answer(ask)
+            }
+            return .file
+        }
+        if case .answer(let ask) = seen { return ask }
+        return try writer.write { db in
             guard var surface = try PreviewSurface.fetchOne(db, key: surfaceId), surface.previewKind == .ios,
                   surface.outsideSandboxApprovedAt == nil else { return nil }
             if let id = surface.outsideSandboxAskId, let ask = try Ask.fetchOne(db, key: id), ask.companyId == surface.companyId { return ask }
