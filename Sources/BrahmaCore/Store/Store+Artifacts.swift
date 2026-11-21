@@ -98,7 +98,7 @@ extension Store {
         // Who, for which item, and the caller's own worktree.
         struct Caller {
             var company: Company; var id: String; var handle: String; var isAgent: Bool; var worktreeKey: String?; var itemId: String?
-            /// Why the publishing session counts as tainted (ML's rule for agent-written text), or nil.
+            /// Why the publishing session counts as tainted (ML's rule for agent-written text; `Store.currentTaint`), or nil.
             var taint: String?
         }
         let caller: Caller = try writer.read { db in
@@ -114,7 +114,9 @@ extension Store {
                     throw WorkError.forbidden(ArtifactMessages.notYourRole)
                 }
                 c.id = id; c.handle = actor.handle; c.isAgent = true
-                c.taint = try Self.taintAt(db: db, agentId: id, at: now) ?? (agent.sessionTainted ? "outside content" : nil)
+                // As every other writer counts it: a turn's mark, the agent row, or the hook-error flag file under the data
+                // home (`currentTaint`; an unreadable flag reads as tainted).
+                c.taint = try Self.taintAt(db: db, agentId: id, at: now) ?? Self.currentTaint(db: db, agentId: id, home: dataHome)
                 try Self.checkArtifactRate(db, companyId: companyId, publisherId: id, now: now)
                 if let lease = try WorkLease.filter(Column("agentId") == id && Column("companyId") == companyId).fetchOne(db) {
                     c.worktreeKey = try String.fetchOne(db, sql: "SELECT key FROM workItem WHERE id = ? AND companyId = ?",

@@ -95,11 +95,9 @@ public struct BackendAdapter: PreviewAdapter {
 
     // MARK: Smoke requests
 
-    /// The smoke origin of a started preview: `http://127.0.0.1:<port>`, `port` being the engine's (`c.port`), never one the
-    /// agent wrote. Nil (no smoke request is sent) when the resolved URL is not a loopback URL on that same port, or the port
-    /// is not one the engine allocates.
-    /// Whether the surface's URL (with `{port}` filled in) names exactly the engine's port. A URL with no port, or none, is
-    /// left to L's start (which refuses a missing one).
+    /// Whether the surface's URL, with `{port}` filled in, names exactly the engine's port (`c.port`). A URL with no port, a
+    /// literal port or one that does not parse is off-port (false). A surface without a URL is let through: L's start refuses
+    /// it ("a web preview needs run and url") before anything runs.
     static func servesOwnPort(_ c: PreviewContext) -> Bool {
         guard let raw = c.surface.url else { return true }
         let text = raw.replacingOccurrences(of: LoopbackURL.placeholder, with: String(c.port))
@@ -107,6 +105,9 @@ public struct BackendAdapter: PreviewAdapter {
         return parts.port == c.port
     }
 
+    /// The smoke origin of a started preview: `http://127.0.0.1:<port>`, `port` being the engine's (`c.port`), never one the
+    /// agent wrote. Nil (no smoke request is sent) when the resolved URL is not a loopback URL on that same port, or the port
+    /// is not one the engine allocates.
     static func origin(resolvedURL: String, port: Int) -> URL? {
         guard let parts = URLComponents(string: resolvedURL), let host = parts.host, LoopbackURL.isLoopback(host: host),
               parts.port == port, (1024...65535).contains(port) else { return nil }
