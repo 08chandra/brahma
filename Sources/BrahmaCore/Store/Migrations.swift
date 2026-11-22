@@ -1874,6 +1874,11 @@ enum Migrations {
                 t.add(column: "expectedSha256", .text)
             }
         }
+        m.registerMigration("vC-ref-counter-seed") { db in
+            // C3b fix round 4 (N3-2, Ruling 50): every counter starts at the highest number its kind ever used in the company,
+            // so a number whose row goes before the kind's first allocation is never handed out again.
+            try seedRefCounters(db)
+        }
     }
 }
 
@@ -1890,6 +1895,56 @@ extension Migrations {
                 guard let source = history.taint(at: row["createdAt"]) else { continue }
                 try db.execute(sql: "UPDATE message SET fromTaintedSession = 1, taintSource = ? WHERE id = ?",
                                arguments: [source, row["id"] as String])
+            }
+        }
+    }
+}
+
+extension Migrations {
+    /// `vC-ref-counter-seed`: raises each company's `refCounter` row of every kind to the highest number the kind ever used
+    /// there (never lowers one): the rows that hold the numbers, and, for a number whose row is already gone, the message refs,
+    /// reads, purges and index docs that still name it. Vault files (`F-`) are not visible here; every `F-` allocation keeps
+    /// the highest vault file as its floor. Self-contained (literal kinds and tables), as a migration must stay.
+    static func seedRefCounters(_ db: Database) throws {
+        var highest: [String: [String: Int]] = [:]          // companyId → kind → number
+        func note(_ companyId: String?, _ kind: String, _ number: Int?) {
+            guard let companyId, let number, number > 0 else { return }
+            highest[companyId, default: [:]][kind] = max(highest[companyId]?[kind] ?? 0, number)
+        }
+        // 1. The rows.
+        let tables = [("resource", "resource"), ("artifact", "artifact"), ("ask", "ask"), ("memory", "memoryEntry"),
+                      ("item", "workItem"), ("release", "release"), ("sprint", "sprint"), ("grant", "grant"),
+                      ("mergeRequest", "mergeRequest"), ("mergeBatch", "mergeBatch")]
+        for (kind, table) in tables {
+            for row in try Row.fetchAll(db, sql: "SELECT companyId, MAX(number) AS n FROM \"\(table)\" GROUP BY companyId") {
+                note(row["companyId"], kind, row["n"])
+            }
+        }
+        // 2. Numbers whose row is gone: a message's ref (its kind and id; an item's id is its key, `<PREFIX>-<n>`).
+        let refKinds: Set<String> = ["resource", "artifact", "ask", "memory", "item", "release", "sprint"]
+        for row in try Row.fetchAll(db, sql: "SELECT companyId, kind, refId FROM messageRef") {
+            let kind: String = row["kind"], id: String = row["refId"]
+            guard refKinds.contains(kind) else { continue }
+            let digits = kind == "item" ? id.split(separator: "-").last.map(String.init) ?? "" : id
+            note(row["companyId"], kind, Int(digits))
+        }
+        //    And the canonical text a ref, a read, a purge or an index doc keeps (`F-9`, `AR-2`, `A-4`, `mem:3`, `rel:1`).
+        let prefixes = [("AR-", "artifact"), ("A-", "ask"), ("F-", "resource"), ("mem:", "memory"), ("rel:", "release")]
+        for sql in ["SELECT companyId, canonical AS c FROM messageRef", "SELECT companyId, canonical AS c FROM refRead",
+                    "SELECT companyId, canonical AS c FROM purgeLog", "SELECT companyId, ref AS c FROM memoryDoc WHERE ref IS NOT NULL"] {
+            for row in try Row.fetchAll(db, sql: sql) {
+                guard let text: String = row["c"], let match = prefixes.first(where: { text.hasPrefix($0.0) }) else { continue }
+                note(row["companyId"], match.1, Int(String(text.dropFirst(match.0.count).prefix { $0.isASCII && $0.isNumber })))
+            }
+        }
+        // 3. Raised, never lowered (`vC-ref-numbers` may already have handed numbers out); only for companies that exist.
+        let companies = Set(try String.fetchAll(db, sql: "SELECT id FROM company"))
+        for (companyId, kinds) in highest where companies.contains(companyId) {
+            for (kind, number) in kinds {
+                try db.execute(sql: """
+                    INSERT INTO refCounter (companyId, kind, last) VALUES (?, ?, ?)
+                    ON CONFLICT(companyId, kind) DO UPDATE SET last = MAX(last, excluded.last)
+                    """, arguments: [companyId, kind, number])
             }
         }
     }

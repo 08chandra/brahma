@@ -5,6 +5,22 @@ import GRDB
 /// keys, releases, sprints, grants, merge requests and batches), each from its own per-company counter (`refCounter`).
 public enum RefCounterKind: String, Sendable {
     case resource, artifact, ask, memory, item, release, sprint, grant, mergeRequest, mergeBatch
+
+    /// The table whose rows hold this kind's numbers (`number`, per `companyId`).
+    var table: String {
+        switch self {
+        case .resource: "resource"
+        case .artifact: "artifact"
+        case .ask: "ask"
+        case .memory: "memoryEntry"
+        case .item: "workItem"
+        case .release: "release"
+        case .sprint: "sprint"
+        case .grant: "grant"
+        case .mergeRequest: "mergeRequest"
+        case .mergeBatch: "mergeBatch"
+        }
+    }
 }
 
 extension Store {
@@ -24,11 +40,17 @@ extension Store {
         return first
     }
 
-    /// The number `nextRefNumber` would hand out now (a preview: nothing is taken).
+    /// The number `nextRefNumber` would hand out now (a preview: nothing is taken). Never at or below a number a row of the
+    /// kind holds, whatever the counter says and whatever `floor` the caller passes (fix round 4, N3-2: belt and braces).
     static func peekRefNumber(db: Database, companyId: String, kind: RefCounterKind, floor: Int) throws -> Int {
         let last = try Int.fetchOne(db, sql: "SELECT last FROM refCounter WHERE companyId = ? AND kind = ?",
                                     arguments: [companyId, kind.rawValue]) ?? 0
-        return max(last, floor) + 1
+        return max(last, floor, try highestRow(db: db, companyId: companyId, kind: kind)) + 1
+    }
+
+    /// The highest number a row of `kind` holds in the company (0 when none).
+    static func highestRow(db: Database, companyId: String, kind: RefCounterKind) throws -> Int {
+        try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) FROM \"\(kind.table)\" WHERE companyId = ?", arguments: [companyId]) ?? 0
     }
 
     static func nextAskNumber(db: Database, companyId: String) throws -> Int {
@@ -69,6 +91,9 @@ extension Store {
 
     // MARK: Share leases (Ruling 51)
 
+    /// A tests-only failure of a lease-item write (`RefHooks.failLeaseKinds`).
+    struct ShareLeaseInjectedFailure: Error {}
+
     /// A share in progress: what it made (copies, snapshots, share refs) is never swept while the lease is live. Released when
     /// the share ends, however it ends; if its process dies, it expires after `ShareLimits.leaseExpiry`.
     func beginShareLease(companyId: String, now: Date) throws -> String {
@@ -83,6 +108,7 @@ extension Store {
     /// Puts `artifact` under the share's lease (right after it is made, or before, for a share ref).
     func leaseShareArtifact(_ lease: String, companyId: String, _ artifact: ShareArtifact) throws {
         let (kind, ref) = Self.leaseKey(artifact)
+        if refHooks.failLeaseKinds.contains(kind) { throw ShareLeaseInjectedFailure() }
         try writer.write { db in
             try db.execute(sql: "INSERT INTO shareLeaseItem (leaseId, companyId, kind, ref) VALUES (?, ?, ?, ?)",
                            arguments: [lease, companyId, kind, ref])

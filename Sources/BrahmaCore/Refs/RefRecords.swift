@@ -247,4 +247,9 @@ final class RefHooks: @unchecked Sendable {
     /// C3b fix round 2 (N-1): runs after a share's refs are prepared, before its post (where the channel and inline refs are read).
     var afterSharePrepared: (@Sendable () throws -> Void)? { lock.withLock { prepared } }
     func setAfterSharePrepared(_ body: (@Sendable () throws -> Void)?) { lock.withLock { prepared = body } }
+    private var leaseFails: Set<String> = []
+    /// C3b fix round 4 (N3-1): putting a share artifact of these lease kinds (`resource`, `snapshot`, `shareRef`) under a
+    /// share's lease fails (a lease write that hits BUSY or a full disk).
+    var failLeaseKinds: Set<String> { lock.withLock { leaseFails } }
+    func setFailLeaseKinds(_ kinds: Set<String>) { lock.withLock { leaseFails = kinds } }
 }

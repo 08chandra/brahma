@@ -355,11 +355,14 @@ extension Store {
                 do {
                     var pinned: WorkRef
                     var created: [ShareArtifact] = []
+                    // N3-1: whatever was made is recorded for removal (`made`) before it is leased, so a lease write that
+                    // fails still has it discarded with the rest.
                     if c.privateFile {
                         pinned = try snapshotPrivateFile(companyId: companyId, agentId: agentId, workspacePath: c.ref.id,
                                                          readers: recipients + [agentId], knownValues: knownValues, paths: paths,
                                                          now: Store.now(), archives: archives)   // M-2: stamped when made
                         if let n = Int(pinned.id) { created.append(.resource(n)) }
+                        made += created
                         for a in created { try hold(a) }
                     } else {
                         // Ruling 49: recorded before the pin, so a pin that fails after writing it still has its share ref
@@ -375,16 +378,14 @@ extension Store {
                         }
                         if pinned.kind == .resource, c.ref.kind != .resource, let n = Int(pinned.id) { created.append(.resource(n)) }
                         if let snapshot = pinned.params["snapshot"], c.ref.params["snapshot"] == nil { created.append(.snapshot(snapshot)) }
-                        for a in created { try hold(a) }
                         made += created
-                        created = []
+                        for a in created { try hold(a) }
                         if [.file, .diff, .commit].contains(pinned.kind), !pinned.isWorktree, pinned.params["share"] == nil,
                            let rev = pinned.rev, let company = c.resolution.company {
                             let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
                             if !(try git.isAncestor(rev, of: "main")) { try git.updateShareRef(c.rowId, to: rev) }
                         }
                     }
-                    made += created
                     // The row: what the pin is, for the sender now (access class, sensitivity, restrictions, reader set, taint).
                     let r = try resolveDetailed(pinned, reader: reader, companyId: companyId, messageRefId: c.rowId)
                     guard r.resolved.visibility == .full, let subject = r.subject else { throw unavailable(i + 1) }
