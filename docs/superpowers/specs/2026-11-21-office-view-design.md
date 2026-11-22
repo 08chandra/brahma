@@ -265,3 +265,12 @@ Corrections: `reviewing` is a new `MapInputs` field, since `DottedLinks.reviewer
 3. **Re-lock:** is a "Hide the office" item wanted in 4c? *Recommended: no; add later if asked.*
 4. **Idle strolls** (ready agents visiting the break room at full LOD): keep, or desks only? *Recommended: keep; it is what makes the floor feel alive at ≤ 50 agents, and it is off under Reduce Motion and above 50 agents.*
 5. **Perks in the break room** ("wall of fame", up to 6 glyphs): wanted, or desk items only? *Recommended: keep; it is the §4.15 break room, cosmetic, and empty until a provider sends perks.*
+
+## Corrections (4c build, 2026-11-22)
+These notes record the controller's rulings during the build. The text above is left as written; where they differ, these notes win.
+- **R33, accessibility of the map view (§4.1, §5.6).** The map view keeps SKView's own accessibility-element answer, which is an AXGroup, in every mode. It does not force `isAccessibilityElement == false`. "Stays false" was a wrong premise: a plain SKView does not answer false, and forcing it would drop the view from its parent's accessibility children and change the frozen inventory. Keeping parity with a plain SKView leaves the inventory unchanged. The office adds children only when its scene is shown.
+- **R13, floor size (§5.2).** The floor wraps its wings adaptively toward a 5:3 shape instead of at a fixed width. The minimum is max(1600, the shared-rooms strip width), widened in 32 pt steps. 300 agents give about 2656×1364 pt.
+- **R16, pod titles (§5.2 rule 2).** A pod with no team card is titled, and tinted, by its members' most common department, not by its owner's department. The team-card title still wins whenever one exists.
+- **R26, pod-label hits (§5.2, §5.7).** A pod label is a `.team` hit only when the pod has a head desk. The label of a pod owned by an agent with an office hits nothing.
+- **R10, Board clicks (§4.1).** The Board clicks use a sliding window: the office unlocks when the last five clicks fall within 3 s, so a stray earlier click never delays it.
+- **R15, the live demo (§6.2).** The live `--map-demo` office does not yet have item phases, reviewers, perks or open asks. The edit to the demo controller that would feed them was denied, and they stay out until the owner approves it. The scene tests and snapshots build `MapInputs` from `SyntheticCompany` directly, so they still show the review, mail and break rooms.

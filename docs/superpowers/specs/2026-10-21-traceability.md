@@ -254,8 +254,8 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 | R-243 | Search across messages (and items/memory) | 4.12.2 | P2 T6; ML | built |
 | R-244 | Org-chart map default with live state, edges, particles, collapse, search, follow, vacancies, dotted review lines | 4.12.3 | 4b T1–T10 | planned |
 | R-245 | Map replay (1 h), pop-out window, `--map-demo` 300 agents, 50 msg/s smooth | 4.12.3 | 4b T6, T10, T11 | planned |
-| R-246 | Hive 3D skin | 4.12.3 | 4c | to-write |
-| R-247 | Village 2D skin with original art | 4.12.3 | 4c | to-write |
+| R-246 | Hive 3D skin | 4.12.3 | not in 4c, no plan (dropped from 4c, 2026-11-21; may return as its own plan) | **UNPLANNED** |
+| R-247 | Village 2D skin with original art (superseded: the Office view, 2026-11-21) | 4.12.3 | Office view, 4c T1–T12 (T11 header toggle waits for Plan P) | building |
 | R-248 | Insights view of engine internals | 4.12.4 | 3a T16a (facts); 3b | building |
 | R-249 | Marketing v1 text/image posts, landing page + waitlist, calendar, owner ask per post | 4.13 | M | to-write |
 | R-250 | Marketing v1 publishing via humanTask or engine-executed connector payloads | 4.13 | M; L (humanTask) | to-write |
@@ -273,7 +273,7 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 | R-262 | Follow-up timers, loop caps, legal/press inbound → reserved ask | 4.14 | 7 (uses 5L T6 timers) | to-write |
 | R-263 | Efficiency meter (engine-measured, many measures, no single score, FeedbackGuard) | 4.15 | 3b T1–T2 | deferred: 3b |
 | R-264 | Trust ladder T0–T3 with effects and hysteresis | 4.15 | 3b T3 | deferred: 3b |
-| R-265 | Cosmetic digital rewards and break room | 4.15 | 3b T6; 4c (Village display) | deferred: 3b |
+| R-265 | Cosmetic digital rewards and break room | 4.15 | 3b T6; break room display: 4c (Office desk items and wall of fame, T5) | deferred: 3b (rewards); building (4c display) |
 | R-266 | HR partner: reviews, warning → PIP → termination + replacement, root cause first | 4.15 | 3b T7 | deferred: 3b |
 | R-267 | Performance analyst scorecard and sprint judge | 4.15 | 3b T5 | deferred: 3b |
 | R-268 | Ideas pipeline, visionary role, Idea review, quota, 💡 perk | 4.15 | 3b T8 | deferred: 3b |
@@ -310,4 +310,5 @@ Date: 2026-10-21 · Pairs with `2026-10-21-brahma-design-v2.md` (§ = section of
 - After the 2026-10-21 chief review, **no requirement is UNPLANNED.** R-011 is an owner checklist (dogfood entry, Plan 8 gate), not code.
 - Newly homed (owner 2026-10-21 18:16): R-067 (L), R-161 (5L T7b), R-205 (ML), R-238 (5L T7c), R-285 (4a T6); R-288–R-292 (Ops, after the dogfood week).
 - Deferred by owner decision: 3b rows (R-106, R-263–R-272); ML-2 rows (R-212, R-225 and the push parts of R-208, R-219, R-221).
+- **Updated 2026-11-22 (Plan 4c):** the Office view replaces the Village skin (R-247, R-265 display). Hive (R-246) was dropped from 4c and has no plan, so it is UNPLANNED; the "no requirement is UNPLANNED" line above dates from 2026-10-21.
 - Previous summary (before this review): built 23 · building 110 · planned 40 · to-write 83 · deferred 11 · UNPLANNED 11.

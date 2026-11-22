@@ -299,7 +299,91 @@ measured. Reproduce with
 enter threshold, so no particles are drawn and edges pulse instead. Timings vary by a factor of two or so from run to run
 with machine load; the 60 fps budget (16.7 ms at the 95th percentile) is met with a wide margin offscreen.
 
-Hive and Village arrive in Plan 4c on the same `MapModel`.
+### Office
+
+The map has an easter egg. Once it is found, the map header shows an `ORG | OFFICE` toggle and the office is a second
+view of the same live `MapModel` and `MapController`, beside the org chart. The chosen view is stored per company; the
+discovery is stored for this Mac's user, and there is no control that hides the office again. Harness runs
+(`--smoke-test`, `--ui-snapshot`, `--map-demo`, `--map-bench`) never read or record the discovery, so their output is the
+same on every Mac.
+
+**What it shows.** The company as a night office floor, seen from a 3/4 top-down view and lit by its screens. All the art is
+drawn in code from the app's own colour tokens; there are no third-party assets. The owner has the board room at the top
+left, and its table shows the open Inbox asks as folders (up to 9, then `9+`). The CEO has the corner office, the other
+executives have offices along the top wall, and each director has an office at the head of a wing. Every agent whose reports
+are not themselves managers with reports gets a pod: two facing columns of desks, the manager at the head desk (unless the
+manager has an office), and the team's title, or else the members' most common department, on a department-tinted carpet. A sub-manager's pod sits right after its parent's pod. Pods under no director
+form one more wing after the directors' wings. Vacancies are dashed, unlit desks with a `HIRING` placard, and former agents (with SHOW FORMER) are dark
+desks with a box. Shared rooms run along the bottom: the review room, the break room (its shelf is a wall of fame of up to six
+perk glyphs) and the mail room. The office has no collapse, so every living agent has a desk.
+
+State is light and posture. A running agent types at a desk whose monitor glows in the status colour. A blocked agent raises
+a hand under a `!` bubble. An agent blocked on the owner stands at the board room door under a `…` bubble. Reviewers and
+meeting participants sit in the review room. A sleeping or paused agent leaves a dark, empty desk. An idle agent now and then
+strolls to the break room and back. An item being checked or merged is a parcel on the mail-room counter, stamped `✓` when its
+checks pass and given a `blocked` strap when they fail. Messages are notes carried along the corridors (dots in aggregate
+mode), broadcasts are notes pinned on the pod board, and hand-offs are folders. A hire slides a new desk in under a balloon,
+a leaver packs a box, a reorg walks the figure to its new desk, and a promotion puts a trophy on the desk.
+
+The org chart's actions work on office targets. Click a desk for the agent, a pod label for its team card (only pods with a
+manager at the head desk); right-click the board room for the owner menu. Hover, search and jump (a ring around the desk), follow,
+zoom to fit, the context menu, vacancies, pop-out and replay all work as on the org chart. Replay shows states only, because
+item phases are not in the timeline.
+
+**Level of detail**, by living-agent count so that snapshots are reproducible:
+
+| Living agents | Detail |
+| --- | --- |
+| ≤ 50 | full: walking, typing, idle strolls, glow pulses |
+| 51–150 | static: figures appear where they are going, no typing, strolls or pulses; notes and events still play |
+| > 150 | desk state only: no figures, the desks show state by light, notes are dots, bubbles are small markers |
+
+Handles show from zoom 0.5 and roles and desk items from 1.2; below zoom 0.3 figures hide.
+
+**Accessibility.** With Reduce Motion on (the setting is watched for changes), nothing walks, types, strolls, pulses or
+travels. Each desk instead shows a state badge (`▶` typing, `✎` reviewing, `✋` blocked, `…` waiting, `⏾` away), and events
+become 0.2 s cross-fades. With VoiceOver, the office exposes one element per room and desk, at most 300 and rebuilt at most once
+a second. A desk reads `@handle, role, state, item`, and the board room reads `Board room, owner, N open asks`. The org chart
+does not expose these elements yet. Colour is never the only carrier of state: the lamp, the bubble and the badge carry it too.
+
+**Demo, snapshots and bench.** `--map-skin=office` opens a harness run (`--map-demo`, `--map-bench`, `--ui-snapshot`) in the
+office without unlocking or storing anything. A normal launch ignores the flag.
+
+```
+scripts/map-demo.sh 50 --map-skin=office                                      # the demo company in the office
+scripts/map-snapshots.sh                                                      # also writes office-*.png into .superpowers/maps
+Brahma --map-demo --map-demo-agents=50 --map-skin=office --map-bench=20       # prints one MAP BENCH mode=office line
+```
+
+The live `--map-demo` office does not yet show item phases, reviewers, perks or open asks, so its review room, mail room,
+wall of fame and board-room folders stay empty. The offscreen snapshots and tests feed those facets directly and do show them.
+
+Measured on an Apple M4 Pro (Mac16,8), macOS 26.2 (build 25C56). The offscreen rows below are release builds driving
+`SKRenderer` into a 1600×900 texture with the same synthetic load as the org rows above (50 msg/s with a 200-message burst
+every 10 s, or 15 msg/s with no bursts for the particle rows). These are the eight `MapPerfTests` lines, verbatim and in log
+order, from the 4c run (`BRAHMA_PERF=1 swift test -c release -Xswiftc -enable-testing --filter MapPerfTests`):
+
+```
+MAP BENCH mode=org agents=300 fps=167.0 p95=12.6ms max=66.6ms dropped=53 aggregate=30.0s
+MAP BENCH mode=org agents=300 fps=550.9 p95=3.0ms max=13.6ms dropped=0 aggregate=30.0s
+MAP BENCH mode=office agents=150 fps=253.6 p95=5.6ms max=16.3ms dropped=0 aggregate=30.0s
+MAP BENCH mode=org agents=500 fps=428.5 p95=4.0ms max=5.7ms dropped=0 aggregate=30.0s
+MAP BENCH mode=org agents=300 fps=225.6 p95=6.0ms max=13.3ms dropped=0 aggregate=0.0s
+MAP BENCH mode=office agents=50 fps=803.9 p95=1.5ms max=5.7ms dropped=0 aggregate=30.0s
+MAP BENCH mode=office agents=300 fps=189.8 p95=6.1ms max=50.3ms dropped=23 aggregate=30.0s
+MAP BENCH mode=office agents=50 fps=604.9 p95=2.2ms max=31.7ms dropped=7 aggregate=0.0s
+```
+
+| Office measurement | Result |
+| --- | --- |
+| Offscreen, 50 agents, full detail, 50 msg/s with bursts | p95 1.5 ms, max 5.7 ms (803.9 fps), 0 dropped |
+| Offscreen, 50 agents, full detail, particles (15 msg/s, no bursts) | p95 2.2 ms, max 31.7 ms (604.9 fps), 7 dropped, no aggregate time |
+| Offscreen, 150 agents, static | p95 5.6 ms, max 16.3 ms (253.6 fps), 0 dropped |
+| Offscreen, 300 agents, desk state only | p95 6.1 ms, max 50.3 ms (189.8 fps), 23 dropped |
+| On screen, 50 agents, `--map-skin=office --map-bench=20` | not measured yet: the 4c run (2026-11-22) had a locked session and printed `MAP BENCH FAIL no frames in 20.0 s (paused=false visible=false key=false fps=60)`; rerun with the display awake and unlocked (target ≥ 58 fps) |
+
+The 60 fps budget (16.7 ms at the 95th percentile) is met in every offscreen office row. The org lines come from the same run and are
+listed so that the two views can be compared on one machine and load.
 
 ## Data locations
 

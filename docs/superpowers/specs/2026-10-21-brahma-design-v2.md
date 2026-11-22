@@ -1055,6 +1055,17 @@ self-granting.
   (2D isometric, SpriteKit, original art, workers, buildings, couriers,
   cosmetic perks shown). Same `MapModel`; exempt from the ops-console brief.
 
+> **After 4c (2026-11-22).** The text above is kept as written. Plan 4c built
+> an **Office** view instead of the Village skin (owner: "I don't want the
+> Clash of Clans look, but make it look like an office instead where workers
+> are working etc."). It is a 3/4 top-down
+> office floor in SpriteKit with original art drawn in code. It runs on the
+> same `MapModel` and `MapController`, shows perks on desks and in a break-room
+> wall of fame, and is exempt from the ops-console brief. It is an easter egg:
+> hidden until the owner finds it, then an `ORG | OFFICE` toggle with no
+> re-lock. **Hive (3D) is not in 4c** and has no plan. Spec:
+> `2026-11-21-office-view-design.md`; plan: `../plans/2026-11-21-plan4c-office.md`.
+
 #### 4.12.4 Insights
 Read-only engine internals: outcome facts, leases, budgets, watchdog events,
 health history, grants ledger, later meter/trust/HR (3b).

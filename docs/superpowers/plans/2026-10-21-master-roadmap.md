@@ -30,7 +30,7 @@ Everything else in v2 stands.
 | 12 | **G Profile/pack generator** | to write | — | 3a packs, asks |
 | 13 | **ML-2 Memory (full)** | to write; after dogfood **[owner 18:16]** | — | ML, dogfood data |
 | 14 | **3b Performance and people** | written then shelved; rewrite on asks from dogfood data | `tmp/2026-10-21-plan3b-performance-people.md` (stale base) | 3a facts, G, dogfood |
-| 15 | **4c Map skins** (Hive, Village) | to write | — | 4b `MapModel`, 3b (perks) |
+| 15 | **4c Office view** (the map's easter egg; replaces the Village skin, which is superseded; Hive is not in 4c) | **building** (2026-11-22) in worktree `plan4c-office` (Tasks 1–10 and 12 done; Task 11, the header toggle, waits for Plan P) | `2026-11-21-plan4c-office.md` | 4b `MapModel`; 3b supplies live perks (optional) |
 | 16 | **7 External comms** | to write | — | 5L (taint, timers, grants), asks |
 | 17 | **11 Running the company** (connectors, funds, browser) | to write | — | 5L, 7 |
 | 18 | **9 Labs and memory v2** | to write | — | ML-2, 5L |
@@ -302,10 +302,13 @@ Owner 18:16: lean = search on demand plus recording. Push and reflection wait fo
 - The plan is rewritten on asks, not the old `decision` table.
 - **R:** 106, 176 (trust layer), 214 (inheritance), 248 (meter/trust), 263–272.
 
-### 2.15 4c Map skins — to write
-- Hive (3D, SceneKit) and Village (2D isometric, SpriteKit, original art, perks shown) on 4b's `MapModel`.
-- They are exempt from the ops-console brief.
-- **R:** 246, 247, 265 (display).
+### 2.15 4c Office view — building (`2026-11-21-plan4c-office.md`)
+- The Office replaces the Village skin (superseded). It is a 3/4 top-down office floor in SpriteKit with original art drawn in code, on 4b's `MapModel` and `MapController`. Perks are shown on desks and in a break-room wall of fame.
+- It is an easter egg: hidden until the owner finds it, then an `ORG | OFFICE` toggle in the map header, with no re-lock. Spec: `../specs/2026-11-21-office-view-design.md`.
+- Hive (3D, SceneKit) is not in 4c and has no plan; it may return as its own plan.
+- Superseded (historical): the original scope was "Hive (3D, SceneKit) and Village (2D isometric, SpriteKit, original art, perks shown)".
+- It is exempt from the ops-console brief.
+- **R:** 247 (Office view), 265 (break room display); 246 (Hive) has no plan.
 
 ### 2.16 7 External comms — to write
 - **Scope (v2 §4.14):**
