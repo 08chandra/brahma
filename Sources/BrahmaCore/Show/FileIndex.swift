@@ -247,8 +247,8 @@ public struct FileIndex: Sendable {
         return try build(git: git, branch: branch, head: head, treeSha: try git.treeSha(commit: head))
     }
 
-    static func build(git: SafeGit, branch: String, head: String, treeSha: String) throws -> FileIndex {
-        let listing = try git.lsTree(rev: head, cap: maxEntries)
+    static func build(git: SafeGit, branch: String, head: String, treeSha: String, cap: Int = maxEntries) throws -> FileIndex {
+        let listing = try git.lsTree(rev: head, cap: cap)
         var paths: [String] = []
         var shas: [String: String] = [:]
         paths.reserveCapacity(listing.entries.count)
@@ -316,16 +316,24 @@ public actor FileIndexCache {
     /// enough, none is better).
     public static let headsTTL: TimeInterval = 2
 
+    /// A build that failed is remembered this long (a repository whose listing breaks a cap isn't listed per keystroke).
+    public static let failureTTL: TimeInterval = 60
+
     nonisolated let storage = SearchCacheStorage<FileIndex>(capacity: FileIndexCache.maxCached)
     nonisolated let trees = SearchCacheStorage<String>(capacity: 256)
     nonisolated let heads = SearchCacheStorage<TimedHeads>(capacity: 64)
+    nonisolated let failures = SearchCacheStorage<Date>(capacity: 64)
+    /// `FileIndex.maxEntries`; tests lower it.
+    nonisolated let entryCap: Int
+
+    public init() { entryCap = FileIndex.maxEntries }
+
+    init(entryCap: Int) { self.entryCap = entryCap }
 
     struct TimedHeads: Sendable {
         var at: Date
         var heads: [String: String]
     }
-
-    public init() {}
 
     public func index(companyId: String, branch: String, git: SafeGit) throws -> FileIndex {
         try indexNow(companyId: companyId, branch: branch, head: try git.head(branch), git: git)
@@ -334,18 +342,24 @@ public actor FileIndexCache {
     /// The same, synchronously, for a head the caller already read (the search core and the `search` tool).
     nonisolated func indexNow(companyId: String, branch: String, head: String, git: SafeGit) throws -> FileIndex {
         let treeKey = companyId + "\u{0}" + head
-        let tree: String
-        if let known = trees.get(treeKey) {
-            tree = known
-        } else {
-            tree = try git.treeSha(commit: head)
-            trees.put(treeKey, tree)
+        if let failed = failures.get(treeKey), Date().timeIntervalSince(failed) < Self.failureTTL { throw SearchIndexError.recentlyFailed }
+        do {
+            let tree: String
+            if let known = trees.get(treeKey) {
+                tree = known
+            } else {
+                tree = try git.treeSha(commit: head)
+                trees.put(treeKey, tree)
+            }
+            let key = companyId + "\u{0}" + tree
+            if let cached = storage.get(key) { return cached.on(branch: branch) }
+            let built = try FileIndex.build(git: git, branch: branch, head: head, treeSha: tree, cap: entryCap)
+            storage.put(key, built)
+            return built
+        } catch {
+            failures.put(treeKey, Date())
+            throw error
         }
-        let key = companyId + "\u{0}" + tree
-        if let cached = storage.get(key) { return cached.on(branch: branch) }
-        let built = try FileIndex.build(git: git, branch: branch, head: head, treeSha: tree)
-        storage.put(key, built)
-        return built
     }
 }
 

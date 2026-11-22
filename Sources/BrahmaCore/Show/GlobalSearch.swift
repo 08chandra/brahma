@@ -69,11 +69,51 @@ public struct GlobalSearch: Sendable {
         self.store = store; self.files = files; self.commits = commits; self.memory = memory
     }
 
-    /// At most `limitPerGroup` hits per group, best first within each group, groups in `ShowGroup` order.
-    public func search(_ rest: String, filters: SearchFilters, companyId: String, reader: Reader, limitPerGroup: Int) async throws -> [ShowHit] {
+    /// At most `limitPerGroup` hits per group, best first within each group, groups in `ShowGroup` order. `knownValues`: the
+    /// company's stored secret values (`Store.knownSecretValues` from the injected vault): no hit carries one (Rulings 53, 54).
+    public func search(_ rest: String, filters: SearchFilters, companyId: String, reader: Reader, limitPerGroup: Int,
+                       knownValues: [(name: String, value: String)]) async throws -> [ShowHit] {
         let me = self
+        let gate = TextGate(knownValues: knownValues)
         return try await Self.blocking.tryRun {
-            try me.searchNow(rest, filters: filters, companyId: companyId, reader: reader, limitPerGroup: limitPerGroup, now: Store.now()).hits
+            try me.searchNow(rest, filters: filters, companyId: companyId, reader: reader, limitPerGroup: limitPerGroup, now: Store.now(),
+                             gate: gate).hits
+        }
+    }
+
+    // MARK: The secret gate on what a hit shows
+
+    /// Rulings 53 and 54: every piece of text a hit shows (its canonical, title, subtitle and snippet; much of it agent-written:
+    /// paths, subjects, titles, message text) is checked against the secret patterns and every form of every stored value
+    /// (`EncodedForms`, `ContentScan.redact`, as `SecretGate.shown` checks a name), read now: a value stored after the text was
+    /// written is caught too. A canonical holding one drops the hit (its ref can't be shown); a title or subtitle is shown
+    /// redacted (withheld: the engine's own words); a snippet holding one is dropped.
+    struct TextGate: Sendable {
+        let expanded: [(name: String, value: String)]
+
+        init(knownValues: [(name: String, value: String)]) { expanded = EncodedForms.expand(knownValues) }
+
+        func holdsSecret(_ s: String) -> Bool {
+            if ContentScan.redact(text: s, findings: [], knownValues: expanded) != s { return true }
+            let skeleton = String(String.UnicodeScalarView(s.unicodeScalars.filter { !SecretGate.isInvisible($0) }))
+            return ContentScan.redact(text: skeleton, findings: [], knownValues: expanded) != skeleton
+        }
+
+        /// `s` redacted (`SecretGate.shown`), or `fallback` when the whole of it is withheld.
+        func name(_ s: String, fallback: String) -> String {
+            guard holdsSecret(s) else { return s }
+            let shown = SecretGate.shown(s, expanded: expanded)
+            return shown == SecretGate.withheldName || holdsSecret(shown) ? fallback : GlobalSearch.flatten(shown, max: SafeTitle.max)
+        }
+
+        func hit(_ h: ShowHit) -> ShowHit? {
+            guard !holdsSecret(h.ref.canonical) else { return nil }
+            var out = h
+            let engine = h.ref.kind == .commit ? "commit \(h.ref.id.prefix(7))" : GlobalSearch.flatten(h.ref.canonical, max: SafeTitle.max)
+            out.title = name(h.title, fallback: engine)
+            out.subtitle = name(h.subtitle, fallback: "")
+            if let snippet = h.snippet, holdsSecret(snippet) { out.snippet = nil }
+            return out
         }
     }
 
@@ -106,26 +146,28 @@ public struct GlobalSearch: Sendable {
     /// The search itself, synchronously (the `search` tool and `ShowResolver` call it on their own thread). `totals` are the
     /// owner's candidate counts per group; empty for every other reader.
     func searchNow(_ rest: String, filters: SearchFilters, companyId: String, reader: Reader, limitPerGroup: Int,
-                   now: Date, git: GitState? = nil) throws -> (hits: [ShowHit], totals: [ShowGroup: Int]) {
+                   now: Date, gate: TextGate, git: GitState? = nil) throws -> (hits: [ShowHit], totals: [ShowGroup: Int], incomplete: Set<ShowGroup>) {
         // A reader of another company is refused like any other read.
         _ = try ReaderContext.load(store: store, companyId: companyId, reader: reader)
-        guard limitPerGroup > 0, let company = try store.company(id: companyId) else { return ([], [:]) }
+        guard limitPerGroup > 0, let company = try store.company(id: companyId) else { return ([], [:], []) }
         let text = rest.trimmingCharacters(in: .whitespacesAndNewlines)
         let listing = FuzzyScorer.foldQuery(text).count < FuzzyScorer.minQuery
             || text.split(whereSeparator: { $0.isWhitespace }).allSatisfy { FuzzyScorer.foldQuery(String($0)).count < FuzzyScorer.minQuery }
-        if listing, filters.isEmpty { return ([], [:]) }
+        if listing, filters.isEmpty { return ([], [:], []) }
         let kinds = Self.kinds(filters, reader: reader)
-        guard !kinds.isEmpty else { return ([], [:]) }
+        guard !kinds.isEmpty else { return ([], [:], []) }
         var actorId: String? = nil
         if let actor = filters.actor {
-            guard let id = try actorKey(actor, companyId: companyId) else { return ([], [:]) }   // no such agent: nothing is by them
+            guard let id = try actorKey(actor, companyId: companyId) else { return ([], [:], []) }   // no such agent: nothing is by them
             actorId = id
         }
 
         var found: [Candidate] = []
         let q = listing ? "" : text
         if !listing { found += try memoryCandidates(q, kinds: kinds, filters: filters, actorId: actorId, companyId: companyId, reader: reader, now: now) }
-        found += try gitCandidates(q, kinds: kinds, filters: filters, company: company, state: git ?? gitState(company: company))
+        var incomplete = Set<ShowGroup>()
+        found += try gitCandidates(q, kinds: kinds, filters: filters, company: company, reader: reader, state: git ?? gitState(company: company),
+                                   incomplete: &incomplete)
         found += try sqlCandidates(q, kinds: kinds, filters: filters, actorId: actorId, companyId: companyId, reader: reader)
 
         // Group, dedupe by canonical (best score kept), order.
@@ -164,12 +206,12 @@ public struct GlobalSearch: Sendable {
             if reader == .owner { totals[group] = list.count }
             var kept = 0
             for c in list.prefix(Self.groupCandidates) where kept < limitPerGroup {
-                guard let hit = try verify(c, companyId: companyId, reader: reader) else { continue }
+                guard let checked = try verify(c, companyId: companyId, reader: reader), let hit = gate.hit(checked) else { continue }
                 hits.append(hit)
                 kept += 1
             }
         }
-        return (hits, totals)
+        return (hits, totals, incomplete)
     }
 
     /// The kinds this query reads: the filter's (all when none), narrowed by a status (items, asks, runs, agents), a channel
@@ -307,27 +349,38 @@ public struct GlobalSearch: Sendable {
 
     // MARK: Git: files and commits
 
-    /// The company's repository as search reads it: `main`'s head and the leased item branches' (read at most every
-    /// `FileIndexCache.headsTTL` seconds per set of leases).
+    /// The company's repository as search reads it: `main`'s head and the leased item branches', with each branch's holder
+    /// and the head it claimed the lease at (read at most every `FileIndexCache.headsTTL` seconds per set of leases).
     struct GitState {
         let git: SafeGit
         let heads: [String: String]
+        /// `item/<KEY>` → its lease holder's handle and claim head: the engine's record of who wrote what is on the branch since.
+        let holders: [String: CommitIndex.BranchHolder]
         var main: String { heads["main"] ?? "" }
     }
 
-    /// Nil for a company without a readable repository (it simply has no files or commits to find).
+    /// Nil for a company without a readable repository.
     func gitState(company: Company) -> GitState? {
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         guard let git = try? store.refGit(workspace),
-              let leased = try? store.writer.read({ db in
-                  try String.fetchAll(db, sql: """
-                      SELECT w.key FROM workLease l JOIN workItem w ON w.id = l.itemId AND w.companyId = l.companyId WHERE l.companyId = ?
-                      ORDER BY w.key
+              let leases = try? store.writer.read({ db in
+                  try Row.fetchAll(db, sql: """
+                      SELECT w.key, a.name, l.claimHead FROM workLease l
+                      JOIN workItem w ON w.id = l.itemId AND w.companyId = l.companyId
+                      JOIN agent a ON a.id = l.agentId AND a.companyId = l.companyId
+                      WHERE l.companyId = ? ORDER BY w.key
                       """, arguments: [company.id])
               }) else { return nil }
-        let key = company.id + "\u{0}" + leased.joined(separator: ",")
-        if let cached = files.heads.get(key), Date().timeIntervalSince(cached.at) < FileIndexCache.headsTTL, cached.at <= Date() {
-            return GitState(git: git, heads: cached.heads)
+        var holders: [String: CommitIndex.BranchHolder] = [:]
+        for row in leases {
+            let key: String = row["key"]
+            guard let claim: String = row["claimHead"] else { continue }
+            holders["item/\(key)"] = CommitIndex.BranchHolder(handle: row["name"], since: claim)
+        }
+        let leased = leases.map { $0["key"] as String }
+        let cacheKey = company.id + "\u{0}" + leased.joined(separator: ",")
+        if let cached = files.heads.get(cacheKey), Date().timeIntervalSince(cached.at) < FileIndexCache.headsTTL, cached.at <= Date() {
+            return GitState(git: git, heads: cached.heads, holders: holders)
         }
         guard let main = try? git.head("main") else { return nil }
         var heads: [String: String] = ["main": main]
@@ -335,22 +388,39 @@ public struct GlobalSearch: Sendable {
             let set = Set(leased)
             for (branch, head) in items where set.contains(String(branch.dropFirst(5))) { heads[branch] = head }
         }
-        files.heads.put(key, FileIndexCache.TimedHeads(at: Date(), heads: heads))
-        return GitState(git: git, heads: heads)
+        files.heads.put(cacheKey, FileIndexCache.TimedHeads(at: Date(), heads: heads))
+        return GitState(git: git, heads: heads, holders: holders)
     }
 
-    private func gitCandidates(_ q: String, kinds: Set<SearchKind>, filters: SearchFilters, company: Company, state: GitState?) throws -> [Candidate] {
+    /// Files and commits. What can't be read (no repository, an index that failed or hit its cap) is named in `incomplete`,
+    /// never dropped silently.
+    private func gitCandidates(_ q: String, kinds: Set<SearchKind>, filters: SearchFilters, company: Company, reader: Reader,
+                               state: GitState?, incomplete: inout Set<ShowGroup>) throws -> [Candidate] {
         let wantFiles = kinds.contains(.file) && !q.isEmpty
         let wantCommits = kinds.contains(.commit)
-        guard wantFiles || wantCommits, let state else { return [] }
+        guard wantFiles || wantCommits else { return [] }
+        guard let state else {
+            if wantFiles { incomplete.insert(.files) }
+            if wantCommits { incomplete.insert(.commits) }
+            return []
+        }
         let git = state.git, heads = state.heads, main = state.main
         var out: [Candidate] = []
-        if wantFiles, let mainIndex = try? files.indexNow(companyId: company.id, branch: "main", head: main, git: git) {
+        var mainIndex: FileIndex? = nil
+        if wantFiles {
+            mainIndex = try? files.indexNow(companyId: company.id, branch: "main", head: main, git: git)
+            if mainIndex?.truncated != false { incomplete.insert(.files) }
+        }
+        if let mainIndex {
             for f in mainIndex.scored(q, limit: Self.groupCandidates, where: nil) {
                 out.append(fileCandidate(path: f.path, branch: nil, score: f.score, time: f.time, filters: filters))
             }
             for (branch, head) in heads.sorted(by: { $0.key < $1.key }) where branch != "main" {
-                guard let index = try? files.indexNow(companyId: company.id, branch: branch, head: head, git: git) else { continue }
+                guard let index = try? files.indexNow(companyId: company.id, branch: branch, head: head, git: git) else {
+                    incomplete.insert(.files)
+                    continue
+                }
+                if index.truncated { incomplete.insert(.files) }
                 // An item branch adds only what differs from main.
                 for f in index.scored(q, limit: Self.groupCandidates, where: { index.sha(of: $0) != mainIndex.sha(of: $0) }) {
                     out.append(fileCandidate(path: f.path, branch: branch, score: f.score, time: f.time, filters: filters))
@@ -358,14 +428,20 @@ public struct GlobalSearch: Sendable {
             }
             if let w = filters.window { out.removeAll { $0.kind == .file && !($0.at.map(w.contains) ?? false) } }
         }
-        if wantCommits, let index = try? commits.indexNow(companyId: company.id, heads: heads, git: git) {
+        var commitIndex: CommitIndex? = nil
+        if wantCommits {
+            commitIndex = try? commits.indexNow(companyId: company.id, heads: heads, holders: state.holders, git: git)
+            if commitIndex == nil { incomplete.insert(.commits) }
+        }
+        if let index = commitIndex {
             var diffs = Set<String>()
             for (c, score) in index.scored(q, filters: filters, limit: Self.groupCandidates, listingScore: Self.listingScore) {
                 let short = String(c.sha.prefix(7))
                 var cand = Candidate(ref: WorkRef(kind: .commit, id: c.sha), kind: .commit, score: score)
-                cand.title = Self.flatten(c.subject, max: SafeTitle.max)
+                // Ruling 54: the subject is agent-written; only the owner sees it (gated), an agent sees the engine's title.
+                cand.title = reader == .owner ? Self.flatten(c.subject, max: SafeTitle.max) : "commit \(short)"
                 cand.taintedTitle = "commit \(short)"
-                cand.subtitle = "commit \(short) · @\(c.author) · \(c.branch)"
+                cand.subtitle = "commit \(short) · " + (c.author == CommitIndex.unverified ? "unverified author" : "@\(c.author)") + " · \(c.branch)"
                 cand.at = c.at
                 cand.light = true
                 out.append(cand)

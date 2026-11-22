@@ -57,7 +57,7 @@ struct ShowFixture {
     }
 
     func resolve(_ q: String, as reader: Reader = .owner) async throws -> ShowResult {
-        try await ShowResolver(store: store, files: files, commits: commits).resolve(q, companyId: c.id, reader: reader)
+        try await ShowResolver(store: store, files: files, commits: commits).resolve(q, companyId: c.id, reader: reader, knownValues: [])
     }
 
     func top(_ q: String) async throws -> ShowHit? { try await resolve(q).hits.first }
@@ -190,19 +190,23 @@ struct ShowFixture {
             }
         }
         let resolver = ShowResolver(store: s, files: FileIndexCache(), commits: CommitIndexCache())
-        _ = try await resolver.resolve("checkout", companyId: c.id, reader: .owner)     // builds the indexes
+        _ = try await resolver.resolve("checkout", companyId: c.id, reader: .owner, knownValues: [])     // builds the indexes
         let queries = (0..<100).map { i in ["checkout", "src/mod\(i)", "payment flaky", "ENG-1", "deploy this week", "by @eng-1 retry",
                                             "file\(i * 37)", "invoice", "kind:commit change", "what's @eng-3 doing"][i % 10] }
-        var times: [Double] = []
-        for q in queries {
-            let start = DispatchTime.now().uptimeNanoseconds
-            _ = try await resolver.resolve(q, companyId: c.id, reader: .owner)
-            times.append(Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
+        // The owner, then an agent (every hit checked for its access, every text gated against a stored value).
+        let known = [(name: "PERF_KEY", value: "perf-secret-value-123")]
+        for reader in [Reader.owner, .agent(fx.eng1.id)] {
+            var times: [Double] = []
+            for q in queries {
+                let start = DispatchTime.now().uptimeNanoseconds
+                _ = try await resolver.resolve(q, companyId: c.id, reader: reader, knownValues: known)
+                times.append(Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
+            }
+            times.sort()
+            let p95 = times[Int(Double(times.count) * 0.95) - 1]
+            print("ShowResolver \(reader) p95 \(p95) ms, median \(times[times.count / 2]) ms")
+            #expect(p95 < 50, "\(reader): p95 \(p95) ms")
         }
-        times.sort()
-        let p95 = times[Int(Double(times.count) * 0.95) - 1]
-        print("ShowResolver p95 \(p95) ms, median \(times[times.count / 2]) ms")
-        #expect(p95 < 50, "p95 \(p95) ms")
     }
 }
 

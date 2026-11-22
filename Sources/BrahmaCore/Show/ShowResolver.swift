@@ -32,11 +32,14 @@ public struct ShowResult: Equatable, Sendable {
     public var intent: ShowIntent
     /// The owner's full candidate counts per group; empty for every other reader (never a hidden count).
     public var groupTotals: [ShowGroup: Int]
+    /// Fix round 1 (I-3): groups whose source couldn't be read in full (`.files`: no repository, an index past its cap or
+    /// one that failed; `.commits`: likewise). A property of the repository, so every reader sees it; it names no object.
+    public var incomplete: Set<ShowGroup>
 
     public init(normalized: String, stripped: String, filters: SearchFilters, answer: FactAnswer?, hits: [ShowHit], topScore: Double,
-                intent: ShowIntent, groupTotals: [ShowGroup: Int]) {
+                intent: ShowIntent, groupTotals: [ShowGroup: Int], incomplete: Set<ShowGroup> = []) {
         self.normalized = normalized; self.stripped = stripped; self.filters = filters; self.answer = answer; self.hits = hits
-        self.topScore = topScore; self.intent = intent; self.groupTotals = groupTotals
+        self.topScore = topScore; self.intent = intent; self.groupTotals = groupTotals; self.incomplete = incomplete
     }
 }
 
@@ -165,13 +168,16 @@ public struct ShowResolver: Sendable {
         self.store = store; self.files = files; self.commits = commits; self.facts = facts; self.memory = memory
     }
 
-    public func resolve(_ query: String, companyId: String, reader: Reader) async throws -> ShowResult {
+    /// `knownValues`: the company's stored secret values (`Store.knownSecretValues` from the injected vault); no hit carries
+    /// one (Rulings 53 and 54, `GlobalSearch.TextGate`).
+    public func resolve(_ query: String, companyId: String, reader: Reader, knownValues: [(name: String, value: String)]) async throws -> ShowResult {
         let me = self
-        return try await GlobalSearch.blocking.tryRun { try me.resolveNow(query, companyId: companyId, reader: reader) }
+        let gate = GlobalSearch.TextGate(knownValues: knownValues)
+        return try await GlobalSearch.blocking.tryRun { try me.resolveNow(query, companyId: companyId, reader: reader, gate: gate) }
     }
 
     /// `resolve`, synchronously; `forced` filters (the `search` tool's arguments) override what the text says.
-    func resolveNow(_ query: String, companyId: String, reader: Reader, forced: SearchFilters = SearchFilters(),
+    func resolveNow(_ query: String, companyId: String, reader: Reader, gate: GlobalSearch.TextGate, forced: SearchFilters = SearchFilters(),
                     now: Date = Store.now()) throws -> ShowResult {
         let (normalized, stripped) = ShowQuery.normalize(query)
         _ = try ReaderContext.load(store: store, companyId: companyId, reader: reader)
@@ -203,7 +209,7 @@ public struct ShowResolver: Sendable {
         let whole = directRefs(stripped, context: context)
         for (ref, _) in whole {
             guard seen.count < Self.maxDirectRefs, !seen.contains(ref.canonical),
-                  let hit = try directHit(ref, git: git, companyId: companyId, reader: reader) else { continue }
+                  let hit = try directHit(ref, git: git, companyId: companyId, reader: reader).flatMap(gate.hit) else { continue }
             seen.insert(ref.canonical)
             top.append(hit)
         }
@@ -214,7 +220,7 @@ public struct ShowResolver: Sendable {
 
         // Phrases.
         if let phrase = ShowPhrases.match(stripped, original: normalized) {
-            let phraseHits = try phraseHits(phrase, company: company, reader: reader)
+            let phraseHits = try phraseHits(phrase, company: company, reader: reader).compactMap(gate.hit)
             if !phraseHits.isEmpty {
                 // Refs typed inside the phrase rank below it (unless the ref is the whole query or what the phrase opens).
                 let opened = Set(phraseHits.map(\.ref.canonical))
@@ -234,7 +240,7 @@ public struct ShowResolver: Sendable {
 
         // Fuzzy search over everything else.
         let found = try search.searchNow(rest, filters: filters, companyId: companyId, reader: reader, limitPerGroup: Self.groupLimit, now: now,
-                                         git: git)
+                                         gate: gate, git: git)
         var rows = top.sorted { $0.score > $1.score }
         let others = found.hits.filter { !seen.contains($0.ref.canonical) || $0.inlineOnly }
         var promoted: ShowHit? = nil
@@ -258,7 +264,8 @@ public struct ShowResolver: Sendable {
             if topCount > 0 { totals[.top] = topCount }
         }
         return ShowResult(normalized: normalized, stripped: stripped, filters: filters, answer: answer, hits: ordered, topScore: topScore,
-                          intent: ShowIntent.classify(stripped: stripped, topScore: topScore, hasFact: answer != nil), groupTotals: totals)
+                          intent: ShowIntent.classify(stripped: stripped, topScore: topScore, hasFact: answer != nil), groupTotals: totals,
+                          incomplete: found.incomplete)
     }
 
     // MARK: Direct refs

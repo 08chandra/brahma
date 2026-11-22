@@ -116,9 +116,24 @@ extension CompanyTools {
             guard let n = v.numberValue, n.isFinite else { throw ToolError(message: "argument limit must be a number") }
             limit = Int(min(max(n, 1), Double(GlobalSearch.toolLimit)))
         }
+        // Rulings 53/54: every text a hit shows is checked against the stored values, read from the injected vault; values that
+        // can't be read refuse the search (fail closed, as `open_ref`).
+        let known: [(name: String, value: String)]
+        do { known = try store.knownSecretValues(companyId: companyId, vault: vault ?? UnavailableVault()) } catch {
+            diagnostics("brahma mcp: could not read the stored secrets to check search results: \(error)")
+            throw ToolError(message: "search results could not be checked for secrets right now, so nothing was shown; try again next turn")
+        }
         let resolver = ShowResolver(store: store, files: Self.searchFiles, commits: Self.searchCommits)
-        let result = try resolver.resolveNow(query, companyId: companyId, reader: .agent(agentId), forced: forced, now: now)
+        let result = try resolver.resolveNow(query, companyId: companyId, reader: .agent(agentId), gate: GlobalSearch.TextGate(knownValues: known),
+                                             forced: forced, now: now)
         return Self.searchLines(result, limit: limit, now: now, tz: tz)
+    }
+
+    /// Fix round 1 (I-5): an agent-written field on a hit line, inert: one line, quoted (`"` → `'`), brackets turned to
+    /// parentheses, so no title can close the line's `[…]` or open a forged one.
+    static func inert(_ s: String, max: Int) -> String {
+        "\"" + GlobalSearch.flatten(s, max: max).replacingOccurrences(of: "\"", with: "'")
+            .replacingOccurrences(of: "[", with: "(").replacingOccurrences(of: "]", with: ")") + "\""
     }
 
     /// The `search` tool's text for a result (also the concierge's, C4c).
@@ -135,14 +150,21 @@ extension CompanyTools {
         var lines: [String] = []
         for hit in result.hits.filter({ !$0.inlineOnly }).prefix(limit) {
             let kind = hit.kind?.rawValue ?? hit.ref.kind.rawValue
-            var line = "[\(kind) \(GlobalSearch.flatten(hit.ref.canonical, max: RefGrammar.maxLength)) · \(GlobalSearch.flatten(hit.title, max: SafeTitle.max))"
+            // A canonical is one token (it opens with `open_ref`), unless it holds white space (a kb page name): then quoted.
+            let canonical = GlobalSearch.flatten(hit.ref.canonical, max: RefGrammar.maxLength)
+            let shownRef = canonical.contains(where: { $0.isWhitespace }) || canonical.contains("·") ? inert(canonical, max: RefGrammar.maxLength) : canonical
+            var line = "[\(kind) \(shownRef) · \(inert(hit.title, max: SafeTitle.max))"
             if let at = hit.at { line += " · " + stamp(at) }
             lines.append(line + "]")
             if let snippet = hit.snippet.map({ GlobalSearch.flatten($0, max: GlobalSearch.snippetMax) }), !snippet.isEmpty {
                 lines.append("    | " + snippet)
             }
         }
-        return lines.isEmpty ? "Nothing found in what you can read." : lines.joined(separator: "\n")
+        if lines.isEmpty { lines.append("Nothing found in what you can read.") }
+        // Fix round 1 (I-3): what couldn't be searched in full is said, never dropped silently.
+        if result.incomplete.contains(.files) { lines.append("(file results incomplete)") }
+        if result.incomplete.contains(.commits) { lines.append("(commit results incomplete)") }
+        return lines.joined(separator: "\n")
     }
 
     /// `post_message` / `send_dm` with `attachments` (`Store.postWithAttachments`); `to` is `#channel` or `@handle`.

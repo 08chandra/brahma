@@ -574,7 +574,11 @@ public enum SecretGate {
     /// direction marks, controls, white space) can split a value in a name and put it back together later; when the name
     /// without them still holds a secret after the redaction, the whole name is withheld (`withheldName`).
     static func shown(_ canonical: String, knownValues: [(name: String, value: String)]) -> String {
-        let expanded = EncodedForms.expand(knownValues)
+        shown(canonical, expanded: EncodedForms.expand(knownValues))
+    }
+
+    /// `shown` with the stored values already expanded (`EncodedForms.expand`; Plan C Task C4a gates many names per query).
+    static func shown(_ canonical: String, expanded: [(name: String, value: String)]) -> String {
         let redacted = ContentScan.redact(text: Store.flat(canonical, max: Int.max), findings: [], knownValues: expanded)
         let skeleton = String(String.UnicodeScalarView(redacted.unicodeScalars.filter { !isInvisible($0) }))
         if ContentScan.redact(text: skeleton, findings: [], knownValues: expanded) != skeleton { return withheldName }
