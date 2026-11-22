@@ -219,8 +219,8 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
         let router = MessageRouter(store: s)
         let engMessage = try router.post(companyId: c.id, channel: "general", from: .agent(fx.eng1.id), text: "zebra55 from eng")
         let ownerMessage = try router.post(companyId: c.id, channel: "general", from: .owner, text: "zebra55 from owner")
-        // eng-1 holds ENG-1: its branch's commits are eng-1's (the engine's lease record), whatever email they carry. A commit
-        // on main claiming eng-1's engine identity is attributed to no one.
+        // eng-1 holds ENG-1, and the engine recorded its turn's commits on the branch (C4b: `recordTurnCommits`): they are
+        // eng-1's, whatever email they carry. A commit on main claiming eng-1's engine identity is attributed to no one.
         let (leaseItem, leaseCompany, leaseAgent) = (fx.item.id, c.id, fx.eng1.id)
         let claimHead = try fx.git.git(["rev-parse", "item/ENG-1"])
         try await s.writer.write { db in
@@ -239,6 +239,7 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
         try fx.git.git(["commit", "-q", "-m", "zebra55 owner change"],
                        env: ["GIT_AUTHOR_NAME": "eng-1", "GIT_AUTHOR_EMAIL": "eng-1@\(c.slug).brahma.local"])
         let ownerCommit = try fx.git.git(["rev-parse", "HEAD"])
+        s.recordTurnCommits(companyId: c.id, agentId: fx.eng1.id, turnId: "turn-eng-1", heldAtStart: [fx.item.id: claimHead], now: now)
         let (cId, engId) = (c.id, fx.eng1.id)
         try await s.writer.write { db in
             try ActivityEvent(companyId: cId, agentId: engId, turnId: nil, kind: .work, text: "zebra55 eng activity", createdAt: now).insert(db)
@@ -307,6 +308,8 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
             lease.claimHead = claimHead
             try lease.insert(db)
         }
+        // C4b: the engine recorded eng-3's turn that made "item work" (its start head was the claim head).
+        w.store.recordTurnCommits(companyId: cId, agentId: eng3Id, turnId: "turn-eng-3", heldAtStart: [itemId: claimHead], now: now)
         let files = try await w.search("src/b.ts", as: .owner, filters: SearchFilters(kinds: [.file]))
         #expect(files.contains { $0.ref.canonical == "ENG-1:src/b.ts" && $0.subtitle.contains("item/ENG-1") }, "\(files.map(\.ref.canonical))")
         let a = try await w.search("src/a.ts", as: .agent(w.fx.qa2.id), filters: SearchFilters(kinds: [.file]))
@@ -315,22 +318,83 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
         let commits = try await w.search("item work", as: .owner, filters: SearchFilters(kinds: [.commit]))
         #expect(commits.contains { $0.ref.kind == .commit && $0.subtitle.hasSuffix("item/ENG-1") }, "\(commits.map(\.subtitle))")
         #expect(commits.contains { $0.ref.canonical == "ENG-1:diff" })
-        // The holder of the lease is the verified author of its branch's commits (eng-3 here), whatever the emails say.
+        // The agent whose turn the engine recorded making them is the verified author (eng-3 here), whatever the emails say.
         #expect(commits.contains { $0.subtitle.contains("@eng-3") && $0.subtitle.hasSuffix("item/ENG-1") })
         // An agent matches what it sees of a commit (Ruling 56): `commit <sha7>`, the verified author and the branch; never
         // the subject.
         let byAuthor = try await w.search("eng-3", as: .agent(w.fx.qa2.id), filters: SearchFilters(kinds: [.commit]))
         #expect(byAuthor.contains { $0.ref.kind == .commit && $0.subtitle.hasSuffix("item/ENG-1") }, "\(byAuthor.map(\.subtitle))")
         #expect(try await w.search("item work", as: .agent(w.fx.qa2.id), filters: SearchFilters(kinds: [.commit])).allSatisfy { $0.ref.kind != .commit })
-        // The index's own API: the same commits, newest first. Without lease records, no author is verified.
+        // The index's own API: the same commits, newest first. Without the engine's record, no author is verified.
         let index = try CommitIndex.build(git: SafeGit(workspace: w.cf.workspace), branches: ["main", "item/ENG-1"])
         #expect(index.search("item work", filters: SearchFilters(), limit: 5).first?.branch == "item/ENG-1")
         #expect(index.search("item work", filters: SearchFilters(), limit: 5).first?.author == CommitIndex.unverified)
         #expect(index.search("zebra42", filters: SearchFilters(actor: "owner"), limit: 5).isEmpty)
+        let store = w.store
         let held = try CommitIndex.build(git: SafeGit(workspace: w.cf.workspace), branches: ["main", "item/ENG-1"],
-                                         holders: ["item/ENG-1": CommitIndex.BranchHolder(handle: "eng-3", since: claimHead)])
+                                         authors: { try store.recordedCommitAuthors(companyId: cId, shas: $0) })
         #expect(held.search("item work", filters: SearchFilters(actor: "eng-3"), limit: 5).count == 1)
         #expect(held.search("zebra42", filters: SearchFilters(actor: "eng-3"), limit: 5).isEmpty)
+    }
+
+    /// C4b (controller ruling): commit authorship comes only from the engine's per-turn record. A past lease holder's recorded
+    /// commit matches `by @thatAgent` after the lease moved on, and after the engine's rebase replays it; a commit whose email
+    /// claims an agent's engine identity, made while another agent holds the lease, is nobody's.
+    @Test func engineRecordedCommitsAttributeAuthors() async throws {
+        let w = try SearchFixture()
+        let s = w.store, fx = w.fx, cId = w.c.id, now = w.now
+        let (itemId, eng3Id, qa2Id) = (fx.item.id, fx.eng3.id, fx.qa2.id)
+        let claimHead = try fx.git.git(["rev-parse", "item/ENG-1~1"])
+        let itemWork = try fx.git.git(["rev-parse", "item/ENG-1"])
+        // eng-3 claimed ENG-1 during turn t-3 (the claim log's trusted head) and made "item work"; the engine recorded the turn.
+        try await s.writer.write { db in
+            try db.execute(sql: "INSERT INTO leaseClaim (companyId, agentId, itemId, turnId, claimHead, createdAt) VALUES (?, ?, ?, 't-3', ?, ?)",
+                           arguments: [cId, eng3Id, itemId, claimHead, now])
+        }
+        s.recordTurnCommits(companyId: cId, agentId: eng3Id, turnId: "t-3", heldAtStart: [:], now: now)
+        // The lease moves to qa-2; a commit on the branch then claims eng-3's engine identity by its email. No turn records it.
+        try await s.writer.write { db in
+            var lease = WorkLease(itemId: itemId, companyId: cId, agentId: qa2Id, acquiredAt: now, expiresActive: 1_000_000_000)
+            lease.claimHead = itemWork
+            try lease.insert(db)
+        }
+        try fx.git.git(["checkout", "-q", "item/ENG-1"])
+        try fx.git.write("src/spoof.ts", "s\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "spoofed work"], env: ["GIT_AUTHOR_NAME": "eng-3", "GIT_AUTHOR_EMAIL": "eng-3@\(w.c.slug).brahma.local"])
+        let spoofed = try fx.git.git(["rev-parse", "HEAD"])
+        try fx.git.git(["checkout", "-q", "main"])
+
+        func commits(_ filters: SearchFilters, _ q: String = "work") async throws -> [ShowHit] {
+            let g = GlobalSearch(store: s, files: FileIndexCache(), commits: CommitIndexCache(), memory: MemoryIndex(store: s))
+            return try await g.search(q, filters: filters, companyId: cId, reader: .owner, limitPerGroup: 20, knownValues: [])
+                .filter { $0.ref.kind == .commit }
+        }
+        let byEng3 = Set(try await commits(SearchFilters(kinds: [.commit], actor: "eng-3")).map(\.ref.id))
+        #expect(byEng3 == [itemWork], "\(byEng3)")
+        #expect(try await commits(SearchFilters(kinds: [.commit], actor: "qa-2")).isEmpty, "the current holder is not the author")
+        let all = try await commits(SearchFilters(kinds: [.commit]))
+        #expect(all.contains { $0.ref.id == spoofed && $0.subtitle.contains("unverified author") }, "\(all.map(\.subtitle))")
+        #expect(all.contains { $0.ref.id == itemWork && $0.subtitle.contains("@eng-3") })
+
+        // The engine's rebase onto a newer main replays both commits: the replayed "item work" keeps eng-3, the spoof stays nobody's.
+        try fx.git.write("src/main2.ts", "m\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "main moves"])
+        try await s.writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET verifiedCommit = ? WHERE id = ?", arguments: [spoofed, itemId])
+        }
+        try fx.git.git(["rebase", "-q", "main", "item/ENG-1"])
+        try fx.git.git(["checkout", "-q", "main"])
+        let rebased = try fx.git.git(["rev-parse", "item/ENG-1"])
+        let replayedWork = try fx.git.git(["rev-parse", "item/ENG-1~1"])
+        s.carryAuthorsThroughRebase(item: try #require(try s.workItem(id: itemId)), rebased: rebased, now: now)
+        let after = try s.recordedCommitAuthors(companyId: cId, shas: [replayedWork, rebased, itemWork, spoofed])
+        #expect(after == [replayedWork: "eng-3", itemWork: "eng-3"], "\(after)")
+        let byEng3Now = Set(try await commits(SearchFilters(kinds: [.commit], actor: "eng-3")).map(\.ref.id))
+        #expect(byEng3Now.contains(replayedWork) && !byEng3Now.contains(rebased), "\(byEng3Now)")
+        // Another company's agent of the same handle never reads this company's record.
+        #expect(try s.recordedCommitAuthors(companyId: fx.d.id, shas: [itemWork]).isEmpty)
     }
 
     @Test func blockedAloneListsBlockedWork() async throws {

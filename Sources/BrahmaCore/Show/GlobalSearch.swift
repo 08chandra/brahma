@@ -568,13 +568,13 @@ public struct GlobalSearch: Sendable {
 
     // MARK: Git: files and commits
 
-    /// The company's repository as search reads it: `main`'s head and the leased item branches', with each branch's holder
-    /// and the head it claimed the lease at (read at most every `FileIndexCache.headsTTL` seconds per set of leases).
+    /// The company's repository as search reads it: `main`'s head and the leased item branches' (read at most every
+    /// `FileIndexCache.headsTTL` seconds per set of leases), and the version of the engine's commit-author record.
     struct GitState {
         let git: SafeGit
         let heads: [String: String]
-        /// `item/<KEY>` → its lease holder's handle and claim head: the engine's record of who wrote what is on the branch since.
-        let holders: [String: CommitIndex.BranchHolder]
+        /// `Store.commitAuthorsVersion` when read: commit authors come only from the engine's per-turn record (C4b).
+        let authorsVersion: Int64
         var main: String { heads["main"] ?? "" }
     }
 
@@ -582,24 +582,16 @@ public struct GlobalSearch: Sendable {
     func gitState(company: Company) -> GitState? {
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
         guard let git = try? store.refGit(workspace),
-              let leases = try? store.writer.read({ db in
-                  try Row.fetchAll(db, sql: """
-                      SELECT w.key, a.name, l.claimHead FROM workLease l
-                      JOIN workItem w ON w.id = l.itemId AND w.companyId = l.companyId
-                      JOIN agent a ON a.id = l.agentId AND a.companyId = l.companyId
+              let leased = try? store.writer.read({ db in
+                  try String.fetchAll(db, sql: """
+                      SELECT w.key FROM workLease l JOIN workItem w ON w.id = l.itemId AND w.companyId = l.companyId
                       WHERE l.companyId = ? ORDER BY w.key
                       """, arguments: [company.id])
               }) else { return nil }
-        var holders: [String: CommitIndex.BranchHolder] = [:]
-        for row in leases {
-            let key: String = row["key"]
-            guard let claim: String = row["claimHead"] else { continue }
-            holders["item/\(key)"] = CommitIndex.BranchHolder(handle: row["name"], since: claim)
-        }
-        let leased = leases.map { $0["key"] as String }
+        let version = store.commitAuthorsVersion(companyId: company.id)
         let cacheKey = company.id + "\u{0}" + leased.joined(separator: ",")
         if let cached = files.heads.get(cacheKey), Date().timeIntervalSince(cached.at) < FileIndexCache.headsTTL, cached.at <= Date() {
-            return GitState(git: git, heads: cached.heads, holders: holders)
+            return GitState(git: git, heads: cached.heads, authorsVersion: version)
         }
         guard let main = try? git.head("main") else { return nil }
         var heads: [String: String] = ["main": main]
@@ -608,7 +600,7 @@ public struct GlobalSearch: Sendable {
             for (branch, head) in items where set.contains(String(branch.dropFirst(5))) { heads[branch] = head }
         }
         files.heads.put(cacheKey, FileIndexCache.TimedHeads(at: Date(), heads: heads))
-        return GitState(git: git, heads: heads, holders: holders)
+        return GitState(git: git, heads: heads, authorsVersion: version)
     }
 
     /// Files and commits. What can't be read (no repository, an index that failed or hit its cap) is named in `incomplete`,
@@ -634,7 +626,6 @@ public struct GlobalSearch: Sendable {
             }
             if case .allowed = readable { heads[branch] = head }
         }
-        let holders = state.holders.filter { heads[$0.key] != nil }
         var out: [Candidate] = []
         var mainIndex: FileIndex? = nil
         if wantFiles {
@@ -662,7 +653,9 @@ public struct GlobalSearch: Sendable {
         }
         var commitIndex: CommitIndex? = nil
         if wantCommits {
-            commitIndex = try? commits.indexNow(companyId: company.id, heads: heads, holders: holders, git: git)
+            let store = self.store, companyId = company.id
+            commitIndex = try? commits.indexNow(companyId: companyId, heads: heads, authorsVersion: state.authorsVersion,
+                                                authors: { try store.recordedCommitAuthors(companyId: companyId, shas: $0) }, git: git)
             if commitIndex == nil { incomplete.insert(.commits) }
         }
         if let index = commitIndex {

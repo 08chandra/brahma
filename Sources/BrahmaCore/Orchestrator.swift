@@ -1653,6 +1653,15 @@ public actor Orchestrator {
             }
         }
 
+        // Plan C4b (controller ruling): every launched turn records the commits it made on the item branches it held or claimed
+        // (`recordTurnCommits`), the only source of commit authorship. Git, off the cooperative pool.
+        if launched {
+            let (store, turnId, started) = (self.store, turn.id, heldAtStart)
+            await blocking.run {
+                store.recordTurnCommits(companyId: agent.companyId, agentId: agent.id, turnId: turnId, heldAtStart: started, now: now)
+            }
+        }
+
         // A resumed session that no longer exists: it is reset and the agent is ready again at once (no penalty). The next
         // turn starts a fresh session. A fresh session that is "not found" again is an ordinary failure.
         var sessionLost: SessionScope?

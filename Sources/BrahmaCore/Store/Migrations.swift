@@ -1928,6 +1928,21 @@ enum Migrations {
             // Every doc indexed before this migration is queued; its company's first search blanks it.
             try db.execute(sql: "INSERT INTO memoryShadowPending(docId, companyId) SELECT id, companyId FROM memoryDoc")
         }
+        m.registerMigration("vC-turn-commits") { db in
+            // C4b (controller ruling, carried from C4a): who made a commit, from the engine's own record. At the end of every
+            // turn the engine lists the commits the turn added to each item branch it touched (`Store.recordTurnCommits`), and
+            // its own rebase carries a row to the commit it replays it as. The first record of a sha wins. A commit with no
+            // row has no verified author (`CommitIndex.unverified`): author emails are never read for attribution.
+            try db.create(table: "turnCommit") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("sha", .text).notNull()
+                t.column("itemId", .text)
+                t.column("agentId", .text).notNull()
+                t.column("turnId", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.primaryKey(["companyId", "sha"])
+            }
+        }
     }
 }
 

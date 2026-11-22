@@ -278,6 +278,8 @@ extension Store {
         case .rebased(let head):
             // Plan C2a (ruling 5): the rewritten commits are as tainted as the ones they replay.
             carryTaintThroughRebase(item: item, rebased: head, now: now)
+            // C4b: and they keep the author the engine recorded for the commits they replay.
+            carryAuthorsThroughRebase(item: item, rebased: head, now: now)
             let base = try? git.mergeBase(GitWorkspace.mainRef, head)
             try writer.write { db in
                 // The engine moved the branch: the rebased head is the recorded head the next submit (and the next holder
