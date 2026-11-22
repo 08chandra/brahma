@@ -17,11 +17,19 @@ public struct MapInputs: Equatable, Sendable {
     public var dotted: [DottedLink]
     public var meetings: [Meeting]
     public var people: MapPeople
+    /// Agent id → the phase of the agent's newest active item (Plan 4c); absent when it has none.
+    public var itemPhases: [String: MapItemPhase]
+    /// The reviewers of items in review whose owner and reviewer are both living agents.
+    public var reviewing: Set<String>
+    /// Asks waiting for the owner.
+    public var openAsks: Int
 
     public init(agents: [Agent], pack: IndustryPack, currentItems: [String: String] = [:], blockers: [String: String] = [:],
-                vacancies: [Vacancy] = [], dotted: [DottedLink] = [], meetings: [Meeting] = [], people: MapPeople = .empty) {
+                vacancies: [Vacancy] = [], dotted: [DottedLink] = [], meetings: [Meeting] = [], people: MapPeople = .empty,
+                itemPhases: [String: MapItemPhase] = [:], reviewing: Set<String> = [], openAsks: Int = 0) {
         self.agents = agents; self.pack = pack; self.currentItems = currentItems; self.blockers = blockers
         self.vacancies = vacancies; self.dotted = dotted; self.meetings = meetings; self.people = people
+        self.itemPhases = itemPhases; self.reviewing = reviewing; self.openAsks = openAsks
     }
 }
 
@@ -43,13 +51,19 @@ public struct MapAgent: Equatable, Sendable, Identifiable {
     public var trust: MapTrust?
     public var perks: [String]
     public var meter: MapMeter?
+    /// The agent's blocker is the owner.
+    public var waitingOnOwner: Bool
+    /// The item's phase while it ships (`MapItemPhase.isShipping`), else nil.
+    public var shipping: MapItemPhase?
+    public var activity: OfficeActivity
 
     public init(id: String, handle: String, role: String, state: AgentState, paused: Bool = false, team: String? = nil,
                 department: Department, blocker: String = "", item: String? = nil, trust: MapTrust? = nil,
-                perks: [String] = [], meter: MapMeter? = nil) {
+                perks: [String] = [], meter: MapMeter? = nil, waitingOnOwner: Bool = false, shipping: MapItemPhase? = nil,
+                activity: OfficeActivity = .idle) {
         self.id = id; self.handle = handle; self.role = role; self.state = state; self.paused = paused; self.team = team
         self.department = department; self.blocker = blocker; self.item = item; self.trust = trust; self.perks = perks
-        self.meter = meter
+        self.meter = meter; self.waitingOnOwner = waitingOnOwner; self.shipping = shipping; self.activity = activity
     }
 }
 
@@ -138,6 +152,8 @@ public struct MapModel: Sendable {
     /// Bumped when membership, managers, teams, roles or vacancies change (and when `showFormer` flips).
     public private(set) var structureRevision = 0
     public private(set) var showFormer = false
+    /// Asks waiting for the owner (never negative).
+    public private(set) var openAsks = 0
 
     /// Events waiting for `step`. `start` is the enqueue time and `duration` is 0 until the queue spawns them.
     var pending: [VisualEvent] = []
@@ -146,6 +162,8 @@ public struct MapModel: Sendable {
     var queue = QueueState()
 
     private var raw: [String: Agent] = [:]
+    /// Agent id → its item's phase, for agents in the snapshot.
+    private var phases: [String: MapItemPhase] = [:]
     private var roleKinds: [String: RoleKind] = [:]
     private var reportIds: [String: [String]] = [:]
     private var trustLabels: [String: String] = [:]
@@ -178,20 +196,37 @@ public struct MapModel: Sendable {
     /// Takes a snapshot. The tree and groups are rebuilt only when the structural key changes. With `emitEvents` and a
     /// previous snapshot, the difference becomes visual events in `pending`.
     public mutating func apply(_ inputs: MapInputs, now: TimeInterval, emitEvents: Bool = true) {
-        let oldRaw = raw, oldTrust = trustLabels, oldMeetings = meetings
+        let oldRaw = raw, oldTrust = trustLabels, oldMeetings = meetings, oldPhases = phases
         let kinds = Dictionary(inputs.pack.roles.map { ($0.id, $0.kind) }, uniquingKeysWith: { first, _ in first })
         var newRaw: [String: Agent] = [:]
         for a in inputs.agents { newRaw[a.id] = a }
         pack = inputs.pack
         roleKinds = kinds
         raw = newRaw
+        phases = inputs.itemPhases.filter { newRaw[$0.key] != nil }
+        openAsks = Swift.max(0, inputs.openAsks)
+
+        meetings = inputs.meetings.compactMap { m in
+            let ids = m.participantIds.filter { newRaw[$0] != nil }
+            guard ids.count >= 2 else { return nil }
+            var m = m
+            m.title = MapText.clean(m.title, max: 40)
+            m.participantIds = ids
+            return m
+        }
+        // Participant → the first meeting (by id) that lists it.
+        var meetingOf: [String: String] = [:]
+        for m in meetings.sorted(by: { $0.id < $1.id }) {
+            for id in m.participantIds where meetingOf[id] == nil { meetingOf[id] = m.id }
+        }
 
         var mapped: [String: MapAgent] = [:]
         mapped.reserveCapacity(newRaw.count)
         var trust: [String: String] = [:]
         for (id, a) in newRaw {
             let m = Self.makeAgent(a, kinds: kinds, item: inputs.currentItems[id], blocker: inputs.blockers[id],
-                                   people: inputs.people)
+                                   people: inputs.people, phase: phases[id], reviewing: inputs.reviewing.contains(id),
+                                   meetingId: meetingOf[id])
             mapped[id] = m
             if let t = m.trust { trust[id] = t.label }
         }
@@ -201,14 +236,6 @@ public struct MapModel: Sendable {
         var seen = Set<String>()
         vacancies = inputs.vacancies.map { $0.cleaned() }.filter { seen.insert($0.id).inserted }
         dotted = inputs.dotted.map { var d = $0; d.itemKey = MapText.clean(d.itemKey, max: 40); return d }
-        meetings = inputs.meetings.compactMap { m in
-            let ids = m.participantIds.filter { mapped[$0] != nil }
-            guard ids.count >= 2 else { return nil }
-            var m = m
-            m.title = MapText.clean(m.title, max: 40)
-            m.participantIds = ids
-            return m
-        }
 
         let sorted = newRaw.values.sorted { ($0.createdAt, $0.name, $0.id) < ($1.createdAt, $1.name, $1.id) }
         var reports: [String: [String]] = [:]
@@ -225,7 +252,7 @@ public struct MapModel: Sendable {
         }
 
         if emitEvents && hasApplied {
-            diff(old: oldRaw, oldTrust: oldTrust, oldMeetings: oldMeetings, now: now)
+            diff(old: oldRaw, oldTrust: oldTrust, oldMeetings: oldMeetings, oldPhases: oldPhases, now: now)
         }
         hasApplied = true
         dropUnknown(now: now)
@@ -250,7 +277,8 @@ public struct MapModel: Sendable {
             + pack.rolesCovering("ceo")).joined(separator: "|")
     }
 
-    static func makeAgent(_ a: Agent, kinds: [String: RoleKind], item: String?, blocker: String?, people: MapPeople) -> MapAgent {
+    static func makeAgent(_ a: Agent, kinds: [String: RoleKind], item: String?, blocker: String?, people: MapPeople,
+                          phase: MapItemPhase? = nil, reviewing: Bool = false, meetingId: String? = nil) -> MapAgent {
         // A label that cleans to the empty marker (only stripped scalars) is no label: the trust is absent.
         let trust = people.trust[a.id].flatMap { t -> MapTrust? in
             let label = MapText.clean(t.label, max: 8)
@@ -263,18 +291,24 @@ public struct MapModel: Sendable {
             MapMeter(line: MapText.clean(m.line, max: 40),
                      fraction: m.fraction.flatMap { $0.isFinite ? Swift.min(1, Swift.max(0, $0)) : nil })
         }
+        var waitingOnOwner = false
+        if case .owner? = a.blocker { waitingOnOwner = true }
         return MapAgent(id: a.id, handle: "@" + MapText.clean(a.name, max: 40), role: MapText.clean(a.role, max: 40),
                         state: a.state, paused: a.paused,
                         team: (a.team?.isEmpty ?? true) ? nil : MapText.clean(a.team, max: 32),
                         department: Department.of(role: a.role, kind: kinds[a.role]),
                         blocker: (blocker?.isEmpty ?? true) ? "" : MapText.clean(blocker, max: 80),
                         item: (item?.isEmpty ?? true) ? nil : MapText.clean(item, max: 80),
-                        trust: trust, perks: Array(perks), meter: meter)
+                        trust: trust, perks: Array(perks), meter: meter, waitingOnOwner: waitingOnOwner,
+                        shipping: phase.flatMap { $0.isShipping ? $0 : nil },
+                        activity: OfficeActivity.of(state: a.state, paused: a.paused, waitingOnOwner: waitingOnOwner,
+                                                    reviewing: reviewing, meetingId: meetingId))
     }
 
     // MARK: Diff
 
-    private mutating func diff(old: [String: Agent], oldTrust: [String: String], oldMeetings: [Meeting], now: TimeInterval) {
+    private mutating func diff(old: [String: Agent], oldTrust: [String: String], oldMeetings: [Meeting],
+                               oldPhases: [String: MapItemPhase], now: TimeInterval) {
         for id in raw.keys.sorted() {
             let new = raw[id]!
             guard let was = old[id] else { emit(.hire, from: .agent(id), now: now); continue }
@@ -286,6 +320,9 @@ public struct MapModel: Sendable {
             if let from = oldTrust[id], let to = trustLabels[id], from != to {
                 emit(.promotion(from: from, to: to), from: .agent(id), now: now)
             }
+            // An agent with no active item counts as working.
+            let fromPhase = oldPhases[id] ?? .working, toPhase = phases[id] ?? .working
+            if fromPhase != toPhase { emit(.phaseChange(from: fromPhase, to: toPhase), from: .agent(id), now: now) }
         }
         let oldIds = Set(oldMeetings.map(\.id)), newIds = Set(meetings.map(\.id))
         for m in meetings.sorted(by: { $0.id < $1.id }) where !oldIds.contains(m.id) {
@@ -426,6 +463,9 @@ public struct MapModel: Sendable {
     }
 
     // MARK: Cards
+
+    /// The phase of the agent's newest active item, or nil when it has none (or is not on the map).
+    public func phase(agentId: String) -> MapItemPhase? { phases[agentId] }
 
     /// A paused agent that is not killed renders like a sleeping one.
     static func displayState(_ state: AgentState, paused: Bool) -> AgentState {

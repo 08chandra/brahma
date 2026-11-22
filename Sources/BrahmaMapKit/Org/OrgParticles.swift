@@ -296,7 +296,7 @@ extension OrgScene {
 
     private static func isContentEvent(_ e: VisualEvent) -> Bool {
         switch e.kind {
-        case .stateChange, .promotion: true
+        case .stateChange, .promotion, .phaseChange: true
         default: false
         }
     }
@@ -416,7 +416,7 @@ extension OrgScene {
         for e in events {
             switch e.kind {
             case .message, .handoff, .broadcast: spawnParticle(e)
-            case .stateChange, .hire, .promotion: m.waiting.append(e)
+            case .stateChange, .hire, .promotion, .phaseChange: m.waiting.append(e)
             // A leave is `beginLeaves`; a reorg is the layout moving the card (Task 9a); a meeting is drawn from the model.
             case .leave, .reorg, .meetingStart, .meetingEnd: break
             }
@@ -439,6 +439,8 @@ extension OrgScene {
         case .stateChange: node.flashStatusBar()
         case .hire: node.playHire()
         case .promotion: node.popTrustChip()
+        // The office's parcel; a card shows no item phase, so the refresh was all it needed.
+        case .phaseChange: break
         default: break
         }
         return true

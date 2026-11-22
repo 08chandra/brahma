@@ -266,6 +266,34 @@ import Foundation
         #expect(m.stats.spawned + m.stats.coalesced + m.stats.aggregated + m.stats.dropped == m.stats.ingested)
     }
 
+    @Test func phaseChangeIsStructural() throws {
+        var (m, agents) = small()
+        var i = inputs(agents)
+        i.itemPhases = [agents[4].id: .working]
+        m.apply(i, now: t0)
+        // 40 message facts (20/s: below aggregate mode) against a cap of 10.
+        m.throttle.queueCap = 10
+        m.ingest(pairs(agents, 40), now: t0)
+        i.itemPhases = [agents[4].id: .checking]
+        m.apply(i, now: t0)
+        #expect(MapThrottle.duration(.phaseChange(from: .working, to: .checking)) == 0.2)
+        #expect(MapThrottle.priority(.phaseChange(from: .working, to: .checking)) == MapThrottle.priority(.stateChange(from: .ready, to: .running)))
+        #expect(!MapThrottle.isTraffic(.phaseChange(from: .checking, to: .merging)))
+
+        // Nothing spawns (no room): the queue is cut to its cap, traffic only.
+        #expect(m.step(now: t0, resolve: id, budget: 0).isEmpty)
+        #expect(m.stats.dropped == 30)
+        #expect(!m.stats.aggregate)
+        #expect(m.pending.contains { $0.kind == .phaseChange(from: .working, to: .checking) })
+        let spawned = m.step(now: t0 + 0.1, resolve: id)
+        let first = try #require(spawned.first)
+        #expect(first.kind == .phaseChange(from: .working, to: .checking))
+        #expect(first.from == .agent(agents[4].id))
+        #expect(first.duration == 0.2)
+        #expect(spawned.dropFirst().allSatisfy { $0.kind == .message })
+        #expect(conserved(m))
+    }
+
     @Test func hiddenPairBecomesBroadcast() {
         var (m, agents) = small()
         let manager = agents[1]
@@ -367,6 +395,38 @@ import Foundation
         #expect(SyntheticCompany.make(agents: 9000).agents.count == 500)
         #expect(SyntheticCompany.make(agents: 0).agents.count == 5)
         #expect(SyntheticCompany.make(agents: -3).agents.count == 5)
+    }
+
+    @Test func syntheticOfficeFacets() {
+        let a = SyntheticCompany.make(agents: 300, seed: 42), b = SyntheticCompany.make(agents: 300, seed: 42)
+        #expect(a.itemPhases == b.itemPhases)
+        #expect(a.reviewing == b.reviewing)
+        #expect(a.people == b.people)
+        #expect(a.openAsks == 3)
+        // Every running agent with an item has a phase, and nobody else.
+        let byId = Dictionary(uniqueKeysWithValues: a.agents.map { ($0.id, $0) })
+        let running = Set(a.agents.filter { $0.state == .running && a.currentItems[$0.id] != nil }.map(\.id))
+        #expect(Set(a.itemPhases.keys) == running)
+        func count(_ p: MapItemPhase) -> Int { a.itemPhases.values.filter { $0 == p }.count }
+        let n = Double(running.count)
+        #expect(count(.inReview) == Int((n * 0.15).rounded()))
+        #expect(count(.checking) == Int((n * 0.10).rounded()))
+        #expect(count(.merging) == Int((n * 0.10).rounded()))
+        #expect(count(.failed) == Int((n * 0.05).rounded()))
+        #expect(count(.passed) == 0)
+        #expect(count(.working) == running.count - count(.inReview) - count(.checking) - count(.merging) - count(.failed))
+        // One living teammate reviews each in-review item.
+        #expect(!a.reviewing.isEmpty && a.reviewing.count <= count(.inReview))
+        for r in a.reviewing {
+            let reviewer = byId[r]!
+            #expect(reviewer.state != .killed)
+            #expect(a.itemPhases.contains { $0.value == .inReview && byId[$0.key]?.team == reviewer.team && $0.key != r })
+        }
+        // Perks: 10 % of the agents, one or two each, from the set.
+        #expect(a.people.perks.count == Int((Double(a.agents.count) * 0.1).rounded()))
+        #expect(a.people.perks.values.allSatisfy { (1...2).contains($0.count) })
+        #expect(a.people.perks.values.joined().allSatisfy { ["☕", "🍜", "🏆", "🔥", "⭐"].contains($0) })
+        #expect(a.people.trust.isEmpty && a.people.meters.isEmpty && a.people.dotted.isEmpty && a.people.vacancies.isEmpty)
     }
 
     @Test func syntheticTrafficShapeAndDeterminism() {

@@ -371,7 +371,9 @@ public final class MapController {
             + cachedPeople.dotted.filter { livingIds.contains($0.from) && livingIds.contains($0.to) }
         let meetings = Meetings.detect(agents: agents, pack: pack, sprints: snapshot.work.openSprints)
         return MapInputs(agents: agents, pack: pack, currentItems: currentItems, blockers: blockers, vacancies: vacancies,
-                         dotted: dotted, meetings: meetings, people: Self.cleaned(cachedPeople))
+                         dotted: dotted, meetings: meetings, people: Self.cleaned(cachedPeople),
+                         itemPhases: Self.itemPhases(snapshot.work, newest: newest),
+                         reviewing: Self.reviewing(snapshot.work, living: livingIds), openAsks: snapshot.work.inbox.count)
     }
 
     /// The provider's strings through `MapText.clean` (trust label and title, meter line, perks); vacancies travel

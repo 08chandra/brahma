@@ -104,6 +104,8 @@ public enum VisualKind: Hashable, Sendable {
     case promotion(from: String, to: String)
     case meetingStart(String)
     case meetingEnd(String)
+    /// The agent's item moved to another phase (Plan 4c): the office's mail-room parcel; the org chart draws nothing.
+    case phaseChange(from: MapItemPhase, to: MapItemPhase)
 }
 
 /// One animation the scene plays: `start` and `duration` are in map time (seconds).

@@ -1,4 +1,5 @@
 import Foundation
+import BrahmaCore
 
 /// The office easter egg (Plan 4c, spec §4): the unlock routes feed `OfficeUnlock` on map time; the unlock is the owner's,
 /// stored in `defaults` under `officeUnlockedKey`, and a synthetic (demo) controller may unlock too (same owner; it still
@@ -30,5 +31,24 @@ extension MapController {
     public func officeOtherClick() {
         guard !officeUnlocked else { return }
         officeUnlock.otherClick()
+    }
+
+    // MARK: Item facets (spec §6.2)
+
+    /// Owner id → the phase of that owner's newest active item (`newest`, as `inputs(for:)` picks it).
+    static func itemPhases(_ work: WorkSnapshot, newest: [String: WorkItem]) -> [String: MapItemPhase] {
+        newest.mapValues { MapItemPhase.of(status: $0.status, mergeState: $0.mergeState, run: work.latestRuns[$0.id]?.status) }
+    }
+
+    /// The reviewers of items in review whose owner and reviewer are both `living`. (`DottedLinks.reviewers` cannot serve:
+    /// it includes items in progress and carries no status.)
+    static func reviewing(_ work: WorkSnapshot, living: Set<String>) -> Set<String> {
+        var ids = Set<String>()
+        for item in work.items where item.status == .inReview {
+            guard let owner = item.ownerId, let reviewer = item.reviewerId, living.contains(owner), living.contains(reviewer)
+            else { continue }
+            ids.insert(reviewer)
+        }
+        return ids
     }
 }

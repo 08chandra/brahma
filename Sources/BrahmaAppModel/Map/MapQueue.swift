@@ -23,7 +23,7 @@ public struct MapThrottle: Equatable, Sendable {
         case .message: 0.9
         case .handoff: 1.4
         case .broadcast: 0.6
-        case .stateChange: 0.2
+        case .stateChange, .phaseChange: 0.2
         case .hire: 0.4
         case .leave: 1.5
         case .reorg: 0.4
@@ -39,7 +39,7 @@ public struct MapThrottle: Equatable, Sendable {
         case .hire: 1
         case .reorg: 2
         case .promotion: 3
-        case .stateChange: 4
+        case .stateChange, .phaseChange: 4
         case .meetingStart, .meetingEnd: 5
         case .handoff: 6
         case .message: 7

@@ -488,4 +488,156 @@ import Foundation
         #expect(capped[0].participantIds.count == 12)
         #expect(capped[0].participantIds.first == "a-mgr-1")
     }
+
+    // MARK: - Office: item phases and activity (Plan 4c)
+
+    @Test func phaseOfItemFacets() {
+        let rows: [(WorkItemStatus, MergeState, VerificationStatus?, MapItemPhase)] = [
+            (.inProgress, .none, nil, .working),
+            (.inReview, .none, nil, .inReview),
+            (.inProgress, .pending, nil, .merging),
+            (.inReview, .none, .running, .checking),
+            (.inProgress, .none, .passed, .passed),
+            (.inProgress, .none, .timedOut, .failed),
+            // Precedence: a merge beats a running check; a queued check beats review; review beats an old result.
+            (.inReview, .verifying, .running, .merging),
+            (.inReview, .none, .queued, .checking),
+            (.inReview, .none, .failed, .inReview),
+            (.inProgress, .none, .failed, .failed),
+            (.inProgress, .none, .error, .failed),
+            (.inProgress, .none, .inconclusive, .working),
+        ]
+        for (status, merge, run, want) in rows {
+            #expect(MapItemPhase.of(status: status, mergeState: merge, run: run) == want, "\(status) \(merge) \(String(describing: run))")
+        }
+        #expect([MapItemPhase.working, .inReview].allSatisfy { !$0.isShipping })
+        #expect([MapItemPhase.checking, .merging, .passed, .failed].allSatisfy { $0.isShipping })
+    }
+
+    @Test func activityTable() {
+        typealias Row = (state: AgentState, paused: Bool, owner: Bool, reviewing: Bool, meeting: String?, want: OfficeActivity)
+        let rows: [Row] = [
+            (.running, false, false, false, nil, .typing),
+            (.running, false, false, true, nil, .reviewing),
+            (.ready, false, false, true, nil, .reviewing),
+            (.running, false, false, false, "m1", .meeting("m1")),
+            (.ready, false, false, false, "m1", .meeting("m1")),
+            (.running, false, false, true, "m1", .meeting("m1")),
+            (.blocked, false, true, false, nil, .waitingOnOwner),
+            (.blocked, false, false, false, nil, .blocked),
+            (.blocked, false, false, true, "m1", .blocked),
+            (.ready, false, false, false, nil, .idle),
+            (.sleeping, false, false, false, nil, .away),
+            (.sleeping, false, false, true, "m1", .away),
+            (.running, true, false, false, nil, .away),
+            (.ready, true, false, true, nil, .away),
+            (.blocked, true, true, false, nil, .away),
+            (.killed, false, false, false, nil, .gone),
+            (.killed, true, true, true, "m1", .gone),
+        ]
+        for r in rows {
+            let got = OfficeActivity.of(state: r.state, paused: r.paused, waitingOnOwner: r.owner, reviewing: r.reviewing,
+                                        meetingId: r.meeting)
+            #expect(got == r.want, "\(r)")
+        }
+    }
+
+    @Test func reviewerOfInReviewItemIsReviewing() throws {
+        var a = base
+        let ids = a.indices.filter { a[$0].managerId == "a-mgr-1" }
+        let owner = a[ids[0]].id, reviewer = a[ids[1]].id, sleeper = a[ids[2]].id
+        a[ids[0]].state = .running
+        a[ids[1]].state = .running
+        a[ids[2]].state = .sleeping
+        var m = MapModel()
+        var i = inputs(a)
+        i.itemPhases = [owner: .inReview]
+        i.reviewing = [reviewer, sleeper, "a-not-here"]
+        m.apply(i, now: t0)
+        #expect(m.agents[reviewer]?.activity == .reviewing)
+        #expect(m.agents[owner]?.activity == .typing)
+        #expect(m.agents[sleeper]?.activity == .away)
+        #expect(m.agents["a-not-here"] == nil)
+        #expect(m.agents["a-mgr-1"]?.activity == .idle)
+    }
+
+    @Test func ownerBlockerIsWaitingOnOwner() throws {
+        var a = base
+        let ids = a.indices.filter { a[$0].managerId == "a-mgr-1" }
+        a[ids[0]].state = .blocked; a[ids[0]].blocker = .owner(reason: "pick a tier")
+        a[ids[1]].state = .blocked; a[ids[1]].blocker = .agent(a[ids[2]].id)
+        var m = MapModel()
+        m.apply(inputs(a), now: t0)
+        let waiting = try #require(m.agents[a[ids[0]].id])
+        #expect(waiting.waitingOnOwner)
+        #expect(waiting.activity == .waitingOnOwner)
+        let blocked = try #require(m.agents[a[ids[1]].id])
+        #expect(!blocked.waitingOnOwner)
+        #expect(blocked.activity == .blocked)
+        #expect(m.agents[a[ids[2]].id]?.waitingOnOwner == false)
+    }
+
+    @Test func meetingParticipantIsInTheFirstMeeting() throws {
+        var a = base
+        let team = a.indices.filter { a[$0].team == "team-1" }.map { a[$0].id }
+        for i in a.indices where team.contains(a[i].id) { a[i].state = .running }
+        let b = Meeting(id: "b", kind: .other, title: "B", participantIds: [team[0], team[1]])
+        let c = Meeting(id: "a", kind: .other, title: "A", participantIds: [team[1], team[2]])
+        var m = MapModel()
+        m.apply(inputs(a, meetings: [b, c]), now: t0)
+        #expect(m.agents[team[0]]?.activity == .meeting("b"))
+        #expect(m.agents[team[1]]?.activity == .meeting("a"), "meetings sorted by id: the first that lists the agent")
+        #expect(m.agents[team[2]]?.activity == .meeting("a"))
+    }
+
+    @Test func shippingFromPhase() throws {
+        let a = base
+        var m = MapModel()
+        var i = inputs(a)
+        i.itemPhases = [a[3].id: .merging, a[4].id: .working, a[5].id: .inReview, a[6].id: .failed]
+        m.apply(i, now: t0)
+        #expect(m.agents[a[3].id]?.shipping == .merging)
+        #expect(m.agents[a[4].id]?.shipping == nil)
+        #expect(m.agents[a[5].id]?.shipping == nil)
+        #expect(m.agents[a[6].id]?.shipping == .failed)
+        #expect(m.agents[a[7].id]?.shipping == nil)
+        #expect(m.phase(agentId: a[3].id) == .merging)
+        #expect(m.phase(agentId: a[7].id) == nil)
+        #expect(m.phase(agentId: "a-not-here") == nil)
+    }
+
+    @Test func phaseChangeEmitsEvent() throws {
+        let a = base
+        let id = a[3].id, other = a[4].id
+        var m = MapModel()
+        var i = inputs(a)
+        i.itemPhases = [id: .working]
+        m.apply(i, now: t0)
+        i.itemPhases = [id: .checking]
+        m.apply(i, now: t0 + 1)
+        #expect(kinds(m) == [.phaseChange(from: .working, to: .checking)])
+        #expect(m.pending.first?.from == .agent(id))
+        // Absent counts as working: no event for working ↔ absent; an item appearing in a later phase is a change.
+        i.itemPhases = [id: .checking, other: .working]
+        m.apply(i, now: t0 + 2)
+        #expect(m.pendingCount == 1)
+        i.itemPhases = [other: .merging]
+        m.apply(i, now: t0 + 3)
+        #expect(m.pendingCount == 3)
+        let later = m.pending.dropFirst().map { "\($0.kind) \($0.from)" }.sorted()
+        #expect(later == ["\(VisualKind.phaseChange(from: .checking, to: .working)) \(MapEndpoint.agent(id))",
+                          "\(VisualKind.phaseChange(from: .working, to: .merging)) \(MapEndpoint.agent(other))"].sorted())
+    }
+
+    @Test func openAsksClamped() {
+        var m = MapModel()
+        #expect(m.openAsks == 0)
+        var i = inputs(base)
+        i.openAsks = -3
+        m.apply(i, now: t0)
+        #expect(m.openAsks == 0)
+        i.openAsks = 12
+        m.apply(i, now: t0 + 1)
+        #expect(m.openAsks == 12)
+    }
 }

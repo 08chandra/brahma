@@ -16,8 +16,8 @@ public struct SplitMix64: RandomNumberGenerator, Sendable {
     }
 }
 
-/// A deterministic demo company for the map: the 3a generator's org with seeded states, items, blockers, vacancies and one
-/// sprint meeting. Nothing here touches a store.
+/// A deterministic demo company for the map: the 3a generator's org with seeded states, items, blockers, vacancies, one
+/// sprint meeting and (Plan 4c) item phases, reviewers, perks and open asks. Nothing here touches a store.
 public enum SyntheticCompany {
     static let epoch = Date(timeIntervalSince1970: 1_799_971_200)
 
@@ -26,10 +26,14 @@ public enum SyntheticCompany {
                              "Cut the release branch", "Triage inbound bugs", "Design the empty state", "Harden the upload path"]
     static let ownerReasons = ["approve the launch budget", "pick a pricing tier", "confirm the vendor contract",
                                "sign off on the release plan", "choose between the two designs"]
+    static let perkGlyphs = ["☕", "🍜", "🏆", "🔥", "⭐"]
+    /// The demo's asks waiting for the owner.
+    static let openAsks = 3
 
     public static func make(agents n: Int, seed: UInt64 = 42, companyId: String = "demo")
         -> (agents: [Agent], pack: IndustryPack, vacancies: [Vacancy], meetings: [Meeting], currentItems: [String: String],
-            blockers: [String: String]) {
+            blockers: [String: String], itemPhases: [String: MapItemPhase], reviewing: Set<String>, people: MapPeople,
+            openAsks: Int) {
         let pack = SoftwarePack.pack
         let count = Swift.min(OrgGenerator.range.upperBound, Swift.max(OrgGenerator.range.lowerBound, n))
         let plan = try! OrgGenerator.generate(goal: "", count: count, pack: pack)
@@ -114,7 +118,47 @@ public enum SyntheticCompany {
             meetings.append(Meeting(id: "sprint-1", kind: .sprintPlanning, title: "SPRINT 1 PLANNING",
                                     participantIds: Array(ids.prefix(8))))
         }
-        return (agents, pack, vacancies, meetings, items, blockers)
+        let office = officeFacets(agents: agents, items: items, seed: seed)
+        return (agents, pack, vacancies, meetings, items, blockers, office.phases, office.reviewing, office.people, openAsks)
+    }
+
+    /// The office's facets, on their own generator so the rest of the company is the same as before 4c: every running agent
+    /// with an item gets a phase (60 % working, 15 % in review, 10 % checking, 10 % merging, 5 % failed, by the seeded
+    /// shuffle); each item in review gets one living teammate of its owner as reviewer (a running or ready one when there
+    /// is one, so the review room fills); living agents numbering 10 % of the company get one or two perks.
+    static func officeFacets(agents: [Agent], items: [String: String], seed: UInt64)
+        -> (phases: [String: MapItemPhase], reviewing: Set<String>, people: MapPeople) {
+        var rng = SplitMix64(seed: seed ^ 0x0FF1_CE00_0FF1_CE00)
+        var withItem = agents.filter { $0.state == .running && items[$0.id] != nil }.map(\.id)
+        withItem.shuffle(using: &rng)
+        let n = Double(withItem.count)
+        let shares: [(MapItemPhase, Double)] = [(.inReview, 0.15), (.checking, 0.10), (.merging, 0.10), (.failed, 0.05)]
+        let quota = shares.map { ($0.0, Int((n * $0.1).rounded())) }
+        var phases: [String: MapItemPhase] = [:]
+        var cursor = 0
+        for (phase, k) in quota {
+            for id in withItem[cursor..<Swift.min(withItem.count, cursor + k)] { phases[id] = phase }
+            cursor = Swift.min(withItem.count, cursor + k)
+        }
+        for id in withItem[cursor...] { phases[id] = .working }
+
+        var reviewing = Set<String>()
+        for a in agents where phases[a.id] == .inReview {
+            guard let team = a.team, !team.isEmpty else { continue }
+            let mates = agents.filter { $0.id != a.id && $0.team == team && $0.state != .killed }
+            let present = mates.filter { $0.state == .running || $0.state == .ready }
+            if let r = (present.isEmpty ? mates : present).randomElement(using: &rng) { reviewing.insert(r.id) }
+        }
+
+        var living = agents.filter { $0.state != .killed }.map(\.id)
+        living.shuffle(using: &rng)
+        var perks: [String: [String]] = [:]
+        for id in living.prefix(Int((Double(agents.count) * 0.1).rounded())) {
+            var glyphs = perkGlyphs
+            glyphs.shuffle(using: &rng)
+            perks[id] = Array(glyphs.prefix(Int.random(in: 1...2, using: &rng)))
+        }
+        return (phases, reviewing, MapPeople(perks: perks))
     }
 }
 
