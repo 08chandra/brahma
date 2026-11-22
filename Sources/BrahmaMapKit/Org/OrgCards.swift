@@ -51,6 +51,23 @@ final class OrgCardNode: SKNode {
     private var vacancyHasNote = false
     /// The previous status bar of a card that stays running, carried over so its pulse keeps its phase.
     private var reusableBar: SKSpriteNode?
+    /// Reduce Motion (spec §5.6): no running-bar pulse and no trust-chip pop. Turning it on stops both at once; turning
+    /// it off starts the pulse of a running card again.
+    var reduceMotion = false {
+        didSet {
+            guard reduceMotion != oldValue else { return }
+            if reduceMotion {
+                statusBar.removeAction(forKey: Self.pulseKey)
+                statusBar.alpha = 1
+                if let chip = details.childNode(withName: "trustChipGroup") {
+                    chip.removeAction(forKey: Self.chipPopKey)
+                    chip.setScale(1)
+                }
+            } else if case .agent(let agent, _)? = content, Self.displayState(agent) == .running {
+                startPulse()
+            }
+        }
+    }
 
     override init() {
         super.init()
@@ -135,14 +152,7 @@ final class OrgCardNode: SKNode {
         statusBar = kept ?? rect(ThemeHex.status(agent.state, paused: agent.paused), 3, h - 2, at: CGPoint(x: -w / 2 + 2.5, y: 0))
         statusBar.name = "statusBar"
         addChild(statusBar)
-        if state == .running, kept == nil {
-            let pulse = SKAction.sequence([
-                .fadeAlpha(to: 0.6, duration: 0.5),
-                .fadeAlpha(to: 1.0, duration: 0.5),
-            ])
-            pulse.timingMode = .easeInEaseOut
-            statusBar.run(.repeatForever(pulse), withKey: Self.pulseKey)
-        }
+        if state == .running, kept == nil { startPulse() }
         if state == .killed { alpha = 0.4 }
         addChild(details)
         addChild(itemLine)
@@ -262,9 +272,20 @@ final class OrgCardNode: SKNode {
         run(.group([grow, .fadeIn(withDuration: Self.hireDuration)]), withKey: Self.hireKey)
     }
 
-    /// A promotion: the chip (already showing the new label and tier color) pops from 1.4× to 1×.
+    /// The running status bar's 1 Hz pulse; none under Reduce Motion.
+    private func startPulse() {
+        guard !reduceMotion, statusBar.action(forKey: Self.pulseKey) == nil else { return }
+        let pulse = SKAction.sequence([
+            .fadeAlpha(to: 0.6, duration: 0.5),
+            .fadeAlpha(to: 1.0, duration: 0.5),
+        ])
+        pulse.timingMode = .easeInEaseOut
+        statusBar.run(.repeatForever(pulse), withKey: Self.pulseKey)
+    }
+
+    /// A promotion: the chip (already showing the new label and tier color) pops from 1.4× to 1×. Not under Reduce Motion.
     func popTrustChip() {
-        guard let chip = details.childNode(withName: "trustChipGroup") else { return }
+        guard !reduceMotion, let chip = details.childNode(withName: "trustChipGroup") else { return }
         chip.removeAction(forKey: Self.chipPopKey)
         chip.setScale(1.4)
         let settle = SKAction.scale(to: 1, duration: Self.chipPopDuration)

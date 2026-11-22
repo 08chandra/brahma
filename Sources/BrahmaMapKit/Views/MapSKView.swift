@@ -74,8 +74,17 @@ public struct HoverThrottle: Sendable {
 /// The SpriteKit view of a map: drag to pan, scroll or pinch to zoom (about the cursor), hover and click hit tests (hover
 /// at 30 Hz), double click, and the right-click menu. It knows no scene type: hits come from the scene's `MapInteractive`
 /// conformance, the menu from `controller.actions(for:)`. Everything it finds goes out through closures.
+///
+/// Accessibility (spec §5.6): a `MapAccessible` scene's items become VoiceOver children (at most `accessibilityLimit`,
+/// rebuilt at most every `accessibilityInterval`); any other scene keeps the superclass's answer. The system's Reduce
+/// Motion reaches every `MapMotionReducible` scene the view presents, and follows the setting when it changes.
 @MainActor
 public final class MapSKView: SKView {
+    /// At most this many VoiceOver elements.
+    public static let accessibilityLimit = 300
+    /// The elements are rebuilt at most this often (when the scene's `accessibilityRevision` moved).
+    public static let accessibilityInterval: TimeInterval = 1
+
     public weak var controller: MapController?
 
     /// A click on a hit, with the scene point it landed on. A click on empty chart is not reported.
@@ -100,13 +109,104 @@ public final class MapSKView: SKView {
     /// Pointer travel below this is a click, not a drag.
     private static let dragSlop: CGFloat = 3
 
+    /// Tests: forces Reduce Motion on or off. Nil reads the system setting.
+    public var reduceMotionOverride: Bool? {
+        didSet { applyReduceMotion() }
+    }
+    /// The clock the element rebuilds are rated by (tests replace it).
+    var accessibilityClock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    private var accessibilityCache: AccessibilityCache?
+
+    /// The elements built for a scene (held weakly: a new scene at the same address is not the same scene).
+    private struct AccessibilityCache {
+        weak var scene: SKScene?
+        var revision: Int
+        var builtAt: TimeInterval
+        var elements: [MapAccessibilityElement]
+    }
+
     public override init(frame: CGRect) {
         super.init(frame: frame)
+        // A selector observer is dropped by the centre when the view goes away.
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displayOptionsChanged),
+                                                          name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+                                                          object: nil)
     }
 
     public required init?(coder: NSCoder) { fatalError("MapSKView is built in code") }
 
     private var interactive: MapInteractive? { scene as? MapInteractive }
+
+    // MARK: Reduce Motion
+
+    /// The override, else the system setting.
+    var shouldReduceMotion: Bool {
+        reduceMotionOverride ?? NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    public override func presentScene(_ scene: SKScene?) {
+        (scene as? MapMotionReducible)?.reduceMotion = shouldReduceMotion
+        super.presentScene(scene)
+    }
+
+    public override func presentScene(_ scene: SKScene, transition: SKTransition) {
+        (scene as? MapMotionReducible)?.reduceMotion = shouldReduceMotion
+        super.presentScene(scene, transition: transition)
+    }
+
+    @objc private func displayOptionsChanged() { applyReduceMotion() }
+
+    private func applyReduceMotion() {
+        (scene as? MapMotionReducible)?.reduceMotion = shouldReduceMotion
+    }
+
+    // MARK: Accessibility
+
+    /// The map itself is a container, never an element.
+    public override func isAccessibilityElement() -> Bool { false }
+
+    /// The scene's items as elements when it is `MapAccessible`; else whatever `SKView` answers (the org chart's frozen
+    /// inventory).
+    public override func accessibilityChildren() -> [Any]? {
+        guard let scene, let source = scene as? MapAccessible else { return super.accessibilityChildren() }
+        return accessibilityElements(scene: scene, source: source)
+    }
+
+    /// The cached elements, rebuilt when the scene changed, or when its revision moved and the last build is at least
+    /// `accessibilityInterval` old. An element whose item is still there is kept (updated in place), so VoiceOver keeps
+    /// its place.
+    private func accessibilityElements(scene: SKScene, source: MapAccessible) -> [MapAccessibilityElement] {
+        let now = accessibilityClock()
+        let same = accessibilityCache?.scene === scene
+        if same, let cache = accessibilityCache,
+           cache.revision == source.accessibilityRevision || now - cache.builtAt < Self.accessibilityInterval {
+            return cache.elements
+        }
+        var old: [String: MapAccessibilityElement] = [:]
+        if same, let cache = accessibilityCache {
+            for element in cache.elements { old[element.item.id] = element }
+        }
+        let elements = source.accessibilityItems(limit: Self.accessibilityLimit).map { item in
+            if let element = old[item.id] {
+                element.update(item)
+                return element
+            }
+            return MapAccessibilityElement(item: item, view: self)
+        }
+        accessibilityCache = AccessibilityCache(scene: scene, revision: source.accessibilityRevision, builtAt: now,
+                                                elements: elements)
+        return elements
+    }
+
+    /// A scene rect as the camera shows it now, in screen coordinates; zero while no scene is shown here.
+    func screenRect(sceneRect r: CGRect) -> CGRect {
+        guard let scene, scene.view === self else { return .zero }
+        let a = scene.convertPoint(toView: CGPoint(x: r.minX, y: r.minY))
+        let b = scene.convertPoint(toView: CGPoint(x: r.maxX, y: r.maxY))
+        let local = CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(b.x - a.x), height: abs(b.y - a.y))
+        guard let window else { return local }
+        return window.convertToScreen(convert(local, to: nil))
+    }
 
     // MARK: Tracking
 
@@ -259,3 +359,4 @@ private final class ActionMenuItem: NSMenuItem {
 }
 
 extension OrgScene: MapInteractive {}
+extension OrgScene: MapMotionReducible {}

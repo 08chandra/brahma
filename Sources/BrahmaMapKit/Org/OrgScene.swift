@@ -63,6 +63,15 @@ public final class OrgScene: SKScene {
     private var resolvedDotted: [DottedKind: [Pair]] = [:]
     private var textLevel = Level.items
     public private(set) var contentBounds = CGRect.zero
+    /// Reduce Motion (spec §5.6): the running bars stop pulsing and promotions do not pop the trust chip. The other card
+    /// animations and the particles are unchanged.
+    public var reduceMotion = false {
+        didSet {
+            guard reduceMotion != oldValue else { return }
+            for node in cards.values { node.reduceMotion = reduceMotion }
+            for node in stubs.values { node.reduceMotion = reduceMotion }
+        }
+    }
 
     private enum Level: Int { case blank, text, items }
 
@@ -283,6 +292,7 @@ public final class OrgScene: SKScene {
     private func place(_ key: String, content: OrgCardNode.Content, at point: CGPoint, in nodes: inout [String: OrgCardNode],
                        moved: inout Bool, zoom: Double) {
         if let node = nodes[key] {
+            node.reduceMotion = reduceMotion
             node.configure(content, zoom: zoom)
             if targets[key] != point {
                 moved = true
@@ -294,6 +304,7 @@ public final class OrgScene: SKScene {
             }
         } else {
             let node = pool.popLast() ?? OrgCardNode()
+            node.reduceMotion = reduceMotion
             node.configure(content, zoom: zoom)
             node.position = point
             targets[key] = point

@@ -105,6 +105,20 @@ public final class OfficeScene: SKScene, MapScene {
     private var driver: MapController?
     private var timeBase: TimeInterval?
 
+    /// Bumped when what VoiceOver hears may have changed (`MapAccessible`).
+    public private(set) var accessibilityRevision = 0
+    /// Bumped whenever `layout` is replaced.
+    private var layoutVersion = 0
+    private var accessibilityKey: AccessibilityKey?
+
+    /// Everything `accessibilityItems` reads: the structure, the layout, the agents and the open asks.
+    private struct AccessibilityKey: Equatable {
+        var structure: Int
+        var layout: Int
+        var agents: [String: MapAgent]
+        var openAsks: Int
+    }
+
     // MARK: Init
 
     public override init(size: CGSize) {
@@ -232,6 +246,7 @@ public final class OfficeScene: SKScene, MapScene {
             builtRevision = model.structureRevision
             if !hasLayout || next != layout {
                 layout = next
+                layoutVersion += 1
                 hasLayout = true
                 motion.layoutChanged()
                 rebuildFloor()
@@ -246,6 +261,12 @@ public final class OfficeScene: SKScene, MapScene {
         let counts = rebuildFigures(model)
         updateRooms(model, waiting: counts.waiting, inReview: counts.inReview, replaying: replaying)
         contentBounds = CGRect(x: 0, y: -layout.size.h, width: layout.size.w, height: layout.size.h)
+        let key = AccessibilityKey(structure: model.structureRevision, layout: layoutVersion, agents: model.agents,
+                                   openAsks: model.openAsks)
+        if key != accessibilityKey {
+            accessibilityKey = key
+            accessibilityRevision += 1
+        }
     }
 
     /// An agent as a replay shows it: its state only (item phases are not in the timeline), so no review room, meeting
@@ -588,4 +609,41 @@ public final class OfficeScene: SKScene, MapScene {
     var fameGlyphs: [String] { rooms["room:break"]?.fame ?? [] }
     var roomNodeCount: Int { rooms.count }
     var deskCount: Int { desks.count }
+}
+
+// MARK: - Accessibility (spec §5.6)
+
+extension OfficeScene: MapAccessible, MapMotionReducible {
+    /// The rooms VoiceOver reads by name besides the board room (a click on them hits nothing, so they are not pressed).
+    static let spokenRooms = [("room:review", "Review room"), ("room:break", "Break room"), ("room:mail", "Mail room")]
+
+    /// The rooms first (so the cap never drops them): the board room with its open asks, then the review, break and mail
+    /// rooms by name; then one item per desk in tree order: `"<handle>, <role>, <state>"` and `", <item>"` when the agent
+    /// has one (the hover card's cleaned fields), or `"Open seat, <role title>"`. Frames are the layout's rects (a gliding
+    /// desk's final one); a desk and the board room press what a click on them hits.
+    public func accessibilityItems(limit: Int) -> [MapAccessibilityItem] {
+        guard limit > 0, let model = builtModel else { return [] }
+        var items: [MapAccessibilityItem] = []
+        if let frame = roomRect("room:board") {
+            items.append(MapAccessibilityItem(id: "room:board", label: "Board room, owner, \(model.openAsks) open asks",
+                                              frame: frame, hit: .owner))
+        }
+        for (id, name) in Self.spokenRooms {
+            guard let frame = roomRect(id) else { continue }
+            items.append(MapAccessibilityItem(id: id, label: name, frame: frame, hit: nil))
+        }
+        let vacancies = Dictionary(model.vacancies.map { ("vacancy:" + $0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for id in model.tree.order where items.count < limit {
+            guard let desk = layout.desks[id] else { continue }
+            let frame = Self.sceneRect(desk.rect)
+            if let seat = vacancies[id] {
+                items.append(MapAccessibilityItem(id: id, label: "Open seat, " + seat.roleTitle, frame: frame,
+                                                  hit: .vacancy(seat.id)))
+            } else if let card = model.hoverCard(agentId: id) {
+                let label = "\(card.handle), \(card.role), \(card.stateLabel)" + (card.item.map { ", " + $0 } ?? "")
+                items.append(MapAccessibilityItem(id: id, label: label, frame: frame, hit: .agent(id)))
+            }
+        }
+        return Array(items.prefix(limit))
+    }
 }
