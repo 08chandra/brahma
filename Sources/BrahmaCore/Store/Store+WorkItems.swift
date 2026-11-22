@@ -164,8 +164,9 @@ extension Store {
         if draft.intensity != .auto,
            let d = WorkPolicy.intensityDenial(draft.intensity, actor: actor.id, actorKind: actor.kind) { throw WorkError.forbidden(d) }
 
-        let number = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM workItem WHERE companyId = ?",
-                                       arguments: [companyId])) ?? 1
+        // Ruling 50: from the company's item counter, never a number a removed item had.
+        let number = try Store.nextRefNumber(db: db, companyId: companyId, kind: .item, floor: try Int.fetchOne(db, sql:
+            "SELECT COALESCE(MAX(number), 0) FROM workItem WHERE companyId = ?", arguments: [companyId]) ?? 0)
         var item = WorkItem(
             id: UUID().uuidString, companyId: companyId, number: number, key: "\(Self.keyPrefix(slug: company.slug))-\(number)",
             type: draft.type, title: title, description: description, acceptanceCriteria: criteria, checkSpec: checkSpec,

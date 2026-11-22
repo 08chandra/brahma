@@ -321,7 +321,8 @@ extension Store {
         let rows = try Int.fetchOne(db, sql: "SELECT MAX(number) FROM artifact WHERE companyId = ?", arguments: [companyId]) ?? 0
         let refs = try String.fetchAll(db, sql: "SELECT ref FROM memoryDoc WHERE companyId = ? AND source = ?",
                                        arguments: [companyId, MemorySource.artifact.rawValue])
-        return max(rows, refs.compactMap(Artifact.parseRef).max() ?? 0) + 1
+        // Ruling 50: from the company's counter, with those as its floor.
+        return try Store.nextRefNumber(db: db, companyId: companyId, kind: .artifact, floor: max(rows, refs.compactMap(Artifact.parseRef).max() ?? 0))
     }
 
     /// The resolved source: the workspace's real path, the source's, and the parts between them.

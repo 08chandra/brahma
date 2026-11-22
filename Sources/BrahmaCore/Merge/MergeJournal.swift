@@ -111,7 +111,8 @@ extension Store {
 
     /// Writes the batch's row in the claim's own transaction (`claimMergeBatch`).
     static func insertMergeBatch(_ db: Database, id: String, companyId: String, requests: [MergeRequest], now: Date) throws {
-        let number = (try Int.fetchOne(db, sql: "SELECT MAX(number) FROM mergeBatch WHERE companyId = ?", arguments: [companyId]) ?? 0) + 1
+        let number = try Store.nextRefNumber(db: db, companyId: companyId, kind: .mergeBatch, floor: try Int.fetchOne(db, sql:
+            "SELECT MAX(number) FROM mergeBatch WHERE companyId = ?", arguments: [companyId]) ?? 0)
         try MergeBatch(id: id, companyId: companyId, number: number, requestIds: requests.map(\.id), startedAt: now).insert(db)
     }
 

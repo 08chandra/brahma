@@ -1847,6 +1847,33 @@ enum Migrations {
             }
             try db.create(index: "gateRequest_pending", on: "gateRequest", columns: ["status", "createdAt"])
         }
+        m.registerMigration("vC-ref-numbers") { db in
+            // C3b fix round 3. Ruling 50: per-company counters every ref number comes from (never decremented, never reused).
+            // Ruling 51: a share in progress leases what it made, so no sweep takes it while the lease is live. Ruling 52: a
+            // gate request names the size and SHA-256 of the bytes its caller will use.
+            try db.create(table: "refCounter") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("kind", .text).notNull()
+                t.column("last", .integer).notNull()
+                t.primaryKey(["companyId", "kind"])
+            }
+            try db.create(table: "shareLease") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("expiresAt", .datetime).notNull()
+            }
+            try db.create(table: "shareLeaseItem") { t in
+                t.column("leaseId", .text).notNull().references("shareLease", onDelete: .cascade)
+                t.column("companyId", .text).notNull()
+                t.column("kind", .text).notNull()              // resource|snapshot|shareRef
+                t.column("ref", .text).notNull()
+            }
+            try db.create(index: "shareLeaseItem_ref", on: "shareLeaseItem", columns: ["companyId", "kind", "ref"])
+            try db.alter(table: "gateRequest") { t in
+                t.add(column: "expectedSize", .integer)
+                t.add(column: "expectedSha256", .text)
+            }
+        }
     }
 }
 

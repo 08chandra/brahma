@@ -103,6 +103,10 @@ extension Store {
         // 2. Access.
         let r = try resolveDetailed(ref, reader: reader, companyId: companyId, messageRefId: nil)
         guard r.resolved.visibility == .full, let subject = r.subject, let company = r.company else {
+            // Ruling 50: the owner is told a handed-out F-number's file was removed (never shown another file under it).
+            if reader == .owner, ref.kind == .resource, let n = Int(ref.id), try resourceRemoved(companyId: companyId, number: n) {
+                return OpenRefResult(text: Self.removedText, tainted: false, canonical: canonical, materializedPath: nil)
+            }
             throw WorkError.notFound(Self.refUnavailable)
         }
         if r.resolved.state == .purged {

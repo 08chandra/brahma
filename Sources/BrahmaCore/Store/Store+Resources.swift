@@ -123,10 +123,16 @@ extension Store {
 
         // 4. The rows as planned (numbers, trust, kinds), and the announcement they make: everyone that exact text reaches
         //    (the context's recipients and every @handle in it) must read the drop in full, checked before anything is copied.
-        let dbMax = try writer.read { db in
-            try Int.fetchOne(db, sql: "SELECT MAX(number) FROM resource WHERE companyId = ?", arguments: [companyId]) ?? 0
+        // Ruling 50: the drop's numbers, previewed from the company's counter (never one a removed resource had); they are taken
+        // in the rows' transaction (step 6), which refuses if another add took them meanwhile.
+        let vaultHighest = try contentVault.highestNumber(companyId: companyId)
+        let numberFloor = try writer.read { db in
+            max(vaultHighest, try Int.fetchOne(db, sql: "SELECT MAX(number) FROM resource WHERE companyId = ?", arguments: [companyId]) ?? 0)
         }
-        var next = max(dbMax, try contentVault.highestNumber(companyId: companyId)) + 1
+        let firstNumber = try writer.read { db in
+            try Store.peekRefNumber(db: db, companyId: companyId, kind: .resource, floor: numberFloor)
+        }
+        var next = firstNumber
         func trust(_ provenance: Provenance, _ tainted: Bool, _ reason: String?) -> (String, Bool, String?, Date?) {
             switch drop.trust {
             case .vouched: (Provenance.owner.raw, false, nil, now)
@@ -229,6 +235,9 @@ extension Store {
         }
         do {
             try writer.write { db in
+                let taken = try Store.nextRefNumber(db: db, companyId: companyId, kind: .resource, floor: max(numberFloor, try Int.fetchOne(db, sql:
+                    "SELECT MAX(number) FROM resource WHERE companyId = ?", arguments: [companyId]) ?? 0), count: rows.count)
+                guard taken == firstNumber else { throw ResourceError.conflict("another add took these numbers meanwhile; add the files again") }
                 for r in rows { try r.insert(db) }
                 for r in rows { try ingestResource(db: db, r, text: texts[r.number], now: now) }
                 let label = try Self.scopeLabel(db: db, resolved.scope, companyId: companyId)
@@ -312,12 +321,12 @@ extension Store {
         let refsOnly = Self.refsOnly(drop)
         // Everyone the announcement reaches must read the link: checked on that exact text before anything is written.
         try writer.read { db in
-            link.number = try highest(db) + 1
+            link.number = try Store.peekRefNumber(db: db, companyId: companyId, kind: .resource, floor: try highest(db))
             let preview = Self.announcement(rows: [link], folder: nil, message: drop.message, refsOnly: refsOnly)
             try checkRecipients(db: db, companyId: companyId, drop: drop, resolved: resolved, announcement: preview)
         }
         try writer.write { db in
-            link.number = try highest(db) + 1
+            link.number = try Store.nextRefNumber(db: db, companyId: companyId, kind: .resource, floor: try highest(db))
             try link.insert(db)
             try ingestResource(db: db, link, text: nil, now: now)
             let label = try Self.scopeLabel(db: db, resolved.scope, companyId: companyId)

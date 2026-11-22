@@ -200,8 +200,9 @@ public struct MemoryEntry: Codable, Equatable, Sendable, FetchableRecord, Persis
         StableHash.fnv1a64(Store.flattened(fact.precomposedStringWithCanonicalMapping.lowercased()))
     }
 
-    /// The next free number in the company (in the caller's write transaction).
+    /// The next number in the company (in the caller's write transaction), from the company's counter (Ruling 50).
     static func nextNumber(db: Database, companyId: String) throws -> Int {
-        (try Int.fetchOne(db, sql: "SELECT MAX(number) FROM memoryEntry WHERE companyId = ?", arguments: [companyId]) ?? 0) + 1
+        try Store.nextRefNumber(db: db, companyId: companyId, kind: .memory, floor: try Int.fetchOne(db, sql:
+            "SELECT MAX(number) FROM memoryEntry WHERE companyId = ?", arguments: [companyId]) ?? 0)
     }
 }

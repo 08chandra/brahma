@@ -39,7 +39,10 @@ public struct EngineGateResult: Equatable, Sendable {
 
 /// What asks the engine to gate a ref (`QueuedRefGate` in `brahma mcp`).
 public protocol RefGateBroker: Sendable {
-    func gate(companyId: String, agentId: String, ref: WorkRef, purpose: GatePurpose) throws -> EngineGateResult
+    /// `expected`: the size and SHA-256 of the bytes the caller will act on (Ruling 52): the engine gates exactly those, or
+    /// refuses.
+    func gate(companyId: String, agentId: String, ref: WorkRef, purpose: GatePurpose,
+              expected: (size: Int, sha256: String)) throws -> EngineGateResult
 }
 
 /// The archive reader of a turn's MCP server: it never runs a helper. Every helper call throws `NeedsEngineGate`, which the
@@ -75,8 +78,9 @@ public struct QueuedRefGate: RefGateBroker {
         self.store = store; self.turnId = turnId; self.timeout = timeout
     }
 
-    public func gate(companyId: String, agentId: String, ref: WorkRef, purpose: GatePurpose) throws -> EngineGateResult {
-        let id = try enqueue(companyId: companyId, agentId: agentId, ref: ref, purpose: purpose)
+    public func gate(companyId: String, agentId: String, ref: WorkRef, purpose: GatePurpose,
+                     expected: (size: Int, sha256: String)) throws -> EngineGateResult {
+        let id = try enqueue(companyId: companyId, agentId: agentId, ref: ref, purpose: purpose, expected: expected)
         defer { try? store.writer.write { db in try db.execute(sql: "DELETE FROM gateRequest WHERE id = ?", arguments: [id]) } }
         // Awake time: a Mac asleep while the engine works is not the engine failing to answer.
         let deadline = AwakeTime.deadline(after: timeout)
@@ -108,17 +112,18 @@ public struct QueuedRefGate: RefGateBroker {
         }
     }
 
-    /// Writes the request: the ref as JSON, the purpose, the agent, the turn. Returns its id.
-    func enqueue(companyId: String, agentId: String, ref: WorkRef, purpose: GatePurpose) throws -> String {
+    /// Writes the request: the ref as JSON, the purpose, the agent, the turn, and the size and SHA-256 of the caller's bytes
+    /// (never the bytes). Returns its id.
+    func enqueue(companyId: String, agentId: String, ref: WorkRef, purpose: GatePurpose, expected: (size: Int, sha256: String)) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let json = String(decoding: try encoder.encode(ref), as: UTF8.self)
         let id = UUID().uuidString
         try store.writer.write { db in
             try db.execute(sql: """
-                INSERT INTO gateRequest (id, companyId, agentId, turnId, purpose, ref, status, createdAt)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-                """, arguments: [id, companyId, agentId, turnId, purpose.rawValue, json, Store.now()])
+                INSERT INTO gateRequest (id, companyId, agentId, turnId, purpose, ref, status, createdAt, expectedSize, expectedSha256)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                """, arguments: [id, companyId, agentId, turnId, purpose.rawValue, json, Store.now(), expected.size, expected.sha256])
         }
         return id
     }
@@ -144,12 +149,13 @@ extension Store {
         }
         guard let engine = archives as? EngineGateArchives else { return try local(archives) }
         guard case .agent(let agentId) = reader else { throw WorkError.notFound(Self.refUnavailable) }
+        let expected = (size: data.count, sha256: SHA256.hex(data))
         if Self.needsHelper(data, ext: ext) {
-            let r = try engine.broker.gate(companyId: companyId, agentId: agentId, ref: ref, purpose: purpose)
+            let r = try engine.broker.gate(companyId: companyId, agentId: agentId, ref: ref, purpose: purpose, expected: expected)
             return (r.data, r.ext, r.verdict)
         }
         do { return try local(engine) } catch is NeedsEngineGate {
-            let r = try engine.broker.gate(companyId: companyId, agentId: agentId, ref: ref, purpose: purpose)
+            let r = try engine.broker.gate(companyId: companyId, agentId: agentId, ref: ref, purpose: purpose, expected: expected)
             return (r.data, r.ext, r.verdict)
         }
     }
@@ -208,8 +214,12 @@ extension Store {
                       let ref = try? JSONDecoder().decode(WorkRef.self, from: Data((row["ref"] as String).utf8)) else {
                     throw WorkError.notFound(Self.refUnavailable)
                 }
+                // Ruling 52: the request names the bytes its caller will use; none named is refused.
+                guard let size: Int = row["expectedSize"], let sha: String = row["expectedSha256"] else {
+                    throw WorkError.notFound(Self.refUnavailable)
+                }
                 let r = try engineGate(companyId: companyId, agentId: agentId, ref: ref, purpose: purpose, archives: archives(companyId),
-                                       knownValues: try knownValues(companyId), paths: paths)
+                                       knownValues: try knownValues(companyId), paths: paths, expected: (size, sha))
                 outcome = ("done", nil, r.data, r.ext, Self.encodeVerdict(r.verdict))
             } catch let e as WorkError {
                 outcome = ("refused", e.message, nil, nil, nil)
@@ -230,7 +240,8 @@ extension Store {
     /// One request: the ref resolved for the agent (anything but `.full` is the generic text), its bytes read as the tool's
     /// read point reads them, then gated (and for `.render`, extracted).
     func engineGate(companyId: String, agentId: String, ref: WorkRef, purpose: GatePurpose, archives: any ArchiveReader,
-                    knownValues: [(name: String, value: String)], paths: BrahmaPaths) throws -> EngineGateResult {
+                    knownValues: [(name: String, value: String)], paths: BrahmaPaths,
+                    expected: (size: Int, sha256: String)) throws -> EngineGateResult {
         let reader = Reader.agent(agentId)
         let r = try resolveDetailed(ref, reader: reader, companyId: companyId, messageRefId: nil)
         guard r.resolved.visibility == .full, let subject = r.subject, let company = r.company, r.resolved.state != .purged else {
@@ -238,8 +249,8 @@ extension Store {
         }
         let content: Content
         do {
-            content = try readContent(r, subject: subject, company: company, paths: paths, whole: purpose != .check && purpose != .render,
-                                      knownValues: knownValues)
+            // Ruling 52: always the whole content (within the global caps), never a shown prefix or a metadata stand-in.
+            content = try readContent(r, subject: subject, company: company, paths: paths, whole: true, knownValues: knownValues)
         } catch let e as WorkError {
             throw e
         } catch {
@@ -252,6 +263,11 @@ extension Store {
         default: canonical = ref.canonical
         }
         let data = content.data, ext = content.ext
+        // Ruling 52: exactly the bytes the caller will act on, or nothing: a verdict is never given for other bytes.
+        guard data.count == expected.size, SHA256.hex(data) == expected.sha256 else {
+            throw WorkError.invalid("\(SecretGate.shown(ref.canonical, knownValues: knownValues)) changed while it was being checked for "
+                                    + "secrets, or couldn't be read whole; open or share it again")
+        }
         let gated: (data: Data, ext: String, verdict: ScanVerdict)
         if purpose.strict || SecretGate.isFlattenTarget(data, ext: ext) {
             let g = try gatedBytes(data, ext: ext, canonical: canonical, companyId: companyId, archives: archives, knownValues: knownValues,

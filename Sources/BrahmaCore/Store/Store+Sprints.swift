@@ -111,8 +111,8 @@ extension Store {
             if try !Store.hasApproved(db: db, companyId: companyId, kind: .prd) { missing.append("PRD") }
             if try !Store.hasApproved(db: db, companyId: companyId, kind: .architecture) { missing.append("Architecture") }
 
-            let number = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM sprint WHERE companyId = ?",
-                                           arguments: [companyId])) ?? 1
+            let number = try Store.nextRefNumber(db: db, companyId: companyId, kind: .sprint, floor: try Int.fetchOne(db, sql:
+                "SELECT COALESCE(MAX(number), 0) FROM sprint WHERE companyId = ?", arguments: [companyId]) ?? 0)
             var sprint = Sprint(id: UUID().uuidString, companyId: companyId, number: number, team: team, goal: cleanGoal, cadence: kind,
                                 status: .pendingApproval,
                                 milestoneItemId: milestone.flatMap { m in items.first { $0.key == m }?.id },

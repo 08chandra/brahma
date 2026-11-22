@@ -126,7 +126,7 @@ extension Store {
             return current
         }
         try Self.cancelQueuedMerges(db: db, itemId: item.id, now: now)
-        let number = (try Int.fetchOne(db, sql: "SELECT MAX(number) FROM mergeRequest WHERE companyId = ?", arguments: [item.companyId]) ?? 0) + 1
+        let number = try Store.nextMergeRequestNumber(db: db, companyId: item.companyId)
         var request = MergeRequest(companyId: item.companyId, itemId: item.id, number: number, headCommit: commit,
                                    checkRevision: item.verifiedRevision, enqueuedAt: now)
         if !secretFindings.isEmpty {
@@ -214,7 +214,7 @@ extension Store {
         try writer.write { db in
             guard var item = try WorkItem.fetchOne(db, key: current.id), item.status == .inReview, item.mergeState == .pending,
                   let commit = item.verifiedCommit else { return }
-            let number = (try Int.fetchOne(db, sql: "SELECT MAX(number) FROM mergeRequest WHERE companyId = ?", arguments: [item.companyId]) ?? 0) + 1
+            let number = try Store.nextMergeRequestNumber(db: db, companyId: item.companyId)
             var request = MergeRequest(companyId: item.companyId, itemId: item.id, number: number, status: .failed, headCommit: commit,
                                        checkRevision: item.verifiedRevision, enqueuedAt: now)
             request.failure = .engineError

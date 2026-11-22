@@ -287,7 +287,8 @@ private struct TimerWorld {
         #expect(names.contains("backup.hourly") && names.contains("digest.daily"))
         w.clock.advance(3601)
         try await w.cycle()                        // the no-op system jobs run without logging anything
-        #expect(try w.errors(c.id).isEmpty)
+        let errors = try w.errors(c.id).map { $0.text }
+        #expect(errors.isEmpty, "\(errors)")
         #expect(try w.timer("backup.hourly", in: nil).lastFiredAt == w.clock.now)
     }
 

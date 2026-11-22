@@ -151,9 +151,12 @@ import GRDB
         let gate = QueuedRefGate(store: w.store, turnId: w.turnId, timeout: .seconds(30))
         let engineReader = Recording(members: ["notes.txt": Data("hello".utf8)])
         // What the tool writes: the ref (as JSON), the purpose, the turn and the agent; no bytes.
-        let id = try gate.enqueue(companyId: w.cf.c.id, agentId: w.fx.eng1.id, ref: try w.fx.ref("F-60"), purpose: .check)
+        let clean = try w.zip(["notes.txt": "hello"])
+        let id = try gate.enqueue(companyId: w.cf.c.id, agentId: w.fx.eng1.id, ref: try w.fx.ref("F-60"), purpose: .check,
+                                  expected: (clean.count, SHA256.hex(clean)))
         let row = try #require(try w.store.writer.read { db in try Row.fetchOne(db, sql: "SELECT * FROM gateRequest WHERE id = ?", arguments: [id]) })
         #expect(row["turnId"] == w.turnId && row["status"] == "pending" && (row["result"] as Data?) == nil)
+        #expect(row["expectedSize"] == clean.count && row["expectedSha256"] == SHA256.hex(clean))
         #expect((row["ref"] as String).contains("\"kind\":\"resource\""))
         // The turn ends: the engine answers no request of it.
         try w.store.writer.write { db in
@@ -162,11 +165,19 @@ import GRDB
         _ = try w.store.serveGateRequests(archives: { _ in engineReader }, knownValues: { _ in [] }, paths: w.cf.paths, now: Store.now())
         let after = try #require(try w.store.writer.read { db in try Row.fetchOne(db, sql: "SELECT * FROM gateRequest WHERE id = ?", arguments: [id]) })
         #expect(after["status"] == "refused" && engineReader.calls == 0)
-        // A ref the agent can't read is never read by the engine for it.
-        let lab = try gate.enqueue(companyId: w.cf.c.id, agentId: w.fx.qa2.id, ref: try w.fx.ref(".brahma/labs/eng-1/mine.txt"), purpose: .check)
+        // N2-4: a live turn of qa-2 asks about a ref qa-2 can't read in full: refused by the engine's own resolution and read
+        // check (the credential is live), with nothing read and nothing returned.
+        if try w.store.agent(id: w.fx.qa2.id)?.state != .ready { _ = try w.store.transition(agentId: w.fx.qa2.id, to: .ready) }
+        let (_, qaTurn) = try #require(try w.store.beginTurn(agentId: w.fx.qa2.id, now: Store.now()))
+        _ = try w.store.issueTurnCredential(turnId: qaTurn.id)
+        let qaGate = QueuedRefGate(store: w.store, turnId: qaTurn.id, timeout: .seconds(30))
+        let lab = try qaGate.enqueue(companyId: w.cf.c.id, agentId: w.fx.qa2.id, ref: try w.fx.ref(".brahma/labs/eng-1/mine.txt"), purpose: .check,
+                                     expected: (8, SHA256.hex(Data("eng lab\n".utf8))))
+        #expect(try w.store.turnCredentialIsLive(turnId: qaTurn.id, companyId: w.cf.c.id, agentId: w.fx.qa2.id))
         _ = try w.store.serveGateRequests(archives: { _ in engineReader }, knownValues: { _ in [] }, paths: w.cf.paths, now: Store.now())
         let refused = try #require(try w.store.writer.read { db in try Row.fetchOne(db, sql: "SELECT * FROM gateRequest WHERE id = ?", arguments: [lab]) })
         #expect(refused["status"] == "refused" && (refused["result"] as Data?) == nil)
+        #expect(refused["message"] == Store.refUnavailable && engineReader.calls == 0)
     }
 
     @Test func noEngineAnswerRefuses() throws {
@@ -184,6 +195,30 @@ import GRDB
         #expect(try w.tools(timeout: .milliseconds(300)).call(name: "share", arguments: [
             "refs": .array([.string("src/a.ts")]), "to": .string("@qa-2"),
         ]).hasPrefix("Shared src/a.ts"))
+    }
+
+    /// Ruling 52: the engine gates exactly the bytes its caller acts on. A secret past the shown-read limit (2 MB) of a file
+    /// the caller reads whole is caught; a request whose bytes don't match what the engine reads is refused.
+    @Test func engineGatesTheWholeBytesAskedAbout() throws {
+        let w = try W()
+        let padding = String(repeating: "a", count: SafeGit.maxTextBytes + 1024)
+        let member = padding + "\nSTRIPE=\(SecretGateTests.value)\n"
+        let big = try w.zip(["big.txt": member])
+        #expect(big.count > SafeGit.maxTextBytes)
+        try w.cf.addResource(64, name: "big.zip", ext: "zip", bytes: big)
+        let engineReader = Recording(members: ["big.txt": Data(member.utf8)])
+        let engine = Engine(store: w.store, paths: w.cf.paths, archives: engineReader)
+        defer { engine.stop() }
+        let refused = try #require(w.refusal { try w.tools().call(name: "share", arguments: ["refs": .array([.string("F-64")]), "to": .string("@qa-2")]) })
+        #expect(refused.contains("contains a stored secret"), "\(refused)")
+        // A request naming other bytes than the engine reads: refused, never a verdict.
+        let gate = QueuedRefGate(store: w.store, turnId: w.turnId, timeout: .seconds(30))
+        let wrong = Data("not the file".utf8)
+        let message = w.refusal {
+            try gate.gate(companyId: w.cf.c.id, agentId: w.fx.eng1.id, ref: try w.fx.ref("F-64"), purpose: .check,
+                          expected: (wrong.count, SHA256.hex(wrong)))
+        }
+        #expect(message?.contains("changed while it was being checked") == true, "\(message ?? "")")
     }
 
     /// `brahma mcp` passes the engine gate, never a helper of its own.

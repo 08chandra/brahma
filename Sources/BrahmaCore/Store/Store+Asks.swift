@@ -311,7 +311,7 @@ extension Store {
                                        detailsLimit: kind == .humanTask ? HumanTaskPolicy.maxDetails : Store.maxAskText)
 
         let active = try Store.activeNow(db: db, companyId: companyId)
-        let number = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM ask WHERE companyId = ?", arguments: [companyId])) ?? 1
+        let number = try Store.nextAskNumber(db: db, companyId: companyId)
         var ask = Ask(id: UUID().uuidString, companyId: companyId, number: number, kind: kind, category: cat,
                       risk: risk ?? .defaultFor(kind), requesterId: requester.id, itemId: itemId, title: cleanTitle,
                       summary: cleanSummary, payload: body, detailsHash: hash, status: .pendingInternal, createdActive: active,
@@ -416,7 +416,7 @@ extension Store {
                 throw WorkError.invalid("expires_in_hours must be between 0 and \(Int(Store.maxExpiryHours))")
             }
             let active = try Store.activeNow(db: db, companyId: companyId)
-            let number = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM ask WHERE companyId = ?", arguments: [companyId])) ?? 1
+            let number = try Store.nextAskNumber(db: db, companyId: companyId)
             var ask = Ask(id: UUID().uuidString, companyId: companyId, number: number, kind: .info, risk: .low,
                           requesterId: requester.id, title: cleanTitle, summary: q, payload: body, status: .pendingOwner,
                           createdActive: active, statusSinceActive: active, createdAt: now, updatedAt: now, requestId: rid)

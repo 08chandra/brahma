@@ -7,6 +7,7 @@ public enum ShareLimits {
     public static let noteMax = 600
     /// How long a share copy may stand with no share message pointing at it before a tick sweeps it.
     public static let orphanGrace: TimeInterval = 600
+    public static let leaseExpiry: TimeInterval = 1800
 }
 
 /// Where a message that names a ref is, for one reader (`Store.backlinks`): the message id and an engine-written title, or
@@ -169,8 +170,11 @@ extension Store {
     private func postRefs(companyId: String, by agentId: String, refs: [String], target: ShareTarget, text: String, kind: MessageKind,
                           replyTo: String?, context: RefContext, knownValues: [(name: String, value: String)], paths: BrahmaPaths,
                           now: Date, archives: any ArchiveReader) throws -> (result: PostResult, prepared: [PreparedRef]) {
+        // Ruling 51: what this share makes is leased until it ends (however it ends), so no sweep takes it meanwhile.
+        let lease = try beginShareLease(companyId: companyId, now: Store.now())
+        defer { endShareLease(lease) }
         let prepared = try prepareRefs(companyId: companyId, agentId: agentId, refs: refs, target: target, replyTo: replyTo,
-                                       context: context, knownValues: knownValues, paths: paths, now: now, archives: archives)
+                                       context: context, knownValues: knownValues, paths: paths, now: now, archives: archives, lease: lease)
         let router = MessageRouter(store: self)
         do {
             // N-1: inside the cleanup, so a failure here removes what the preparation made.
@@ -220,7 +224,7 @@ extension Store {
     /// Steps 1–5 of a share for `refs` (see `share`). Throws the share's refusals (`WorkError`, `RouterError`, `ThreadError`).
     func prepareRefs(companyId: String, agentId: String, refs: [String], target: ShareTarget, replyTo: String?, context: RefContext,
                      knownValues: [(name: String, value: String)], paths: BrahmaPaths, now: Date,
-                     archives: any ArchiveReader) throws -> [PreparedRef] {
+                     archives: any ArchiveReader, lease: String? = nil) throws -> [PreparedRef] {
         // The sender, the target and its recipients (agent ids, at share time), and `replyTo` checked before anything is made.
         let (sender, recipients, recipientHandle) = try writer.read { db -> (Agent, [String], String?) in
             guard let sender = try Agent.fetchOne(db, key: agentId), sender.companyId == companyId, sender.state != .killed else {
@@ -342,6 +346,10 @@ extension Store {
         //    a later step fails; an engine failure is the generic text (fix round 1, I-3).
         var prepared: [PreparedRef] = []
         var made: [ShareArtifact] = []
+        /// Ruling 51: puts what the share made under its lease (a lease that can't be recorded fails the share: fail closed).
+        func hold(_ artifact: ShareArtifact) throws {
+            if let lease { try leaseShareArtifact(lease, companyId: companyId, artifact) }
+        }
         do {
             for (i, c) in candidates.enumerated() {
                 do {
@@ -352,10 +360,12 @@ extension Store {
                                                          readers: recipients + [agentId], knownValues: knownValues, paths: paths,
                                                          now: Store.now(), archives: archives)   // M-2: stamped when made
                         if let n = Int(pinned.id) { created.append(.resource(n)) }
+                        for a in created { try hold(a) }
                     } else {
                         // Ruling 49: recorded before the pin, so a pin that fails after writing it still has its share ref
                         // removed (deleting one that was never written is harmless).
                         made.append(.shareRef(c.rowId))
+                        try hold(.shareRef(c.rowId))
                         do {
                             pinned = try pinRef(c.ref, for: reader, companyId: companyId, messageRefId: c.rowId, knownValues: knownValues,
                                                 paths: paths, archives: archives)
@@ -365,6 +375,7 @@ extension Store {
                         }
                         if pinned.kind == .resource, c.ref.kind != .resource, let n = Int(pinned.id) { created.append(.resource(n)) }
                         if let snapshot = pinned.params["snapshot"], c.ref.params["snapshot"] == nil { created.append(.snapshot(snapshot)) }
+                        for a in created { try hold(a) }
                         made += created
                         created = []
                         if [.file, .diff, .commit].contains(pinned.kind), !pinned.isWorktree, pinned.params["share"] == nil,
@@ -648,14 +659,14 @@ extension Store {
             do {
                 switch artifact {
                 case .resource(let n):
-                    try discardShareCopy(companyId: companyId, number: n, vault: vault, onlyOrphan: onlyOrphans)
+                    try discardShareCopy(companyId: companyId, number: n, vault: vault, onlyOrphan: onlyOrphans, now: now)
                 case .snapshot(let id):
                     let path = try writer.write { db -> String? in
                         // M-2: the sweep re-checks, in the deleting transaction, that no row points at it.
                         if onlyOrphans, try Bool.fetchOne(db, sql: """
                             SELECT EXISTS(SELECT 1 FROM refSnapshot s JOIN messageRef m ON m.companyId = s.companyId AND m.id = s.cacheKey
                                           WHERE s.companyId = ? AND s.id = ?)
-                            """, arguments: [companyId, id]) == true { return nil }
+                            """, arguments: [companyId, id]) == true || Store.leased(db: db, companyId: companyId, artifact, now: now) { return nil }
                         let path = try String.fetchOne(db, sql: "SELECT vaultPath FROM refSnapshot WHERE companyId = ? AND id = ? AND kind = ?",
                                                        arguments: [companyId, id, RefSnapshot.worktreeDiff])
                         try db.execute(sql: "DELETE FROM refSnapshot WHERE companyId = ? AND id = ? AND kind = ?",
@@ -666,8 +677,9 @@ extension Store {
                 case .shareRef(let id):
                     guard let company = try company(id: companyId) else { continue }
                     if onlyOrphans, try writer.read({ db in
-                        try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM messageRef WHERE companyId = ? AND id = ?)", arguments: [companyId, id])
-                    }) == true { continue }
+                        try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM messageRef WHERE companyId = ? AND id = ?)", arguments: [companyId, id]) == true
+                            || Store.leased(db: db, companyId: companyId, artifact, now: now)
+                    }) { continue }
                     try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true)).deleteShareRef(id)
                 }
             } catch {
@@ -679,13 +691,14 @@ extension Store {
 
     /// Deletes a share copy `F-<number>` (only a row `addedVia = share`): its row and index doc in one transaction, then its
     /// vault file.
-    private func discardShareCopy(companyId: String, number: Int, vault: Vault, onlyOrphan: Bool) throws {
+    private func discardShareCopy(companyId: String, number: Int, vault: Vault, onlyOrphan: Bool, now: Date) throws {
         let path = try writer.write { db -> String? in
             guard let r = try Store.resource(db: db, companyId: companyId, number: number), r.addedVia == "share" else { return nil }
             // M-2: the sweep re-checks, in this transaction, that no share message points at it.
             if onlyOrphan, try Bool.fetchOne(db, sql: """
                 SELECT EXISTS(SELECT 1 FROM messageRef WHERE companyId = ? AND kind = 'resource' AND inline = 0 AND refId = ?)
-                """, arguments: [companyId, String(number)]) == true { return nil }
+                """, arguments: [companyId, String(number)]) == true
+                || Store.leased(db: db, companyId: companyId, .resource(number), now: now) { return nil }
             try db.execute(sql: "DELETE FROM memoryDoc WHERE companyId = ? AND source = ? AND sourceId = ?",
                            arguments: [companyId, MemorySource.resource.rawValue, r.id])
             try db.execute(sql: "DELETE FROM resource WHERE companyId = ? AND id = ?", arguments: [companyId, r.id])
@@ -702,6 +715,17 @@ extension Store {
     @discardableResult
     public func sweepShareOrphans(companyId: String, paths: BrahmaPaths, now: Date) throws -> Int {
         let cutoff = now.addingTimeInterval(-ShareLimits.orphanGrace)
+        // Ruling 51: a dead share's lease ends here; a live one keeps what it holds. Whether the company has ever shared (a share
+        // message, or a share's lease, a crashed one's included) is read first: a company that never shared has no share ref,
+        // and its repository is not touched.
+        let shared = try writer.write { db -> Bool in
+            let shared = try Bool.fetchOne(db, sql: """
+                SELECT EXISTS(SELECT 1 FROM messageRef WHERE companyId = ? AND inline = 0)
+                    OR EXISTS(SELECT 1 FROM shareLease WHERE companyId = ?)
+                """, arguments: [companyId, companyId]) ?? true
+            try db.execute(sql: "DELETE FROM shareLease WHERE companyId = ? AND expiresAt <= ?", arguments: [companyId, now])
+            return shared
+        }
         let (copies, snapshots) = try writer.read { db -> ([Int], [String]) in
             let copies = try Int.fetchAll(db, sql: """
                 SELECT r.number FROM resource r WHERE r.companyId = ? AND r.addedVia = 'share' AND r.createdAt < ?
@@ -717,7 +741,7 @@ extension Store {
         var artifacts = copies.map(ShareArtifact.resource) + snapshots.map(ShareArtifact.snapshot)
         // Ruling 49: share refs of the company's repository no `messageRef` row names, older than the grace (by the time their
         // id starts with; an id without one is taken as old).
-        if let company = try company(id: companyId) {
+        if shared, let company = try company(id: companyId) {
             let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
             let ids = try git.shareRefIds()
             let named = try writer.read { db in
@@ -728,6 +752,7 @@ extension Store {
                 artifacts.append(.shareRef(id))
             }
         }
+        artifacts = try writer.read { db in try artifacts.filter { try !Store.leased(db: db, companyId: companyId, $0, now: now) } }
         discardShareArtifacts(companyId: companyId, artifacts, paths: paths, now: now, onlyOrphans: true)
         return artifacts.count
     }

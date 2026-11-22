@@ -901,10 +901,12 @@ extension Store {
         let content = ContentVault(paths: paths)
         let vault = Vault(paths: paths, companyId: companyId, content: content)
         for _ in 0..<5 {
-            let dbMax = try writer.read { db in
-                try Int.fetchOne(db, sql: "SELECT MAX(number) FROM resource WHERE companyId = ?", arguments: [companyId]) ?? 0
+            // Ruling 50: from the company's counter, never a number a removed copy had (the rows and vault files its floor).
+            let vaultHighest = try content.highestNumber(companyId: companyId)
+            let number = try writer.write { db in
+                try Store.nextRefNumber(db: db, companyId: companyId, kind: .resource, floor: max(vaultHighest, try Int.fetchOne(db, sql:
+                    "SELECT MAX(number) FROM resource WHERE companyId = ?", arguments: [companyId]) ?? 0))
             }
-            let number = max(dbMax, try content.highestNumber(companyId: companyId)) + 1
             let written: (path: String, sha256: String)
             do { written = try vault.write(data, area: .resources, name: "F-\(number).\(ext)") } catch WorkError.conflict(_) { continue }
             let row = Resource(companyId: companyId, number: number, kind: .file, displayName: ResourceIntake.sanitizeName(fileName),

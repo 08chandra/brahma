@@ -435,8 +435,7 @@ extension Store {
         let functions = try gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: companyId)
             .treeHasDirectory(at: commit, path: "functions")
         let (number, previous) = try writer.read { db -> (Int, Release?) in
-            let n = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM release WHERE companyId = ?",
-                                      arguments: [companyId])) ?? 1
+            let n = try Store.peekRefNumber(db: db, companyId: companyId, kind: .release, floor: try Store.highestRelease(db, companyId))
             let prev = try Release.filter(Column("companyId") == companyId && Column("status") == ReleaseStatus.deployed.rawValue)
                 .order(Column("number").desc).fetchOne(db)
             return (n, prev)
@@ -455,8 +454,7 @@ extension Store {
         return try writer.write { db in
             // The slot again, in the write that takes it (a concurrent proposal, or a version taken meanwhile).
             try Self.checkReleaseSlot(db, companyId: companyId, version: version)
-            let latestNumber = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM release WHERE companyId = ?",
-                                                 arguments: [companyId])) ?? 1
+            let latestNumber = try Store.peekRefNumber(db: db, companyId: companyId, kind: .release, floor: try Store.highestRelease(db, companyId))
             let latest = try Company.fetchOne(db, key: companyId)
             guard latestNumber == number, latest?.mainCommit == commit else {
                 throw WorkError.conflict("main or the releases changed while proposing; propose again")
@@ -476,6 +474,8 @@ extension Store {
                                   payload: AskPayload(proposal: proposal), document: nil, itemId: nil, subjectId: release.id,
                                   supersedes: nil, requestId: nil, decisionClass: .taste, viaOwner: true, now: now)
             release.askId = ask.id
+            // Ruling 50: the number previewed above is taken from the counter now (it is still the next one: checked above).
+            _ = try Store.nextRefNumber(db: db, companyId: companyId, kind: .release, floor: try Store.highestRelease(db, companyId))
             try release.insert(db)
             let agentName = try Agent.fetchOne(db, key: agentId)?.name ?? "agent"
             try ActivityEvent(companyId: companyId, agentId: agentId, turnId: nil, kind: .release,

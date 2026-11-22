@@ -217,8 +217,8 @@ extension Store {
             if sprint == nil { sprint = try Sprint.filter(open && Column("team") == nil).order(Column("number").desc).fetchOne(db) }
             if let sprint { sprintId = sprint.id } else { expires = active + GrantResolver.noSprintTTL }
         }
-        let number = try Int.fetchOne(db, sql: #"SELECT COALESCE(MAX(number), 0) + 1 FROM "grant" WHERE companyId = ?"#,
-                                      arguments: [ask.companyId]) ?? 1
+        let number = try Store.nextRefNumber(db: db, companyId: ask.companyId, kind: .grant, floor: try Int.fetchOne(db, sql:
+            #"SELECT COALESCE(MAX(number), 0) FROM "grant" WHERE companyId = ?"#, arguments: [ask.companyId]) ?? 0)
         let grant = Grant(id: UUID().uuidString, companyId: ask.companyId, number: number, askId: ask.id, kind: approval.kind,
                           value: approval.value, scope: scope, scopeRef: scopeRef, requesterId: requester.id, duration: duration,
                           sprintId: sprintId, expiresActive: expires, usesLeft: scope == .once || duration == .turn ? 1 : nil,

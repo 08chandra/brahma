@@ -157,7 +157,7 @@ extension Store {
             if try MergeRequest.filter(Column("itemId") == item.id && Self.openStatuses.contains(Column("status"))).fetchCount(db) > 0 {
                 throw WorkError.conflict("\(item.key) already has a merge in the queue")
             }
-            let number = (try Int.fetchOne(db, sql: "SELECT MAX(number) FROM mergeRequest WHERE companyId = ?", arguments: [request.companyId]) ?? 0) + 1
+            let number = try Store.nextMergeRequestNumber(db: db, companyId: request.companyId)
             // The same approval: a fresh request pinned to the verified commit and check revision.
             var fresh = MergeRequest(companyId: request.companyId, itemId: item.id, number: number, headCommit: item.verifiedCommit ?? request.headCommit,
                                      checkRevision: item.verifiedRevision ?? request.checkRevision, enqueuedAt: now)

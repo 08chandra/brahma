@@ -188,7 +188,8 @@ public enum ExtensionLibrary {
             // Insert-only (B-I1): the shared row keeps its first fetch facts; each company's view lives on its own row at approve.
             if try ExtensionPackage.fetchOne(db, key: treeHash) == nil { try package.insert(db) }
             // The review page is named after the ask it belongs to, so the number is taken inside the write.
-            let number = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM ask WHERE companyId = ?", arguments: [companyId])) ?? 1
+            // (Ruling 50: the number `propose` takes from the ask counter below, previewed; checked equal after it.)
+            let number = try Store.peekAskNumber(db: db, companyId: companyId)
             _ = try EngineFiles.directory(workspace: workspace, reviewDir)
             _ = try EngineFiles.replace(Data(page.utf8), workspace: workspace, dir: reviewDir, name: "A-\(number).md")
             let document = try Store.readDocument("\(reviewDir)/A-\(number).md", workspace: company.workspacePath)

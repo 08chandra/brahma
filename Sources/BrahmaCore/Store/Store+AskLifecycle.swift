@@ -286,7 +286,7 @@ extension Store {
                                   && Column("status") == AskStatus.pendingOwner.rawValue && Column("subjectId") == key).fetchCount(db)
         guard open == 0 else { return }
         let active = try Store.activeNow(db: db, companyId: company.id)
-        let number = (try Int.fetchOne(db, sql: "SELECT COALESCE(MAX(number), 0) + 1 FROM ask WHERE companyId = ?", arguments: [company.id])) ?? 1
+        let number = try Store.nextAskNumber(db: db, companyId: company.id)
         let summary = Store.stripControls(text, keepNewlines: true)
         var ask = Ask(id: UUID().uuidString, companyId: company.id, number: number, kind: .engineAlert, risk: .defaultFor(.engineAlert),
                       requesterId: "system", title: Store.flat(text, max: Store.maxAskTitle), summary: summary, status: .pendingOwner,
