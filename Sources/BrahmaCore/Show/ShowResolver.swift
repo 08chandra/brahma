@@ -24,7 +24,7 @@ public struct ShowResult: Equatable, Sendable {
     public var normalized: String
     public var stripped: String
     public var filters: SearchFilters
-    /// Nil until C4b.
+    /// C4b: the engine-composed answer to a factual question (`FactsResolver`), shown above every hit but a direct ref.
     public var answer: FactAnswer?
     /// At most `ShowResolver.groupLimit` per group, TOP first.
     public var hits: [ShowHit]
@@ -46,9 +46,10 @@ public struct ShowResult: Equatable, Sendable {
     }
 }
 
-/// C4b answers factual questions with engine-composed lines (no LLM).
+/// C4b answers factual questions with engine-composed lines (no LLM). `query` is the normalized query (`ShowQuery`), filler
+/// kept; `gate` checks every final display string against the stored values (Rulings 53-56).
 public protocol FactsAnswering: Sendable {
-    func answer(_ stripped: String, filters: SearchFilters, companyId: String, reader: Reader, now: Date) throws -> FactAnswer?
+    func answer(_ query: String, filters: SearchFilters, companyId: String, reader: Reader, now: Date, gate: GlobalSearch.TextGate) throws -> FactAnswer?
 }
 
 /// A phrase of the design §2.2 table, before the resolver looks it up.
@@ -149,6 +150,10 @@ public enum ShowPhrases {
 /// Plan C Task C4a: the Show bar's engine side (design §2.2), no LLM. Order: normalize → direct refs (the whole query and
 /// each token; score 1.0, TOP) → facts (C4b) → phrases (0.95, TOP) → `SearchFilters.parse` → `GlobalSearch` (fuzzy, ≤ 0.95).
 /// Every hit is resolved for `reader`; the result never says what was dropped. Typing never starts a turn and writes nothing.
+///
+/// C4b: a fact answer (`FactsResolver` by default) makes the intent `.fact` and sits above everything except a direct ref:
+/// TOP then holds only direct refs, phrase hits go to their kind's group and no fuzzy hit is promoted (C6 renders TOP, then
+/// the answer, then the groups). The `search` tool's `kind` argument turns facts off.
 public struct ShowResolver: Sendable {
     public static let groupLimit = 5
     public static let maxQuery = ShowQuery.maxQuery
@@ -163,7 +168,13 @@ public struct ShowResolver: Sendable {
     let facts: (any FactsAnswering)?
     let memory: any MemorySearching
 
-    public init(store: Store, files: FileIndexCache, commits: CommitIndexCache, facts: (any FactsAnswering)? = nil) {
+    /// The engine's and the app's resolver: facts answered by `FactsResolver`.
+    public init(store: Store, files: FileIndexCache, commits: CommitIndexCache) {
+        self.init(store: store, files: files, commits: commits, facts: FactsResolver(store: store), memory: MemoryIndex(store: store))
+    }
+
+    /// `facts`: nil answers no fact.
+    public init(store: Store, files: FileIndexCache, commits: CommitIndexCache, facts: (any FactsAnswering)?) {
         self.init(store: store, files: files, commits: commits, facts: facts, memory: MemoryIndex(store: store))
     }
 
@@ -218,8 +229,9 @@ public struct ShowResolver: Sendable {
         }
         let wholeQueryRef = whole.first(where: \.whole).map(\.ref.canonical)
 
-        // Facts (C4b).
-        let answer = try facts?.answer(stripped, filters: filters, companyId: companyId, reader: reader, now: now)
+        // Facts (C4b), on the normalized query (filler kept: `who's on ENG-142`, `pending approvals`); none for a forced kind.
+        let answer = forced.kinds.isEmpty
+            ? try facts?.answer(normalized, filters: filters, companyId: companyId, reader: reader, now: now, gate: gate) : nil
 
         // Phrases.
         if let phrase = ShowPhrases.match(stripped, original: normalized) {
@@ -236,7 +248,10 @@ public struct ShowResolver: Sendable {
                 }
                 for hit in phraseHits where !seen.contains(hit.ref.canonical) {
                     seen.insert(hit.ref.canonical)
-                    top.append(hit)
+                    var h = hit
+                    // C4b: with an answer, only direct refs rank above it.
+                    if answer != nil { h.group = h.kind?.group ?? .top }
+                    top.append(h)
                 }
             }
         }
@@ -247,7 +262,7 @@ public struct ShowResolver: Sendable {
         var rows = top.sorted { $0.score > $1.score }
         let others = found.hits.filter { !seen.contains($0.ref.canonical) || $0.inlineOnly }
         var promoted: ShowHit? = nil
-        if !rows.contains(where: { $0.group == .top }), let best = others.max(by: { $0.score < $1.score }) {
+        if answer == nil, !rows.contains(where: { $0.group == .top }), let best = others.max(by: { $0.score < $1.score }) {
             promoted = best
             var b = best
             b.group = .top
@@ -269,6 +284,18 @@ public struct ShowResolver: Sendable {
         return ShowResult(normalized: normalized, stripped: stripped, filters: filters, answer: answer, hits: ordered, topScore: topScore,
                           intent: ShowIntent.classify(stripped: stripped, topScore: topScore, hasFact: answer != nil), groupTotals: totals,
                           incomplete: found.incomplete, notes: GlobalSearch.notes(filters))
+    }
+
+    // MARK: Facts (C4b)
+
+    /// The live answer `ref` opens (C6's OPENED slot): `fact:<query>` re-evaluated now (the owner's), `sprint:<n>` that
+    /// sprint's progress (any reader of the sprint). Nil for anything else or a reader the ref doesn't resolve `.full` for.
+    public func openFact(_ ref: WorkRef, companyId: String, reader: Reader, knownValues: [(name: String, value: String)]) async throws -> FactAnswer? {
+        let store = self.store
+        let gate = GlobalSearch.TextGate(knownValues: knownValues)
+        return try await GlobalSearch.blocking.tryRun {
+            try FactsResolver(store: store).answer(for: ref, companyId: companyId, reader: reader, now: Store.now(), gate: gate)
+        }
     }
 
     // MARK: Direct refs

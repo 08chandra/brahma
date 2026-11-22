@@ -194,6 +194,17 @@ extension Store {
         }
     }
 
+    /// Plan C Task C4b: what a `fact:<query>` or `sprint:<n>` ref reads, live: the answer (`FactsResolver.answer(for:)`)
+    /// evaluated now for `reader`, as `FactsResolver.lines` prints it (gated with `knownValues`), under its header; a query
+    /// that is no fact (or a reader it doesn't resolve for) reads the same text as an empty answer would.
+    func liveFactBody(_ ref: WorkRef, reader: Reader, companyId: String, knownValues: [(name: String, value: String)]) throws -> String {
+        let gate = GlobalSearch.TextGate(knownValues: knownValues)
+        guard let answer = try FactsResolver(store: self).answer(for: ref, companyId: companyId, reader: reader, now: Store.now(), gate: gate)
+        else { return "No answer." }
+        let (header, lines) = FactsResolver.lines(answer, tz: ownerTimeZone(), gate: gate)
+        return ([header] + lines).joined(separator: "\n")
+    }
+
     // MARK: Resolution
 
     /// A resolution with what `openRef` and `pinRef` read next: the subject (for `.full` only), the company and the reader's

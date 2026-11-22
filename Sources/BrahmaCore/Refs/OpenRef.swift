@@ -389,7 +389,10 @@ extension Store {
             let size = file.size
             return Content(body: .bytes(try file.readAll(), ext: ext), rev: nil,
                            makeCard: { _ in "[artifact \(a.ref) · \(title) · \(a.kind.rawValue) · \(ResourceText.size(Int64(size)))]" }, ext: ext)
-        case .preview, .release, .agent, .channel, .sprint, .fact:
+        case .sprint, .fact:
+            // C4b: the live answer, evaluated now for this reader (`liveFactBody`).
+            return metadata(try liveFactBody(ref, reader: r.resolved.reader, companyId: company.id, knownValues: knownValues))
+        case .preview, .release, .agent, .channel:
             // Their metadata is the content (the renderers are C6's).
             return metadata(r.resolved.subtitle)
         }

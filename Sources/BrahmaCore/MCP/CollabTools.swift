@@ -85,7 +85,8 @@ extension CompanyTools {
 
     /// `search {query, kind?, since?, by?, limit?}`: `ShowResolver` for this agent (never the owner's view), one line per hit
     /// `[<kind> <canonical> · <title> · <HH:mm or yyyy-mm-dd>]` with its snippet quoted on the next line (`    | `); nothing
-    /// found: `"Nothing found in what you can read."`. No count of what the agent can't read is ever printed.
+    /// found: `"Nothing found in what you can read."`. No count of what the agent can't read is ever printed. C4b: a fact
+    /// answer for the agent comes first (`FactsResolver.lines`).
     func searchTool(_ args: [String: JSONValue]) throws -> String {
         let query = try string(args, "query")
         var forced = SearchFilters()
@@ -149,6 +150,12 @@ extension CompanyTools {
             return gate.holdsSecret(out) ? nil : out
         }
         var lines: [String] = []
+        // C4b: a fact answer comes first (`Answer (<title>, as of HH:mm):`, then one line per fact line with its ref chips).
+        if let answer = result.answer {
+            let (header, body) = FactsResolver.lines(answer, tz: tz, gate: gate)
+            lines.append("Answer (\(header)):")
+            lines += body
+        }
         var printed = 0
         for hit in result.hits where !hit.inlineOnly && printed < limit {
             let kind = hit.kind?.rawValue ?? hit.ref.kind.rawValue
@@ -179,6 +186,7 @@ extension CompanyTools {
             }
             printed += 1
         }
+        // (An answer is itself what was found.)
         if lines.isEmpty { lines.append("Nothing found in what you can read.") }
         // Fix round 1 (I-3): what couldn't be searched in full is said, never dropped silently.
         for group in ShowGroup.allCases where result.incomplete.contains(group) {
