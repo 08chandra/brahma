@@ -185,7 +185,6 @@ final class MotionState {
     static let edgeInterval = 0.1
     /// Cards pick up content changes (states, items) at least this often even when the structure did not change.
     static let refreshInterval = 0.25
-    static let cameraEase = 0.3
 
     let particleLayer = SKNode()
     let glowLayer = SKNode()
@@ -222,36 +221,6 @@ final class MotionState {
     let ring = SKNode()
     var ringBars: [SKSpriteNode] = []
     var ringRect: CGRect?
-
-    // Camera.
-    var camera = CameraState()
-
-    struct CameraState {
-        struct Ease {
-            var start: TimeInterval
-            var from: CGPoint
-            var fromScale: CGFloat
-            /// A target agent is shown at least this big; nil follows the goal's own zoom (a fit).
-            var zoom: Double?
-        }
-
-        struct FitKey: Equatable {
-            var bounds: CGRect
-            var size: CGSize
-        }
-
-        var target: CameraTarget?
-        /// The controller's `cameraRequest` this scene has acted on.
-        var requestSeen = 0
-        var ease: Ease?
-        /// Following the chart's bounds: a fit target the owner has not panned or zoomed away from.
-        var autoFit = true
-        /// The owner is dragging or zooming: a followed card is no longer tracked until the next camera request.
-        var suspended = false
-        var snapNext = true
-        var fitKey: FitKey?
-        var lastControllerZoom: Double?
-    }
 }
 
 // MARK: - Live visuals
@@ -290,8 +259,9 @@ extension OrgScene {
         updateGlow(model: model, now: now)
         updateHulls(model: model)
         updateHighlight(controller: controller)
-        updateCamera(controller: controller, now: now)
-        syncZoom(controller: controller)
+        cameraDriver.update(controller: controller, now: now, targetRect: currentCardRect, contentBounds: contentBounds)
+        cameraDriver.syncZoom(controller: controller)
+        cameraMovedIfNeeded()
     }
 
     private static func isContentEvent(_ e: VisualEvent) -> Bool {
@@ -311,9 +281,7 @@ extension OrgScene {
 
     /// The owner dragged or zoomed: stop easing, stop tracking a followed card, stop refitting.
     public func userMovedCamera() {
-        motion.camera.ease = nil
-        motion.camera.autoFit = false
-        motion.camera.suspended = true
+        cameraDriver.userMoved()
     }
 
     private func resetMotion(for controller: MapController) {
@@ -334,7 +302,7 @@ extension OrgScene {
         m.hullSignature = nil
         m.ringRect = nil
         m.ring.isHidden = true
-        m.camera = MotionState.CameraState()
+        cameraDriver.reset()
         m.lastRebuild = -.infinity
         forceRebuild()
     }
