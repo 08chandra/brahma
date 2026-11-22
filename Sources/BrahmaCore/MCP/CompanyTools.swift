@@ -75,21 +75,28 @@ public struct CompanyTools: Sendable {
     /// (`brahma mcp`: `CompanyTools.liveArchives`, the sandboxed unzip reader with the PDF helper). Nil: none, so archives and
     /// PDFs are refused (fail closed).
     let archives: (any ArchiveReader)?
+    /// Plan C Task C4c: set for the concierge's server (`brahma mcp --agent concierge --show-request <id>`): exactly
+    /// `find_refs`, `search`, `open_ref` and `show`, read as `.concierge`, for this one request's live run.
+    let conciergeRequestId: String?
     let counter = TurnQuotaCounter()
 
     public init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
                 quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false, taintFlag: URL? = nil,
-                paths: BrahmaPaths? = nil, vault: (any SecretVault)? = nil, archives: (any ArchiveReader)? = nil) {
+                paths: BrahmaPaths? = nil, vault: (any SecretVault)? = nil, archives: (any ArchiveReader)? = nil,
+                conciergeRequestId: String? = nil) {
         self.init(store: store, companyId: companyId, agentId: agentId, reviewItemId: reviewItemId, auditTurnId: auditTurnId,
                   quotas: quotas, quotaTurnId: quotaTurnId, planTurn: planTurn, taintFlag: taintFlag, paths: paths, vault: vault,
-                  archives: archives, diagnostics: { line in FileHandle.standardError.write(Data((line + "\n").utf8)) })
+                  archives: archives, conciergeRequestId: conciergeRequestId,
+                  diagnostics: { line in FileHandle.standardError.write(Data((line + "\n").utf8)) })
     }
 
     init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
          quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false, taintFlag: URL? = nil,
          paths: BrahmaPaths? = nil, vault: (any SecretVault)? = nil, archives: (any ArchiveReader)? = nil,
-         diagnostics: @escaping @Sendable (String) -> Void) {
+         conciergeRequestId: String? = nil, diagnostics: @escaping @Sendable (String) -> Void) {
         self.store = store; self.companyId = companyId; self.agentId = agentId; self.diagnostics = diagnostics
+        // The concierge identity and the concierge's request go together (fail closed: neither alone serves anything of it).
+        self.conciergeRequestId = agentId == ConciergeCaps.agentId ? (conciergeRequestId ?? "") : nil
         self.paths = paths
         self.vault = vault
         self.archives = archives
@@ -103,7 +110,7 @@ public struct CompanyTools: Sendable {
 
     /// Tools that only read; they carry `readOnlyHint` and are never counted.
     static let readOnlyTools: Set<String> = ["read_channel", "list_channels", "list_agents", "list_work", "show_work_item",
-                                             "search_memory", "recall", "search_kb", "kb_read", "search"]
+                                             "search_memory", "recall", "search_kb", "kb_read", "search", "find_refs"]
     /// High-authority company tools (design §2.2): one call per turn when sub-agents are on, none on a plan turn, denied under
     /// taint (5-lite). `update_work_item` counts when it changes the spec or the assignee.
     /// Plan L's ops tools (`CompanyToolNames.ops`) count as high risk too; under taint they are refused by `TaintPolicy`
@@ -120,7 +127,7 @@ public struct CompanyTools: Sendable {
 
     func quotaKind(_ name: String, _ args: [String: JSONValue]) -> TurnQuotaCounter.Kind? {
         switch name {
-        case "post_message", "send_dm", "share": return .posts
+        case "post_message", "send_dm", "share", "show": return .posts
         case "create_work_item": return .items
         case "comment_work_item": return .comments
         case "update_work_item": return Set(args.keys).isSubset(of: Self.updateLowRiskFields) ? nil : .highRisk
@@ -178,6 +185,8 @@ public struct CompanyTools: Sendable {
 
     /// The same list for every role (a stable prompt prefix); `call` enforces what the caller's role may use.
     public func specs() -> [ToolSpec] {
+        // The concierge sees its four tools only (`CompanyToolNames.concierge` is served to no one else).
+        if conciergeRequestId != nil { return Self.conciergeSpecs() }
         let all = Self.allSpecs()
         // An audit turn sees the audit tool only (`audit` is listed only here).
         if auditTurnId != nil { return [Self.auditSpec()] }
@@ -194,6 +203,9 @@ public struct CompanyTools: Sendable {
     }
 
     private static let implemented: Set<String> = Set(allSpecs().map(\.name))
+
+    /// Every tool an agent's server lists (C4c's tool-schema budget reads them).
+    static func allToolSpecs() -> [ToolSpec] { allSpecs() }
 
     private static func baseSpecs() -> [ToolSpec] {
         let s = Self.self
@@ -235,6 +247,7 @@ public struct CompanyTools: Sendable {
 
     /// Runs a tool and returns its text result. Appends one `toolUse` event whether it succeeds or fails.
     public func call(name: String, arguments: [String: JSONValue]) throws -> String {
+        if let request = conciergeRequestId { return try callAsConcierge(name, arguments, request: request) }
         defer { logUse(name) }
         // Validate the caller on every call: it may have been killed or removed since the server started.
         guard let me = try? store.agent(id: agentId), me.companyId == companyId, me.state != .killed else {

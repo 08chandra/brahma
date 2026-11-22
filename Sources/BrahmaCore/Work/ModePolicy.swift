@@ -308,6 +308,8 @@ public struct ModeInputs: Equatable, Sendable {
     public var ultra: UltraAdmission? = nil
     /// Why an approved Ultra run was not admitted: recorded on the turn, which runs the computed non-Ultra rung.
     public var ultraRefusal: String? = nil
+    /// Plan C Task C4c: a `.show` turn whose every engine candidate is a ref the owner typed (or attached): it runs on Haiku.
+    public var showDirectRefsOnly = false
 
     public init() {}
 }
@@ -404,6 +406,13 @@ public enum ModePolicy {
             return decision(.quick, rung: .r0, model: pin ?? "haiku", effort: .low, i: i, reasons: reasons)
         case .review, .audit:
             return review(i, pin: pin, small: small)
+        case .show:
+            // Plan C Task C4c: an owner's show request (`ShowTurnCaps`): Sonnet, Haiku when every candidate is a direct ref; an
+            // owner pin wins.
+            let m = pin ?? (i.showDirectRefsOnly ? "haiku" : "sonnet")
+            reasons.append("show turn: \(m)" + (i.showDirectRefsOnly && pin == nil ? " (every candidate a direct ref)" : ""))
+            return decision(.quick, rung: i.showDirectRefsOnly ? .r0 : .r1, model: m, effort: i.showDirectRefsOnly ? .low : .medium,
+                            i: i, reasons: reasons, caps: ShowTurnCaps.modeCaps)
         case .work where !i.hasItem && !(i.decidingPRD || i.decidingArchitecture):
             if i.leadRole {
                 reasons.append("itemless lead work: Quick (\(model(.r0)) low) with Standard caps")

@@ -5,6 +5,8 @@ import GRDB
 /// keys, releases, sprints, grants, merge requests and batches), each from its own per-company counter (`refCounter`).
 public enum RefCounterKind: String, Sendable {
     case resource, artifact, ask, memory, item, release, sprint, grant, mergeRequest, mergeBatch
+    /// Plan C Task C4c: the owner's show requests.
+    case showRequest
 
     /// The table whose rows hold this kind's numbers (`number`, per `companyId`).
     var table: String {
@@ -19,6 +21,7 @@ public enum RefCounterKind: String, Sendable {
         case .grant: "grant"
         case .mergeRequest: "mergeRequest"
         case .mergeBatch: "mergeBatch"
+        case .showRequest: "showRequest"
         }
     }
 }

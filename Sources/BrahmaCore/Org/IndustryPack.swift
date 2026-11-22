@@ -8,7 +8,10 @@ public enum CompanyToolNames {
     /// Plan ML's handbook tools: every role gets them too.
     public static let kb = ["search_kb", "kb_read", "kb_write"]
     /// Plan C Task C3b's collab tools: every role gets them (part of `base`). Plan C Task C4a adds `search`.
-    public static let collab = ["share", "open_ref", "search"]
+    /// Plan C Task C4c adds `show` (refs to the owner's preview, cited).
+    public static let collab = ["share", "open_ref", "search", "show"]
+    /// Plan C Task C4c: served only to the concierge identity (`brahma mcp --agent concierge`), never in a role's list.
+    public static let concierge = ["find_refs"]
     public static let base = ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked"]
         + memory + kb + collab
     public static let work = ["list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency",
@@ -27,7 +30,7 @@ public enum CompanyToolNames {
     public static let review = ["show_work_item", "comment_work_item", "create_work_item", "review"]
     /// Audit turns only (9c), regardless of role: the verdict on each auto-merge of the turn's batch.
     public static let audit = ["audit"]
-    public static var all: [String] { base + work + lead + executive + ops + design + ["review"] + audit }
+    public static var all: [String] { base + work + lead + executive + ops + design + ["review"] + audit + concierge }
 }
 
 public struct RoleTemplate: Codable, Equatable, Sendable {

@@ -27,6 +27,9 @@ public enum TaintPolicy {
         // Plan C Task C4a: `search` only reads, with the agent's own access, and shows no snippet or agent-written title of a
         // tainted source (reading one is `open_ref`'s, which taints first).
         .union(["search"])
+        // Plan C Task C4c: `show` resolves every ref for the caller (`.full` only) and posts only to the owner, a tainted
+        // session's answer carrying its taint like any message; `find_refs` only reads (the concierge's, which has no write tool).
+        .union(["show"]).union(CompanyToolNames.concierge)
 
     /// The company tools reviewed as high risk (`everyToolClassified` pins `CompanyToolNames.all` against both sets). A task
     /// that adds a tool adds it to one of the two in the same commit (10b: `propose_extension`, refused while tainted).

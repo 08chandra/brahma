@@ -103,7 +103,7 @@ extension Store {
                 try current.update(db, columns: ["turnsWithoutProgress"])
             }
             return nil
-        case .notice, .plan: return nil
+        case .notice, .plan, .show: return nil
         }
         let work = try Store.watchdogWork(db: db, agentId: current.id)
         let earlier = try String?.fetchAll(db, sql: """

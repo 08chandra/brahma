@@ -1,5 +1,32 @@
 import Foundation
 
+/// Plan C Task C4c (design §7): what Collab adds to every turn's tool list, in tokens (characters ÷ 4): the schema JSON of
+/// `share`, `open_ref`, `show` and `search`, plus the three new parameters of existing tools (`attachments`, `reply_to`,
+/// `thread`). `brahma doctor`'s `collab-tools` item passes while it is at most `maxTokens`.
+public enum CollabToolBudget {
+    public static let maxTokens = 900
+    static let tools = ["share", "open_ref", "show", "search"]
+    static let parameters = [("post_message", "attachments"), ("post_message", "reply_to"), ("read_channel", "thread")]
+
+    public static func addedTokens() -> Int {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let specs = CompanyTools.allToolSpecs()
+        var chars = 0
+        for name in tools {
+            guard let spec = specs.first(where: { $0.name == name }), let data = try? encoder.encode(spec) else { continue }
+            chars += data.count
+        }
+        for (tool, parameter) in parameters {
+            guard let spec = specs.first(where: { $0.name == tool }),
+                  case .object(let schema) = spec.inputSchema, case .object(let props)? = schema["properties"],
+                  let p = props[parameter], let data = try? encoder.encode(p) else { continue }
+            chars += parameter.count + 3 + data.count
+        }
+        return chars / 4
+    }
+}
+
 /// Plan C Task C3b's agent tools: `share` (refs to a teammate or channel, pinned and gated) and `open_ref` (the one read path
 /// for shared content), plus the `attachments` argument of `post_message` and `send_dm`. Every secret-gate read point here
 /// gets the injected vault's stored values (`Store.knownSecretValues`) and the archive reader (`archives`: in `brahma mcp`,
@@ -32,7 +59,113 @@ extension CompanyTools {
                                             "by": s.prop("string", "@handle or @owner"),
                                             "limit": s.prop("integer", "At most 20 (default 10)")],
                                            required: ["query"])),
+            showSpec(),
         ]
+    }
+
+    // MARK: show and find_refs (Plan C Task C4c)
+
+    /// `show`: refs for the owner's preview, with a note citing them.
+    static func showSpec() -> ToolSpec {
+        let s = Self.self
+        return ToolSpec(name: "show", description: "Show the owner 1-6 refs in their preview. End each sentence of the note with the refs it relies on, like [1].",
+                        inputSchema: s.schema(["request": s.prop("string", "The show request you answer (optional)"),
+                                               "refs": s.refsProp("1-6 refs, in showing order"),
+                                               "notes": s.refsProp("Optional: one note per ref (max 280 chars each)"),
+                                               "note": s.prop("string", "What the owner reads (max 600 chars)")],
+                                              required: ["refs", "note"]))
+    }
+
+    /// The concierge's whole surface, in this order: `find_refs`, `search`, `open_ref` (no `copy`), `show`.
+    static func conciergeSpecs() -> [ToolSpec] {
+        let s = Self.self
+        let search = collabToolSpecs().first { $0.name == "search" }!
+        return [
+            ToolSpec(name: "find_refs", description: "Find refs for words (items, files, people, runs, kb…). One line per hit; open_ref to read.",
+                     inputSchema: s.schema(["query": s.prop("string", "Words or a ref")], required: ["query"]), readOnly: true),
+            search,
+            ToolSpec(name: "open_ref", description: "Read a ref (bounded; lines a-b).",
+                     inputSchema: s.schema(["ref": s.prop("string", "The ref, e.g. ENG-12:src/a.ts or F-3"),
+                                            "lines": s.prop("string", "Line window, e.g. 40-120")], required: ["ref"]), readOnly: true),
+            showSpec(),
+        ]
+    }
+
+    /// The concierge's calls (`brahma mcp --agent concierge`): only while its run of `request` is live; read as `.concierge`
+    /// (the owner's access minus secret values); `show` answers that request only. Refusals are the generic texts.
+    func callAsConcierge(_ name: String, _ args: [String: JSONValue], request: String) throws -> String {
+        let live: Bool
+        do { live = try !request.isEmpty && store.conciergeRunIsLive(companyId: companyId, requestId: request) } catch {
+            diagnostics("brahma mcp: could not check the concierge's run: \(error)")
+            live = false
+        }
+        guard live else { throw ToolError(message: Self.turnEndedMessage) }
+        do {
+            return try collabGeneric {
+                switch name {
+                case "find_refs":
+                    return try findRefsTool(args)
+                case "search":
+                    return try searchTool(args, reader: .concierge)
+                case "open_ref":
+                    var copy = false
+                    if let v = args["copy"], v != .null {
+                        guard case .bool(let b) = v else { throw ToolError(message: "argument copy must be true or false") }
+                        copy = b
+                    }
+                    let env = try collabEnvironment()
+                    return try store.openRef(companyId: companyId, reader: .concierge, ref: try string(args, "ref"),
+                                             lines: try optionalString(args, "lines"), copy: copy, turnId: nil,
+                                             context: try conciergeContext(), knownValues: env.known, paths: env.paths, now: Store.now(),
+                                             archives: env.archives).text
+                case "show":
+                    return try showTool(args, caller: .concierge, request: request)
+                default:
+                    throw ToolError(message: "unknown tool: \(name)")
+                }
+            }
+        } catch let e as WorkError {
+            throw ToolError(message: e.message)
+        } catch let e as RouterError {
+            throw ToolError(message: Self.describe(e))
+        }
+    }
+
+    /// `show {request?, refs, notes?, note}` for `caller`. An agent's `request` defaults to the open request its running
+    /// `.show` turn took; the concierge's is always its run's.
+    func showTool(_ args: [String: JSONValue], caller: Reader, request: String?) throws -> String {
+        let refs = try stringArray(args, "refs")
+        var notes: [String]?
+        if let v = args["notes"], v != .null { notes = try stringArray(args, "notes") }
+        guard let v = args["note"], v != .null, let note = v.stringValue else { throw ToolError(message: "missing required argument: note") }
+        let known: [(name: String, value: String)]
+        do { known = try store.allKnownSecretValues(companyId: companyId, vault: vault ?? UnavailableVault()) } catch {
+            diagnostics("brahma mcp: could not read the stored secrets to check a show note: \(error)")
+            throw ToolError(message: "the note could not be checked for secrets right now, so nothing was shown; try again next turn")
+        }
+        return try store.answerShow(companyId: companyId, caller: caller, request: request, refs: refs, notes: notes, note: note,
+                                    knownValues: known, now: Store.now())
+    }
+
+    /// `find_refs {query}`: the Show bar's resolver for the concierge, printed as `search` prints.
+    func findRefsTool(_ args: [String: JSONValue]) throws -> String {
+        let query = try string(args, "query")
+        let known: [(name: String, value: String)]
+        do { known = try store.allKnownSecretValues(companyId: companyId, vault: vault ?? UnavailableVault()) } catch {
+            diagnostics("brahma mcp: could not read the stored secrets to check refs: \(error)")
+            throw ToolError(message: "search results could not be checked for secrets right now, so nothing was shown; try again next turn")
+        }
+        let gate = GlobalSearch.TextGate(knownValues: known)
+        let now = Store.now()
+        let resolver = ShowResolver(store: store, files: Self.searchFiles, commits: Self.searchCommits)
+        let result = try resolver.resolveNow(query, companyId: companyId, reader: .concierge, gate: gate, now: now)
+        return Self.searchLines(result, limit: Self.searchDefaultLimit, now: now, tz: store.ownerTimeZone(), gate: gate)
+    }
+
+    /// What the concierge's refs resolve against: the company's key prefix, no acting agent.
+    func conciergeContext() throws -> RefContext {
+        guard let company = try store.company(id: companyId) else { throw ToolError(message: Store.refUnavailable) }
+        return RefContext(companyId: companyId, keyPrefixes: [Store.keyPrefix(slug: company.slug)])
     }
 
     func dispatchCollab(_ name: String, _ args: [String: JSONValue]) throws -> String? {
@@ -71,6 +204,9 @@ extension CompanyTools {
                                      paths: env.paths, now: Store.now(), archives: env.archives).text
         case "search":
             return try searchTool(args)
+        case "show":
+            let bound = try optionalString(args, "request") ?? (try store.boundShowRequest(agentId: agentId, turnId: try runningTurnId()))
+            return try showTool(args, caller: .agent(agentId), request: bound)
         default:
             return nil
         }
@@ -87,7 +223,7 @@ extension CompanyTools {
     /// `[<kind> <canonical> · <title> · <HH:mm or yyyy-mm-dd>]` with its snippet quoted on the next line (`    | `); nothing
     /// found: `"Nothing found in what you can read."`. No count of what the agent can't read is ever printed. C4b: a fact
     /// answer for the agent comes first (`FactsResolver.block`, gated as the assembled block).
-    func searchTool(_ args: [String: JSONValue]) throws -> String {
+    func searchTool(_ args: [String: JSONValue], reader: Reader? = nil) throws -> String {
         let query = try string(args, "query")
         var forced = SearchFilters()
         let tz = store.ownerTimeZone()
@@ -126,7 +262,7 @@ extension CompanyTools {
         }
         let gate = GlobalSearch.TextGate(knownValues: known)
         let resolver = ShowResolver(store: store, files: Self.searchFiles, commits: Self.searchCommits)
-        let result = try resolver.resolveNow(query, companyId: companyId, reader: .agent(agentId), gate: gate, forced: forced, now: now)
+        let result = try resolver.resolveNow(query, companyId: companyId, reader: reader ?? .agent(agentId), gate: gate, forced: forced, now: now)
         return Self.searchLines(result, limit: limit, now: now, tz: tz, gate: gate)
     }
 

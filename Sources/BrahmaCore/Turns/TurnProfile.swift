@@ -105,6 +105,13 @@ public enum TurnProfileCompiler {
     static let subagentTools = ["Task", "Agent"]
 
     public static func profile(for r: TurnRequest) -> TurnProfile {
+        if let c = r.concierge {
+            var p = conciergeProfile(companyId: c.companyId, requestId: c.requestId, mcpConfigPath: r.mcpConfigPath, workdir: c.workdir)
+            // The engine's `BRAHMA_*` variables join; the concierge's identity is its own.
+            for (name, value) in r.environment where p.environment[name] == nil { p.environment[name] = value }
+            p.expectations = r.expectations
+            return p
+        }
         let session: TurnProfile.Session = r.agent.sessionStarted
             ? .resume(id: r.agent.sessionId, systemPrompt: r.appendSystemPrompt)
             : .start(id: r.agent.sessionId, systemPrompt: r.appendSystemPrompt)
@@ -150,6 +157,28 @@ public enum TurnProfileCompiler {
             postToolHook: r.postToolHook, preToolHook: p.preToolHook, kind: r.kind, plansDirectory: r.planDirectory,
             deniedPaths: r.profile == .workspace ? r.deniedPaths : [], workflow: r.profile == .sandboxed ? p.workflow : nil,
             machMarker: r.profile == .sandboxed ? r.containmentMarker : nil)
+        return p
+    }
+
+    /// Plan C Task C4c: the concierge's turn (design §2.3), like the doctor's probe: Haiku, no built-in tools (`--tools ""`),
+    /// only its MCP server (`--strict-mcp-config`, `mcp__company`), `--max-turns 4`, a 60 s wall clock, a fresh session that is
+    /// never resumed, no role card (`--append-system-prompt` is absent: its byte-stable instructions open the stdin prompt), no
+    /// continuity, and `workdir` (a fresh 0700 directory under `paths.home/tmp`) as its cwd and only directory. Every mode
+    /// kill switch rides along (no fast mode, no workflows, no `Task`/`Agent`/`Workflow`). `companyId` and `requestId` are
+    /// the run's (its MCP config names them; nothing else in the argv does).
+    public static func conciergeProfile(companyId: String, requestId: String, mcpConfigPath: String, workdir: URL) -> TurnProfile {
+        var p = TurnProfile(model: ConciergeCaps.model, session: .start(id: UUID().uuidString.lowercased(), systemPrompt: nil),
+                            mcpConfigPath: mcpConfigPath, permission: .workspace, workingDirectory: workdir.path, addDirs: [workdir.path])
+        p.tools = []
+        p.allowedTools = ["mcp__company"]
+        for name in subagentTools + ["Workflow"] where !p.disallowedTools.contains(name) { p.disallowedTools.append(name) }
+        p.maxTurns = ConciergeCaps.maxTurns
+        p.wallClock = ConciergeCaps.wallClock
+        p.disableSlashCommands = true
+        p.environment = ["BRAHMA_AGENT_ID": ConciergeCaps.agentId, "CLAUDE_CODE_DISABLE_FAST_MODE": "1",
+                         "CLAUDE_CODE_DISABLE_WORKFLOWS": "1"]
+        p.settings = ClaudeSettingsCompiler.compile(scope: nil, profile: .workspace, mode: nil, mounts: [], postToolHook: nil,
+                                                    preToolHook: nil, kind: .show)
         return p
     }
 

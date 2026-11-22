@@ -21,6 +21,8 @@ extension Orchestrator {
         if !engineStoppedNow { log("stopped by the owner (\(stop.by)) since \(stop.since.ISO8601Format())") }
         engineStoppedNow = true
         for t in tasks.values { t.cancel() }
+        // Plan C Task C4c: the owner lane's concierge runs too.
+        for t in conciergeTasks.values { t.cancel() }
         for t in checkTasks.values { t.cancel() }
         for t in mergeTasks.values { t.cancel() }
         // Every main smoke (L-5lite-A, PR-35 5s): its group is killed and a merge run goes back to the queue in place, as on

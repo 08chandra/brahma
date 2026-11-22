@@ -51,7 +51,9 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         let r = await Doctor.run(claudePath: "claude", runner: runner, exec: exec(), now: t0)
         #expect(r.ok, "\(r.items)")
         #expect(r.cliVersion == "2.1.312")
-        #expect(r.items.map(\.name) == ["version", "flags", "probe", "resume-keeps-role", "overage", "tools-present", "sideload-allowed"])
+        // Plan C Task C4c adds `collab-tools` (the tool-schema budget).
+        #expect(r.items.map(\.name) == ["version", "flags", "probe", "resume-keeps-role", "overage", "tools-present", "sideload-allowed",
+                                        "collab-tools"])
         #expect(r.items.allSatisfy { $0.status == .pass }, "\(r.items)")
         let reqs = runner.requests
         #expect(reqs.count == 2)

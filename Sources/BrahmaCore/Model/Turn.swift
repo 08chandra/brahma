@@ -6,6 +6,9 @@ public enum TurnOutcome: String, Codable, Sendable { case inProgress, succeeded,
 /// What a turn is for. Stored on the turn (a notice-only turn is stored `notice`) and used by `ModelContext`.
 public enum TurnKind: String, Codable, CaseIterable, Sendable, Equatable, DatabaseValueConvertible {
     case work, review, audit, notice, plan
+    /// Plan C Task C4c: an itemless turn that answers the owner's show request(s) only (`ShowTurnCaps`); the rest of the
+    /// agent's inbox waits for its next ordinary turn.
+    case show
 
     /// Kinds that look at finished work: they run clean-context, with no `Task`/`Agent`/`Workflow` tools.
     public var isReview: Bool { self == .review || self == .audit }

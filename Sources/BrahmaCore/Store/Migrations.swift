@@ -1943,6 +1943,50 @@ enum Migrations {
                 t.primaryKey(["companyId", "sha"])
             }
         }
+        m.registerMigration("vC-show") { db in
+            // Plan C Task C4c: the owner's show and explain requests (who answers, why, the engine's candidates filtered for
+            // that target, the lifecycle and the cost), the Show bar's misses, and whether a show answer cites its sources.
+            try db.create(table: "showRequest") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("kind", .text).notNull()                  // show|explain
+                t.column("query", .text).notNull()
+                t.column("attachedRef", .text)
+                t.column("target", .text).notNull()                // concierge|agent
+                t.column("targetAgentId", .text)
+                t.column("routedBy", .text).notNull()              // owner|rule
+                t.column("reason", .text).notNull()
+                t.column("candidates", .text).notNull()            // JSON, filtered for the target
+                t.column("status", .text).notNull()                // open|answered|expired|cancelled
+                t.column("answerMessageId", .text)
+                t.column("turnId", .text)
+                t.column("costUSD", .double)
+                t.column("costShare5h", .double)
+                t.column("autoOpenedAt", .datetime)
+                t.column("createdAt", .datetime).notNull()
+                t.column("createdActive", .double).notNull()
+            }
+            try db.create(index: "showRequest_status", on: "showRequest", columns: ["companyId", "status"])
+            try db.create(table: "showMiss") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("query", .text).notNull()
+                t.column("chosen", .text).notNull()                // ask|none
+                t.column("topScore", .double)
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.alter(table: "message") { t in t.add(column: "answerVerified", .boolean) }
+            // The concierge has no turn row (and so no `turnCredential`): its run of one request holds the credential its
+            // `brahma mcp --agent concierge --show-request <id>` server checks, live only while the run is.
+            try db.create(table: "conciergeRun") { t in
+                t.primaryKey("requestId", .text).references("showRequest", onDelete: .cascade)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("tokenHash", .text).notNull()
+                t.column("startedAt", .datetime).notNull()
+                t.column("endedAt", .datetime)
+            }
+        }
     }
 }
 

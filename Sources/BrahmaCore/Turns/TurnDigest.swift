@@ -245,6 +245,43 @@ public enum TurnDigest {
     }
 
     public static func render(_ c: TurnContext, agent: Agent, company: Company) -> String {
+        var out = orientation(c)
+        out += afterOrientation(c, agent: agent, company: company)
+        return out.joined(separator: "\n")
+    }
+
+    // MARK: Show turns (Plan C Task C4c)
+
+    public static let showAnswerLine = "    Answer with show(refs: [...], note: \"...\") or a DM reply. If you can't, say why in one line."
+    public static let showTurnLine = "Show turn: answer the owner's request below. Your item and your other messages wait for your next turn."
+
+    /// A `.show` turn's text: the orientation, then the show request block(s) as the only inbox content (design §2.3). Nothing
+    /// else of the inbox, no notices and no item are shown or delivered.
+    public static func renderShow(_ c: TurnContext, requests: [ShowRequest], gate: GlobalSearch.TextGate) -> String {
+        var out = orientation(c)
+        out.append("## Current work")
+        out.append(showTurnLine)
+        out.append("# Inbox")
+        out.append(requests.map { showRequestBlock($0, gate: gate) }.joined(separator: "\n"))
+        return out.joined(separator: "\n")
+    }
+
+    /// One request: `- @owner SHOW REQUEST: "<query>"` (one line, at most 300 characters, `"` shown as `'`), the engine
+    /// candidates already filtered for this agent joined by ` · ` (with `<n> more the owner can see` last when some were left
+    /// out), and how to answer. Each line is gated as built against the stored values (Rulings 53–55): a query holding one
+    /// reads `(withheld)`, a candidate holding one is left out.
+    public static func showRequestBlock(_ r: ShowRequest, gate: GlobalSearch.TextGate = GlobalSearch.TextGate(knownValues: [])) -> String {
+        let query = ReviewDigest.flat(r.query, max: ShowQuery.maxQuery).replacingOccurrences(of: "\"", with: "'")
+        var head = "- @owner SHOW REQUEST: \"\(query)\""
+        if gate.holdsSecret(head) { head = "- @owner SHOW REQUEST: \"(withheld)\"" }
+        let candidates = r.candidateLines.map { ReviewDigest.flat($0, max: 400) }.filter { !$0.isEmpty && !gate.holdsSecret($0) }
+        var line = "      " + (candidates.isEmpty ? "(none)" : candidates.joined(separator: " · "))
+        if gate.holdsSecret(line) { line = "      (none)" }
+        return [head, "    Engine candidates (pick, combine or find better):", line, showAnswerLine].joined(separator: "\n")
+    }
+
+    /// The orientation every turn opens with: role card, operating rules, org, previews, roster, sprint, notes, done tasks.
+    static func orientation(_ c: TurnContext) -> [String] {
         var out: [String] = ["# Orientation"]
         out.append("Role card (re-read from file every turn):")
         out.append(ReviewDigest.quote(c.roleCard, maxChars: maxRoleCard))
@@ -272,7 +309,11 @@ public enum TurnDigest {
         }
         if let path = c.notesPath { out.append("Your notes: \(path)") }
         if let done = answeredTasksBlock(c.answeredTasks) { out.append(done) }
+        return out
+    }
 
+    static func afterOrientation(_ c: TurnContext, agent: Agent, company: Company) -> [String] {
+        var out: [String] = []
         out.append("## Current work")
         if let item = c.item {
             if c.itemTainted {
@@ -306,7 +347,7 @@ public enum TurnDigest {
             }
             out.append(inbox)
         }
-        return out.joined(separator: "\n")
+        return out
     }
 
     /// `## New resources (<n>)`, at most `maxNewResources` engine-built lines (names flattened and quoted), then

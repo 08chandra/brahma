@@ -73,6 +73,9 @@ public struct TurnRequest: Sendable {
     public var taskWebTools = false
     /// The runner yields every stdout line as `.raw` too (the sandbox canary reads tool results the parser only digests).
     public var emitRawLines = false
+    /// Plan C Task C4c: a concierge run. `TurnProfileCompiler.profile(for:)` then compiles `conciergeProfile` (no built-in
+    /// tools, no role card, no session to resume, `--max-turns 4`, Haiku) instead of an agent's turn.
+    public var concierge: ConciergeTurn? = nil
 
     public init(agent: Agent, company: Company, prompt: String, appendSystemPrompt: String?,
                 mcpConfigPath: String, workingDirectory: String, profile: PermissionProfile,
@@ -147,8 +150,46 @@ public enum MCPConfig {
         }
         return url.path
     }
+
+    /// Plan C Task C4c: the concierge's `<runDir>/concierge-<requestId>.mcp.json` (0600, atomic): `brahma mcp --agent concierge
+    /// --company <id> --show-request <id>`, the run's token in the server's env block.
+    public static func writeConcierge(paths: BrahmaPaths, executable: String, companyId: String, requestId: String, token: String,
+                                      environment: [String: String] = ProcessInfo.processInfo.environment) throws -> String {
+        try FileManager.default.createDirectory(at: paths.runDir, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let args = ["mcp", "--db", paths.database.path, "--company", companyId, "--agent", ConciergeCaps.agentId,
+                    "--show-request", requestId]
+        var env = [tokenVariable: token, MCPLaunch.showRequestVariable: requestId]
+        if environment[SecretStore.environmentVariable] == "file" { env[SecretStore.environmentVariable] = "file" }
+        let config: [String: Any] = ["mcpServers": ["company": ["command": executable, "args": args, "env": env] as [String: Any]]]
+        let data = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+        let name = "concierge-\(requestId).mcp.json"
+        let url = paths.runDir.appending(path: name)
+        let temp = paths.runDir.appending(path: ".\(name).\(UUID().uuidString)")
+        let fd = open(temp.path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
+        guard fd >= 0 else { throw CocoaError(.fileWriteUnknown) }
+        let bytes = [UInt8](data)
+        let written = Foundation.write(fd, bytes, bytes.count)
+        close(fd)
+        guard written == bytes.count, rename(temp.path, url.path) == 0 else {
+            try? FileManager.default.removeItem(at: temp)
+            throw CocoaError(.fileWriteUnknown)
+        }
+        return url.path
+    }
 }
 
+
+/// Plan C Task C4c: what identifies one concierge run (its company, its show request and its fresh 0700 working directory).
+public struct ConciergeTurn: Equatable, Sendable {
+    public var companyId: String
+    public var requestId: String
+    public var workdir: URL
+
+    public init(companyId: String, requestId: String, workdir: URL) {
+        self.companyId = companyId; self.requestId = requestId; self.workdir = workdir
+    }
+}
 
 /// `brahma mcp`'s parameters: its flags, or its env block (`BRAHMA_MCP_*`, written next to the turn token in the 0600 MCP
 /// config). A sandboxed turn's shell prefix starts the server by the fixed argv `<exe> mcp`, so there the env block is all
@@ -159,15 +200,20 @@ public struct MCPLaunch: Equatable, Sendable {
     public static let agentVariable = "BRAHMA_MCP_AGENT"
     public static let reviewItemVariable = "BRAHMA_MCP_REVIEW_ITEM"
     public static let auditVariable = "BRAHMA_MCP_AUDIT"
+    /// Plan C Task C4c: the concierge's server serves exactly one show request.
+    public static let showRequestVariable = "BRAHMA_MCP_SHOW_REQUEST"
 
     public var db: String
     public var company: String
     public var agent: String
     public var reviewItem: String?
     public var audit: Bool
+    /// Plan C Task C4c: set exactly for the concierge (`--agent concierge`).
+    public var showRequest: String? = nil
 
-    public init(db: String, company: String, agent: String, reviewItem: String?, audit: Bool) {
+    public init(db: String, company: String, agent: String, reviewItem: String?, audit: Bool, showRequest: String? = nil) {
         self.db = db; self.company = company; self.agent = agent; self.reviewItem = reviewItem; self.audit = audit
+        self.showRequest = showRequest
     }
 
     public struct Failure: Error, CustomStringConvertible {
@@ -175,7 +221,7 @@ public struct MCPLaunch: Equatable, Sendable {
     }
 
     public static func resolve(db: String?, company: String?, agent: String?, reviewItem: String?, audit: Bool,
-                               environment: [String: String]) throws -> MCPLaunch {
+                               showRequest: String? = nil, environment: [String: String]) throws -> MCPLaunch {
         func one(_ flag: String?, _ variable: String, _ name: String) throws -> String? {
             let env = environment[variable].flatMap { $0.isEmpty ? nil : $0 }
             if let flag, let env, flag != env { throw Failure(description: "--\(name) does not match this server's \(variable)") }
@@ -189,6 +235,14 @@ public struct MCPLaunch: Equatable, Sendable {
         let envAudit = environment[auditVariable] == "1"
         let isAudit = audit || envAudit
         if item != nil && isAudit { throw Failure(description: "a server is either a review or an audit server, never both") }
-        return MCPLaunch(db: db, company: company, agent: agent, reviewItem: item, audit: isAudit)
+        // Plan C Task C4c: the concierge's server serves one show request, and only the concierge's does.
+        let request = try one(showRequest, showRequestVariable, "show-request")
+        if agent == ConciergeCaps.agentId {
+            guard let request, !request.isEmpty else { throw Failure(description: "the concierge's server needs --show-request") }
+            guard item == nil, !isAudit else { throw Failure(description: "the concierge's server is neither a review nor an audit server") }
+        } else if request != nil {
+            throw Failure(description: "--show-request is only for the concierge")
+        }
+        return MCPLaunch(db: db, company: company, agent: agent, reviewItem: item, audit: isAudit, showRequest: request)
     }
 }

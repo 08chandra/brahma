@@ -647,7 +647,7 @@ public struct SandboxScope: Equatable, Sendable {
     ///
     /// - Item turn (`work`/`notice` with an item): cwd = the item worktree; writes to the agent's home, lab and cache, the
     ///   common git dir's objects, the item's admin dir, ref, ref lock and reflog, its progress file and the agent's notes.
-    /// - Itemless turn: cwd = lab; writes to home, lab, cache and notes.
+    /// - Itemless turn (and every `show` turn, Plan C Task C4c): cwd = lab; writes to home, lab, cache and notes.
     /// - Review / audit: cwd = lab; writes to home and lab; a review also reads the worktree (read-only).
     /// - Plan (needs an item; without one it gets the audit scope): cwd = `plansDir(KEY)`; writes to home and that directory;
     ///   reads the worktree (read-only).
@@ -702,6 +702,8 @@ public struct SandboxScope: Equatable, Sendable {
         case .review: shape = .review(item?.key)
         case .audit: shape = .audit
         case .plan: shape = item.map { .plan($0.key) } ?? .audit
+        // Plan C Task C4c: a show turn is itemless whatever the agent holds: the lab, never a worktree.
+        case .show: shape = .itemless
         }
 
         let cwd: URL

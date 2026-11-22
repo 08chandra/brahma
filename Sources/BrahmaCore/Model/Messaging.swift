@@ -60,6 +60,21 @@ public struct Message: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     /// Plan C Task C3a: the root of the thread this message replies in (always a root: a reply to a reply joins the root);
     /// nil for a message that is not a reply.
     public var parentId: String? = nil
+    /// Plan C Task C4c: the stored `answerVerified` (0/1; NULL except `kind = showAnswer`). Held as an integer: GRDB 7.11's
+    /// record decoding of an optional `Bool` column was seen to yield a malformed `Bool` (a byte other than 0 or 1).
+    var answerVerdict: Int? = nil
+
+    /// Plan C Task C4c: whether a `kind = showAnswer` message's note cites a source for every claim (`CitationCheck.verify`);
+    /// nil for every other kind.
+    public var answerVerified: Bool? {
+        get { answerVerdict.map { $0 != 0 } }
+        set { answerVerdict = newValue.map { $0 ? 1 : 0 } }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, companyId, channelId, senderId, text, createdAt, flag, taintedOrigin, kind, fromTaintedSession, taintSource, parentId
+        case answerVerdict = "answerVerified"
+    }
 }
 
 /// The stored `message.kind`.

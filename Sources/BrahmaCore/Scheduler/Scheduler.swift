@@ -60,10 +60,14 @@ public enum Scheduler {
     ///   (`blockingCount > 0`) are still admitted.
     /// - `paceStrict`: pace-closed companies whose spend has reached the owner's reserve (`util >= 1 - reserve`);
     ///   the critical-path exemption ends there and nothing is admitted.
+    /// - `ownerRequestAgentIds` (Plan C Task C4c): agents an owner show request waits on. They go first among their company's
+    ///   ready candidates (above the critical path) and count as critical under a closed pace; nothing here ever stops a
+    ///   running turn (only ready agents are candidates).
     public static func select(candidates: [Candidate], runningByCompany: [String: Int], config: SchedulerConfig,
                               usage: (Company) -> UsageDecision, otherChildren: Int = 0, safetyOnly: Int = 0,
                               pressure: MemoryPressure = .normal, held: Bool = false,
-                              paceClosed: Set<String> = [], paceStrict: Set<String> = []) -> [Agent] {
+                              paceClosed: Set<String> = [], paceStrict: Set<String> = [],
+                              ownerRequestAgentIds: Set<String> = []) -> [Agent] {
         var globalFree = freeSlots(config: config, running: runningByCompany.values.reduce(0, +), otherChildren: otherChildren,
                                    safetyOnly: safetyOnly, pressure: pressure, held: held)
         if globalFree <= 0 { return [] }
@@ -76,12 +80,14 @@ public enum Scheduler {
             if gateOpen[id] == nil { gateOpen[id] = usage(cand.company) == .open }
             guard gateOpen[id] == true else { continue }
             if paceStrict.contains(id) { continue }
-            if paceClosed.contains(id), cand.blockingCount <= 0 { continue }
+            if paceClosed.contains(id), cand.blockingCount <= 0, !ownerRequestAgentIds.contains(cand.agent.id) { continue }
             companies[id] = cand.company
             queues[id, default: []].append(cand)
         }
         for id in queues.keys {
             queues[id]!.sort { a, b in
+                let (oa, ob) = (ownerRequestAgentIds.contains(a.agent.id), ownerRequestAgentIds.contains(b.agent.id))
+                if oa != ob { return oa }
                 if a.blockingCount != b.blockingCount { return a.blockingCount > b.blockingCount }
                 let (ra, rb) = (roleWeight(a.agent.role), roleWeight(b.agent.role))
                 if ra != rb { return ra > rb }
@@ -99,7 +105,11 @@ public enum Scheduler {
                 (taken[$0.id] ?? 0) < queues[$0.id]!.count && assigned[$0.id]! < config.modeCap($0.usageMode)
             }
             func ratio(_ c: Company) -> Double { Double(assigned[c.id]!) / Double(max(1, c.priorityWeight)) }
+            // An owner request's agent goes first across companies too.
+            func ownerFirst(_ c: Company) -> Bool { ownerRequestAgentIds.contains(queues[c.id]![taken[c.id] ?? 0].agent.id) }
             guard let pick = eligible.min(by: { a, b in
+                let (oa, ob) = (ownerFirst(a), ownerFirst(b))
+                if oa != ob { return oa }
                 let (ra, rb) = (ratio(a), ratio(b))
                 return ra != rb ? ra < rb : a.name < b.name
             }) else { break }

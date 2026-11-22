@@ -535,7 +535,7 @@ import BrahmaKeychain
         #expect(RolePrompt.render(agent: w.eng1, company: w.company).contains("search_memory, recall, remember"))
         #expect(CompanyToolNames.memory == ["search_memory", "recall", "remember"])
         // Task 4 appends the handbook tools after them (and Plan C Task C3b its collab tools after those).
-        #expect(Array(CompanyToolNames.base.suffix(9)) == CompanyToolNames.memory + CompanyToolNames.kb + CompanyToolNames.collab)
+        #expect(Array(CompanyToolNames.base.suffix(10)) == CompanyToolNames.memory + CompanyToolNames.kb + CompanyToolNames.collab)
         #expect(TaintPolicy.taintSafeTools.isSuperset(of: CompanyToolNames.memory))
     }
 

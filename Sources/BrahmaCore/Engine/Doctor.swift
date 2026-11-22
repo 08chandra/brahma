@@ -90,6 +90,7 @@ public enum Doctor {
         items += probe.items
         items.append(toolsItem(probe.tools))
         items.append(sideloadItem(path: managedSettingsPath, preferences: managedPreferencesPath.map { [$0] } ?? managedPreferencePaths()))
+        items.append(collabToolsItem())
         if let sandbox { items.append(await pluginDetailsItem(claudePath: claudePath, sandbox: sandbox)) }
         // The sandbox canary (Task 3): `sandbox-backend`, `sandbox-canary-local`, `sandbox-canary`, `sandbox-helpers`. The doctor only reports them; the
         // engine's per-launch gate records a pass for the shapes its turns use.
@@ -112,6 +113,14 @@ public enum Doctor {
             report.items.append(DoctorItem(name: "subagent-gate", status: .pass, detail: SubagentGate.workspaceDetail))
         }
         return report
+    }
+
+    /// Plan C Task C4c: what Collab's tools add to every turn's prompt (`CollabToolBudget`), against its budget.
+    public static func collabToolsItem(tokens: Int = CollabToolBudget.addedTokens()) -> DoctorItem {
+        tokens <= CollabToolBudget.maxTokens
+            ? DoctorItem(name: "collab-tools", status: .pass, detail: "\(tokens) added tokens per turn (budget \(CollabToolBudget.maxTokens))")
+            : DoctorItem(name: "collab-tools", status: .fail,
+                         detail: "\(tokens) added tokens per turn, over the budget of \(CollabToolBudget.maxTokens)")
     }
 
     /// Reuses the stored report when it passed, is fresh, and was made by the same CLI version.

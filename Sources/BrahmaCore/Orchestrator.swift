@@ -121,6 +121,9 @@ public actor Orchestrator {
     var loggedPaceClosed = Set<String>()
     /// Timer jobs in flight, by timer id (a job never overlaps itself).
     var timerTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
+    /// Plan C Task C4c: the owner lane's concierge runs in flight (by request id), and the lane that admits them.
+    var conciergeTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
+    nonisolated let ownerLane = OwnerLane()
     /// The background reload of the store's redactor (vault reads never run on the actor: `reloadSecretsIfDue`).
     var secretsTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
     /// C3b Ruling 48: the pass answering turns' gate requests (`Store.serveGateRequests`), off the actor; never overlaps itself.
@@ -271,6 +274,9 @@ public actor Orchestrator {
                 do { try store.reloadRedactorIfNeeded(vault: vault); return nil } catch { return "\(error)" }
             }
             if let failure { log("could not load secrets: \(failure)") }
+            // Plan C Task C4c: concierge runs an earlier engine left open end now (their credentials with them); their requests
+            // stay open until they expire.
+            attempt { try store.endOrphanConciergeRuns(now: clock()) }
             // The data home lies outside every workspace and its private directories are 0700 (Task 3).
             let paths = self.paths
             let workspaces = try store.companies().map(\.workspacePath)
@@ -423,7 +429,7 @@ public actor Orchestrator {
     private var isIdle: Bool {
         tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty && timerTasks.isEmpty
             && secretsTask == nil && pushTask == nil && stopObserverTask == nil && previewTask == nil && smokeTasks.isEmpty
-            && releaseTasks.isEmpty && gateTask == nil
+            && releaseTasks.isEmpty && gateTask == nil && conciergeTasks.isEmpty
     }
 
     private func resumeIdleWaitersIfIdle() {
@@ -510,6 +516,7 @@ public actor Orchestrator {
         for (timerId, t) in timerTasks { add("timer \(timerId)", t) }
         for (companyId, t) in smokeTasks { add("smoke \(companyId)", t) }
         for (companyId, t) in releaseTasks { add("release \(companyId)", t) }
+        for (requestId, t) in conciergeTasks { add("concierge \(requestId)", t) }
         add("secrets reload", secretsTask)
         add("push", pushTask)
         add("stop observers", stopObserverTask)
@@ -584,6 +591,9 @@ public actor Orchestrator {
 
         // Open asks: expiry, owner reminders, internal aging and paused-approver rerouting (company-active time).
         attempt { _ = try store.sweepAsks(now: now) }
+
+        // Plan C Task C4c: open show requests past an active hour expire.
+        for c in companies { attempt { _ = try store.sweepShowRequests(companyId: c.id, now: now) } }
 
         // Sprints (company-active time): timeboxes, then engine standups (system posts, no LLM turns, nobody wakes).
         attempt { _ = try store.enforceTimeboxes(now: now) }
@@ -743,14 +753,20 @@ public actor Orchestrator {
         }
         let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: cfg,
                                         usage: { decisions[$0.id] ?? .open }, otherChildren: otherChildren,
-                                        safetyOnly: previewChildren, pressure: pressure,
-                                        held: held, paceClosed: paceClosed, paceStrict: paceStrict)
+                                        safetyOnly: previewChildren + conciergeTasks.count, pressure: pressure,
+                                        held: held, paceClosed: paceClosed, paceStrict: paceStrict,
+                                        ownerRequestAgentIds: (try? store.ownerRequestAgentIds()) ?? [])
         for agent in selected { launch(agent, now: now) }
+
+        // 5e. Plan C Task C4c: the owner lane (the concierge), outside mode concurrency, under the gate, the hold, the stop and
+        //     the safety cap.
+        conciergeTick(cfg: cfg, decisions: decisions, paceStrict: paceStrict, held: held, pressure: pressure)
 
         // 6. Engine dispatch, after admission: only into the slots admission left over, and only for companies whose gate,
         //    pace and concurrency cap would let a new agent run. Leases are never reserved for agents admission would refuse.
         if !held {
-            let free = Scheduler.freeSlots(config: cfg, running: runningCount(), otherChildren: otherChildren, safetyOnly: previewChildren,
+            let free = Scheduler.freeSlots(config: cfg, running: runningCount(), otherChildren: otherChildren,
+                                           safetyOnly: previewChildren + conciergeTasks.count,
                                            pressure: pressure, held: held)
             var companyFree: [String: Int] = [:]
             for c in companies where c.status == .running && (decisions[c.id] ?? .open) == .open && !paceClosed.contains(c.id) {
@@ -939,6 +955,10 @@ public actor Orchestrator {
         // agent-count kill, and the turn's leader (for its SIGINT).
         var ultraPlan: UltraPlan?
         var ultraReserved = false
+        // Plan C Task C4c: a show turn's requests were taken, its session's earlier total, and its soft-cap stop.
+        var showBound = false
+        var showCostBefore = 0.0
+        var showCapped = false
         var agentCapped = false
         var leaderPid: Int32?
         do {
@@ -948,11 +968,15 @@ public actor Orchestrator {
             // and kills what they (or an earlier engine's) left before any of its own work.
             try await settleEarlierTurns(agent: agent, company: company, turnId: turn.id)
             let template = store.catalog.template(role: agent.role, pack: company.packId)
-            // A pending review is its own clean-context turn: no inbox, no notices, a fresh session.
             let store = self.store
-            let review = try await blocking.tryRun { try Self.prepareReview(store: store, agent: agent, company: company) }
+            // Plan C Task C4c: an owner's show request comes first: an itemless `.show` turn that handles only the request(s).
+            let showRequests = try store.showRequestsAwaitingTurn(agentId: agent.id)
+            let showTurn = !showRequests.isEmpty
+            // A pending review is its own clean-context turn: no inbox, no notices, a fresh session.
+            let review = showTurn ? nil : try await blocking.tryRun { try Self.prepareReview(store: store, agent: agent, company: company) }
             // Otherwise a batched audit of auto-merges (9c) is the same kind of clean-context turn.
-            let audit = review == nil ? try await blocking.tryRun { try Self.prepareAudit(store: store, agent: agent, company: company) } : nil
+            let audit = review == nil && !showTurn
+                ? try await blocking.tryRun { try Self.prepareAudit(store: store, agent: agent, company: company) } : nil
             isReview = review != nil || audit != nil
             var turnPrompt = ""
             var sent = agent
@@ -1010,6 +1034,15 @@ public actor Orchestrator {
                 // Reads the item's recent commits (git): off the cooperative pool.
                 let paths = self.paths
                 var c = try await blocking.tryRun { try TurnContext.load(store: store, paths: paths, agent: agent, company: company) }
+                if showTurn {
+                    // Plan C Task C4c: the request is the turn's only inbox content. No item, lease, notice or message is shown,
+                    // and nothing is delivered (the rest waits for the next ordinary turn); the turn reads no relayed text.
+                    c.item = nil; c.lease = nil; c.playbook = nil
+                    c.inbox = []; c.inboxOverflow = 0; c.channelCounts = []; c.threadRoots = [:]; c.attachments = [:]
+                    c.notices = []; c.collapsedNotices = 0; c.inboxItemIds = []; c.quietItemIds = []; c.noticeIds = []
+                    c.pendingReviewCount = 0; c.newResources = []
+                    c.relayedTaint = try store.importTaint(companyId: company.id)
+                }
                 let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
                 var checkout: URL?
                 var git: GitWorkspace?
@@ -1051,6 +1084,7 @@ public actor Orchestrator {
                 // Only work updates to read and nothing to answer: a notice-only turn (cheapest model for `auto` agents). A
                 // leaseholder's updates are its work, so its turns stay work turns.
                 if c.onlyNotices, c.lease == nil { kind = .notice }
+                if showTurn { kind = .show }
                 scope = kind == .notice ? .base : c.scope
                 if scope != c.scope {
                     c.recentSummaries = (try? store.recentTurnSummaries(agentId: agent.id, scope: scope)) ?? []
@@ -1146,7 +1180,14 @@ public actor Orchestrator {
                     slotModel = nil
                     slotTools = nil
                 }
-                turnPrompt = TurnDigest.render(c, agent: agent, company: company)
+                if showTurn {
+                    // The request's text is gated against the stored values (fail closed: an unreadable vault fails the turn).
+                    let (companyId, vault) = (company.id, self.vault)
+                    let known = try await blocking.tryRun { try store.allKnownSecretValues(companyId: companyId, vault: vault) }
+                    turnPrompt = TurnDigest.renderShow(c, requests: showRequests, gate: GlobalSearch.TextGate(knownValues: known))
+                } else {
+                    turnPrompt = TurnDigest.render(c, agent: agent, company: company)
+                }
                 ctx = c
             }
 
@@ -1159,6 +1200,7 @@ public actor Orchestrator {
             let ultra = await ultraPreflight(kind: review != nil ? .review : audit != nil ? .audit : kind, itemBudget: review == nil && itemBudget,
                                              facts: facts, inputs: inputs, agent: agent, company: company, profile: profile,
                                              relayedTaint: ctx?.relayedTaint != nil)
+            if showTurn { inputs.showDirectRefsOnly = showRequests.allSatisfy { store.showCandidatesAreDirect($0, company: company) } }
             inputs.ultraTrigger = ultra.trigger
             inputs.ultra = ultra.plan?.admission
             inputs.ultraRefusal = ultra.refusal
@@ -1405,6 +1447,14 @@ public actor Orchestrator {
                     LabProvenance.commitSet(store: store, workspace: labWorkspace, handle: handle, companyId: companyId)
                 }
             }
+            // Plan C Task C4c: the show turn takes its requests (and their DMs) as it starts; its session's cost so far is what
+            // its soft cap is measured past (the CLI's total is cumulative over `--resume`).
+            if showTurn {
+                try store.bindShowTurn(turnId: turn.id, agentId: agent.id, requestIds: showRequests.map(\.id))
+                showBound = true
+                showCostBefore = wasResume ? store.sessionCostBefore(sessionId: sent.sessionId, turnId: turn.id) : 0
+            }
+            let showCalibration = showTurn ? ((try? store.usageCalibration()) ?? UsageCalibration()) : UsageCalibration()
             // Leaving the loop early (`break`) drops the stream, which terminates the child process.
             do {
                 events: for try await event in runner.run(request) {
@@ -1443,6 +1493,13 @@ public actor Orchestrator {
                     case .sandboxNote(let text):
                         try store.appendEvent(ActivityEvent(companyId: agent.companyId, agentId: agent.id, turnId: turn.id,
                                                             kind: .error, text: text, createdAt: clock()))
+                    case .result(let r) where showTurn:
+                        // Plan C Task C4c: a show turn past its soft cap (`ShowTurnCaps.softCap5h` of 5H) is stopped.
+                        if let total = r.costUSD,
+                           ShowCost.share5h(max(0, total - showCostBefore), calibration: showCalibration) > ShowTurnCaps.softCap5h {
+                            showCapped = true
+                            break events
+                        }
                     case .toolCall(let name, let input):
                         // The backup taint path (Task 10): every tool call, the sub-agents' and workflow agents' included. Every
                         // source is recorded, not only the first (2d): a verdict's exemption depends on all of them.
@@ -1565,7 +1622,7 @@ public actor Orchestrator {
             end = .interrupted(partial: result)
         } else if abortReason != nil {
             end = .interrupted()
-        } else if agentCapped {
+        } else if agentCapped || showCapped {
             end = .interrupted(partial: result)
         } else if unrecorded {
             // Nothing ran: the runner killed the child it had just spawned because no exact record could name it (Task 9c fix
@@ -1692,6 +1749,15 @@ public actor Orchestrator {
                                       deliveredItemIds: (ctx?.inboxItemIds ?? []) + (ctx?.quietItemIds ?? []),
                                       deliveredNoticeIds: ctx?.noticeIds ?? [], sessionReset: sessionLost, sessionUse: use,
                                       telemetry: telemetry, taintHome: paths.home, now: now)
+        }
+        // Plan C Task C4c: the show turn's cost lands on its requests; one it left open is answered by its DM to the owner, or
+        // expires (a soft-cap stop says so).
+        if showBound {
+            let ownCost = ((try? store.turn(id: turn.id)) ?? nil)?.costUSD ?? result?.costUSD.map { max(0, $0 - showCostBefore) }
+            attempt {
+                if showCapped { try store.expireShowTurn(turnId: turn.id, agentId: agent.id, reason: "stopped past its soft cap of \(Int(ShowTurnCaps.softCap5h))% of 5H", now: now) }
+                try store.finishShowTurn(turnId: turn.id, agentId: agent.id, startedAt: turn.startedAt, costUSD: ownCost, now: now)
+            }
         }
         // Task 10: the lab's new commits are recorded with the session's taint state, then a fresh session a refused high-risk
         // call asked for is applied (both flags and the flag file cleared). Git, off the cooperative pool.

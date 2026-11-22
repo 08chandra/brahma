@@ -333,7 +333,8 @@ import GRDB
         #expect(review(tier: .l) == "opus"); #expect(review(flagged: true) == "opus")
         #expect(review(tier: .l, mode: .low) == "sonnet")
         #expect(review("haiku", tier: .l) == "haiku")
-        #expect(TurnKind.allCases.map(\.rawValue).sorted() == ["audit", "notice", "plan", "review", "work"])
+        // Plan C Task C4c adds `show` (additive).
+        #expect(TurnKind.allCases.map(\.rawValue).sorted() == ["audit", "notice", "plan", "review", "show", "work"])
     }
 
     // MARK: Digest

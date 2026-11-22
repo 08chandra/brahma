@@ -16,6 +16,8 @@ struct MCP: ParsableCommand {
     var reviewItem: String?
     @Flag(name: .customLong("audit"), help: "An audit turn: the server offers the audit tool for the turn's batch only.")
     var audit = false
+    @Option(name: .customLong("show-request"), help: "The concierge's show request (only with --agent concierge).")
+    var showRequest: String?
 
     func run() throws {
         signal(SIGPIPE, SIG_IGN)
@@ -23,7 +25,7 @@ struct MCP: ParsableCommand {
         let launch: MCPLaunch
         do {
             launch = try MCPLaunch.resolve(db: db, company: company, agent: agent, reviewItem: reviewItem, audit: audit,
-                                           environment: ProcessInfo.processInfo.environment)
+                                           showRequest: showRequest, environment: ProcessInfo.processInfo.environment)
         } catch {
             FileHandle.standardError.write(Data("brahma mcp: \(error)\n".utf8))
             throw ExitCode.failure
@@ -43,6 +45,35 @@ struct MCP: ParsableCommand {
         let packs = BrahmaPaths.fromEnvironment().packsDir
         let catalog = PackCatalog.loadOrBuiltin(directory: packs) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
         let store = try Store(path: db, catalog: catalog)
+        // Plan C Task C4c: the concierge's server. Its process runs as `BRAHMA_AGENT_ID=concierge` (so no owner command runs from
+        // it), its token must name the live run of exactly this request in this company, and it serves only the concierge's
+        // four tools, read as `.concierge`. Archives and PDFs are refused in its `open_ref` (no gate broker: fail closed).
+        if agent == ConciergeCaps.agentId {
+            guard ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"] == ConciergeCaps.agentId, let request = launch.showRequest,
+                  store.conciergeCredentialIsValid(token: token, companyId: company, requestId: request) else {
+                FileHandle.standardError.write(Data("brahma mcp: concierge credential invalid or run ended\n".utf8))
+                throw ExitCode.failure
+            }
+            let secretPaths = BrahmaPaths(home: URL(fileURLWithPath: db).deletingLastPathComponent(),
+                                          workspaces: BrahmaPaths.fromEnvironment().workspaces)
+            let vault: any SecretVault
+            do {
+                let selection = try PlatformSecretVault.resolve(paths: secretPaths)
+                try PlatformSecretVault.refuseMemory(selection)
+                vault = selection.vault
+            } catch {
+                FileHandle.standardError.write(Data("brahma mcp: \(error)\n".utf8))
+                throw ExitCode.failure
+            }
+            let check: @Sendable () throws -> Void = {
+                try store.prepareForToolCall(vault: vault) { FileHandle.standardError.write(Data("brahma mcp: \($0)\n".utf8)) }
+            }
+            try? check()
+            MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: ConciergeCaps.agentId, paths: secretPaths, vault: vault,
+                                          conciergeRequestId: request), beforeCall: check)
+                .serve(input: .standardInput, output: .standardOutput)
+            return
+        }
         // The credential comes first, and it alone decides the mode: a review token opens the review tools for its own item and
         // nothing else; no flag can widen it or turn another token into a review server.
         guard let context = store.turnCredentialContext(token: token, companyId: company, agentId: agent) else {
