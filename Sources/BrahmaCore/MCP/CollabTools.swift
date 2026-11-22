@@ -159,7 +159,17 @@ extension CompanyTools {
             let title = field(hit.title, max: SafeTitle.max, quoted: true) ?? "\"(withheld)\""
             var line = "[\(kind) \(canonical) · \(title)"
             if let at = hit.at { line += " · " + stamp(at) }
-            lines.append(line + "]")
+            line += "]"
+            // M-2: the assembled line is gated as printed too.
+            guard !gate.holdsSecret(line) else { continue }
+            lines.append(line)
+            // Fix round 3 (controller ruling 2): when the line had to show the ref changed (brackets mapped, quoted), the ref
+            // itself follows on its own line, exactly as `open_ref` takes it. It is the engine's canonical of a ref that passed
+            // every gate (`TextGate.hit`), one line already (grammar-checked), and is gated again as printed.
+            if canonical != raw, GlobalSearch.TextGate.display(raw, inert: false) == raw {
+                let refLine = "    ref: " + raw
+                if !gate.holdsSecret(refLine) { lines.append(refLine) }
+            }
             if let snippet = hit.snippet.flatMap({ gate.final($0, max: GlobalSearch.snippetMax) }), !snippet.isEmpty,
                !gate.holdsSecret("    | " + snippet) {
                 lines.append("    | " + snippet)
@@ -168,8 +178,15 @@ extension CompanyTools {
         }
         if lines.isEmpty { lines.append("Nothing found in what you can read.") }
         // Fix round 1 (I-3): what couldn't be searched in full is said, never dropped silently.
-        if result.incomplete.contains(.files) { lines.append("(file results incomplete)") }
-        if result.incomplete.contains(.commits) { lines.append("(commit results incomplete)") }
+        for group in ShowGroup.allCases where result.incomplete.contains(group) {
+            let name: String = switch group {
+            case .files: "file"
+            case .commits: "commit"
+            case .items: "item"
+            default: group.rawValue
+            }
+            lines.append("(\(name) results incomplete)")
+        }
         return lines.joined(separator: "\n")
     }
 

@@ -1,6 +1,13 @@
 import Foundation
 import GRDB
 
+/// How a search combines its words. `andThenOr` is ML's (every word, then any word when fewer than
+/// `MemoryPolicy.orFallbackBelow` hits came back); Plan C Task C4a's global search runs `all` and `any` itself, so it decides
+/// the fallback on the hits it keeps.
+public enum MemoryMatch: Sendable {
+    case andThenOr, all, any
+}
+
 /// The company-memory index: one scoped full-text index over every source, read through the access engine. Every query is
 /// bound to one company (`companyId = ?`); a ref of another company answers exactly like a missing one.
 public struct MemoryIndex: Sendable {
@@ -21,7 +28,7 @@ public struct MemoryIndex: Sendable {
     /// 5. Score `-bm25 × recency × weight`. Fewer than `MemoryPolicy.orFallbackBelow` hits: steps 2–4 again with OR, merged.
     /// 6. Score descending, then newest first.
     public func search(companyId: String, scope: Reader, query: String, sources: Set<MemorySource>? = nil,
-                       limit: Int = MemoryPolicy.defaultHits, now: Date) throws -> [MemoryHit] {
+                       limit: Int = MemoryPolicy.defaultHits, now: Date, match: MemoryMatch = .andThenOr) throws -> [MemoryHit] {
         try store.writer.read { db in
             let ctx = try ReaderContext.load(db: db, catalog: store.catalog, companyId: companyId, reader: scope)
             guard let expr = MemoryQuery.expression(query) else { return [] }
@@ -39,8 +46,15 @@ public struct MemoryIndex: Sendable {
                 }
                 return found
             }
-            merge(try passes(expr.and))
-            if hits.count < MemoryPolicy.orFallbackBelow, expr.or != expr.and { merge(try passes(expr.or)) }
+            switch match {
+            case .andThenOr:
+                merge(try passes(expr.and))
+                if hits.count < MemoryPolicy.orFallbackBelow, expr.or != expr.and { merge(try passes(expr.or)) }
+            case .all:
+                merge(try passes(expr.and))
+            case .any:
+                merge(try passes(expr.or))
+            }
 
             let sorted = hits.values.sorted { a, b in
                 a.score != b.score ? a.score > b.score : a.updatedAt != b.updatedAt ? a.updatedAt > b.updatedAt : a.docId > b.docId

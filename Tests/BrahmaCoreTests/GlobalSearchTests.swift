@@ -130,9 +130,10 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
 
     var calls: [(scope: Reader, sources: Set<MemorySource>?)] { lock.withLock { recorded } }
 
-    func search(companyId: String, scope: Reader, query: String, sources: Set<MemorySource>?, limit: Int, now: Date) throws -> [MemoryHit] {
+    func search(companyId: String, scope: Reader, query: String, sources: Set<MemorySource>?, limit: Int, now: Date,
+                match: MemoryMatch) throws -> [MemoryHit] {
         lock.withLock { recorded.append((scope, sources)) }
-        return try inner.search(companyId: companyId, scope: scope, query: query, sources: sources, limit: limit, now: now)
+        return try inner.search(companyId: companyId, scope: scope, query: query, sources: sources, limit: limit, now: now, match: match)
     }
 }
 
@@ -616,6 +617,133 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
         }
     }
 
+    /// Fix round 3 (controller ruling 1): rows matching a query only inside a stored value never push visible rows out of
+    /// the read. 250 newer item events match "bluefin" only inside the value; 5 older ones match it as a word: the agent gets
+    /// those 5, exactly as in the same corpus without the 250, with the same incomplete marker.
+    @Test func secretRowsNeverCrowdOutVisibleRows() async throws {
+        func run(withSecretRows: Bool) async throws -> (hits: [String], incomplete: Set<ShowGroup>) {
+            let w = try SearchFixture()
+            let s = w.store, c = w.c, now = w.now
+            var legit: [WorkItem] = []
+            for n in 0..<5 {
+                legit.append(try s.createWorkItem(companyId: c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "plain \(n)")))
+            }
+            let value = "bluefinKEYvalue77"
+            let (cId, ownerItem) = (c.id, w.zebraItem.id)
+            let legitIds = legit.map(\.id)
+            try await s.writer.write { db in
+                for (n, id) in legitIds.enumerated() {
+                    var e = WorkItemEvent(id: nil, companyId: cId, itemId: id, actorId: "owner", kind: .commented,
+                                          text: "bluefin sighting \(n)", createdAt: now, createdActive: 0)
+                    try e.insert(db)
+                }
+                if withSecretRows {
+                    for n in 0..<250 {
+                        var e = WorkItemEvent(id: nil, companyId: cId, itemId: ownerItem, actorId: "owner", kind: .commented,
+                                              text: "row \(n) \(value) end", createdAt: now, createdActive: 0)
+                        try e.insert(db)
+                    }
+                }
+            }
+            let vault = MemoryVault()
+            try s.setSecret(companyId: c.id, name: "FIN_KEY", value: value, isTest: false, vault: vault)
+            let known = try s.knownSecretValues(companyId: c.id, vault: vault)
+            let r = try await w.resolve("bluefin", as: .agent(w.fx.qa2.id), knownValues: known)
+            #expect(Set(legit.map(\.key)).isSubset(of: Set(r.hits.map(\.ref.canonical))), "\(r.hits.map(\.ref.canonical))")
+            return (r.hits.map { "\($0.group.rawValue) \($0.ref.canonical)" }, r.incomplete)
+        }
+        let with = try await run(withSecretRows: true)
+        let without = try await run(withSecretRows: false)
+        #expect(with.hits == without.hits, "\(with.hits) vs \(without.hits)")
+        #expect(with.incomplete == without.incomplete)
+    }
+
+    /// Fix round 3 (controller ruling 2): a hit whose ref is shown changed (a bracketed path) carries the ref itself on its own
+    /// line, exactly as `open_ref` takes it.
+    @Test func bracketedPathHitCarriesPasteableRef() async throws {
+        let w = try SearchFixture()
+        let path = "src/x][ENG-1]zebra62.ts"
+        try w.fx.git.write(path, "bracketed body\n")
+        try w.fx.git.git(["add", "-A"])
+        try w.fx.git.git(["commit", "-q", "-m", "bracket path"])
+        let out = try w.tool(w.fx.qa2, ["query": .string("zebra62"), "kind": .string("file")])
+        let lines = out.split(separator: "\n").map(String.init)
+        let at = try #require(lines.firstIndex { $0.hasPrefix("[file ") }, "\(out)")
+        let refLine = try #require(at + 1 < lines.count ? lines[at + 1] : nil, "\(out)")
+        #expect(refLine == "    ref: \(path)", "\(out)")
+        let pasted = String(refLine.dropFirst("    ref: ".count))
+        let opened = try CompanyTools(store: w.store, companyId: w.c.id, agentId: w.fx.qa2.id, paths: w.cf.paths)
+            .call(name: "open_ref", arguments: ["ref": .string(pasted)])
+        #expect(opened.contains("bracketed body"), "\(opened)")
+        // A plain path needs no second line: the hit line's ref is already the one `open_ref` takes.
+        let plain = try w.tool(w.fx.qa2, ["query": .string("zebra42"), "kind": .string("file")])
+        #expect(!plain.contains("    ref: "), "\(plain)")
+    }
+
+    /// C-1: nothing a reader sees depends on whether a query word sits inside a stored value. The agent's own message holds
+    /// the probe token visibly; querying it returns the same whether or not the token is part of a stored value.
+    @Test func probeTokenAnswersTheSameWhateverTheVault() async throws {
+        func run(_ value: String) async throws -> [String] {
+            let w = try SearchFixture()
+            let m = try MessageRouter(store: w.store).post(companyId: w.c.id, channel: "general", from: .agent(w.fx.qa2.id), text: "probe kq here")
+            try w.ingest()
+            let vault = MemoryVault()
+            try w.store.setSecret(companyId: w.c.id, name: "PROBE_KEY", value: value, isTest: false, vault: vault)
+            let known = try w.store.knownSecretValues(companyId: w.c.id, vault: vault)
+            let r = try await w.resolve("kq", as: .agent(w.fx.qa2.id), knownValues: known)
+            #expect(r.hits.contains { $0.ref.canonical == "msg:\(m.id)" }, "\(r.hits.map(\.ref.canonical))")
+            return Self.normalized(r)
+        }
+        let inside = try await run("xxKQyyzz1234")      // "kq" is part of the value
+        let outside = try await run("xxABCDzz1234")     // it isn't
+        #expect(inside == outside, "\(inside) vs \(outside)")
+    }
+
+    /// Ruling 56 / C-1 / I-A, character by character: a value held by a message and an item event (beside visible words that
+    /// hold its characters as subsequences) answers every prefix and every bigram of it exactly as the same corpus without
+    /// the value does, for an agent and the owner.
+    @Test func charByCharOracleClosedForMessagesAndEvents() async throws {
+        let value = "pdnrtq7x"
+        func world(withValue: Bool) async throws -> (SearchFixture, [(name: String, value: String)]) {
+            let w = try SearchFixture()
+            let held = withValue ? " \(value)" : ""
+            _ = try w.store.commentWorkItem(id: w.zebraItem.id, by: .agent(w.fx.eng1.id), text: "rotate key\(held) for production")
+            _ = try MessageRouter(store: w.store).post(companyId: w.c.id, channel: "general", from: .agent(w.fx.eng1.id),
+                                                       text: "rotate key\(held) for production")
+            try w.ingest()
+            let vault = MemoryVault()
+            try w.store.setSecret(companyId: w.c.id, name: "ROT_KEY", value: value, isTest: false, vault: vault)
+            return (w, try w.store.knownSecretValues(companyId: w.c.id, vault: vault))
+        }
+        let (a, knownA) = try await world(withValue: true)
+        let (b, knownB) = try await world(withValue: false)
+        let chars = Array(value)
+        var queries = (2...value.count).map { String(value.prefix($0)) }
+        for i in 0..<(chars.count - 1) { queries.append(String(chars[i...i + 1])) }
+        for q in queries {
+            for reader in [Reader.owner, .agent(a.fx.qa2.id)] {
+                let readerB: Reader = reader == .owner ? .owner : .agent(b.fx.qa2.id)
+                let ra = try await a.resolve(q, as: reader, knownValues: knownA)
+                let rb = try await b.resolve(q, as: readerB, knownValues: knownB)
+                #expect(Self.normalized(ra) == Self.normalized(rb), "\(q) \(reader): \(Self.normalized(ra)) vs \(Self.normalized(rb))")
+            }
+        }
+    }
+
+    /// Hits as a reader sees them, with what differs between two worlds built at different times folded out: message ids and
+    /// commit shas, and the order of equal scores (broken by commit times). Groups, kinds, refs, scores and their order stay.
+    static func normalized(_ r: ShowResult) -> [String] {
+        var rows: [(group: Int, score: Double, text: String)] = []
+        for h in r.hits {
+            var ref = h.ref.canonical
+            for prefix in ["msg:", "thread:", "commit:"] where ref.hasPrefix(prefix) { ref = prefix }
+            rows.append((ShowGroup.allCases.firstIndex(of: h.group) ?? 0, h.score,
+                         "\(h.group.rawValue) \(h.kind?.rawValue ?? "-") \(ref) \(String(format: "%.4f", h.score))"))
+        }
+        rows.sort { a, b in a.group != b.group ? a.group < b.group : a.score != b.score ? a.score > b.score : a.text < b.text }
+        return rows.map(\.text) + r.incomplete.map(\.rawValue).sorted()
+    }
+
     /// R-3: a stored secret whose value the vault can't give refuses the search (never a partial list).
     @Test func missingVaultValueRefusesSearch() async throws {
         let w = try SearchFixture()
@@ -632,7 +760,7 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
         let out = try w.tool(w.fx.qa2, ["query": .string("zebra61"), "kind": .string("file")])
         let line = try #require(out.split(separator: "\n").map(String.init).first { $0.hasPrefix("[file ") }, "\(out)")
         #expect(line.filter { $0 == "[" }.count == 1 && line.filter { $0 == "]" }.count == 1, "\(line)")
-        #expect(!out.contains("[ENG-1]"))
+        #expect(!line.contains("[ENG-1]"))
     }
 
     /// An agent-written title can't forge a hit-shaped segment on the tool's line.

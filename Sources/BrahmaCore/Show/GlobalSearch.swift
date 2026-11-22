@@ -31,7 +31,8 @@ public struct ShowHit: Equatable, Sendable {
 
 /// What global search asks of company memory: `MemoryIndex.search` (tests record the calls).
 public protocol MemorySearching: Sendable {
-    func search(companyId: String, scope: Reader, query: String, sources: Set<MemorySource>?, limit: Int, now: Date) throws -> [MemoryHit]
+    func search(companyId: String, scope: Reader, query: String, sources: Set<MemorySource>?, limit: Int, now: Date,
+                match: MemoryMatch) throws -> [MemoryHit]
 }
 
 extension MemoryIndex: MemorySearching {}
@@ -93,8 +94,6 @@ public struct GlobalSearch: Sendable {
     /// value's characters.
     struct TextGate: Sendable {
         let expanded: [(name: String, value: String)]
-        /// Each value lowercased (and its NFKC form): the memory query drops any word that is part of one.
-        let lowered: [String]
         /// Identifies the value set (memos keyed by it never hold a value).
         let fingerprint: String
         /// Every literal `ContentScan.redact` could find (each value form's `Redactor.forms`) plus a literal every secret
@@ -120,8 +119,6 @@ public struct GlobalSearch: Sendable {
                 }
             }
             expanded = EncodedForms.expand(forms)
-            lowered = knownValues.flatMap { [$0.value.lowercased(), $0.value.precomposedStringWithCompatibilityMapping.lowercased()] }
-                .filter { $0.count >= Redactor.minLength }
             fingerprint = StableHash.fnv1a64(expanded.map { "\($0.name)\u{0}\($0.value)" }.joined(separator: "\u{1}"))
             if SecretScan.patterns.map(\.ere) == Self.patternTriggers.patterns {
                 needles = Self.patternTriggers.triggers
@@ -197,17 +194,6 @@ public struct GlobalSearch: Sendable {
             if r == d { return skeletonHolds(d) ? "" : d }
             let blanked = r.replacingOccurrences(of: #"\[redacted [^\]]*\]"#, with: " ", options: .regularExpression)
             return holdsSecret(blanked) ? "" : blanked
-        }
-
-        /// The company-memory query without any word that is part of a stored value (its full-text index holds texts as they
-        /// were written): a guess at a value's token confirms nothing.
-        func memoryQuery(_ q: String) -> String {
-            guard !lowered.isEmpty else { return q }
-            return q.split(whereSeparator: { $0.isWhitespace }).filter { word in
-                let parts = word.lowercased().precomposedStringWithCompatibilityMapping
-                    .split(whereSeparator: { !$0.isLetter && !$0.isNumber }).filter { $0.count >= 2 }
-                return !parts.contains { part in lowered.contains { $0.contains(part) } }
-            }.joined(separator: " ")
         }
 
         /// A snippet of `raw`: the whole display text is gated first (any value in it: no snippet at all, so no part of a value
@@ -289,9 +275,9 @@ public struct GlobalSearch: Sendable {
 
         var found: [Candidate] = []
         let q = listing ? "" : text
-        let memoryQ = gate.memoryQuery(q)
-        if !listing, !memoryQ.isEmpty {
-            found += try memoryCandidates(memoryQ, kinds: kinds, filters: filters, actorId: actorId, companyId: companyId, reader: reader, now: now, gate: gate)
+        // C-1: the query is never changed by what the vault holds; each hit is checked against the text the reader can see.
+        if !listing {
+            found += try memoryCandidates(q, kinds: kinds, filters: filters, actorId: actorId, companyId: companyId, reader: reader, now: now, gate: gate)
         }
         var incomplete = Set<ShowGroup>()
         found += try gitCandidates(q, kinds: kinds, filters: filters, company: company, reader: reader, state: git ?? gitState(company: company),
@@ -367,11 +353,65 @@ public struct GlobalSearch: Sendable {
     // MARK: Company memory
 
     /// `MemoryIndex` per group of sources (messages apart, so they never crowd out the rest), with the reader's own scope.
-    /// A memory doc's whole indexed text (bound to the company).
-    private func docBody(_ docId: Int64, companyId: String) throws -> String? {
-        try store.writer.read { db in
-            try String.fetchOne(db, sql: "SELECT body FROM memoryDoc WHERE companyId = ? AND id = ? AND removedAt IS NULL", arguments: [companyId, docId])
+    /// The words of a memory query as `MemoryQuery` makes its tokens (letters, digits and `-`; a hyphenated word is a phrase
+    /// of its parts; a one-letter part dropped unless numeric; at most `MemoryQuery.maxTokens`), folded.
+    static func memoryWords(_ q: String) -> [[String]] {
+        var cleaned = String.UnicodeScalarView()
+        for scalar in q.precomposedStringWithCanonicalMapping.unicodeScalars {
+            switch scalar.properties.generalCategory {
+            case .control: cleaned.append(" ")
+            case .format: continue
+            default: cleaned.append(scalar)
+            }
         }
+        var words: [[String]] = []
+        var current = ""
+        func flush() {
+            defer { current = "" }
+            let parts = current.split(separator: "-").map { fold(String($0)) }.filter { !$0.isEmpty }
+            guard !parts.isEmpty, !(parts.count == 1 && parts[0].count < MemoryQuery.minTokenLength && !parts[0].allSatisfy(\.isNumber)),
+                  !words.contains(parts), words.count < MemoryQuery.maxTokens else { return }
+            words.append(parts)
+        }
+        for ch in String(cleaned) {
+            if ch.isLetter || ch.isNumber || ch == "-" { current.append(ch) } else { flush() }
+        }
+        flush()
+        return words
+    }
+
+    static func fold(_ s: String) -> String { s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).lowercased() }
+
+    /// The folded words of `text` (runs of letters and digits).
+    static func textWords(_ text: String) -> [String] {
+        fold(text).split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+    }
+
+    /// Whether the query words occur as words (a phrase as consecutive words) of `text`: every one (`all`) or any one.
+    static func containsWords(_ words: [[String]], in text: String, all: Bool) -> Bool {
+        let tokens = textWords(text)
+        let set = Set(tokens)
+        func has(_ parts: [String]) -> Bool {
+            if parts.count == 1 { return set.contains(parts[0]) }
+            guard tokens.count >= parts.count else { return false }
+            for i in 0...(tokens.count - parts.count) where Array(tokens[i..<(i + parts.count)]) == parts { return true }
+            return false
+        }
+        return all ? words.allSatisfy(has) : words.contains(where: has)
+    }
+
+    /// A memory hit the reader can see the query in: its doc's title (and, at full access, body), with every stored value
+    /// blanked, holds the query words. Returns the body ("" when not readable in full) for the snippet, or nil (dropped).
+    private func visibleDoc(_ hit: MemoryHit, words: [[String]], all: Bool, companyId: String, gate: TextGate) throws -> String?? {
+        guard let row = try store.writer.read({ db in
+            try Row.fetchOne(db, sql: "SELECT title, body FROM memoryDoc WHERE companyId = ? AND id = ? AND removedAt IS NULL",
+                             arguments: [companyId, hit.docId])
+        }) else { return nil }
+        let title: String = row["title"], body: String = row["body"]
+        let full = hit.level == .full
+        let visible = gate.matchText(full ? title + "\n" + body : title)
+        guard Self.containsWords(words, in: visible, all: all) else { return nil }
+        return .some(full ? body : nil)
     }
 
     private func memoryCandidates(_ q: String, kinds: Set<SearchKind>, filters: SearchFilters, actorId: String?, companyId: String,
@@ -388,9 +428,29 @@ public struct GlobalSearch: Sendable {
         if kinds.contains(.sprint) { rest.insert(.retro) }
         if !rest.isEmpty { calls.append(rest) }
 
+        let words = Self.memoryWords(q)
+        guard !words.isEmpty else { return [] }
         var out: [Candidate] = []
         for sources in calls {
-            for hit in try memory.search(companyId: companyId, scope: reader, query: q, sources: sources, limit: MemoryPolicy.maxHits, now: now) {
+            // C-1 / Ruling 56: every word must be a word of the doc's text as the reader sees it (title, and the body when the
+            // reader may read it in full, every stored value blanked); the any-word fallback is decided on the hits kept.
+            var kept: [(hit: MemoryHit, body: String?)] = []
+            var seenDocs = Set<Int64>()
+            for hit in try memory.search(companyId: companyId, scope: reader, query: q, sources: sources, limit: MemoryPolicy.maxHits, now: now,
+                                         match: .all) {
+                guard let checked = try visibleDoc(hit, words: words, all: true, companyId: companyId, gate: gate) else { continue }
+                kept.append((hit, checked))
+                seenDocs.insert(hit.docId)
+            }
+            if kept.count < MemoryPolicy.orFallbackBelow, words.count > 1 {
+                for hit in try memory.search(companyId: companyId, scope: reader, query: q, sources: sources, limit: MemoryPolicy.maxHits,
+                                             now: now, match: .any) where !seenDocs.contains(hit.docId) {
+                    guard let checked = try visibleDoc(hit, words: words, all: false, companyId: companyId, gate: gate) else { continue }
+                    kept.append((hit, checked))
+                    seenDocs.insert(hit.docId)
+                }
+            }
+            for (hit, body) in kept {
                 guard let found = try memoryRef(hit, companyId: companyId), kinds.contains(found.1) else { continue }
                 let (ref, kind) = found
                 if let w = filters.window, !w.contains(hit.updatedAt) { continue }
@@ -398,7 +458,7 @@ public struct GlobalSearch: Sendable {
                 var c = Candidate(ref: ref, kind: kind, score: 0.9 * max(hit.score, 0) / (max(hit.score, 0) + 1))
                 // I-1: the snippet is cut by the engine from the doc's whole text, after the whole text is gated; never the
                 // index's own cut (`MemoryHit.snippet`, which the reader's access decided: only then is the body read).
-                if !hit.tainted, hit.snippet != nil, let body = try docBody(hit.docId, companyId: companyId) {
+                if !hit.tainted, hit.snippet != nil, let body {
                     c.snippet = gate.snippet(body, around: q, max: Self.snippetMax)
                 }
                 c.tainted = hit.tainted
@@ -545,7 +605,18 @@ public struct GlobalSearch: Sendable {
             if wantCommits { incomplete.insert(.commits) }
             return []
         }
-        let git = state.git, heads = state.heads, main = state.main
+        let git = state.git, main = state.main
+        // N-5 / M-3: only item branches whose item the reader can read are indexed, so neither their hits nor their failures
+        // (the incomplete flags) ever reach a reader who can't read the item.
+        var heads: [String: String] = ["main": main]
+        for (branch, head) in state.heads where branch != "main" {
+            let readable = try store.writer.read { db in
+                try RefAccess.canRead(reader, WorkRef(kind: .item, id: String(branch.dropFirst(5))), companyId: company.id, db: db,
+                                      catalog: store.catalog)
+            }
+            if case .allowed = readable { heads[branch] = head }
+        }
+        let holders = state.holders.filter { heads[$0.key] != nil }
         var out: [Candidate] = []
         var mainIndex: FileIndex? = nil
         if wantFiles {
@@ -558,12 +629,6 @@ public struct GlobalSearch: Sendable {
                 out.append(fileCandidate(path: f.path, branch: nil, score: f.score, time: f.time, filters: filters))
             }
             for (branch, head) in heads.sorted(by: { $0.key < $1.key }) where branch != "main" {
-                // N-5: an item branch the reader can't read never colours the flag (or the hits: each is checked anyway).
-                let readable = try store.writer.read { db in
-                    try RefAccess.canRead(reader, WorkRef(kind: .item, id: String(branch.dropFirst(5))), companyId: company.id, db: db,
-                                          catalog: store.catalog)
-                }
-                guard case .allowed = readable else { continue }
                 guard let index = try? files.indexNow(companyId: company.id, branch: branch, head: head, git: git) else {
                     incomplete.insert(.files)
                     continue
@@ -579,7 +644,7 @@ public struct GlobalSearch: Sendable {
         }
         var commitIndex: CommitIndex? = nil
         if wantCommits {
-            commitIndex = try? commits.indexNow(companyId: company.id, heads: heads, holders: state.holders, git: git)
+            commitIndex = try? commits.indexNow(companyId: company.id, heads: heads, holders: holders, git: git)
             if commitIndex == nil { incomplete.insert(.commits) }
         }
         if let index = commitIndex {
@@ -627,6 +692,15 @@ public struct GlobalSearch: Sendable {
         let listing = q.isEmpty
         let tokens = q.lowercased().split(whereSeparator: { $0.isWhitespace }).map(String.init).filter { $0.count >= FuzzyScorer.minQuery }
         let folded = tokens.map(FuzzyScorer.foldQuery)
+        /// I-A: a row read through the raw prefilter is kept only if every query word is a substring of its text as the reader
+        /// sees it (every stored value blanked), then scored on that text: the scorer's subsequences can't reach into a value.
+        func visibleScore(_ text: String) -> Double {
+            if listing { return Self.listingScore }
+            let visible = gate.matchText(text)
+            let lower = visible.lowercased()
+            guard tokens.allSatisfy({ lower.contains($0) }) else { return 0 }
+            return FuzzyScorer.words(folded, visible.split(whereSeparator: { $0.isWhitespace }).map { FuzzyScorer.Folded(String($0)) })
+        }
         // N-1: a row is matched on its text with every stored value blanked, never on the raw text.
         func score(_ text: String) -> Double {
             listing ? Self.listingScore
@@ -643,6 +717,26 @@ public struct GlobalSearch: Sendable {
         let limit = Self.sqlCandidates
         var out: [Candidate] = []
         try store.writer.read { db in
+            /// Fix round 3 (controller ruling 1, re-review I-A): a source read through a raw prefilter (item events, activity) is
+            /// read with a cursor, newest first by `rowKey`, within a window that doesn't depend on the query (the newest
+            /// `activityRows` rows of the source, or the time window), and a row counts only when `accept` keeps it, so rows
+            /// that match only inside a stored value never take another row's place. It stops at `limit` kept rows or at the
+            /// window's end; nothing about which rows matched decides anything else.
+            func paged(_ base: String, _ args: [DatabaseValueConvertible], key: String, accept: (Row) throws -> Candidate?) throws {
+                var accepted = 0
+                var before: Int64? = nil
+                while true {
+                    var sql = base, a = args
+                    if let before { sql += " AND \(key) < ?"; a.append(before) }
+                    sql += " ORDER BY \(key) DESC LIMIT \(limit)"
+                    let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(a))
+                    for row in rows {
+                        if let c = try accept(row) { out.append(c); accepted += 1 }
+                    }
+                    if rows.count < limit || accepted >= limit { return }
+                    before = rows.last?["rowKey"]
+                }
+            }
             // Agents: handle, name, role, team and current item title; prefix or fuzzy. Status: the agent state.
             if kinds.contains(.agent), !listing || filters.status != nil {
                 let states = filters.status.map { Self.agentStates($0) ?? [] }
@@ -729,19 +823,25 @@ public struct GlobalSearch: Sendable {
             // Item events: their text (a hit opens the item); the event's own mark and its writer's session decide its taint.
             if kinds.contains(.event), !listing || filters.actor != nil || filters.window != nil {
                 var sql = """
-                    SELECT e.actorId, e.kind, e.text, e.createdAt, e.taintedOrigin, w.key FROM workItemEvent e
+                    SELECT e.id AS rowKey, e.actorId, e.kind, e.text, e.createdAt, e.taintedOrigin, w.key FROM workItemEvent e
                     JOIN workItem w ON w.id = e.itemId AND w.companyId = e.companyId WHERE e.companyId = ?
                     """
                 var args: [DatabaseValueConvertible] = [companyId]
                 let (cs, ca) = contains("e.text"); sql += cs; args += ca
                 if let actorId { sql += " AND e.actorId = ?"; args.append(actorId) }
-                let (w, wa) = window("e.createdAt"); sql += w; args += wa
-                sql += " ORDER BY e.id DESC LIMIT \(limit)"
-                for row in try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args)) {
+                if filters.window != nil {
+                    let (w, wa) = window("e.createdAt"); sql += w; args += wa
+                } else {
+                    sql += """
+                         AND e.id >= COALESCE((SELECT id FROM workItemEvent WHERE companyId = ? ORDER BY id DESC LIMIT 1 OFFSET \(Self.activityRows - 1)), 0)
+                        """
+                    args.append(companyId)
+                }
+                try paged(sql, args, key: "e.id") { row in
                     let text: String = row["text"], key: String = row["key"], kind: String = row["kind"], actor: String = row["actorId"]
                     let at: Date = row["createdAt"]
-                    let s = score(text)
-                    guard s > 0 else { continue }
+                    let s = visibleScore(text)
+                    guard s > 0 else { return nil }
                     var c = Candidate(ref: WorkRef(kind: .item, id: key), kind: .event, score: s)
                     c.title = "\(key) · \(kind)"
                     c.taintedTitle = c.title
@@ -749,7 +849,7 @@ public struct GlobalSearch: Sendable {
                     let authorTainted = try Self.authorTainted(db, actor, at: at)
                     c.tainted = (row["taintedOrigin"] as Bool) || authorTainted
                     c.snippet = c.tainted ? nil : gate.snippet(text, around: q, max: Self.snippetMax)
-                    out.append(c)
+                    return c
                 }
             }
             // Runs: by item key, item title and status.
@@ -832,7 +932,7 @@ public struct GlobalSearch: Sendable {
             }
             // Activity (the owner's alone): the newest 20 000 lines, or the window; a hit opens its subject (item, agent, release).
             if kinds.contains(.activity), reader == .owner, !listing || filters.actor != nil || filters.window != nil {
-                var sql = "SELECT id, agentId, text, createdAt FROM activityEvent WHERE companyId = ?"
+                var sql = "SELECT id AS rowKey, id, agentId, text, createdAt FROM activityEvent WHERE companyId = ?"
                 var args: [DatabaseValueConvertible] = [companyId]
                 if let w = filters.window {
                     sql += " AND createdAt >= ? AND createdAt <= ?"; args += [w.start, w.end]
@@ -846,13 +946,11 @@ public struct GlobalSearch: Sendable {
                     if actorId == "owner" { sql += " AND agentId IS NULL" } else { sql += " AND agentId = ?"; args.append(actorId) }
                 }
                 let (cs, ca) = contains("text"); sql += cs; args += ca
-                sql += " ORDER BY id DESC LIMIT \(limit)"
-                let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
                 let context = try refContext(db, companyId: companyId)
-                for row in rows {
+                try paged(sql, args, key: "id") { row in
                     let text: String = row["text"], id: Int64 = row["id"]
-                    let s = score(text)
-                    guard s > 0 else { continue }
+                    let s = visibleScore(text)
+                    guard s > 0 else { return nil }
                     var c = Candidate(ref: WorkRef(kind: .fact, id: "activity:\(id)"), kind: .activity, score: s)
                     c.title = text
                     c.subtitle = "activity"
@@ -863,7 +961,7 @@ public struct GlobalSearch: Sendable {
                     } else {
                         c.inlineOnly = true
                     }
-                    out.append(c)
+                    return c
                 }
             }
         }
