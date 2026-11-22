@@ -23,6 +23,8 @@ final class OfficeRoomNode: SKNode {
         didSet { if count != oldValue { applyCount() } }
     }
 
+    /// The title as drawn: `room.title` cut to fit.
+    private(set) var titleText: String?
     /// Folders on the board table.
     private(set) var askFolders = 0
     /// `9+` when there are more asks than folders.
@@ -91,11 +93,15 @@ final class OfficeRoomNode: SKNode {
         leaf.name = "door"
         addChild(leaf)
 
-        let title = OrgCardNode.fit(room.title, width: r.width - 12, size: 9, mono: true)
+        // The title sits top left; over a door in the top wall it ends 2 pt short of the gap.
+        let titleX = r.minX + 6
+        let titleWidth = doorOnTop ? door.x - gap / 2 - 2 - titleX : r.width - 12
+        let title = OrgCardNode.fit(room.title, width: titleWidth, size: 9, mono: true)
+        titleText = title
         let texture = LabelTextures.shared.text(title, size: 9, mono: true, color: ThemeHex.text2)
         let label = SKSpriteNode(texture: texture, size: OrgCardNode.points(texture))
         label.anchorPoint = CGPoint(x: 0, y: 1)
-        label.position = CGPoint(x: r.minX + 6, y: r.maxY - 4)
+        label.position = CGPoint(x: titleX, y: r.maxY - 4)
         label.name = "title"
         addChild(label)
 

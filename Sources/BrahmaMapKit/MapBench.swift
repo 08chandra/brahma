@@ -18,6 +18,8 @@ public struct MapBenchResult: Sendable {
     public var dropped: Int
     /// Virtual seconds the queue spent in aggregate mode.
     public var aggregateSeconds: Double
+    /// The office's level of detail at the end of the run; nil for the org chart.
+    public var officeLOD: OfficeLOD?
     /// The `MAP BENCH …` line the tests print and the README quotes.
     public var line: String
 }
@@ -49,9 +51,10 @@ public enum MapBench {
                            seconds: Double = 30, expandAll: Bool = false) -> MapBenchResult {
         // An epoch multiple of 10 s, so a (10, n) burst lands 10 s into the run.
         let clock = VirtualClock(Date(timeIntervalSince1970: 1_800_000_000))
+        clearDefaults()
+        defer { clearDefaults() }
         let controller = MapController(source: .synthetic(agents: agents, rate: rate, seed: 42),
-                                       defaults: UserDefaults(suiteName: "brahma.mapbench.\(UUID().uuidString)")!,
-                                       clock: { clock.now })
+                                       defaults: UserDefaults(suiteName: suiteName)!, clock: { clock.now })
         controller.syntheticBurst = burst.map { (every: $0.0, size: $0.1) }
         controller.mode = mode   // before `present`: the mode decides what the controller collapses (none in the office)
         let scene = MapSceneFactory.make(mode, size: size)
@@ -65,7 +68,7 @@ public enum MapBench {
                 + "p95=\(f(stats.p95Ms))ms max=\(f(stats.maxMs))ms dropped=\(dropped) aggregate=\(f(aggregate))s"
             return MapBenchResult(mode: controller.mode, agents: controller.model.agents.count, frames: stats.frames,
                                   meanMs: stats.meanMs, p95Ms: stats.p95Ms, maxMs: stats.maxMs, dropped: dropped,
-                                  aggregateSeconds: aggregate, line: line)
+                                  aggregateSeconds: aggregate, officeLOD: (scene as? OfficeScene)?.lod, line: line)
         }
 
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
@@ -136,5 +139,47 @@ public enum MapBench {
             if controller.model.stats.aggregate { aggregate += step }
         }
         return result(intervals, aggregate: aggregate)
+    }
+
+    // MARK: Defaults
+
+    /// The bench's defaults suite. The controller persists the mode it is given (`MapController.mode`), so a run needs a
+    /// suite; one fixed name, emptied before and after every run, keeps the bench from leaving a plist per run in
+    /// `~/Library/Preferences`. `cfprefsd` may write the emptied domain back a few seconds later (as for the harness suite,
+    /// ruling R11), which bounds the leftover to this one file, removed again by the next run. Runs that share the suite
+    /// do not disturb each other: the bench sets `mode` after `init`, so the stored value is never read.
+    public static let suiteName = "brahma.mapbench"
+    /// Earlier builds gave every run its own suite, `brahma.mapbench.<UUID>`.
+    static let perRunPrefix = "brahma.mapbench."
+    static let plistExtension = ".plist"
+
+    /// Empties the bench suite and removes the bench's plists from `directory` (`removePlists(in:)`).
+    static func clearDefaults(in directory: URL = HarnessDefaults.preferencesDirectory) {
+        UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        UserDefaults(suiteName: suiteName)?.synchronize()
+        removePlists(in: directory)
+    }
+
+    /// Removes the bench's plists from `directory`: `brahma.mapbench.plist` and the per-run `brahma.mapbench.<UUID>.plist`
+    /// files of earlier builds. Only regular files with exactly those names are touched (a canonical upper-case UUID, as
+    /// `UUID().uuidString` wrote it); links, folders and every other name are left alone. Returns the files removed.
+    @discardableResult
+    static func removePlists(in directory: URL) -> [URL] {
+        let keys: Set<URLResourceKey> = [.isRegularFileKey]
+        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: Array(keys))
+        else { return [] }
+        return urls.filter { url in
+            guard isBenchPlist(url.lastPathComponent),
+                  (try? url.resourceValues(forKeys: keys))?.isRegularFile == true else { return false }
+            return (try? FileManager.default.removeItem(at: url)) != nil
+        }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    /// `brahma.mapbench.plist`, or `brahma.mapbench.<UUID>.plist` with the UUID in `UUID().uuidString`'s canonical form.
+    static func isBenchPlist(_ name: String) -> Bool {
+        if name == suiteName + plistExtension { return true }
+        guard name.hasPrefix(perRunPrefix), name.hasSuffix(plistExtension) else { return false }
+        let middle = String(name.dropFirst(perRunPrefix.count).dropLast(plistExtension.count))
+        return UUID(uuidString: middle)?.uuidString == middle
     }
 }

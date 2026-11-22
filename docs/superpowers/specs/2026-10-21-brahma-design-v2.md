@@ -1145,6 +1145,9 @@ health history, grants ledger, later meter/trust/HR (3b).
   first-pass, 🍜 large item under budget, 🏆 employee of the sprint, 🔥 streaks,
   ⭐ owner kudos; break-room view. Shown in the Village skin and profiles;
   ops-console views show them as text chips. **[owner 2026-10-20: build it]**
+  *(Superseded, 2026-11-22: the Village skin was replaced by the Office view
+  (Plan 4c), which shows perks on desks and on its break-room wall of fame; see
+  the After-4c note in §4.12.3.)*
 - **HR partner** (reports to CEO): reviews each sprint from meter + manager
   input; warning → PIP (T0, measurable targets) → termination with replacement
   (clean session, improved card, hand-off); **root cause first** (fix the
@@ -1291,7 +1294,7 @@ time-to-unblock. **[call]**
 | 10 | **M Marketing** | Text/image posts first (§4.13), recurring work items; M2 video next. | **to write** |
 | 11 | **G Generator** | Role generation (`propose_role`), hire/new company from description, save company as pack, A/B evaluation, non-software packs, per-industry tool bundles. | **to write** |
 | 12 | **3b Performance & people** | Redesigned from dogfood data (§4.15). | **written then shelved** (12 tasks; must be rewritten on the ask model) |
-| 13 | **4c Map skins** | Hive (3D) and Village (2D) skins on `MapModel`. | **to write** |
+| 13 | **4c Map skins** | Hive (3D) and Village (2D) skins on `MapModel`. | **to write** *(superseded 2026-11-22: Plan 4c built the Office view instead of Village; Hive has no plan; see the After-4c note in §4.12.3)* |
 | 14 | **7 External comms** | §4.14. | to write |
 | 15 | **11 Running the company** | Connectors catalog, Integrations page, funds, browser, business roles, metered spend (§4.10). | to write |
 | 16 | **9 Labs & memory v2** | §4.16 + embeddings, librarian, procedural memory. | to write |
@@ -1336,8 +1339,8 @@ Authority: **L** = latest owner decision, **O** = owner decision, **C** =
 | C-22 | Old §6.17 Knowledge Base as `kb/` files vs §6.28 Markdown-in-git then SQLite | SQLite/GRDB handbook; Markdown export only | L 17:47 |
 | C-23 | Old §6.15 Steward hot-swaps engine builds, Level-1/2 automatic in Auto vs §6.24 reports + PRs, no hot-swap | Reports + PRs; tuning via Inbox; prompt changes owner-required | O 15:16 |
 | C-24 | Old §6.19/§6.20 performance, HR, trust, rewards, ideas in Plan 3/4 vs §6.24 defer all of 3b until dogfood | Deferred; 3a collects facts only | O 15:16 |
-| C-25 | Old §6.21 Hive + Village in Plan 4 vs org chart first | Org chart in 4b; Hive/Village skins in 4c, exempt from ops brief | O 15:16 |
-| C-26 | Emoji perks / cartoon Village vs ops-console brief | Emoji only in the Village skin and profiles; ops views use text chips | C (design review nit) |
+| C-25 | Old §6.21 Hive + Village in Plan 4 vs org chart first | Org chart in 4b; Hive/Village skins in 4c, exempt from ops brief *(superseded 2026-11-22: 4c built the Office view instead of Village; no Hive)* | O 15:16 |
+| C-26 | Emoji perks / cartoon Village vs ops-console brief | Emoji only in the Village skin and profiles; ops views use text chips *(superseded 2026-11-22: the Village skin became the Office view, 4c)* | C (design review nit) |
 | C-27 | Old §6.22 skills/slash commands vs P1/3a `--disable-slash-commands` | Kept until 5L mounts company skills via `--plugin-dir`, then removed (or restored if project skills leak, 5L check) | C |
 | C-28 | "argv frozen as Plan 1" vs TurnProfile compiler | Compiler; Plan 1 argv snapshots kept as tests | O 15:16 |
 | C-29 | §6.24 order (… 5-lite → Memory-lite → 4a → 4b …) vs §6.24a order (… 5-lite → L → Memory-lite → 4a rest …) | §6.24a | L 17:53 |

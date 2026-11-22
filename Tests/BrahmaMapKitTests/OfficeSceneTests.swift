@@ -306,6 +306,41 @@ import AppKit
         }
     }
 
+    /// Final review M3 (Task 5 M3): a director's office is titled with the director's handle, cut to fit, and every room
+    /// title stays clear of its door: left of the gap on a top door wall, inside the room on the others.
+    @Test func roomTitlesNameDirectorsAndClearTheDoor() throws {
+        let probe = Self.model(agents: 50)
+        let directors = probe.tree.order.filter { probe.tree.nodes[$0]?.tier == .director }
+        let long = try #require(directors.first)
+        let model = Self.model(agents: 50, edit: { agents in
+            if let i = agents.firstIndex(where: { $0.id == long }) { agents[i].name = "a-very-long-director-handle-name" }
+        })
+        let scene = Self.scene(model)
+        #expect(directors.count >= 2)
+        for d in directors {
+            let room = try #require(scene.layout.rooms["office:\(d)"])
+            let handle = try #require(model.agents[d]?.handle)
+            #expect(room.title == handle)
+            let node = try #require(scene.roomNode(room.id))
+            let shown = try #require(node.titleText)
+            if d == long {
+                #expect(shown.hasSuffix("…") && shown.count < handle.count, "a long handle is cut: \(shown)")
+            } else {
+                #expect(shown == handle, "a short handle fits whole: \(shown)")
+            }
+        }
+        for room in scene.layout.rooms.values {
+            let node = try #require(scene.roomNode(room.id))
+            let label = try #require(node.childNode(withName: "title") as? SKSpriteNode)
+            let r = node.rect
+            #expect(label.frame.minX >= r.minX && label.frame.maxX <= r.maxX - 4, "\(room.id): \(label.frame) in \(r)")
+            if room.door.y <= room.rect.y {
+                // The door gap is 16 pt wide around the door point.
+                #expect(label.frame.maxX <= room.door.x - 8 - 2, "\(room.id): \(label.frame.maxX) runs into the door")
+            }
+        }
+    }
+
     @Test func emptyCompanyShowsRoomsOnly() throws {
         var model = MapModel()
         model.apply(MapInputs(agents: [], pack: SoftwarePack.pack), now: 0)
@@ -612,6 +647,40 @@ import AppKit
         #expect(Self.near(scene.particleSprite(77)?.position, Self.scenePoint(scene.layout.mailCounter(0)), within: 2))
     }
 
+    /// Final review M5 (Task 7 M6): a folder's key label never hangs past the floor's outer wall, all the way along a
+    /// flight to the desk nearest the right wall.
+    @Test func folderKeyLabelStaysOnTheFloor() throws {
+        let (c, _) = Self.officeController(50) { $0.meetings = []; $0.reviewing = [] }
+        let scene = OfficeScene(size: Self.size)
+        scene.reduceMotion = false
+        Self.run(scene, c, to: 0.1)
+        let seated = Self.seated(scene, c)
+        let layout = scene.layout
+        let right = try #require(seated.max { (layout.location(.agent($0))?.x ?? 0) < (layout.location(.agent($1))?.x ?? 0) })
+        let from = try #require(seated.first { $0 != right })
+        let e = VisualEvent(id: 104, kind: .handoff, from: .agent(from), to: .agent(right), label: "BRH-104-CHECKOUT",
+                            start: 0.1, duration: 1.4)
+        scene.update(controller: c, events: [e], now: 0.1)
+        #expect(scene.particleKind(104) == .folder)
+        let bounds = scene.contentBounds
+        var overhang = false, frames = 0
+        var t = 0.1
+        while t < 1.49 {
+            t += 1.0 / 60
+            scene.update(controller: c, events: [], now: t)
+            guard let sprite = scene.particleSprite(104), let label = scene.particleLabel(104) else { continue }
+            frames += 1
+            let p = sprite.position, f = label.frame
+            // Where the label would hang without the clamp: right of the folder.
+            overhang = overhang || p.x + 6 + f.width > bounds.maxX
+            let shown = f.offsetBy(dx: p.x, dy: p.y)
+            #expect(shown.minX >= bounds.minX && shown.maxX <= bounds.maxX && shown.minY >= bounds.minY
+                    && shown.maxY <= bounds.maxY, "t \(t): \(shown) leaves the floor \(bounds)")
+        }
+        #expect(frames > 60)
+        #expect(overhang, "the flight never came near the right wall, so the clamp was not exercised")
+    }
+
     @Test func phaseChangeStampsParcel() throws {
         let (c, base) = Self.officeController(12) { $0.itemPhases = [:] }
         let scene = OfficeScene(size: Self.size)
@@ -695,6 +764,69 @@ import AppKit
         #expect(scene.deskNode(victim) == nil)
         #expect(scene.figureNode(victim) == nil)
         #expect(scene.layout.desks[victim] == nil, "the layout was rebuilt without it")
+    }
+
+    /// Final review M2: a content event that waits (here a state change of a desk the held layout does not have yet) does
+    /// not rebuild the floor on every frame; the refresh cadence, the hire's structure change and the leave's end cover it.
+    @Test func waitingContentEventRebuildsAtRefreshCadence() throws {
+        let made = SyntheticCompany.make(agents: 12)
+        let hired = try #require(made.agents.last { a in
+            a.state != .killed && a.managerId != nil && !made.agents.contains { $0.managerId == a.id }
+        })
+        let (c, base) = Self.officeController(12) { $0.meetings = []; $0.reviewing = [] }
+        var without = base
+        without.agents.removeAll { $0.id == hired.id }
+        c.model.apply(without, now: 0, emitEvents: false)
+        let scene = OfficeScene(size: Self.size)
+        scene.reduceMotion = false
+        Self.run(scene, c, to: 0.1)
+
+        // A leave holds the layout for 1.5 s.
+        let victim = try #require(Self.seated(scene, c).first { id in !made.agents.contains { $0.managerId == id } })
+        var killed = without
+        let i = try #require(killed.agents.firstIndex { $0.id == victim })
+        killed.agents[i].state = .killed
+        c.model.apply(killed, now: 0.1)
+        Self.run(scene, c, from: 0.1, to: 0.2)
+        #expect(scene.leavingIds == [victim])
+
+        // The hire arrives while the layout is held, so its desk does not exist yet; then its state changes.
+        var hiredInputs = killed
+        hiredInputs.agents.append(try #require(base.agents.first { $0.id == hired.id }))
+        c.model.apply(hiredInputs, now: 0.2)
+        var t = Self.run(scene, c, from: 0.2, to: 0.25)
+        let j = try #require(hiredInputs.agents.firstIndex { $0.id == hired.id })
+        hiredInputs.agents[j].state = hiredInputs.agents[j].state == .sleeping ? .ready : .sleeping
+        c.model.apply(hiredInputs, now: t)
+        func waitingStateChange() -> Bool {
+            scene.waitingEvents.contains { e in
+                if case .stateChange = e.kind, case .agent(hired.id) = e.from { true } else { false }
+            }
+        }
+        var sawStateChange = false
+        while t < 0.6, !waitingStateChange() {
+            t += 1.0 / 60
+            let events = c.frame(now: t)
+            sawStateChange = sawStateChange || events.contains { if case .stateChange = $0.kind { true } else { false } }
+            scene.update(controller: c, events: events, now: t)
+        }
+        #expect(sawStateChange)
+        #expect(waitingStateChange(), "the state change waits for its desk")
+        #expect(scene.deskNode(hired.id) == nil && scene.leavingIds == [victim])
+
+        // 0.4 s of frames while it waits: about one rebuild per `refreshInterval`, not one per frame (24).
+        let before = scene.rebuildCount
+        let end = t + 0.4
+        t = Self.run(scene, c, from: t + 1.0 / 60, to: end)
+        #expect(waitingStateChange(), "still waiting: the window measured what it should")
+        let rebuilds = scene.rebuildCount - before
+        #expect(rebuilds <= Int((0.4 / OfficeScene.refreshInterval).rounded(.up)) + 1, "\(rebuilds) rebuilds in 0.4 s")
+
+        // When the leave ends the floor is rebuilt with the new desk, and nothing waits any more.
+        Self.run(scene, c, from: t + 1.0 / 60, to: 2.0)
+        #expect(scene.leavingIds.isEmpty)
+        #expect(scene.deskNode(hired.id) != nil)
+        #expect(!waitingStateChange())
     }
 
     /// R3: (a) a figure walking to the review room whose review ends (its item's owner was killed) heads back to its own

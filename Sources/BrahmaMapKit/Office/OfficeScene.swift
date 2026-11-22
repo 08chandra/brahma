@@ -109,6 +109,8 @@ public final class OfficeScene: SKScene, MapScene {
     public private(set) var accessibilityRevision = 0
     /// Bumped whenever `layout` is replaced.
     private var layoutVersion = 0
+    /// How many times the floor was rebuilt (tests).
+    private(set) var rebuildCount = 0
     private var accessibilityKey: AccessibilityKey?
 
     /// Everything `accessibilityItems` reads: the structure, the layout, the agents and the open asks.
@@ -236,6 +238,7 @@ public final class OfficeScene: SKScene, MapScene {
     /// stays where it was until its animation ends; spec §5.4), but states, activities and rooms are refreshed. During a
     /// replay the item facets are not shown (spec §5.7): no reviewing, meetings or parcels.
     func rebuild(model: MapModel, replaying: Bool) {
+        rebuildCount += 1
         builtModel = model
         builtReplaying = replaying
         let tree = model.tree

@@ -224,6 +224,9 @@ import Foundation
             let office = try #require(layout.rooms["office:\(d)"])
             #expect(office.kind == .director(agentId: d))
             #expect(contains(wing.rect, office.rect))
+            // Titled by its director's (cleaned) handle, which names the wing (final review M3).
+            #expect(office.title == m.agents[d]?.handle && office.title.hasPrefix("@"))
+            #expect(wing.title == office.title)
         }
     }
 

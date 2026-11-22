@@ -22,10 +22,16 @@ private enum PerfGate {
 @Suite(.scratch) struct MapPerfTests {
     static let budgetMs = 16.7
 
+    /// A run empties its defaults suite when it ends (final review M1): nothing of `brahma.mapbench` stays behind.
+    @MainActor static var benchDefaultsCleared: Bool {
+        UserDefaults.standard.persistentDomain(forName: MapBench.suiteName)?.isEmpty ?? true
+    }
+
     @Test(.enabled(if: PerfGate.enabled, "needs BRAHMA_PERF=1 and a Metal device"))
     @MainActor func sixtyFpsAt300DefaultCollapse() {
         let r = MapBench.run(agents: 300)
         print(r.line)
+        #expect(Self.benchDefaultsCleared, "the run left values in its defaults suite")
         #expect(r.frames > 0)
         #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
     }
@@ -34,6 +40,7 @@ private enum PerfGate {
     @MainActor func sixtyFpsAt300FullyExpanded() {
         let r = MapBench.run(agents: 300, expandAll: true)
         print(r.line)
+        #expect(Self.benchDefaultsCleared, "the run left values in its defaults suite")
         #expect(r.frames > 0)
         #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
     }
@@ -43,6 +50,7 @@ private enum PerfGate {
         // The org generator tops out at `OrgGenerator.range` (500), so 600 is clamped: the line says `agents=500`.
         let r = MapBench.run(agents: 600, rate: 120)
         print(r.line)
+        #expect(Self.benchDefaultsCleared, "the run left values in its defaults suite")
         #expect(r.agents == OrgGenerator.range.upperBound, "the generator's range changed: \(r.line)")
         #expect(r.frames > 0)
         #expect(r.aggregateSeconds > 0, "120 msg/s never switched the queue to aggregate mode: \(r.line)")
@@ -55,6 +63,7 @@ private enum PerfGate {
     @MainActor func sixtyFpsAt300WithParticles() {
         let r = MapBench.run(agents: 300, rate: 15, burst: nil, expandAll: true)
         print(r.line)
+        #expect(Self.benchDefaultsCleared, "the run left values in its defaults suite")
         #expect(r.frames > 0)
         #expect(r.aggregateSeconds == 0, "aggregate mode ran, so the particle path was not what was measured: \(r.line)")
         #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
@@ -67,7 +76,9 @@ private enum PerfGate {
     @MainActor func officeSixtyFpsAt50Bursts() {
         let r = MapBench.run(agents: 50, mode: .office)
         print(r.line)
+        #expect(Self.benchDefaultsCleared, "the run left values in its defaults suite")
         #expect(r.mode == .office)
+        #expect(r.officeLOD == .full, "the row measured another level of detail: \(r.line)")
         #expect(r.frames > 0)
         #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
     }
@@ -77,7 +88,9 @@ private enum PerfGate {
     @MainActor func officeSixtyFpsAt50Particles() {
         let r = MapBench.run(agents: 50, mode: .office, rate: 15, burst: nil)
         print(r.line)
+        #expect(Self.benchDefaultsCleared, "the run left values in its defaults suite")
         #expect(r.mode == .office)
+        #expect(r.officeLOD == .full, "the row measured another level of detail: \(r.line)")
         #expect(r.frames > 0)
         #expect(r.aggregateSeconds == 0, "aggregate mode ran, so the note path was not what was measured: \(r.line)")
         #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
@@ -88,7 +101,9 @@ private enum PerfGate {
     @MainActor func officeAt150Static() {
         let r = MapBench.run(agents: 150, mode: .office)
         print(r.line)
+        #expect(Self.benchDefaultsCleared, "the run left values in its defaults suite")
         #expect(r.mode == .office)
+        #expect(r.officeLOD == .staticFigures, "the row measured another level of detail: \(r.line)")
         #expect(r.frames > 0)
         #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
     }
@@ -98,7 +113,9 @@ private enum PerfGate {
     @MainActor func officeAt300DeskOnly() {
         let r = MapBench.run(agents: 300, mode: .office)
         print(r.line)
+        #expect(Self.benchDefaultsCleared, "the run left values in its defaults suite")
         #expect(r.mode == .office)
+        #expect(r.officeLOD == .deskOnly, "the row measured another level of detail: \(r.line)")
         #expect(r.frames > 0)
         #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
     }

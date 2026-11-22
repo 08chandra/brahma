@@ -161,8 +161,9 @@ extension OfficeScene {
 
         beginLeaves(events, model: model, now: now)
         advanceLeaves(now: now)
-        // A content event's desk still shows the old content: refresh first, then play the effect on it.
-        let contentEvent = events.contains(where: Self.isContentEvent) || m.waiting.contains(where: Self.isContentEvent)
+        // A content event's desk still shows the old content: refresh first, then play the effect on it. One that waits
+        // for its desk needs no rebuild per frame: the leave's end, the hire's structure change and the refresh cover it.
+        let contentEvent = events.contains(where: Self.isContentEvent)
         let due = m.needsRebuild || contentRevision != model.structureRevision || contentEvent
             || now - m.lastRebuild >= Self.refreshInterval || now < m.lastRebuild
         if due {
@@ -478,8 +479,25 @@ extension OfficeScene {
                 }
             }
             p.sprite.isHidden = false
+            keepLabelOnFloor(p)
         }
         for p in expired { release(p) }
+    }
+
+    /// Where `MotionParticle` hangs a label: right of and above its sprite.
+    static let particleLabelOffset = CGPoint(x: 6, y: 7)
+
+    /// A note's `×n` or a folder's key hangs right of its sprite; near the floor's right wall it flips to the left side,
+    /// and it is clamped inside the floor (`contentBounds`) whatever the sprite's place (final review M5, Task 7 M6).
+    private func keepLabelOnFloor(_ p: MotionParticle) {
+        guard let label = p.label, !label.isHidden else { return }
+        let at = p.sprite.position, size = label.size, bounds = contentBounds
+        let offset = Self.particleLabelOffset
+        // The label's anchor is its left edge, vertically centred.
+        var x = at.x + offset.x + size.width > bounds.maxX ? -offset.x - size.width : offset.x
+        x = Swift.max(bounds.minX - at.x, Swift.min(x, bounds.maxX - at.x - size.width))
+        let y = Swift.max(bounds.minY - at.y + size.height / 2, Swift.min(offset.y, bounds.maxY - at.y - size.height / 2))
+        label.position = CGPoint(x: x, y: y)
     }
 
     // MARK: Routes
@@ -709,6 +727,10 @@ extension OfficeScene {
     var particleSpriteCount: Int { motion.created }
     func particleSprite(_ eventId: Int) -> SKSpriteNode? { motion.used[eventId]?.sprite }
     func particleKind(_ eventId: Int) -> MotionParticle.Kind? { motion.used[eventId]?.kind }
+    func particleLabel(_ eventId: Int) -> SKSpriteNode? {
+        guard let label = motion.used[eventId]?.label, !label.isHidden else { return nil }
+        return label
+    }
     var particleKinds: [MotionParticle.Kind] { motion.used.values.map(\.kind) }
     /// Where a particle is heading now: the last point of its route, in scene coordinates.
     func particleTarget(_ eventId: Int) -> CGPoint? { motion.used[eventId]?.route?.end }
@@ -718,6 +740,8 @@ extension OfficeScene {
     /// Who stands at the board room's door, by spot.
     var doorQueue: [String] { motion.doorSpots.sorted { $0.value < $1.value }.map(\.key) }
     var leavingIds: Set<String> { Set(motion.leaving.keys) }
+    /// Desk effects waiting for their desk.
+    var waitingEvents: [VisualEvent] { motion.waiting }
     var flashingDesks: Set<String> { Set(motion.flashes.keys) }
     var highlightRing: CGRect? { motion.ringRect }
 }

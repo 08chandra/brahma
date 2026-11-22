@@ -15,7 +15,7 @@ public struct OfficeRoom: Identifiable, Equatable, Sendable {
     public var id: String
     public var kind: OfficeRoomKind
     public var rect: MapRect
-    /// A fixed title, or the cleaned role of the office's agent.
+    /// A fixed title; an executive office's cleaned role; a director office's cleaned handle (it names the wing).
     public var title: String
     /// The middle of the wall that faces the corridor.
     public var door: MapPoint2
@@ -335,6 +335,7 @@ public struct OfficeLayout: Equatable, Sendable {
                                          roomId: room)
         }
         func role(_ id: String) -> String { model.agents[id]?.role ?? MapText.empty }
+        func handle(_ id: String) -> String { model.agents[id]?.handle ?? MapText.empty }
 
         addRoom("room:board", .board, MapRect(x: 0, y: 0, w: boardRoom.w, h: boardRoom.h), "BOARD ROOM", doorOnTop: false)
         if !orphanSeats.isEmpty {
@@ -377,7 +378,7 @@ public struct OfficeLayout: Equatable, Sendable {
                 wingRects[placed.wing] = wingRects[placed.wing].map { union($0, band) } ?? band
                 switch placed.item {
                 case .office(let d):
-                    addRoom("office:\(d)", .director(agentId: d), rect, role(d), doorOnTop: true)
+                    addRoom("office:\(d)", .director(agentId: d), rect, handle(d), doorOnTop: true)
                     addOfficeDesk(d, room: "office:\(d)", rect, facesDown: true)
                 case .pod(let spec):
                     wingPods[placed.wing, default: []].append(spec.id)
