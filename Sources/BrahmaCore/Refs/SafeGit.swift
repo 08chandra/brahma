@@ -336,6 +336,42 @@ public struct SafeGit: Sendable {
         return heads
     }
 
+    /// Plan C Task C4a: the tree of commit `commit` (a sha), for the file index's cache key.
+    public func treeSha(commit: String) throws -> String {
+        let r = try run(["rev-parse", "--verify", "--quiet", "--end-of-options", "\(try Self.sha(commit))^{tree}"], allowFailure: true)
+        guard r.status == 0, let sha = Self.fullSha(r.stdout) else { throw SafeGitError.badRev }
+        return sha
+    }
+
+    /// One commit as the search index keeps it (Plan C Task C4a). `email`, `name` and `subject` are agent-controlled text.
+    public struct LogEntry: Equatable, Sendable {
+        public var sha: String
+        public var time: Int
+        public var email: String
+        public var name: String
+        public var subject: String
+    }
+
+    /// Plan C Task C4a: at most `max` commits reachable from `tip` and not from `base` (both shas), newest first, with their
+    /// author and subject. Fields are NUL-separated (`-z`), so no subject or name can forge a record; a record whose id is not a
+    /// sha ends the listing.
+    public func commitLog(tip: String, excluding base: String?, max: Int) throws -> [LogEntry] {
+        var args = ["log", "-z", "--format=%H%x00%ct%x00%ae%x00%an%x00%s", "-n", String(Swift.max(1, max)), "--no-textconv", "--no-ext-diff",
+                    "--end-of-options", try Self.sha(tip)]
+        if let base { args.append("^" + (try Self.sha(base))) }
+        args.append("--")
+        let fields = try output(args).split(separator: 0, omittingEmptySubsequences: false).map { String(decoding: $0, as: UTF8.self) }
+        var entries: [LogEntry] = []
+        var i = 0
+        while i + 4 < fields.count {
+            let sha = fields[i].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard Self.fullSha(Data(sha.utf8)) != nil, let time = Int(fields[i + 1]) else { break }
+            entries.append(LogEntry(sha: sha, time: time, email: fields[i + 2], name: fields[i + 3], subject: fields[i + 4]))
+            i += 5
+        }
+        return entries
+    }
+
     /// Path → unix time of the most recent of the last `commits` commits from `rev` that touched it.
     public func recentPaths(rev: String, commits: Int) throws -> [String: Int] {
         let out = Self.text(try output(["log", "--format=%x01%ct", "--name-only", "--no-textconv", "--no-ext-diff", "--no-renames",

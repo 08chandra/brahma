@@ -24,6 +24,14 @@ extension CompanyTools {
                                             "lines": s.prop("string", "Line window, e.g. 40-120"),
                                             "copy": s.prop("boolean", "Copy the whole content into your lab")],
                                            required: ["ref"])),
+            // Plan C Task C4a: the Show bar's search (no LLM), with your access.
+            ToolSpec(name: "search", description: "Search the company (items, messages, files, commits, kb, people…) for what you can read. One line per hit; open_ref to read.",
+                     inputSchema: s.schema(["query": s.prop("string", "Words, a ref or a phrase, e.g. checkout blocked this week"),
+                                            "kind": s.prop("string", "Only this kind: item, message, file, commit, kb, agent, run…"),
+                                            "since": s.prop("string", "yyyy-mm-dd"),
+                                            "by": s.prop("string", "@handle or @owner"),
+                                            "limit": s.prop("integer", "At most 20 (default 10)")],
+                                           required: ["query"])),
         ]
     }
 
@@ -61,9 +69,80 @@ extension CompanyTools {
             return try store.openRef(companyId: companyId, reader: .agent(agentId), ref: ref, lines: try optionalString(args, "lines"),
                                      copy: copy, turnId: try runningTurnId(), context: try refContext(), knownValues: env.known,
                                      paths: env.paths, now: Store.now(), archives: env.archives).text
+        case "search":
+            return try searchTool(args)
         default:
             return nil
         }
+    }
+
+    // MARK: search (Plan C Task C4a)
+
+    /// The engine's search caches for this process (`brahma mcp` serves one agent's turn).
+    static let searchFiles = FileIndexCache()
+    static let searchCommits = CommitIndexCache()
+    static let searchDefaultLimit = 10
+
+    /// `search {query, kind?, since?, by?, limit?}`: `ShowResolver` for this agent (never the owner's view), one line per hit
+    /// `[<kind> <canonical> · <title> · <HH:mm or yyyy-mm-dd>]` with its snippet quoted on the next line (`    | `); nothing
+    /// found: `"Nothing found in what you can read."`. No count of what the agent can't read is ever printed.
+    func searchTool(_ args: [String: JSONValue]) throws -> String {
+        let query = try string(args, "query")
+        var forced = SearchFilters()
+        let tz = store.ownerTimeZone()
+        let now = Store.now()
+        if let k = try optionalString(args, "kind") {
+            guard let kind = SearchKind.parse(k.trimmingCharacters(in: .whitespaces)) else {
+                throw ToolError(message: "kind must be one of: " + SearchKind.allCases.map(\.rawValue).joined(separator: ", "))
+            }
+            forced.kinds = [kind]
+        }
+        if let since = try optionalString(args, "since") {
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = tz
+            guard let start = SearchFilters.day(since.trimmingCharacters(in: .whitespaces), cal: cal) else {
+                throw ToolError(message: "since must be a date like 2026-10-01")
+            }
+            forced.window = TimeWindow(start: start, end: now, label: "SINCE \(since.trimmingCharacters(in: .whitespaces))")
+        }
+        if let by = try optionalString(args, "by") {
+            let h = by.trimmingCharacters(in: .whitespaces).lowercased()
+            let handle = h.hasPrefix("@") ? String(h.dropFirst()) : h
+            guard RefGrammar.isHandle(handle) else { throw ToolError(message: "by must be @handle or @owner") }
+            forced.actor = handle
+        }
+        var limit = Self.searchDefaultLimit
+        if let v = args["limit"], v != .null {
+            guard let n = v.numberValue, n.isFinite else { throw ToolError(message: "argument limit must be a number") }
+            limit = Int(min(max(n, 1), Double(GlobalSearch.toolLimit)))
+        }
+        let resolver = ShowResolver(store: store, files: Self.searchFiles, commits: Self.searchCommits)
+        let result = try resolver.resolveNow(query, companyId: companyId, reader: .agent(agentId), forced: forced, now: now)
+        return Self.searchLines(result, limit: limit, now: now, tz: tz)
+    }
+
+    /// The `search` tool's text for a result (also the concierge's, C4c).
+    static func searchLines(_ result: ShowResult, limit: Int, now: Date, tz: TimeZone) -> String {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        func stamp(_ d: Date) -> String {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.timeZone = tz
+            f.dateFormat = cal.isDate(d, inSameDayAs: now) ? "HH:mm" : "yyyy-MM-dd"
+            return f.string(from: d)
+        }
+        var lines: [String] = []
+        for hit in result.hits.filter({ !$0.inlineOnly }).prefix(limit) {
+            let kind = hit.kind?.rawValue ?? hit.ref.kind.rawValue
+            var line = "[\(kind) \(GlobalSearch.flatten(hit.ref.canonical, max: RefGrammar.maxLength)) · \(GlobalSearch.flatten(hit.title, max: SafeTitle.max))"
+            if let at = hit.at { line += " · " + stamp(at) }
+            lines.append(line + "]")
+            if let snippet = hit.snippet.map({ GlobalSearch.flatten($0, max: GlobalSearch.snippetMax) }), !snippet.isEmpty {
+                lines.append("    | " + snippet)
+            }
+        }
+        return lines.isEmpty ? "Nothing found in what you can read." : lines.joined(separator: "\n")
     }
 
     /// `post_message` / `send_dm` with `attachments` (`Store.postWithAttachments`); `to` is `#channel` or `@handle`.

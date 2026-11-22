@@ -7,8 +7,8 @@ public enum CompanyToolNames {
     public static let memory = ["search_memory", "recall", "remember"]
     /// Plan ML's handbook tools: every role gets them too.
     public static let kb = ["search_kb", "kb_read", "kb_write"]
-    /// Plan C Task C3b's collab tools: every role gets them (part of `base`).
-    public static let collab = ["share", "open_ref"]
+    /// Plan C Task C3b's collab tools: every role gets them (part of `base`). Plan C Task C4a adds `search`.
+    public static let collab = ["share", "open_ref", "search"]
     public static let base = ["post_message", "send_dm", "read_channel", "list_channels", "list_agents", "create_channel", "set_blocked"]
         + memory + kb + collab
     public static let work = ["list_work", "show_work_item", "create_work_item", "update_work_item", "link_dependency",

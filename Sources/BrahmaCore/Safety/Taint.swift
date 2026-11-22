@@ -24,6 +24,9 @@ public enum TaintPolicy {
         // Plan C Task C3b: a tainted session's share is stamped tainted (and can't send a private snapshot as a reply);
         // `open_ref` taints the reader before any tainted byte is read.
         .union(CompanyToolNames.collab)
+        // Plan C Task C4a: `search` only reads, with the agent's own access, and shows no snippet or agent-written title of a
+        // tainted source (reading one is `open_ref`'s, which taints first).
+        .union(["search"])
 
     /// The company tools reviewed as high risk (`everyToolClassified` pins `CompanyToolNames.all` against both sets). A task
     /// that adds a tool adds it to one of the two in the same commit (10b: `propose_extension`, refused while tainted).

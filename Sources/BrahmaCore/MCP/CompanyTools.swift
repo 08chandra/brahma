@@ -103,7 +103,7 @@ public struct CompanyTools: Sendable {
 
     /// Tools that only read; they carry `readOnlyHint` and are never counted.
     static let readOnlyTools: Set<String> = ["read_channel", "list_channels", "list_agents", "list_work", "show_work_item",
-                                             "search_memory", "recall", "search_kb", "kb_read"]
+                                             "search_memory", "recall", "search_kb", "kb_read", "search"]
     /// High-authority company tools (design §2.2): one call per turn when sub-agents are on, none on a plan turn, denied under
     /// taint (5-lite). `update_work_item` counts when it changes the spec or the assignee.
     /// Plan L's ops tools (`CompanyToolNames.ops`) count as high risk too; under taint they are refused by `TaintPolicy`

@@ -61,7 +61,7 @@ private struct MCPWorld {
         "release_lease", "submit_for_review", "confirm_spec", "plan_sprint", "close_sprint",
         "propose_decision", "request_from_owner", "escalate_decision", "decide", "request_mode", "write_handoff",
         "request_access", "request_secret", "use_secret", "readopt_branch", "propose_extension", "request_human_task", "set_preview_command", "set_smoke_check", "set_deploy_config", "propose_deploy", "set_main_check",
-        "publish_artifact", "search_memory", "recall", "remember", "search_kb", "kb_read", "kb_write", "share", "open_ref"]
+        "publish_artifact", "search_memory", "recall", "remember", "search_kb", "kb_read", "kb_write", "share", "open_ref", "search"]
     #expect(Set(tools.compactMap { $0["name"] as? String }) == expected)
     #expect(tools.count == expected.count)
     for t in tools { #expect((t["inputSchema"] as? [String: Any])?["type"] as? String == "object") }
