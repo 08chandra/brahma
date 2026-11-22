@@ -21,6 +21,7 @@ struct Status: ParsableCommand {
             }
             print(safe(header))
             print("  inbox: \(try store.ownerWaitingCount(companyId: c.id)) waiting")
+            print("  merge queue: \(try store.mergeRequests(companyId: c.id, statuses: [.queued, .running, .landing], limit: 1000).count) open")
             if !agents.contains(where: { $0.state == .running }) {
                 let report = try store.stallReport(companyId: c.id)
                 if let first = report.reasons.first { print(safe("  0 running: \(first)")) }

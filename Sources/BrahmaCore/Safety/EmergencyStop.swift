@@ -124,6 +124,11 @@ public enum EmergencyStop {
     public struct Signalled: Equatable, Sendable {
         public var terminated: [Int32] = []
         public var killed: [Int32] = []
+
+        public init(terminated: [Int32] = [], killed: [Int32] = []) {
+            self.terminated = terminated
+            self.killed = killed
+        }
     }
 
     /// The live (non-zombie) processes of the owner's own user in group `pgid`, never this process's own group.
@@ -157,12 +162,13 @@ public enum EmergencyStop {
         return out
     }
 
-    /// The groups of every turn the database records as in progress (`Store.runningTurnPids`; each turn's `claude` leads its
-    /// own session and group), and of every check and merge child the engine recorded at spawn (`ChildGroups`, under the
-    /// data home's `run/children`; only leaders whose start time still matches), and of every preview server Plan L's
-    /// `previewState` records (`previewGroups`, L-5lite-A).
+    /// The groups of every check and merge child the engine recorded at spawn (`ChildGroups`, under the data home's
+    /// `run/children`; only leaders whose start time still matches), and of every preview server Plan L's `previewState`
+    /// records (`previewGroups`, L-5lite-A). The database's in-progress turn rows are not a source (Task 9c fix round 2): a row
+    /// carries no start time, so a pid reused after its turn started would pass any one-sided check; the turns' leaders come
+    /// from the runner's records instead (`Store.recordedTurnLeaders`, in `engineGroups`), which hold the exact start.
     public static func recordedGroups(store: Store) -> Set<Int32> {
-        var groups = (try? store.runningTurnPids()) ?? []
+        var groups = Set<Int32>()
         if let home = store.dataHome {
             groups.formUnion(ChildGroups.liveLeaders(in: ChildGroups.directory(runDir: home.appending(path: "run", directoryHint: .isDirectory))))
         }
@@ -170,15 +176,31 @@ public enum EmergencyStop {
         return groups
     }
 
+    /// Every process group the engine recorded, for the stop paths (Task 9c fix round 1, controller ruling 1): `recordedGroups`
+    /// plus the turn leaders the runner recorded at spawn under `<runDir>/turns` (`Store.recordedTurnLeaders`: every production
+    /// turn is recorded there with its exact start, and a record still names a `claude` whose turn the engine already recorded
+    /// `interrupted` but which is winding down). Every source matches a recorded start time exactly.
+    public static func engineGroups(store: Store, paths: BrahmaPaths) -> Set<Int32> {
+        recordedGroups(store: store).union(Store.recordedTurnLeaders(paths: paths))
+    }
+
+    /// The one stop every path uses: STOP EVERYTHING, `brahma stop`, a quit whose bound passed, and the second quit signal
+    /// (`EngineShutdown.force`) all signal exactly `engineGroups` (SIGTERM, `grace`, SIGKILL; `grace` 0 is SIGKILL right behind
+    /// SIGTERM). Nothing the engine did not record is ever signalled. Blocking.
+    public static func signalEngineGroups(store: Store, paths: BrahmaPaths, grace: TimeInterval = grace) -> Signalled {
+        signalGroups(engineGroups(store: store, paths: paths), grace: grace)
+    }
+
     /// The groups of the preview servers recorded `building`, `starting` or `running`, each only while its pid still leads
-    /// its own group of ours with a start time inside the record (`PreviewRunner.orphanGroup`, PR-4): a recycled pid is never
-    /// signalled. What reaches previews when the engine itself cannot (`brahma stop`, the app's STOP EVERYTHING).
+    /// its own group of ours with exactly the start time recorded at the spawn (`PreviewRunner.orphanGroup`, final review
+    /// I2): a recycled pid, or a record without a start (an older engine's), is never signalled. What reaches previews when
+    /// the engine itself cannot (`brahma stop`, the app's STOP EVERYTHING).
     static func previewGroups(store: Store) -> Set<Int32> {
         var groups = Set<Int32>()
         for company in (try? store.companies()) ?? [] {
             for state in ((try? store.previewStates(companyId: company.id)) ?? [:]).values
             where [.building, .starting, .running].contains(state.status) {
-                if let pid = state.pid, PreviewRunner.orphanGroup(pid: pid, startedAt: state.startedAt, updatedAt: state.updatedAt) {
+                if let pid = state.pid, PreviewRunner.orphanGroup(pid: pid, pidStart: state.pidStart) {
                     groups.insert(pid)
                 }
             }

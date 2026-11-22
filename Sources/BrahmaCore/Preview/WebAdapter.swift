@@ -6,6 +6,8 @@ import Foundation
 public struct WebAdapter: PreviewAdapter {
     /// SIGTERM to a preview's group, then this much awake time before SIGKILL.
     public static let stopGrace: Duration = .seconds(5)
+    /// A spawned process whose start time could not be read (final review I2): it is stopped at once, never recorded.
+    static let startNotRecordedMessage = "its process's start time could not be read, so it was stopped before it ran"
     /// How many times the listen addresses are asked for before an empty answer counts as "could not tell" (deferred minor 3).
     static let listenProbes = 3
     /// One readiness request's own timeout.
@@ -17,7 +19,25 @@ public struct WebAdapter: PreviewAdapter {
 
     public var kind: PreviewKind { .web }
     public func availability() -> String? { nil }
-    public func start(_ c: PreviewContext) async -> PreviewUpdate { await Self.startServer(c, deps: deps) }
+    /// Through the runner `deps.runner(for: c)` picks (PR-5), telling `c.onSpawn` the server's pid.
+    public func start(_ c: PreviewContext) async -> PreviewUpdate {
+        var routed = deps
+        routed.sandbox = deps.runner(for: c)
+        return await Self.startServer(c, deps: routed, onSpawn: c.onSpawn)
+    }
+
+    /// One request's own timeout for a demo.
+    static let demoTimeout: Duration = .seconds(10)
+
+    /// One GET of the running preview's URL: ok when it answers below 400, `"<name>: HTTP <status>"`; no answer is
+    /// `"<name>: not reachable"`, no URL `"<name>: not running"`. Never the body.
+    public func demo(_ c: PreviewContext, state: PreviewState) async -> DemoCapture {
+        let name = c.surface.name
+        guard let text = state.resolvedURL, let url = URL(string: text) else { return DemoCapture(ok: false, line: "\(name): not running") }
+        let answer = await deps.http.send(method: "GET", url: url, body: nil, timeout: Self.demoTimeout)
+        guard let status = answer.status else { return DemoCapture(ok: false, line: "\(name): not reachable") }
+        return DemoCapture(ok: status < 400, line: "\(name): HTTP \(status)")
+    }
 
     public func stop(_ c: PreviewContext, state: PreviewState) async {
         guard let pid = state.pid, let process = deps.processes.process(pid) else { return }
@@ -41,7 +61,7 @@ public struct WebAdapter: PreviewAdapter {
     ///    engine sets HOST and PORT)")`; none known after `listenProbes` asks fails closed the same way ("could not tell");
     /// 5. otherwise `running` at the resolved URL.
     /// Every failure after the spawn terminates the group and removes it from the table first. Cancellation stops the start.
-    static func startServer(_ c: PreviewContext, deps: PreviewDependencies, onSpawn: (@Sendable (Int32) async -> Void)?) async -> PreviewUpdate {
+    static func startServer(_ c: PreviewContext, deps: PreviewDependencies, onSpawn: (@Sendable (Int32, Double) async -> Void)?) async -> PreviewUpdate {
         guard let urlText = c.surface.url, let run = c.surface.run, let url = LoopbackURL.resolve(urlText, port: c.port) else {
             return PreviewUpdate(status: .failed, message: "a web preview needs run and url")
         }
@@ -63,7 +83,14 @@ public struct WebAdapter: PreviewAdapter {
             return PreviewUpdate(status: .failed, message: "could not start: \(Store.flat("\(error)", max: 200))")
         }
         deps.processes.insert(process)
-        await onSpawn?(process.pid)
+        // Its exact start time, read at the spawn, is what lets a later stop prove the process is still this one (final review
+        // I2); without it the server is stopped now, before anything records a pid no stop could prove.
+        guard let start = process.leaderStart else {
+            await process.terminate(grace: stopGrace)
+            deps.processes.remove(process.pid)
+            return PreviewUpdate(status: .failed, message: startNotRecordedMessage)
+        }
+        await onSpawn?(process.pid, start)
 
         func fail(_ message: String?, status: PreviewStatus = .failed) async -> PreviewUpdate {
             await process.terminate(grace: stopGrace)

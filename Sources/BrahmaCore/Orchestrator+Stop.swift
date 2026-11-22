@@ -7,8 +7,8 @@ extension Orchestrator {
     /// Ultra turn's process group goes with it, its workflow agents included, and the run is charged its full cap (F6, Task
     /// 14u: `UltraAccounting.charge`, released through its reservation when the turn is recorded);
     /// every main smoke the tick started is cancelled (its group killed; a merge run is re-queued in place, L-5lite-A);
-    /// every merge and every git task is cancelled, and each re-reads the stop before it changes anything (a merge right
-    /// before each ref it moves: `Store.performMerge`); the observers run once per stop (the release executor and the
+    /// every merge and every git task is cancelled, and each re-reads the stop before it changes anything (the merge queue
+    /// right before `main` moves); the observers run once per stop (the release executor and the
     /// preview runner among them). Admission is held by the caller
     /// (`held`; the restore-marker step and lease git wait too), and active time stands still (`accrueActiveTime`).
     func enforceStop(_ stop: EngineStopRow?, now: Date) {

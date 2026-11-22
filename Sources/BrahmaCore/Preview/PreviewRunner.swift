@@ -24,13 +24,22 @@ import Glibc
 /// - a failed start sends one system DM to its setter (an agent) with the engine's reason and the log's path, never the
 ///   log's text, and an activity line; a successful one an activity line.
 /// The first pass of a runner treats every `building`, `starting` or `running` record as an earlier engine's: its process
-/// group is killed when the recorded pid is still that group's leader with a start time inside the record (3a's
-/// `ProcessTable`, PR-4), the surface becomes `stopped` and is started again from a fresh export (the engine's startup sweep
-/// deleted every export).
+/// group is killed when the recorded pid is still that group's leader with exactly the start time recorded at the spawn
+/// (`pidStart`, final review I2), the surface becomes `stopped` and is started again from a fresh export (the engine's
+/// startup sweep deleted every export).
 ///
 /// The owner's emergency stop (5-lite 7c, L-5lite-A): the runner is one of the engine's stop observers. `stopAll(reason:)`
 /// stops every surface of every company (`"stopped by the owner"`); while `store.engineStopped()` holds (or cannot be read)
 /// `reconcile` starts and restarts nothing; the first pass after the resume starts them again as on engine start.
+///
+/// Plan 4a Task 4: every kind starts through its injected adapter (`adapters`, by default `PreviewAdapters.defaults`; a kind
+/// without one, or whose adapter is not available here, is `unavailable`), under its kind's policy
+/// (`PreviewPolicy.forKind`); kinds without a URL get port 0. A `ran` result (a one-shot demo) is terminal: no crash
+/// tracking, re-run only when `main` moves, it changes or a restart is flagged. Every stop of a run calls its adapter's
+/// `stop` (a Simulator app, a macOS app), the owner's stop included. An iOS surface runs only with the owner's approval
+/// (`outsideSandboxApprovedAt`, set only by `applySimulatorApprovalEffects`): until then it is `unavailable`, its run (if
+/// any) stopped, and the engine files the owner ask once (`Store.requestSimulatorApproval`); the approval is read again
+/// right before the adapter starts.
 public actor PreviewRunner: EmergencyStopObserver {
     public static let debounce: TimeInterval = 5
     public static let crashWindow: TimeInterval = 300
@@ -42,6 +51,9 @@ public actor PreviewRunner: EmergencyStopObserver {
     static let pressureMessage = "waiting: memory pressure"
     static let pausedMessage = "company paused"
     static let engineRestartedMessage = "engine restarted"
+    static let unsafeAppDataMessage = "its app data directory is not safe to use"
+    /// A kind this engine has no adapter for.
+    static func noAdapterMessage(_ kind: PreviewKind) -> String { "\(kind.title) previews are not available on this engine yet" }
     public static let shutdownMessage = "engine stopped"
     /// What every surface the owner's stop reached records (the owner's note stays in the stop's own activity line).
     public static let ownerStopMessage = "stopped by the owner"
@@ -55,42 +67,63 @@ public actor PreviewRunner: EmergencyStopObserver {
     let clock: @Sendable () -> Date
     let blocking: Blocking
     let baseEnvironment: [String: String]
+    /// The adapter of each kind (Plan 4a fix 5: injected).
+    nonisolated let adapters: [PreviewKind: any PreviewAdapter]
+    /// Each kind's `availability()`, asked once per runner.
+    private var availabilityCache: [PreviewKind: String?] = [:]
 
     /// Starts in flight whose server is not spawned yet (a build, an export): child work next to `deps.processes`.
     private nonisolated let pending = PendingStarts()
     /// Surface id → its start task.
     private var starts: [String: Task<Void, Never>] = [:]
-    /// Surface id → the run it has now (its export and, once spawned, its process).
-    private var runs: [String: Run] = [:]
+    /// Surface id → the run it has now (its export and, once spawned, its process). Read by the sprint demo (`demo(sprint:)`).
+    var runs: [String: Run] = [:]
     /// Company id → the `main` last seen and when it was first seen (the debounce).
     private var mainSeen: [String: (commit: String, at: Date)] = [:]
     /// Surface id → when a crashed server may start again.
     private var restartAt: [String: Date] = [:]
     private var startCounter = 0
     private var recovered = false
-    /// While `stopAll` runs, `reconcile` does nothing.
-    private var stopping = 0
+    /// While `stopAll` runs, `reconcile` (and the sprint demo) does nothing.
+    var stopping = 0
     /// Bumped by every `stopAll` (Task 3 M1): a pass that began before it brings nothing up after it (`launch` and the
     /// pass's own writes check that the epoch they started in is still current).
-    private var stopEpoch = 0
+    var stopEpoch = 0
+    /// The sprint-review demo in flight (Plan 4a Task 7), cancelled by `stop` like the starts (fix round 1, I1).
+    var demoTask: Task<DemoOutcome?, Never>?
+    /// Sprint id → how many times its demo's results could not be recorded (fix round 1, M6; `maxDemoAttempts`).
+    var demoAttempts: [String: Int] = [:]
+    /// Tests only: makes the demo's record step throw.
+    var demoRecordFailure: (any Error)?
+    /// After this many record failures the engine gives the sprint up: one `failed` row and a post that it failed.
+    static let maxDemoAttempts = 3
+
+    func failDemoRecords(with error: (any Error)?) { demoRecordFailure = error }
 
     struct Run: Sendable {
         var company: Company
         var runId: String
         var pid: Int32?
+        var kind: PreviewKind = .web
+        /// The start's context once it is built (what the adapter's `stop` is given).
+        var context: PreviewContext? = nil
+        var simulatorId: String? = nil
     }
 
+    /// `adapters` nil: `PreviewAdapters.defaults(deps)`.
     public init(store: Store, paths: BrahmaPaths, deps: PreviewDependencies, sandboxLayout: @escaping @Sendable (Company) -> SandboxLayout,
-                timeouts: PreviewTimeouts = .init(), memory: @escaping @Sendable () -> Bool, clock: @escaping @Sendable () -> Date = Store.now) {
+                timeouts: PreviewTimeouts = .init(), memory: @escaping @Sendable () -> Bool, clock: @escaping @Sendable () -> Date = Store.now,
+                adapters: [PreviewKind: any PreviewAdapter]? = nil) {
         self.init(store: store, paths: paths, deps: deps, sandboxLayout: sandboxLayout, timeouts: timeouts, memory: memory, clock: clock,
-                  blocking: Blocking(), environment: ProcessInfo.processInfo.environment)
+                  blocking: Blocking(), environment: ProcessInfo.processInfo.environment, adapters: adapters)
     }
 
     init(store: Store, paths: BrahmaPaths, deps: PreviewDependencies, sandboxLayout: @escaping @Sendable (Company) -> SandboxLayout,
          timeouts: PreviewTimeouts, memory: @escaping @Sendable () -> Bool, clock: @escaping @Sendable () -> Date, blocking: Blocking,
-         environment: [String: String]) {
+         environment: [String: String], adapters: [PreviewKind: any PreviewAdapter]? = nil) {
         self.store = store; self.paths = paths; self.deps = deps; self.sandboxLayout = sandboxLayout; self.timeouts = timeouts
         self.memory = memory; self.clock = clock; self.blocking = blocking; self.baseEnvironment = environment
+        self.adapters = adapters ?? PreviewAdapters.defaults(deps)
     }
 
     /// Non-turn child work previews hold for the safety cap: every running server plus every start not yet spawned.
@@ -100,7 +133,11 @@ public actor PreviewRunner: EmergencyStopObserver {
 
     // MARK: The pass
 
-    public func reconcile(now: Date) async {
+    public func reconcile(now: Date) async { await reconcile(now: now, settledCompany: nil) }
+
+    /// `settledCompany`: that company's moved `main` counts as past its debounce (the sprint-review demo wants its current
+    /// `main` now; every other company keeps the debounce, fix round 1 M3).
+    func reconcile(now: Date, settledCompany: String?) async {
         guard stopping == 0 else { return }
         let epoch = stopEpoch
         if !recovered {
@@ -127,9 +164,17 @@ public actor PreviewRunner: EmergencyStopObserver {
             }
             guard let main = company.mainCommit else { continue }
             if mainSeen[company.id]?.commit != main { mainSeen[company.id] = (main, now) }
-            let mainSettled = now.timeIntervalSince(mainSeen[company.id]?.at ?? now) >= Self.debounce
-            for surface in surfaces where starts[surface.id] == nil && surface.previewKind == .web {
+            let mainSettled = settledCompany == company.id || now.timeIntervalSince(mainSeen[company.id]?.at ?? now) >= Self.debounce
+            for surface in surfaces {
+                guard let kind = surface.previewKind, kind != .artifact else { continue }
                 let state = states[surface.id] ?? PreviewState(surfaceId: surface.id, companyId: company.id, updatedAt: now)
+                // The iOS gate (fix 4): no Simulator preview runs, or keeps running, without the owner's approval.
+                if kind == .ios, surface.outsideSandboxApprovedAt == nil {
+                    await holdForOwner(surface: surface, state: state, now: now)
+                    guard epoch == stopEpoch else { return }
+                    continue
+                }
+                guard starts[surface.id] == nil else { continue }
                 if await noticeExit(surface: surface, company: company, state: state, epoch: epoch, now: now) {
                     guard epoch == stopEpoch else { return }
                     continue
@@ -153,7 +198,7 @@ public actor PreviewRunner: EmergencyStopObserver {
     }
 
     /// Whether the owner's stop holds now; a database error reads as stopped (nothing starts by mistake).
-    private var ownerStopHolds: Bool {
+    var ownerStopHolds: Bool {
         do { return try store.engineStopped() != nil } catch { return true }
     }
 
@@ -165,7 +210,7 @@ public actor PreviewRunner: EmergencyStopObserver {
         if changed || (moved && mainSettled) { return true }
         if isLive(surface.id) { return nil }
         switch state.status {
-        case .failed, .unavailable:
+        case .failed, .unavailable, .ran:
             return nil                               // until main moves, it changes, or it is flagged
         default:
             if moved { return nil }                  // the debounce
@@ -175,8 +220,12 @@ public actor PreviewRunner: EmergencyStopObserver {
         }
     }
 
+    /// A run with a process is live while it is alive; a started run with none to watch (a Simulator app, a finished demo)
+    /// stays as it is until it is stopped or restarted.
     private func isLive(_ id: String) -> Bool {
-        guard let pid = runs[id]?.pid, let process = deps.processes.process(pid) else { return false }
+        guard let run = runs[id] else { return false }
+        guard let pid = run.pid else { return run.context != nil && starts[id] == nil }
+        guard let process = deps.processes.process(pid) else { return false }
         return process.isAlive()
     }
 
@@ -206,6 +255,41 @@ public actor PreviewRunner: EmergencyStopObserver {
         return true
     }
 
+    // MARK: The iOS gate
+
+    /// An iOS surface without the owner's approval: its start or run (a Simulator app) is stopped, the engine's owner ask is
+    /// filed once, and it is `unavailable` with why. A kind with no adapter here, or one not available on this machine, says
+    /// that instead and files nothing (there is nothing to approve yet).
+    private func holdForOwner(surface: PreviewSurface, state: PreviewState, now: Date) async {
+        let id = surface.id
+        if starts[id] != nil || runs[id] != nil { await stopSurface(id, message: SimulatorApproval.waitingMessage, now: now) }
+        let message: String
+        if let why = await unavailableReason(.ios) {
+            message = why
+        } else {
+            do {
+                let ask = try store.requestSimulatorApproval(surfaceId: id, now: now)
+                message = ask.map { !$0.status.isPending } == true ? SimulatorApproval.declinedMessage : SimulatorApproval.waitingMessage
+            } catch {
+                message = SimulatorApproval.waitingMessage
+            }
+        }
+        guard state.status != .unavailable || state.message != message || state.pid != nil || state.simulatorId != nil else { return }
+        _ = try? store.updatePreviewState(surfaceId: id, now: now) {
+            $0.status = .unavailable; $0.message = message; $0.pid = nil; $0.resolvedURL = nil; $0.simulatorId = nil
+        }
+    }
+
+    /// Why `kind` cannot start here: no adapter, or its adapter's `availability()` (asked once per runner, off the actor's
+    /// thread). Nil when it can.
+    private func unavailableReason(_ kind: PreviewKind) async -> String? {
+        guard let adapter = adapters[kind] else { return Self.noAdapterMessage(kind) }
+        if let cached = availabilityCache[kind] { return cached }
+        let reason = await blocking.run { adapter.availability() }
+        availabilityCache[kind] = .some(reason)
+        return reason
+    }
+
     // MARK: Starts
 
     /// Nothing is launched by a pass that a `stopAll` overtook (`epoch`), while one runs, or while the owner's stop holds
@@ -217,7 +301,7 @@ public actor PreviewRunner: EmergencyStopObserver {
         restartAt[surface.id] = nil
         pending.insert(surface.id)
         starts[surface.id] = Task {
-            await self.perform(company: company, surface: surface, commit: commit, fresh: fresh, start: n, now: now)
+            await self.perform(company: company, surface: surface, commit: commit, fresh: fresh, start: n, epoch: epoch, now: now)
             self.startEnded(surface.id)
         }
     }
@@ -227,35 +311,62 @@ public actor PreviewRunner: EmergencyStopObserver {
         pending.remove(id)
     }
 
-    /// Waits for every start in flight (tests; and `stopAll`, after cancelling them).
+    /// Waits for every start in flight (tests; the sprint demo; and `stopAll`, after cancelling them). Returns as soon as the
+    /// caller is cancelled (fix round 2, N1: the owner's stop cancels the demo waiting here and the starts it waits for; a
+    /// cancelled waiter never cancels the starts itself).
     public func waitForStarts() async {
-        while let task = starts.values.first { await task.value }
+        while !Task.isCancelled, let task = starts.values.first {
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { _ = await task.value }
+                group.addTask { try? await Task.sleep(for: .seconds(86_400)) }   // ends at once when the waiter is cancelled
+                await group.next()
+                group.cancelAll()
+            }
+        }
     }
 
-    private func perform(company: Company, surface: PreviewSurface, commit: String, fresh: Bool, start n: Int, now: Date) async {
+    /// `epoch`: the stop epoch the start was launched in. A start that ends after a `stopAll` (cancelled, or the epoch moved)
+    /// is torn down, never recorded running (fix round 2, N1).
+    private func perform(company: Company, surface: PreviewSurface, commit: String, fresh: Bool, start n: Int, epoch: Int, now: Date) async {
         await stopRun(surface.id)
         let id = surface.id
-        let layout = EngineLayout(workspace: sandboxLayout(company).workspace)
+        let sandbox = sandboxLayout(company)
+        let layout = EngineLayout(workspace: sandbox.workspace)
         let logURL = layout.previewLog(name: surface.name)
         // A failure is recorded against this start (its commit, its start time, the flag cleared), so the same surface at
         // the same main is not tried, and its setter not told, again on every pass.
-        func finish(_ status: PreviewStatus, _ message: String?) {
+        func finish(_ status: PreviewStatus, _ message: String?, _ update: PreviewUpdate? = nil) {
             _ = try? store.updatePreviewState(surfaceId: id, now: clock()) {
                 $0.status = status; $0.message = message; $0.pid = nil; $0.resolvedURL = nil
                 $0.commit = commit; $0.startedAt = now; $0.restartRequestedAt = nil; $0.logPath = logURL.path
+                $0.simulatorId = nil; $0.smokeResults = update?.smokeResults ?? []; $0.outputPath = update?.outputPath
             }
             if status == .failed { notifyFailure(company: company, surface: surface, commit: commit, message: message ?? "failed", now: clock()) }
         }
-        let port: Int
-        do { port = try PortAllocator.port(for: surface, store: store) } catch {
-            finish(.failed, Store.flat(Self.text(error), max: 200))
+        guard let kind = surface.previewKind, kind != .artifact else {
+            finish(.failed, PreviewSurface.kindRefusal)
             return
+        }
+        if let why = await unavailableReason(kind) {
+            finish(.unavailable, why)
+            return
+        }
+        // Kinds without a URL get port 0 (`PORT=0`) and record none.
+        let port: Int
+        if kind.usesURL {
+            do { port = try PortAllocator.port(for: surface, store: store) } catch {
+                finish(.failed, Store.flat(Self.text(error), max: 200))
+                return
+            }
+        } else {
+            port = 0
         }
         // The port is recorded (reserved) in the same write that moves the surface to building.
         let started = try? store.updatePreviewState(surfaceId: id, now: now) {
             $0.status = surface.build == nil ? .starting : .building
-            $0.commit = commit; $0.port = port; $0.startedAt = now; $0.restartRequestedAt = nil; $0.pid = nil; $0.message = nil
-            $0.resolvedURL = nil; $0.logPath = logURL.path
+            $0.commit = commit; $0.port = kind.usesURL ? port : nil; $0.startedAt = now; $0.restartRequestedAt = nil; $0.pid = nil
+            $0.message = nil; $0.resolvedURL = nil; $0.logPath = logURL.path
+            $0.simulatorId = nil; $0.smokeResults = []; $0.outputPath = nil
             if fresh { $0.exits = [] }
         }
         guard started != nil else { return }        // removed meanwhile
@@ -283,43 +394,89 @@ public actor PreviewRunner: EmergencyStopObserver {
             finish(.failed, f.message)
             return
         }
-        runs[id] = Run(company: company, runId: runId, pid: nil)
+        runs[id] = Run(company: company, runId: runId, pid: nil, kind: kind)
         if Task.isCancelled { await stopRun(id); return }
-        var deps = self.deps
-        if Self.unsandboxed(store: engineStore, company: company, surface: surface) { deps.sandbox = deps.unsandboxed }
+        guard let adapter = adapters[kind] else {    // checked above; the table never changes
+            await stopRun(id)
+            finish(.unavailable, Self.noAdapterMessage(kind))
+            return
+        }
+        // The iOS gate, again at the last moment: the approval is read now, and the approved surface is what starts.
+        var surface = surface
+        if kind == .ios {
+            guard let current = try? store.previewSurface(companyId: company.id, id: id), current.previewKind == .ios,
+                  current.outsideSandboxApprovedAt != nil else {
+                await stopRun(id)
+                finish(.unavailable, SimulatorApproval.waitingMessage)
+                return
+            }
+            surface = current
+        }
+        // A macOS app's data place, made (link-safe) before its policy names it (fix round 1, I1).
+        if kind == .macos {
+            let name = surface.name
+            let prepared = await blocking.run { (try? PreviewPolicy.prepareAppData(layout, surface: name)) != nil }
+            guard prepared else {
+                await stopRun(id)
+                finish(.failed, Self.unsafeAppDataMessage)
+                return
+            }
+        }
+        let policies = PreviewPolicy.forKind(kind, layout: layout, run: run, company: company, sandbox: sandbox, port: port,
+                                             surface: surface.name)
+        var environment = PreviewContext.environment(base: baseEnvironment, port: port)
+        if kind == .ios || kind == .macos { environment["BRAHMA_DERIVED_DATA"] = PreviewPolicy.derivedData(run: run).path }
         let context = PreviewContext(surface: surface, company: company, layout: layout, run: run, commit: commit, port: port,
-                                     policy: PreviewPolicy.server(layout, run: run, company: company, port: port),
-                                     environment: PreviewContext.environment(base: baseEnvironment, port: port), logURL: logURL,
-                                     timeouts: timeouts)
-        let update = await WebAdapter.startServer(context, deps: deps, onSpawn: { pid in await self.spawned(id, pid: pid) })
-        if Task.isCancelled || update.status == .stopped {
+                                     policy: policies.policy, environment: environment, logURL: logURL, timeouts: timeouts,
+                                     outputURL: layout.previewOutput(name: surface.name), appPolicy: policies.appPolicy,
+                                     unsandboxed: Self.unsandboxed(store: engineStore, company: company, surface: surface),
+                                     onSpawn: { pid, start in await self.spawned(id, pid: pid, start: start) }, redactor: engineStore.redactor)
+        runs[id]?.context = context
+        let update = await adapter.start(context)
+        if Task.isCancelled || epoch != stopEpoch || update.status == .stopped {
+            // What the start left (a pid, a device) is recorded on the run so `stopRun` reaches it. (O1: the fallback is read
+            // before the run is modified; an optional-chained assignment would read `runs` inside its own modify access.)
+            let pid = update.process ?? runs[id]?.pid
+            runs[id]?.pid = pid
+            runs[id]?.simulatorId = update.simulatorId
             await stopRun(id)
             return
         }
-        guard update.status == .running, let pid = update.process else {
+        guard update.status == .running || update.status == .ran else {
             await stopRun(id)
-            finish(update.status, update.message)
+            finish(update.status, update.message, update)
             return
         }
-        runs[id]?.pid = pid
+        // Running (a server, a macOS app with its pid, a Simulator app with its device) or ran (terminal: its export stays
+        // until the next start or stop, no process is watched).
+        runs[id]?.pid = update.process
+        runs[id]?.simulatorId = update.simulatorId
         let saved = try? store.updatePreviewState(surfaceId: id, now: clock()) {
-            $0.status = .running; $0.pid = pid; $0.resolvedURL = update.resolvedURL; $0.message = nil
+            $0.status = update.status; $0.pid = update.process; $0.resolvedURL = update.resolvedURL; $0.message = update.message
+            $0.simulatorId = update.simulatorId; $0.smokeResults = update.smokeResults; $0.outputPath = update.outputPath
         }
         guard saved != nil else {                    // removed while it started
             await stopRun(id)
             return
         }
-        _ = try? store.appendEvent(ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .preview,
-                                                 text: "Preview \(surface.name) running at \(Store.flat(update.resolvedURL ?? "", max: 120))",
-                                                 createdAt: clock()))
+        let text: String
+        if update.status == .ran {
+            text = "Preview \(surface.name) ran at \(commit.prefix(7))" + (update.message.map { ": " + Store.flat($0, max: 120) } ?? "")
+        } else if let url = update.resolvedURL {
+            text = "Preview \(surface.name) running at \(Store.flat(url, max: 120))"
+        } else {
+            text = "Preview \(surface.name) running at \(commit.prefix(7))"
+        }
+        _ = try? store.appendEvent(ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .preview, text: text, createdAt: clock()))
     }
 
     struct ExportFailure: Error, Sendable { var message: String }
 
-    private func spawned(_ id: String, pid: Int32) {
+    /// The adapter spawned the server (or app): its pid and its exact start time, read while it was unreaped (final review I2).
+    private func spawned(_ id: String, pid: Int32, start: Double) {
         pending.remove(id)
         runs[id]?.pid = pid
-        _ = try? store.updatePreviewState(surfaceId: id, now: clock()) { $0.status = .starting; $0.pid = pid }
+        _ = try? store.updatePreviewState(surfaceId: id, now: clock()) { $0.status = .starting; $0.pid = pid; $0.pidStart = start }
     }
 
     static func text(_ error: any Error) -> String {
@@ -347,9 +504,15 @@ public actor PreviewRunner: EmergencyStopObserver {
 
     // MARK: Stops
 
-    /// Terminates the run's process group (if any) and deletes its export.
+    /// Stops what the run's adapter started (`stop`: a Simulator app, a macOS app, a server), terminates the run's process
+    /// group (if any is still in the table) and deletes its export.
     private func stopRun(_ id: String) async {
         guard let run = runs.removeValue(forKey: id) else { return }
+        if let context = run.context, let adapter = adapters[run.kind] {
+            let state = PreviewState(surfaceId: id, companyId: run.company.id, status: .running, commit: context.commit,
+                                     port: context.port, pid: run.pid, updatedAt: clock(), simulatorId: run.simulatorId)
+            await adapter.stop(context, state: state)
+        }
         if let pid = run.pid, let process = deps.processes.process(pid) {
             await process.terminate(grace: WebAdapter.stopGrace)
             deps.processes.remove(pid)
@@ -385,6 +548,14 @@ public actor PreviewRunner: EmergencyStopObserver {
         stopping += 1
         stopEpoch += 1
         defer { stopping -= 1 }
+        // The starts and a sprint demo in flight (its reconcile passes, a running demo command) are cancelled together, then
+        // awaited: the demo returns as soon as it is cancelled (`waitForStarts`), and no start is waited out (fix round 1 I1,
+        // fix round 2 N1).
+        for task in starts.values { task.cancel() }
+        if let demo = demoTask {
+            demo.cancel()
+            _ = await demo.value
+        }
         while !starts.isEmpty {
             for task in starts.values { task.cancel() }
             await waitForStarts()
@@ -407,34 +578,45 @@ public actor PreviewRunner: EmergencyStopObserver {
     // MARK: Engine start
 
     /// Every record an earlier engine left building, starting or running: its group is killed if it still is that record's
-    /// (`orphanGroup`), and it becomes `stopped`, so this pass starts it again.
+    /// (`orphanGroup`), and it becomes `stopped`, so this pass starts it again. A Simulator device an earlier engine left
+    /// (Task 7, obligation b): the recorded `simulatorId` is shut down and cleared, and every booted `Brahma …` device is shut
+    /// down too (`shutdownLeftovers`; the owner's own simulators are never touched).
     private func recover(now: Date) async {
+        let simulator = deps.simulator
         for company in (try? store.companies()) ?? [] {
-            for state in ((try? store.previewStates(companyId: company.id)) ?? [:]).values
-            where [.building, .starting, .running].contains(state.status) {
-                if let pid = state.pid, Self.orphanGroup(pid: pid, startedAt: state.startedAt, updatedAt: state.updatedAt) {
+            for state in ((try? store.previewStates(companyId: company.id)) ?? [:]).values {
+                if let udid = state.simulatorId {
+                    await blocking.run { _ = try? simulator.shutdown(udid) }
+                    _ = try? store.updatePreviewState(surfaceId: state.surfaceId, now: now) { $0.simulatorId = nil }
+                }
+                guard [.building, .starting, .running].contains(state.status) else { continue }
+                // Signalled only while the recorded pid is still exactly the process the engine spawned (a legacy record
+                // without `pidStart` never is); the record becomes `stopped` either way.
+                if let pid = state.pid, Self.orphanGroup(pid: pid, pidStart: state.pidStart) {
                     killpg(pid, SIGTERM)
                     let deadline = AwakeTime.deadline(after: WebAdapter.stopGrace)
-                    while AwakeTime.now < deadline, Self.orphanGroup(pid: pid, startedAt: state.startedAt, updatedAt: state.updatedAt) {
+                    while AwakeTime.now < deadline, Self.orphanGroup(pid: pid, pidStart: state.pidStart) {
                         try? await AwakeTime.sleep(for: .milliseconds(50))
                     }
-                    if Self.orphanGroup(pid: pid, startedAt: state.startedAt, updatedAt: state.updatedAt) { killpg(pid, SIGKILL) }
+                    if Self.orphanGroup(pid: pid, pidStart: state.pidStart) { killpg(pid, SIGKILL) }
                 }
                 _ = try? store.updatePreviewState(surfaceId: state.surfaceId, now: now) {
-                    $0.status = .stopped; $0.message = Self.engineRestartedMessage; $0.pid = nil; $0.resolvedURL = nil
+                    $0.status = .stopped; $0.message = Self.engineRestartedMessage; $0.pid = nil; $0.resolvedURL = nil; $0.simulatorId = nil
                 }
             }
         }
+        await blocking.run { _ = try? simulator.shutdownLeftovers() }
     }
 
-    /// Whether `pid` is still the leader of its own process group, ours, alive, and started between the record's start and
-    /// its last write (3a's `ProcessTable`, PR-4: pgid and start time, so a recycled pid is never signalled). Off Darwin the
-    /// table's start times are not wall-clock, so nothing is claimed.
-    static func orphanGroup(pid: Int32, startedAt: Date?, updatedAt: Date) -> Bool {
+    /// Whether `pid` is still exactly the process the engine spawned: the leader of its own process group, ours, alive, and
+    /// started at exactly `pidStart`, the start time read at the spawn while the child was unreaped (final review I2; the
+    /// rule turns, child groups and litestream follow). A recycled pid has another start, so it is never signalled, and a
+    /// record without `pidStart` (an older engine's) proves nothing, so it never is either. Off Darwin nothing is claimed.
+    static func orphanGroup(pid: Int32, pidStart: Double?) -> Bool {
         #if canImport(Darwin)
-        guard pid > 1, let startedAt, let entry = ProcessTable.entry(pid), entry.pgid == pid, entry.uid == getuid(), !entry.isZombie
+        guard pid > 1, let pidStart, let entry = ProcessTable.entry(pid), entry.pgid == pid, entry.uid == getuid(), !entry.isZombie
         else { return false }
-        return entry.start >= startedAt.timeIntervalSince1970 - 2 && entry.start <= updatedAt.timeIntervalSince1970 + 2
+        return entry.start == pidStart
         #else
         return false
         #endif
@@ -527,6 +709,7 @@ final class PlainGroupProcess: SandboxedProcess, @unchecked Sendable {
     }
 
     var pid: Int32 { child.pid }
+    var leaderStart: Double? { child.leaderStart }
     func isAlive() -> Bool { !child.hasExited() }
 
     func exitStatus() -> Int32? {

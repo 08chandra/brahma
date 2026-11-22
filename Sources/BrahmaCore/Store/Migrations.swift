@@ -1495,6 +1495,146 @@ enum Migrations {
             try db.create(index: "resource_parent", on: "resource", columns: ["companyId", "parentId"])
             try db.create(index: "resource_created", on: "resource", columns: ["companyId", "createdAt"])
         }
+        m.registerMigration("v4a-merge") { db in
+            // Plan 4a Task 1a: the merge queue. `company.mainCommit` predates 4a ("v5-..."), so it is not added again.
+            // `mainCheck`: JSON CheckSpec. `mergeRequest.conflictFiles`: JSON array of file names (agent-controlled text).
+            try db.alter(table: "company") { t in
+                t.add(column: "mainCheck", .text)
+                t.add(column: "mainCheckSetById", .text)
+                t.add(column: "mergeBatchSize", .integer).notNull().defaults(to: 1)
+                t.add(column: "mergeStrategy", .text).notNull().defaults(to: "ff")
+                t.add(column: "mergeHold", .text)
+            }
+            try db.create(table: "mergeRequest") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("status", .text).notNull()
+                t.column("headCommit", .text).notNull()
+                t.column("checkRevision", .integer)
+                t.column("baseCommit", .text)
+                t.column("candidateCommit", .text)
+                t.column("mergedCommit", .text)
+                t.column("batchId", .text)
+                t.column("failure", .text)
+                t.column("detail", .text)
+                t.column("conflictFiles", .text).notNull().defaults(to: "[]")
+                t.column("outputTail", .text)
+                t.column("outputPath", .text)
+                t.column("attempts", .integer).notNull().defaults(to: 0)
+                t.column("requeues", .integer).notNull().defaults(to: 0)
+                t.column("inconclusive", .integer).notNull().defaults(to: 0)
+                t.column("retryRequestedAt", .datetime)
+                t.column("enqueuedAt", .datetime)
+                t.column("startedAt", .datetime)
+                t.column("finishedAt", .datetime)
+            }
+            try db.create(index: "mergeRequest_queue", on: "mergeRequest", columns: ["companyId", "status", "number"])
+            try db.create(table: "mergeRun") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("batchId", .text)
+                t.column("requestId", .text).references("mergeRequest", onDelete: .cascade)
+                t.column("prefix", .integer)
+                t.column("candidateCommit", .text)
+                t.column("kind", .text)                  // main | item | mainAtBase
+                t.column("itemId", .text)
+                t.column("command", .text)
+                t.column("scriptHash", .text)
+                t.column("status", .text)                // VerificationStatus
+                t.column("attempt", .integer).notNull().defaults(to: 1)
+                t.column("flaky", .boolean).notNull().defaults(to: false)
+                t.column("exitCode", .integer)
+                t.column("outputPath", .text)
+                t.column("outputTail", .text)
+                t.column("startedAt", .datetime)
+                t.column("finishedAt", .datetime)
+            }
+            try db.create(index: "mergeRun_request", on: "mergeRun", columns: ["requestId"])
+        }
+        m.registerMigration("v4a-merge-journal") { db in
+            // Plan 4a Task 2: one row per batch of the merge queue, written step by step (`MergeStep`). `requestIds`, `candidates`
+            // and `landedIds` are JSON. `expectedParent` and `preparedCommit` belong to a step the queue never writes (S1).
+            try db.create(table: "mergeBatch") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("base", .text)
+                t.column("step", .text).notNull()
+                t.column("requestIds", .text).notNull()
+                t.column("expectedParent", .text)
+                t.column("preparedCommit", .text)
+                t.column("candidates", .text).notNull().defaults(to: "{}")
+                t.column("landCommit", .text)
+                t.column("landedIds", .text).notNull().defaults(to: "[]")
+                t.column("error", .text)
+                t.column("startedAt", .datetime)
+                t.column("updatedAt", .datetime)
+                t.column("finishedAt", .datetime)
+            }
+            try db.create(index: "mergeBatch_company", on: "mergeBatch", columns: ["companyId", "step", "number"])
+        }
+        m.registerMigration("v4a-preview-kinds") { db in
+            // Plan 4a Task 4: non-web preview kinds. The agent-written fields of a surface, the engine's record of the owner's
+            // Simulator approval, and what a start left (`smokeResults`: a JSON array of `SmokeResult`).
+            try db.alter(table: "previewSurface") { t in
+                t.add(column: "demo", .text)
+                t.add(column: "openapiPath", .text)
+                t.add(column: "appPath", .text)
+                t.add(column: "bundleId", .text)
+                t.add(column: "device", .text)
+                t.add(column: "outsideSandboxAskId", .text)
+                t.add(column: "outsideSandboxApprovedAt", .datetime)
+            }
+            try db.alter(table: "previewState") { t in
+                t.add(column: "simulatorId", .text)
+                t.add(column: "outputPath", .text)
+                t.add(column: "smokeResults", .text).notNull().defaults(to: "[]")
+                // The recorded pid's exact start time (final review I2): only a process with exactly this start is signalled.
+                t.add(column: "pidStart", .double)
+            }
+        }
+        m.registerMigration("v4a-artifacts") { db in
+            // Plan 4a Task 6: published artifacts, engine-owned copies under `<ws>/.brahma/artifacts/`. `title` and `sourcePath`
+            // are agent-controlled text; `storedPath` is relative to the workspace, `entryFile` to `storedPath`.
+            try db.create(table: "artifact") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("number", .integer).notNull()
+                t.column("title", .text).notNull()
+                t.column("kind", .text).notNull()
+                t.column("storedPath", .text).notNull()
+                t.column("entryFile", .text).notNull()
+                t.column("sourcePath", .text).notNull()
+                t.column("publishedById", .text).notNull()
+                t.column("itemId", .text).references("workItem", onDelete: .setNull)
+                t.column("bytes", .integer).notNull()
+                t.column("createdAt", .datetime).notNull()
+                // Task 6 fix round 1: published by a tainted session (its title stays out of agents' prompts).
+                t.column("tainted", .boolean).notNull().defaults(to: false)
+                t.column("taintReason", .text)
+                t.uniqueKey(["companyId", "number"])
+            }
+            try db.create(index: "artifact_publisher", on: "artifact", columns: ["companyId", "publishedById", "createdAt"])
+        }
+        m.registerMigration("v4a-demos") { db in
+            // Plan 4a Task 7: what each preview (and the latest artifact) showed at a sprint's review demo. `line` is
+            // engine-composed and redacted; `surfaceId` is nil for the artifact demo and for the one row of an empty demo.
+            try db.create(table: "previewDemo") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("sprintId", .text).notNull()
+                t.column("surfaceId", .text)
+                t.column("surfaceName", .text).notNull()
+                t.column("commit", .text)
+                t.column("ok", .boolean).notNull()
+                t.column("line", .text).notNull()
+                t.column("outputPath", .text)
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "previewDemo_sprint", on: "previewDemo", columns: ["sprintId"])
+        }
     }
 }
 

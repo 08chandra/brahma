@@ -503,7 +503,7 @@ import GRDB
         let k = try await r.verified("third", by: r.eng3)
         try r.reviewTurn(r.rev, k)
         #expect(try r.reviewTools(r.rev, k).call(name: "review", arguments: ["key": .string(k.key), "decision": .string("approve"), "notes": .string("ok")])
-                == "Approved \(k.key); the engine will merge it into main.")
+                == "Approved \(k.key); it is queued to merge as M-1.")
     }
 
     @Test func checkChangedDuringReviewReturnsItem() async throws {
@@ -807,17 +807,18 @@ import GRDB
         #expect(done.status == .done); #expect(try r.mainHead() == verified)
     }
 
-    /// The stop between the rebase's merge-tree check and the item branch's compare-and-swap: neither the branch nor main moves.
-    @Test func stopAtBranchSeamLeavesRefsUnchanged() async throws {
+    /// The stop between the candidate's build (the rebase in the engine's repository) and the landing: neither the item branch nor
+    /// main moves (the queue never moves an item branch), the request keeps its place, and it lands after the resume.
+    @Test func stopAfterARebaseLeavesRefsUnchanged() async throws {
         let r = try R()
         let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
         let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
         _ = try await r.drive(a)
         let verifiedB = try #require(try r.fresh(b).verifiedCommit)
         let main = try r.mainHead()
-        let store = r.store, now = r.now, branch = r.ws.branchRef(key: b.key)
+        let store = r.store, now = r.now
         store.mergeRefProbe.set { ref in
-            if ref == branch { _ = try? store.emergencyStop(note: nil, by: "owner", now: now) }
+            if ref == GitWorkspace.mainRef { _ = try? store.emergencyStop(note: nil, by: "owner", now: now) }
         }
         try await r.cycle()
         store.mergeRefProbe.set(nil)
@@ -827,62 +828,58 @@ import GRDB
         let held = try r.fresh(b)
         #expect(held.mergeState == .pending); #expect(held.verifiedCommit == verifiedB); #expect(held.status == .inReview)
         #expect(try r.events(b, .mergeFailed).isEmpty)
+        #expect(try store.latestMergeRequest(itemId: b.id)?.status == .queued)
         try store.resumeAfterStop(now: r.now)
-        try await r.cycle()
-        #expect(try r.fresh(b).mergeState == .verifying, "after the resume the rebase goes on as usual")
+        #expect(try await r.drive(b).status == .done, "after the resume the rebase goes on as usual")
     }
 
-    @Test func rebaseReverifiesBeforeMerge() async throws {
+    /// Main moved on: the queue rebases the verified commit onto it, checks the result in a fresh export under the data home and
+    /// only then lands it.
+    @Test func rebaseChecksBeforeItLands() async throws {
         let r = try R()
         let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
         let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
         _ = try await r.drive(a)
         let verifiedB = try #require(try r.fresh(b).verifiedCommit)
-        try await r.cycle()    // main moved on: b is rebased and must pass its check again before it lands
-        let mid = try r.fresh(b)
-        #expect(mid.status == .inReview); #expect(mid.mergeState == .verifying)
-        // Approved already: its reviewer is told so, not that it awaits a review after the re-check.
+        let mainAfterA = try r.mainHead()
+        let calls = r.world.checks.calls.count
+        // Approved already: its reviewer is told so.
         let again = r.failure { _ = try r.review(r.rev, b, .approve); return "" }
         #expect(again.contains("already approved"), "\(again)")
-        let rebased = try #require(try r.head(b))
-        #expect(rebased != verifiedB)
-        let run = try #require(try r.store.latestVerification(itemId: b.id))
-        #expect(run.purpose == .merge); #expect(run.status == .queued); #expect(run.commit == rebased)
-        #expect(try r.ws.isAncestor(try r.mainHead(), of: rebased), "the rebased branch sits on main")
-        #expect(mid.baseCommit == (try r.mainHead()))
-        #expect(try r.mainHead() != rebased, "nothing lands before the re-check")
-        let calls = r.world.checks.calls.count
-        try await r.cycle()
-        let ready = try r.fresh(b)
-        #expect(ready.mergeState == .pending); #expect(ready.verifiedCommit == rebased); #expect(ready.status == .inReview)
+        try await r.cycle()    // b is rebased onto the new main, checked and landed
+        let done = try r.fresh(b)
+        #expect(done.status == .done)
+        let landed = try #require(done.mergedCommit)
+        #expect(landed != verifiedB)
+        #expect(try r.mainHead() == landed)
+        #expect(try GitFixture.plainGit(["rev-parse", "\(landed)^"], in: r.root) == mainAfterA, "the rebased branch sits on main")
         #expect(r.world.checks.calls.count == calls + 1)
-        // The merge check ran on the engine's export under the data home, not in the workspace.
+        // The merge check ran on a fresh export under the data home, not in the workspace, and was recorded.
+        let request = try #require(try r.store.latestMergeRequest(itemId: b.id))
+        let run = try #require(try r.store.mergeRuns(requestId: request.id).first)
         let ran = try #require(r.world.checks.calls.last).workingDirectory
         #expect(ran.path == r.store.gitWorkspace(root: r.root, companyId: r.company.id).exportPath(runId: run.id).path)
         #expect(ran.path.hasSuffix("/run/exports/\(run.id)") && !ran.path.hasPrefix(r.root.path), "\(ran.path)")
-        #expect(try r.store.latestVerification(itemId: b.id)?.workingDirectory == ran.path)
-        try await r.cycle()
-        let done = try r.fresh(b)
-        #expect(done.status == .done); #expect(try r.mainHead() == rebased)
+        #expect(request.headCommit == verifiedB && request.candidateCommit == landed)
         #expect(FileManager.default.fileExists(atPath: r.root.appending(path: "src/a.txt").path))
         #expect(FileManager.default.fileExists(atPath: r.root.appending(path: "src/b.txt").path))
     }
 
-    @Test func failedReverifyReturnsItem() async throws {
+    @Test func failedCheckAfterRebaseReturnsItem() async throws {
         let r = try R()
         let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
         let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
         _ = try await r.drive(a)
         let mainAfterA = try r.mainHead()
-        r.world.checks.enqueue(FakeCheckRunner.fail(), FakeCheckRunner.fail())
-        try await r.cycle(); try await r.cycle(); try await r.cycle()
+        r.world.checks.enqueue(FakeCheckRunner.fail(), FakeCheckRunner.fail())   // fails, and again on its one re-run
+        try await r.cycle()
         let back = try r.fresh(b)
         #expect(back.status == .inProgress); #expect(back.mergeState == .none)
-        let event = try #require(try r.events(b, .verificationFailed).last)
-        #expect(event.text.contains("after rebase onto main"))
+        let event = try #require(try r.events(b, .mergeFailed).last)
+        #expect(event.text.contains("check failed"), "\(event.text)")
         #expect(try r.mainHead() == mainAfterA)
         #expect(try r.store.lease(itemId: b.id)?.agentId == r.eng2.id)
-        let notice = try r.store.pendingNotices(agentId: r.eng2.id).first { $0.event.kind == .verificationFailed }
+        let notice = try r.store.pendingNotices(agentId: r.eng2.id).first { $0.event.kind == .mergeFailed }
         #expect(notice?.notice.wakes == true)
     }
 
@@ -952,14 +949,18 @@ import GRDB
 
     // MARK: Merge integrity (9b fix round 1: B1, B2, I1-I4, m1, m3)
 
-    /// Uncommitted edits in the root checkout, then one merge pass: they are quarantined, never committed to main.
+    /// Uncommitted edits in the root checkout, quarantined by the engine's own step (`Store.quarantineRoot`, which an owner's
+    /// accept still works from): they are saved on a ref and asked about, never committed to main. (The merge queue itself does
+    /// the same on its tick, and never commits the root: `MergeQueueTests.dirtyRootIsQuarantinedNotCommitted`.)
     private func quarantined(_ r: R) async throws -> (item: WorkItem, before: String, ref: String) {
         try r.commitMain(["README.md": "hello\n"])
         let i = try await r.approved(file: "src/a.txt")
         let before = try r.mainHead()
         try r.write("scratch.txt", "the owner was here\n", in: r.root)     // untracked
         try r.write("README.md", "edited\n", in: r.root)                   // modified
-        try await r.cycle()
+        let company = try #require(try r.store.company(id: r.company.id))
+        try r.store.quarantineRoot(company: company, git: r.store.gitWorkspace(root: r.root, companyId: r.company.id),
+                                   expectedMain: before, now: r.now)
         let refs = try GitFixture.plainGit(["for-each-ref", "--format=%(refname)", "refs/brahma/quarantine/"], in: r.root)
             .split(separator: "\n").map(String.init)
         #expect(refs.count == 1)
@@ -1020,7 +1021,9 @@ import GRDB
         try "".write(to: r.root.appending(path: ".git/info/exclude"), atomically: true, encoding: .utf8)
         try r.write(".brahma/engine-note.txt", "engine state\n", in: r.root)
         try r.write("scratch.txt", "the owner was here\n", in: r.root)
-        try await r.cycle()
+        let company = try #require(try r.store.company(id: r.company.id))
+        try r.store.quarantineRoot(company: company, git: r.store.gitWorkspace(root: r.root, companyId: r.company.id),
+                                   expectedMain: before, now: r.now)
         let refs = try GitFixture.plainGit(["for-each-ref", "--format=%(refname)", "refs/brahma/quarantine/"], in: r.root)
             .split(separator: "\n").map(String.init)
         let ref = try #require(refs.first)
@@ -1186,35 +1189,28 @@ import GRDB
         #expect(try !r.store.quarantineHeld(companyId: r.company.id), "an agent's ask does not hold the merge step")
     }
 
+    /// After the check passed and the item was approved, the author slips an unreviewed commit onto the branch and parks its
+    /// worktree: the queue lands exactly the commit that was verified (`request.headCommit`), never the branch's tip.
     @Test func commitBetweenVerifyAndMergeNeverReachesMain() async throws {
         let r = try R()
         let i = try await r.approved(file: "src/a.txt")
         let verified = try #require(try r.fresh(i).verifiedCommit)
-        let before = try r.mainHead()
-        // After its check passed and it was approved, the author slips an unreviewed commit onto the branch and parks its
-        // worktree on another branch.
         try r.commitInWorktree(i, ["src/evil.txt": "unreviewed\n"])
         let evil = try #require(try r.head(i))
         #expect(evil != verified)
         let wt = r.ws.worktreePath(key: i.key)
         try GitFixture.plainGit(["checkout", "-q", "-b", "parked", verified], in: wt)
         try await r.cycle()
-        #expect(try r.mainHead() == before, "nothing lands")
+        #expect(try r.mainHead() == verified, "exactly the verified commit lands")
         #expect(try !r.ws.isAncestor(evil, of: try r.mainHead()))
-        let back = try r.fresh(i)
-        #expect(back.status == .inProgress); #expect(back.mergeState == .none)
-        #expect(back.verifiedCommit == nil); #expect(back.verifiedRevision == nil)
-        let event = try #require(try r.events(i, .verificationFailed).last)
-        #expect(event.text.contains("moved after its check passed"), "\(event.text)")
-        #expect(try r.store.lease(itemId: i.id)?.agentId == r.eng.id)
-        #expect(try r.dms(r.eng).contains { $0.hasPrefix("\(i.key) changed after its check passed") })
-        try await r.cycle(); try await r.cycle()
-        #expect(try r.mainHead() == before)
+        let done = try r.fresh(i)
+        #expect(done.status == .done); #expect(done.mergedCommit == verified)
+        #expect(try r.events(i, .verificationFailed).isEmpty)
         #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/parked"], in: r.root) == verified, "the parked branch is not touched")
         #expect(!FileManager.default.fileExists(atPath: r.root.appending(path: "src/evil.txt").path))
     }
 
-    @Test func rebaseUsesTheVerifiedCommitInAnEngineWorktree() async throws {
+    @Test func rebaseUsesTheVerifiedCommitInTheEnginesRepository() async throws {
         let r = try R()
         let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
         let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
@@ -1230,9 +1226,9 @@ import GRDB
         let parked = try GitFixture.plainGit(["rev-parse", "HEAD"], in: wt)
         try r.write("junk.txt", "junk\n", in: wt)
         try await r.cycle()
-        let mid = try r.fresh(b)
-        #expect(mid.mergeState == .verifying)
-        let rebased = try #require(try r.head(b), "the branch now carries the engine's rebase")
+        #expect(try r.fresh(b).status == .done)
+        let rebased = try r.mainHead()
+        #expect(try r.fresh(b).mergedCommit == rebased, "main is exactly the checked, rebased commit")
         #expect(try GitFixture.plainGit(["rev-parse", "\(rebased)^"], in: r.root) == mainAfterA)
         #expect(try GitFixture.plainGit(["diff", "--name-only", mainAfterA, rebased], in: r.root) == "src/b.txt")
         #expect(try GitFixture.plainGit(["diff", verifiedB, rebased, "--", "src/b.txt"], in: r.root).isEmpty)
@@ -1243,11 +1239,6 @@ import GRDB
         #expect(!engineGit.mergeWorktreePath.path.hasPrefix(r.root.path))
         #expect(!FileManager.default.fileExists(atPath: r.root.appending(path: ".brahma/wt/.merge").path))
         #expect(!FileManager.default.fileExists(atPath: r.root.appending(path: ".git/worktrees/-merge").path))
-        #expect(try GitFixture.plainGit(["rev-parse", "HEAD"], in: engineGit.mergeWorktreePath,
-                                        env: ["GIT_DIR": engineGit.mergeRepositoryPath.path]) == rebased)
-        _ = try await r.drive(b)
-        #expect(try r.fresh(b).status == .done)
-        #expect(try r.mainHead() == rebased, "main is exactly the re-verified commit")
         #expect(!FileManager.default.fileExists(atPath: r.root.appending(path: "src/parked.txt").path))
         #expect(!FileManager.default.fileExists(atPath: r.root.appending(path: "junk.txt").path))
     }
@@ -1276,26 +1267,27 @@ import GRDB
         #expect(try r.world.turns(r.eng).count > before)
     }
 
-    @Test func stuckMergeReturnsItemAndTheQueueMovesOn() async throws {
+    /// An item whose own merge fails in git (its verified commit shares no history with main) is retried `maxAttempts` times, then
+    /// its request is `failed` (the owner is told) and the queue moves on to the next item.
+    @Test func stuckMergeFailsAndTheQueueMovesOn() async throws {
         let r = try R()
         let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
         let before = try r.mainHead()
-        // A failure of this item's own merge: its verified commit shares no history with main.
+        // A failure of this item's own merge: the commit it was approved at shares no history with main.
         let orphan = try GitFixture.plainGit(["commit-tree", "\(before)^{tree}", "-m", "orphan"], in: r.root)
-        try GitFixture.plainGit(["update-ref", "refs/heads/item/\(a.key)", orphan], in: r.root)
-        try r.exec("UPDATE workItem SET verifiedCommit = ? WHERE id = ?", [orphan, a.id])
+        try r.exec("UPDATE mergeRequest SET headCommit = ? WHERE itemId = ?", [orphan, a.id])
         let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")     // its check's tick is a's first attempt
-        for _ in 1..<Store.maxMergeFailures {
+        for _ in 1..<MergeQueue.maxAttempts {
             r.world.clock.advance(61)
             try await r.cycle()
         }
         #expect(try r.mainHead() == before)
+        let failed = try #require(try r.store.latestMergeRequest(itemId: a.id))
+        #expect(failed.status == .failed); #expect(failed.attempts == MergeQueue.maxAttempts)
+        #expect(failed.detail?.contains("shares no history with main") == true, "\(failed.detail ?? "")")
         let back = try r.fresh(a)
-        #expect(back.status == .inProgress); #expect(back.mergeState == .none); #expect(back.verifiedCommit == nil)
-        let event = try #require(try r.events(a, .mergeFailed).last)
-        #expect(event.text.contains("after \(Store.maxMergeFailures) attempts"))
-        #expect(try r.alerts().contains { $0.status == .pendingOwner && $0.title.contains(a.key) })
-        #expect(try r.store.pendingNotices(agentId: r.eng.id).contains { $0.event.kind == .mergeFailed && $0.notice.wakes })
+        #expect(back.status == .inReview); #expect(back.mergeState == MergeState.none); #expect(back.verifiedCommit != nil)
+        #expect(try r.store.allNotices().contains { $0.title == "Merge \(failed.ref) (\(a.key)) stopped" })
         #expect(try r.fresh(b).mergeState == .pending)
         let done = try await r.drive(b)
         #expect(done.status == .done)
@@ -1381,85 +1373,6 @@ import GRDB
         #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.isEmpty)
     }
 
-    @Test func aMergeCheckExportFaultHoldsWithoutReturningTheItem() async throws {
-        // A store with a data home of its own, so the engine's merge directory is this test's alone.
-        let home = try tempDir().appending(path: "home", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
-        let r = try R(store: try Store(path: home.appending(path: "brahma.db").path))
-        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
-        let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
-        _ = try await r.drive(a)
-        try await r.cycle()    // b is rebased onto the new main; its merge check is queued
-        let rebased = try #require(try r.head(b))
-        #expect(try r.fresh(b).mergeState == .verifying)
-        let run = try #require(try r.store.latestVerification(itemId: b.id))
-        #expect(run.purpose == .merge); #expect(run.status == .queued)
-        // The engine's merge repository cannot be made for the check's export (its parent directory is a file).
-        let parent = r.store.gitWorkspace(root: r.root, companyId: r.company.id).mergeDirectory.deletingLastPathComponent()
-        try #require(parent.path.hasPrefix(home.path))
-        if FileManager.default.fileExists(atPath: parent.path) { try FileManager.default.removeItem(at: parent) }
-        try "blocked".write(to: parent, atomically: true, encoding: .utf8)
-        let calls = r.world.checks.calls.count
-        for _ in 0..<(3 * Store.maxInconclusive) {
-            r.world.clock.advance(61)
-            try await r.cycle()
-        }
-        #expect(r.world.checks.calls.count == calls, "no check ran without its export")
-        let held = try r.fresh(b)
-        #expect(held.status == .inReview, "the item is not returned for the company's fault")
-        #expect(held.mergeState == .verifying); #expect(held.verifiedCommit != nil)
-        #expect(try r.events(b, .verificationFailed).isEmpty)
-        let runs = try await r.store.writer.read { db in
-            try VerificationRun.filter(Column("itemId") == b.id && Column("purpose") == "merge").fetchAll(db)
-        }
-        #expect(runs.count == 1, "the same run waits; no inconclusive attempts pile up: \(runs.map(\.status))")
-        #expect(runs.first?.status == .queued)
-        let hold = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
-        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.count == 1, "one owner alert")
-        // Once the fault clears the export works and the check runs: the export's success resolves the alert at once (A1),
-        // before b lands.
-        try FileManager.default.removeItem(at: parent)
-        r.world.clock.advance(61)
-        try await r.cycle()
-        #expect(r.world.checks.calls.count == calls + 1)
-        #expect(try r.fresh(b).status == .inReview, "not landed yet")
-        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.isEmpty, "the export resolved the hold alert")
-        let done = try await r.drive(b)
-        #expect(done.status == .done); #expect(try r.mainHead() == rebased)
-        #expect(r.world.checks.calls.count == calls + 1)
-        #expect(try r.alerts().filter { $0.status == .pendingOwner && $0.subjectId == hold }.isEmpty)
-    }
-
-    /// A1: a merge check whose export keeps failing for Brahma's own reasons is deferred at most `maxMergeCheckDeferrals`
-    /// times; then the run is recorded inconclusive (the usual retry and return path, never charged as a failure).
-    @Test func mergeCheckExportDeferralsAreCappedPerRun() async throws {
-        let home = try tempDir().appending(path: "home", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
-        let r = try R(store: try Store(path: home.appending(path: "brahma.db").path))
-        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
-        let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
-        _ = try await r.drive(a)
-        try await r.cycle()
-        #expect(try r.fresh(b).mergeState == .verifying)
-        let parent = r.store.gitWorkspace(root: r.root, companyId: r.company.id).mergeDirectory.deletingLastPathComponent()
-        if FileManager.default.fileExists(atPath: parent.path) { try FileManager.default.removeItem(at: parent) }
-        try "blocked".write(to: parent, atomically: true, encoding: .utf8)
-        for _ in 0..<(Orchestrator.maxMergeCheckDeferrals + 1) {
-            r.world.clock.advance(61)
-            try await r.cycle()
-        }
-        let runs = try await r.store.writer.read { db in
-            try VerificationRun.filter(Column("itemId") == b.id && Column("purpose") == "merge").order(Column("rowid")).fetchAll(db)
-        }
-        #expect(runs.map(\.status) == [.inconclusive, .queued], "\(runs.map(\.status))")
-        #expect(runs.last?.attempt == 2)
-        let held = try r.fresh(b)
-        #expect(held.status == .inReview); #expect(held.mergeState == .verifying)
-        #expect(try r.events(b, .verificationFailed).isEmpty, "inconclusive is not a failure")
-    }
-
-    /// A1: an export that fails because of the item's own tree (a path tar refuses, names that collide on a case-insensitive
-    /// volume) is the item's fault: the item goes back to its holder with the reason, no hold is raised, and the queue moves.
     @Test func anUnexportableTreeReturnsTheItemAndTheQueueMoves() async throws {
         let home = try tempDir().appending(path: "home", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
@@ -1471,17 +1384,12 @@ import GRDB
         var trees: [(name: String, files: [String: String], why: String)] = [("long", ["src/\(long)": "one"], "could not be unpacked")]
         if caseInsensitive { trees.append(("case", ["src/A.txt": "one", "src/a.txt": "two"], "differ only in case")) }
         for (n, tree) in trees.enumerated() {
-            let a = try await r.approved("a\(n)", by: r.eng, file: "src/a\(n).txt")
             let b = try await r.approved("b\(n)", by: r.eng2, file: "src/b\(n).txt")
-            #expect(try await r.drive(a).status == .done)
-            try await r.cycle()
-            let rebased = try #require(try r.head(b))
-            let run = try #require(try r.store.latestVerification(itemId: b.id))
-            #expect(run.purpose == .merge); #expect(run.status == .queued)
-            // The rebased commit as the item's tree would make it: one that git holds but no export can write out faithfully.
+            let head = try #require(try r.fresh(b).verifiedCommit)
+            // The approved commit as the item's tree would make it: one that git holds but no export can write out faithfully.
             let index = try tempDir().appending(path: "index")
             let env = ["GIT_INDEX_FILE": index.path]
-            try GitFixture.plainGit(["read-tree", rebased], in: r.root, env: env)
+            try GitFixture.plainGit(["read-tree", head], in: r.root, env: env)
             for (path, text) in tree.files {
                 let file = index.deletingLastPathComponent().appending(path: "blob-\(path.count)-\(text)")
                 try text.write(to: file, atomically: true, encoding: .utf8)
@@ -1489,19 +1397,22 @@ import GRDB
                 try GitFixture.plainGit(["update-index", "--add", "--cacheinfo", "100644,\(blob),\(path)"], in: r.root, env: env)
             }
             let treeId = try GitFixture.plainGit(["write-tree"], in: r.root, env: env)
-            let bad = try GitFixture.plainGit(["commit-tree", treeId, "-p", rebased, "-m", "bad tree"], in: r.root)
-            try r.exec(#"UPDATE verificationRun SET "commit" = ? WHERE id = ?"#, [bad, run.id])
+            let bad = try GitFixture.plainGit(["commit-tree", treeId, "-p", head, "-m", "bad tree"], in: r.root)
+            try r.exec("UPDATE mergeRequest SET headCommit = ? WHERE itemId = ?", [bad, b.id])
             let calls = r.world.checks.calls.count
             r.world.clock.advance(61)
             try await r.cycle()
             #expect(r.world.checks.calls.count == calls, "\(tree.name): no check ran without its export")
             let back = try r.fresh(b)
-            #expect(back.status == .inProgress, "\(tree.name): the item is returned"); #expect(back.mergeState == .none)
-            let event = try #require(try r.events(b, .verificationFailed).last, "\(tree.name)")
+            #expect(back.status == .inProgress, "\(tree.name): the item is returned"); #expect(back.mergeState == MergeState.none)
+            let event = try #require(try r.events(b, .mergeFailed).last, "\(tree.name)")
             #expect(event.text.contains(tree.why), "\(tree.name): \(event.text)")
             #expect(try r.dms(r.eng2).contains { $0.contains(b.key) && $0.contains(tree.why) }, "\(tree.name): the holder is told why")
             let hold = Store.engineAlertKey(Store.mergeHoldAlertReason(r.company.id))
             #expect(try r.alerts().filter { $0.subjectId == hold }.isEmpty, "\(tree.name): not the company's fault")
+            let request = try #require(try r.store.latestMergeRequest(itemId: b.id))
+            let run = try #require(try r.store.mergeRuns(requestId: request.id).last)
+            #expect(run.status == .error)
             #expect(!FileManager.default.fileExists(atPath: r.store.gitWorkspace(root: r.root, companyId: r.company.id).exportPath(runId: run.id).path))
             // The queue moves: the next approved item lands.
             let c = try await r.approved("c\(n)", by: r.eng3, file: "src/c\(n).txt")
@@ -1604,27 +1515,6 @@ import GRDB
         let next = try r.item("next")
         #expect(r.failure { try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(next.key)]) }
                 == "main changed outside Brahma; the owner must review it")
-    }
-
-    @Test func flakyPassAfterRebaseIsFlagged() async throws {
-        let r = try R()
-        let a = try await r.approved("a", by: r.eng, file: "src/a.txt")
-        let b = try await r.approved("b", by: r.eng2, file: "src/b.txt")
-        _ = try await r.drive(a)
-        try await r.cycle()
-        #expect(try r.fresh(b).mergeState == .verifying)
-        r.world.checks.enqueue(FakeCheckRunner.fail(), FakeCheckRunner.pass)
-        try await r.cycle(); try await r.cycle()
-        let flagged = try r.fresh(b)
-        #expect(flagged.reviewFlags.contains(Store.flakeFlag)); #expect(flagged.mergeState == .none)
-        #expect(flagged.status == .inReview)
-        #expect(try r.store.pendingReviews(agentId: r.rev.id).map(\.id) == [b.id], "the reviewer looks again")
-        let main = try r.mainHead()
-        try await r.cycle()
-        #expect(try r.mainHead() == main, "a flaky pass does not land without an explicit approval")
-        #expect(r.failure { try r.review(r.rev, b, .approve).key }.contains("has review flags"))
-        _ = try r.review(r.rev, b, .approve, flags: true)
-        #expect(try await r.drive(b).status == .done)
     }
 
     @Test func submitRecomputesTheConflictFlag() async throws {
@@ -1833,7 +1723,10 @@ import GRDB
         #expect(try r.ws.head(of: GitWorkspace.mainRef) == tip)
     }
 
-    @Test func agentFastForwardOfMainRaisesAlertAndNeverResolves() async throws {
+    /// 3a raised one alert and held claims until the owner accepted; since Plan 4a Task 3 the engine's tick restores `main` to
+    /// the record (the foreign tip saved under `refs/brahma/foreign/`), closes that alert and tells the owner, and claims work
+    /// again. Only the owner's `adopt-main` makes the foreign tip the record.
+    @Test func agentFastForwardOfMainIsRestoredByTheGuard() async throws {
         let r = try R()
         let recorded = try #require(try r.store.company(id: r.company.id)?.mainCommit)
         #expect(recorded == (try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root)))
@@ -1847,28 +1740,41 @@ import GRDB
         #expect(moved != recorded)
         let i = try r.item("second")
         let message = "main changed outside Brahma; the owner must review it"
+        // Until the engine's tick, 3a's guard holds claims and alerts the owner once.
         #expect(r.failure { try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]) } == message)
         #expect(try r.store.lease(itemId: i.id) == nil)
         func alerts() throws -> [Ask] {
             try r.store.writer.read { try Ask.filter(Column("companyId") == r.company.id && Column("kind") == AskKind.engineAlert).fetchAll($0) }
         }
         #expect(try alerts().count == 1); #expect(try alerts().first?.status == .pendingOwner)
-        // Later claims and ticks refuse again and never resolve or duplicate it.
-        #expect(r.failure { try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]) } == message)
-        try await r.cycle(); try await r.cycle()
-        #expect(try r.store.lease(itemId: i.id) == nil, "the engine does not dispatch into a changed main either")
-        #expect(try alerts().count == 1); #expect(try alerts().first?.status == .pendingOwner)
+        // The tick: main is back at the record, the sneak is saved, the alert is closed, and the record did not move.
+        try await r.cycle()
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root) == recorded)
+        let saved = try GitFixture.plainGit(["for-each-ref", "--format=%(objectname) %(refname)", "refs/brahma/foreign/"], in: r.root)
+        #expect(saved.hasPrefix(moved + " refs/brahma/foreign/"), "\(saved)")
+        #expect(try alerts().count == 1); #expect(try alerts().first?.status != .pendingOwner)
         #expect(try r.store.company(id: r.company.id)?.mainCommit == recorded, "nothing but the engine or the owner moves the record")
-        // A rewrite is refused the same way.
-        try GitFixture.plainGit(["reset", "--hard", recorded], in: r.root)
-        try GitFixture.plainGit(["commit", "--amend", "--allow-empty", "-m", "rewritten"], in: r.root)
-        #expect(r.failure { try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]) } == message)
-        #expect(try alerts().first?.status == .pendingOwner)
-        // The owner accepts the new head: the alert clears and claims work again.
-        try r.store.acceptMainCommit(companyId: r.company.id)
-        #expect(try alerts().first?.status != .pendingOwner)
+        #expect(try r.store.allNotices().contains { $0.title == "main restored" })
+        #expect(!FileManager.default.fileExists(atPath: r.root.appending(path: "evil.txt").path))
+        // Claims work again, on the restored main.
         #expect(try r.tools(r.eng2).call(name: "claim_lease", arguments: ["key": .string(i.key)]).hasPrefix("You hold"))
-        #expect(try r.store.company(id: r.company.id)?.mainCommit == (try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root)))
+        #expect(try r.fresh(i).baseCommit == recorded)
+        // A rewrite is a foreign move too: refused until the tick, then restored.
+        try GitFixture.plainGit(["commit", "--amend", "--allow-empty", "-m", "rewritten"], in: r.root)
+        let rewritten = try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root)
+        let third = try r.item("third")
+        #expect(r.failure { try r.tools(r.eng3).call(name: "claim_lease", arguments: ["key": .string(third.key)]) } == message)
+        try await r.cycle()
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root) == recorded)
+        #expect(try GitFixture.plainGit(["for-each-ref", "refs/brahma/foreign/"], in: r.root).split(separator: "\n").count == 2)
+        #expect(try alerts().allSatisfy { $0.status != .pendingOwner })
+        // The owner adopts the saved sneak by its ref: main moves there and the record follows.
+        let sneakRef = try #require(saved.split(separator: " ").last.map(String.init))
+        #expect(try r.store.adoptMain(companyId: r.company.id, by: .owner, commit: sneakRef) == moved)
+        #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root) == moved)
+        #expect(try r.store.company(id: r.company.id)?.mainCommit == moved)
+        #expect(FileManager.default.fileExists(atPath: r.root.appending(path: "evil.txt").path))
+        _ = rewritten
     }
 
     @Test func companyWithoutRecordedMainRaisesAlert() throws {
@@ -2439,10 +2345,18 @@ extension ReviewTests {
         let b = try await submitted(r, files: ["src/second.txt": "y\n"])
         #expect(try r.fresh(b).autoApproved)
         _ = try await r.drive(a)
-        // b's merge rebases it onto the new main; the owner switches auto-merge off before the result is recorded.
+        // b is rebased onto the new main (the engine's candidate build, the branch moved to it, as 3a's step did); the owner
+        // switches auto-merge off before the result is recorded.
         let company = try #require(try r.store.company(id: r.company.id))
-        let result = try #require(try r.store.performMerge(item: try r.fresh(b), company: company, now: r.now))
-        guard case .rebased(let head) = result else { Issue.record("expected a rebase, got \(result)"); return }
+        let git = r.store.gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
+        let verified = try #require(try r.fresh(b).verifiedCommit)
+        let mainHead = try #require(try git.head(of: GitWorkspace.mainRef))
+        guard case .built(let head, _) = try git.buildCandidate(key: b.key, head: verified, onto: mainHead, mergeMessage: nil) else {
+            Issue.record("expected a rebase"); return
+        }
+        #expect(head != verified)
+        try GitFixture(existing: URL(fileURLWithPath: company.workspacePath, isDirectory: true)).git(["update-ref", git.branchRef(key: b.key), head, verified])
+        let result = MergeResult.rebased(head: head)
         #expect(try r.head(b) == head, "the branch carries the rebased commit")
         try r.store.setAutoMerge(false)
         #expect(try r.fresh(b).mergeState == .none)
@@ -2490,20 +2404,20 @@ extension ReviewTests {
         #expect(try r.store.company(id: r.company.id)?.autoMergeCount == 0)
     }
 
-    @Test func switchingAutoMergeOffDuringAReCheckSendsTheItemToReview() async throws {
+    @Test func switchingAutoMergeOffWhileQueuedSendsTheItemToReview() async throws {
         let r = try R()
         let a = try await submitted(r, files: ["src/first.txt": "x\n"])
         let b = try await submitted(r, files: ["src/second.txt": "y\n"])
         #expect(try r.fresh(b).autoApproved)
-        _ = try await r.drive(a)
-        for _ in 0..<4 where try r.fresh(b).mergeState != .verifying { try await r.cycle() }
-        #expect(try r.fresh(b).mergeState == .verifying, "main moved on: b re-checks after its rebase")
+        #expect(try r.store.latestMergeRequest(itemId: b.id)?.status == .queued, "queued behind a, which the engine's tick landed")
         try r.store.setAutoMerge(false)
-        #expect(try r.fresh(b).mergeState == .verifying); #expect(!(try r.fresh(b).autoApproved))
+        // The queued request is withdrawn with the auto-approval; the item goes to its reviewer.
+        #expect(try r.store.latestMergeRequest(itemId: b.id)?.status == .cancelled); #expect(!(try r.fresh(b).autoApproved))
+        let waiting = try r.fresh(b)
+        #expect(waiting.mergeState == MergeState.none); #expect(waiting.status == .inReview)
         try await r.cycle()
-        let rechecked = try r.fresh(b)
-        #expect(rechecked.mergeState == .none); #expect(rechecked.status == .inReview)
-        #expect(try r.store.pendingReviews(agentId: r.rev.id).map(\.id).contains(b.id), "the passed re-check goes to review")
+        #expect(try r.fresh(b).status == .inReview, "nothing merges it without a review")
+        #expect(try r.store.pendingReviews(agentId: r.rev.id).map(\.id).contains(b.id))
         _ = try r.review(r.rev, b, .approve)
         #expect(try await r.drive(b).status == .done)
         #expect(try audit(r, b.id) == nil); #expect(try audit(r, a.id) != nil)

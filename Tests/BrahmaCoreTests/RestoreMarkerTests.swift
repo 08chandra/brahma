@@ -167,7 +167,10 @@ import GRDB
         #expect(try mainAlertsOpen(r.store, r.acme) == 0)
     }
 
-    @Test func matchingNonceButHeadMovedQuarantinesAndAlerts() async throws {
+    /// The restore never adopts a head that is not its record. Since Plan 4a Task 3 the main guard follows: it stands back while
+    /// the restore is pending (the restore step decides first), then saves the moved head under `refs/brahma/foreign/` and puts
+    /// `main` back at the record, closing 3a's alert.
+    @Test func matchingNonceButHeadMovedIsSavedAndRestored() async throws {
         let r = try await restoredRig()
         let marker = BackupService.restoreMarker(paths: r.env.paths)
         let nonce = try markerNonce(marker)
@@ -176,18 +179,33 @@ import GRDB
 
         try await tick(r.orchestrator)
 
-        let company = try #require(try r.store.company(id: r.acme.id))
+        // The restore step saw the moved head and adopted nothing (whatever the guard did after it in the same tick).
+        var company = try #require(try r.store.company(id: r.acme.id))
         #expect(company.mainCommit == r.recorded)                                        // the restore's record, not git's head
         #expect(company.mainCommit != moved)
         #expect(company.pendingMainCommit == nil)
         #expect(r.events.all.isEmpty)                                                    // nothing re-adopted, no handler ran
-        #expect(try mainAlertsOpen(r.store, r.acme) == 1)                                // 3a's main-moved owner alert
-        #expect(throws: WorkError.conflict(Store.mainChangedMessage)) { try r.store.checkMain(company: company) }
-        let texts = try activity(r.store, r.acme)
+        var texts = try activity(r.store, r.acme)
         #expect(texts.contains { $0.hasPrefix("restored from \(r.snapshot.lastPathComponent); main is not the commit") }, "\(texts)")
         #expect(!texts.contains { $0.contains("repos re-adopted") })
         #expect(try restoreRow(r.store, nonce)?["consumedAt"] as Date? != nil)
         #expect(!FileManager.default.fileExists(atPath: marker.path))
+
+        try await tick(r.orchestrator)
+
+        // The guard: main is the record again, the moved head is saved, nothing is left for the owner to accept.
+        company = try #require(try r.store.company(id: r.acme.id))
+        #expect(company.mainCommit == r.recorded)
+        let git = GitFixture(existing: URL(fileURLWithPath: r.acme.workspacePath, isDirectory: true))
+        #expect(try git.git(["rev-parse", "refs/heads/main"]) == r.recorded)
+        let foreign = try git.git(["for-each-ref", "--format=%(objectname)", "refs/brahma/foreign/"])
+        #expect(foreign == moved, "the moved head is saved: \(foreign)")
+        #expect(try mainAlertsOpen(r.store, r.acme) == 0)
+        try r.store.checkMain(company: company)                                          // 3a's guard agrees
+        texts = try activity(r.store, r.acme)
+        #expect(texts.contains { $0.hasPrefix("main was changed outside the merge queue; restored to \(r.recorded.prefix(7))") }, "\(texts)")
+        #expect(try r.store.allNotices().contains { $0.title == "main restored" })
+        #expect(r.events.all.isEmpty)
     }
 
     @Test func nonceConsumedOnce() async throws {

@@ -54,6 +54,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var notifier: UNNotificationPoster?
     /// Set once the bounded engine stop has begun; later quit requests wait on it instead of exiting early.
     private(set) var quitting = false
+    /// SIGTERM and SIGINT received so far (coalesced deliveries counted each): the first quits, the second forces the exit.
+    private var quitSignals = 0
 
     override init() {
         options = LaunchOptions.parse(CommandLine.arguments)
@@ -120,7 +122,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for sig in [SIGINT, SIGTERM] {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-            source.setEventHandler { AppDelegate.requestQuit() }
+            // The first signal quits (the bounded engine stop); a second one, during that stop or coalesced with the first,
+            // forces the exit (Task 9c). `source` is held for the app's life, so the capture is no leak.
+            source.setEventHandler { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.quitSignals += Int(min(max(source.data, 1), 1000))
+                    // A signal during a ⌘Q-started stop is the owner's second quit request too (fix round 1, M7).
+                    if self.quitting || self.quitSignals > 1 { self.forceQuit() } else { AppDelegate.requestQuit() }
+                }
+            }
             source.resume()
             signalSources.append(source)
         }
@@ -231,6 +242,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// A second SIGTERM or SIGINT (Task 9c): the owner wants the app gone now. When this app is the engine, every process group
+    /// it recorded is killed (turns, checks, merges, previews, its litestream), in-flight turns are recorded interrupted
+    /// (`EngineHost.forceStop`); when it is not (a terminal engine owns the processes, or none started), nothing is signalled.
+    /// Either way the process exits at once, without waiting out the bounded stop. Only engine-written text is logged.
+    func forceQuit() -> Never {
+        let killed = model?.engine?.forceStop()
+        let what = killed.map { "\($0.groups.terminated.count) process group(s) signalled\($0.litestream.map { "; \($0)" } ?? "")" }
+            ?? "not the engine here, nothing signalled"
+        FileHandle.standardError.write(Data("brahma: second quit request: \(what); exiting now\n".utf8))
+        exit(0)
+    }
+
     /// Quit pauses the engine: in-flight turns are interrupted (their agents return to ready) and the
     /// next launch resumes them. Company status is never written.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -243,7 +266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         quitting = true
         Task { @MainActor in
-            await engine.stop(timeout: .seconds(15))
+            await engine.stop()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

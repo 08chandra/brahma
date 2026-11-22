@@ -44,17 +44,6 @@ extension Store {
     /// `quarantine:<ref>@<full sha>`: the ask names the exact commit the engine quarantined, which is all an accept merges.
     static func quarantineSubject(_ ref: String, commit: String) -> String { "quarantine:\(ref)@\(commit)" }
 
-    /// The oldest approved item of the company still waiting to land (one whose merge is not already running).
-    func nextPendingMerge(companyId: String) throws -> WorkItem? {
-        try writer.read { db in
-            try WorkItem.fetchOne(db, sql: """
-                SELECT * FROM workItem w WHERE companyId = ? AND status = 'inReview' AND mergeState = 'pending' AND verifiedCommit IS NOT NULL
-                AND NOT EXISTS (SELECT 1 FROM itemMerge m WHERE m.itemId = w.id AND m.running)
-                ORDER BY updatedAt, number LIMIT 1
-                """, arguments: [companyId])
-        }
-    }
-
     // MARK: Lockout while merging
 
     /// The merge of this item has started: its holder gets no work turn and the MCP tools refuse the item until `endMerging`.
@@ -127,49 +116,6 @@ extension Store {
         try db.execute(sql: "UPDATE company SET mainCommit = ?, pendingMainCommit = NULL WHERE id = ?", arguments: [commit, companyId])
     }
 
-    // MARK: Failures
-
-    /// One merge attempt of the item failed (git failed, not a hold). After `maxMergeFailures` in a row the item goes back to
-    /// its holder with a `mergeFailed` event, the owner gets an engine alert, and the company's queue moves on. True then.
-    @discardableResult
-    func noteMergeFailure(itemId: String, error: String, now: Date = Store.now()) throws -> Bool {
-        let reason = Self.flat(error, max: 300)
-        return try writer.write { db -> Bool in
-            try db.execute(sql: """
-                INSERT INTO itemMerge (itemId, failures, lastError) VALUES (?, 1, ?)
-                ON CONFLICT(itemId) DO UPDATE SET failures = failures + 1, lastError = excluded.lastError
-                """, arguments: [itemId, reason])
-            let failures = try Int.fetchOne(db, sql: "SELECT failures FROM itemMerge WHERE itemId = ?", arguments: [itemId]) ?? 0
-            guard failures >= Self.maxMergeFailures, var item = try WorkItem.fetchOne(db, key: itemId), item.status == .inReview,
-                  item.mergeState == .pending, let company = try Company.fetchOne(db, key: item.companyId) else { return false }
-            try db.execute(sql: "UPDATE itemMerge SET failures = 0 WHERE itemId = ?", arguments: [itemId])
-            item.mergeState = .none
-            item.reviewAttempts = 0
-            item.verifiedRevision = nil
-            item.verifiedCommit = nil
-            item.updatedAt = now
-            try item.update(db)
-            let returned = try engineSetStatus(db: db, itemId: itemId, to: .inProgress, now: now)
-            try Store.refreshLease(db, itemId: itemId, companyId: item.companyId)
-            let holder = try Self.leaseHolderId(db: db, itemId: itemId) ?? item.ownerId
-            try recordItemEvent(db: db, item: returned, actor: "system", kind: .mergeFailed,
-                                text: "could not be merged into main after \(Self.maxMergeFailures) attempts (\(reason)); it is back with its holder",
-                                alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
-            if let holder, let agent = try Agent.fetchOne(db, key: holder), agent.state != .killed {
-                try MessageRouter(store: self).sendDM(
-                    db: db, companyId: item.companyId, from: .system, to: agent.name,
-                    text: "\(item.key) could not be merged into main after \(Self.maxMergeFailures) attempts; the owner was alerted. "
-                        + "Check item/\(item.key) (rebase it on main if it is behind), run your check and resubmit.", now: now)
-            }
-            try EngineAlerts.raise(
-                store: self, db: db,
-                text: "\(company.name): \(item.key) could not be merged into main after \(Self.maxMergeFailures) attempts (\(reason)). "
-                    + "It went back to its holder and the merge queue moved on.",
-                now: now, reason: Self.mergeFailureAlertReason(itemId))
-            return true
-        }
-    }
-
     // MARK: Quarantine
 
     static let openAskStatuses = [AskStatus.pendingOwner.rawValue, AskStatus.pendingInternal.rawValue]
@@ -237,82 +183,6 @@ extension Store {
 
     // MARK: Git side
 
-    /// The engine's merge step for one approved item (off the actor: it runs git).
-    ///
-    /// 1. `main` must be exactly the recorded head (`checkMain`) and the root checkout on `refs/heads/main`; otherwise nothing
-    ///    is merged (one engine alert) and nil is returned.
-    /// 2. A quarantine waiting for the owner holds the merge step (nil). A dirty root checkout is quarantined, never
-    ///    committed, and the merge step holds (nil).
-    /// 3. `GitWorkspace.landVerified` lands exactly the verified commit: refused when the branch moved, a fast-forward
-    ///    (`pendingMainCommit` written before `main` moves, the record finalized after), or a rebase of the verified commit in
-    ///    the engine's merge checkout.
-    ///
-    /// Everything up to the landing (the guard, the checkout, a quarantine) and the locks, moving `main`, the merge repository
-    /// and `main`'s history fail as `MergeInfrastructureError`: the company's fault, never counted against the item. Stale
-    /// lock files left in the workspace repository are removed and reported to the owner (`reportMergeTamper`).
-    ///
-    /// The owner's stop (Task 7c fix round 1, S15) is read before anything is done, before a quarantine, and again right
-    /// before each ref the landing moves (`landVerified`'s `beforeRefMove`): once it is raised the merge throws
-    /// `StoppedByOwner` with nothing moved (a pending `main` record is cleared). `childGroups` records each git it runs.
-    func performMerge(item: WorkItem, company: Company, now: Date, childGroups: ChildGroups? = nil) throws -> MergeResult? {
-        let root = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
-        var git = gitWorkspace(root: root, companyId: company.id)
-        git.childGroups = childGroups
-        let stopGate: (String) throws -> Void = { [self] ref in
-            mergeRefProbe.call(ref)
-            if try engineStopped() != nil { throw StoppedByOwner() }
-        }
-        try stopGate("")
-        guard let verified = item.verifiedCommit else { throw WorkError.conflict("\(item.key) has no verified commit") }
-        let expected: String? = try MergeInfrastructureError.wrapping {
-            // `main` must still be what the engine expects; if it was changed outside Brahma the merge is held (the guard
-            // has raised its alert) until the owner accepts it.
-            do { try checkMain(company: company, git: git) } catch let error as WorkError where error.message == Store.mainChangedMessage { return nil }
-            let checkedOut = try git.checkedOutRef()
-            guard checkedOut == GitWorkspace.mainRef else {
-                try raiseMainHeadAlert(company: company, ref: checkedOut)
-                return nil
-            }
-            try writer.write { db in try resolveEngineAlerts(db, reasons: [Self.mainHeadAlertReason(company.id)], now: now) }
-            if try quarantineHeld(companyId: company.id) { return nil }
-            guard let expected = try self.company(id: company.id)?.mainCommit else { return nil }
-            if try git.isDirty(in: root) {
-                try stopGate("refs/quarantine")
-                try quarantineRoot(company: company, git: git, expectedMain: expected, now: now)
-                return nil
-            }
-            return expected
-        }
-        guard let expected else { return nil }
-        // Scan (b), Task 4-wire: what the verified commit adds against `main` is scanned again right before it lands (a value
-        // may have become a known secret since the submit). A finding bounces the item to its holder (`finishMerge`).
-        let scanBase = try git.mergeBase(expected, verified) ?? item.baseCommit ?? git.emptyTree()   // the recorded main, never the live ref
-        let findings = try SecretScan.check(git: git, base: scanBase, head: verified, knownValues: knownSecretValues(companyId: company.id))
-        if !findings.isEmpty { return .secretsFound(findings: findings) }
-        var pending: String?
-        let outcome: GitWorkspace.LandOutcome
-        do {
-            outcome = try git.landVerified(key: item.key, verified: verified, expectedMain: expected, recordPending: { next in
-                try MergeInfrastructureError.wrapping { try self.setPendingMainCommit(companyId: company.id, next) }
-                pending = next
-            }, tamper: { removed in self.reportMergeTamper(company: company, removed: removed, now: now) }, beforeRefMove: stopGate)
-        } catch {
-            if let pending { try? clearPendingMainCommit(companyId: company.id, ifEqual: pending) }
-            throw error
-        }
-        switch outcome {
-        case .fastForwarded(let head):
-            try MergeInfrastructureError.wrapping { try writer.write { db in try finalizeMainCommit(db, companyId: company.id, commit: head) } }
-            return .merged(mainHead: head)
-        case .alreadyLanded(let head): return .merged(mainHead: head)
-        case .rebased(let head): return .rebased(head: head)
-        case .conflict(let files, let base, let mainHead):
-            return .conflict(files: files, mergeBase: base, mainCommit: mainHead, itemCommit: verified)
-        case .branchMoved(let head): return .branchMoved(head: head)
-        case .mainMoved: return nil    // the guard sees it on the next attempt
-        }
-    }
-
     /// Agent-writable state that held the merge queue was repaired (A3: stale git lock files, a planted `shallow` or
     /// `info/grafts`, objects of `main`'s history restored): the owner hears about it (one open alert at a time), since Brahma
     /// did not leave it there.
@@ -330,22 +200,22 @@ extension Store {
     }
 
     /// One alert per company however often the merge is retried; it resolves itself when the checkout is back on `main`.
-    private func raiseMainHeadAlert(company: Company, ref: String?) throws {
+    func raiseMainHeadAlert(company: Company, ref: String?, now: Date = Store.now()) throws {
         let reason = Self.mainHeadAlertReason(company.id)
         let open = try writer.read { db in
             try Ask.filter(Column("kind") == AskKind.engineAlert && Column("status") == AskStatus.pendingOwner.rawValue
-                           && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
+                           && Column("subjectId") == Store.engineAlertKey(reason) && Column("companyId") == company.id).fetchCount(db)
         }
         guard open == 0 else { return }
         try EngineAlerts.raise(
             store: self, text: "\(company.name): main checkout is on \(ref ?? "a detached HEAD"); switch it back to main. "
-                + "Brahma merges nothing there until you do.", now: Store.now(), reason: reason)
+                + "Brahma merges nothing there until you do.", now: now, reason: reason, companyId: company.id)
     }
 
     // MARK: Recording
 
-    /// Applies the merge step's result. Runs git (the conflict brief, removing the landed branch, the dry runs of everybody
-    /// else's branch), so it is called off the actor, by the same detached task as `performMerge`.
+    /// Applies a merge result (the queue's `recordLanded`, `bounceMerge` and 3a's conflict and leak hand-offs). Runs git (the
+    /// conflict brief, removing the landed branch, the dry runs of everybody else's branch), so it is called off the actor.
     ///
     /// - `.merged`: `done`, `doneAt`, `mergedCommit`, lease deleted, event `merged`, the completion hook; then the worktree and
     ///   branch go and `MergeSafety.afterLanding` looks at everybody else's branch.
@@ -356,7 +226,10 @@ extension Store {
     /// - `.branchMoved`: the branch is not what was checked and reviewed: the item goes back to its holder, nothing merged.
     /// - `.secretsFound`: the merge-step leak scan found something: the item goes back to its holder with the findings
     ///   (never a value), its verification cleared, nothing merged.
-    func finishMerge(itemId: String, result: MergeResult, now: Date = Store.now()) throws {
+    ///
+    /// `triggerAfterLanding: false` (the merge queue's `recordLanded`, which records `main`'s head itself and runs
+    /// `MergeSafety.afterLanding` once for a whole batch) leaves both out of `.merged`.
+    func finishMerge(itemId: String, result: MergeResult, triggerAfterLanding: Bool = true, now: Date = Store.now()) throws {
         guard let item = try workItem(id: itemId), let company = try company(id: item.companyId) else { throw WorkError.notFound("no such work item") }
         let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
         // The attempt did not fail: the failure count starts again.
@@ -385,7 +258,12 @@ extension Store {
                                             + "(it was \(wasStatus.title.lowercased())); check that main holds what you intend",
                                         alsoNotify: [holder].compactMap { $0 }, alsoNotifyRole: .holder, now: now)
                 }
-                try finalizeMainCommit(db, companyId: company.id, commit: head)
+                // A merge request this landing completes (3a's step landing an item the queue has not claimed) is closed with it.
+                try db.execute(sql: """
+                    UPDATE mergeRequest SET status = 'merged', mergedCommit = ?, finishedAt = ?
+                    WHERE itemId = ? AND status IN ('queued', 'running', 'landing')
+                    """, arguments: [head, now, itemId])
+                if triggerAfterLanding { try finalizeMainCommit(db, companyId: company.id, commit: head) }
                 try resolveEngineAlerts(db, reasons: [Self.mergeFailureAlertReason(itemId), Self.mergeHoldAlertReason(company.id)], now: now)
                 return true
             }
@@ -395,7 +273,7 @@ extension Store {
             try? store.removeItemWorktree(git: git, companyId: companyId, key: key)
             try? git.deleteBranch(key: key)
             try? clearBaseCommit(itemId: itemId)
-            try MergeSafety(store: self).afterLanding(companyId: company.id, mergedKey: item.key)
+            if triggerAfterLanding { try MergeSafety(store: self).afterLanding(companyId: company.id, mergedKey: item.key) }
 
         case .rebased(let head):
             let base = try? git.mergeBase(GitWorkspace.mainRef, head)
@@ -408,6 +286,8 @@ extension Store {
                 // rebased commit, so the rebase is applied all the same and the item goes to its reviewer from there.
                 let revoked = current.mergeState == .none && current.reviewedRound < current.reviewRound && current.verifiedCommit != nil
                 guard current.mergeState == .pending || revoked else { return }
+                // The branch now carries a rebased head: a request pinned to the old one is withdrawn (3a's check re-runs on this head).
+                try Self.cancelQueuedMerges(db: db, itemId: itemId, now: now)
                 // Weakening is measured from where the branch now starts.
                 if let base, current.baseCommit != nil { current.baseCommit = base }
                 current.updatedAt = now

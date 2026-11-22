@@ -139,6 +139,7 @@ final class FakeSandboxProcess: SandboxedProcess, @unchecked Sendable {
     }
 
     var pid: Int32 { child.pid }
+    var leaderStart: Double? { child.leaderStart }
     func isAlive() -> Bool { !child.hasExited() }
 
     func exitStatus() -> Int32? {

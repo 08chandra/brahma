@@ -73,9 +73,9 @@ public struct Turn: Codable, Equatable, Sendable, FetchableRecord, PersistableRe
 }
 
 /// What an activity line is about. `preview` and `release` are Plan L's (preview surfaces; releases and deploys); `resource`
-/// is Plan ML's (owner resources added, vouched, rescoped or purged).
+/// is Plan ML's (owner resources added, vouched, rescoped or purged); `merge` is Plan 4a's (the merge queue landed an item).
 public enum ActivityKind: String, Codable, Sendable {
-    case stateChanged, message, toolUse, turnStarted, turnFinished, usage, error, work, approval, preview, release, resource
+    case stateChanged, message, toolUse, turnStarted, turnFinished, usage, error, work, approval, preview, release, resource, merge
 }
 
 public struct ActivityEvent: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {

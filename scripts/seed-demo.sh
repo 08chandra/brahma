@@ -55,13 +55,13 @@ BRAHMA_DEV=1 "$B" dev propose Initech --by cto --kind other --category pricing -
 BRAHMA_DEV=1 "$B" dev decide Initech A-2 --by ceo --approve >/dev/null
 "$B" items add Initech --type epic --title "Streaks" --description "Daily streak tracking" >/dev/null
 "$B" items add Initech --type task --title "Streak counter" --parent INITE-1 --tier s --priority 1 \
-  --check "test -f streak.txt" --path . --description "Count consecutive days" >/dev/null
+  --check "test -f streak.txt" --path streak.txt --description "Count consecutive days" >/dev/null
 "$B" items add Initech --type bug --title "Reminder fires twice" --owner eng-1 --priority 1 >/dev/null
 
 # Agent map (Plan 4b): INITE-3 in progress with eng-1 as owner and the CTO as reviewer (a dashed reviewer line on the chart,
 # `dev claim` takes the work lease as the agent), and one open ENGINEER seat under the CTO (an `OPEN · ENGINEER` card).
 # Not INITE-2: with BRAHMA_DEV=1 the release scenario below links a human task to INITE-2 and blocks it.
-"$B" items edit Initech INITE-3 --reviewer cto --status ready --check "test -f reminder.txt" --path . >/dev/null
+"$B" items edit Initech INITE-3 --reviewer cto --status ready --check "test -f reminder.txt" --path reminder.txt >/dev/null
 BRAHMA_DEV=1 "$B" dev claim Initech INITE-3 --by eng-1 >/dev/null
 "$B" org vacancy add Initech --role engineer --manager cto --note "Backend, streaks service" >/dev/null
 
@@ -90,6 +90,19 @@ git -C "$W" add index.html
 git -C "$W" -c user.name=Brahma -c user.email=engine@brahma.local -c commit.gpgsign=false commit -q -m "Habit tracker landing page" >/dev/null
 "$B" main accept Initech >/dev/null
 "$B" hosting set Initech --provider cloudflare-pages --project initech-demo --account-id 0123456789abcdef0123456789abcdef >/dev/null
+
+# Plan 4a: a CLI demo (its sealed output is the DEMO tab's terminal; the engine runs it from main) and three artifacts published
+# from the workspace, AR-1..AR-3 in this order (the UI snapshots rely on it). The fixtures are copied into docs/ first (fix 14);
+# the clip is Task 9b's and is published only once it exists, so AR-1 and AR-2 keep their numbers either way.
+for f in mock.html parts.csv clip-9x16.mp4; do
+  [ -f "scripts/fixtures/$f" ] && cp "scripts/fixtures/$f" "$W/docs/$f"
+done
+"$B" preview set Initech demo --kind cli --demo "printf '\033[32mPASS\033[0m streaks\n'; ls" >/dev/null
+"$B" artifacts publish Initech "$W/docs/mock.html" --title "Landing mock" >/dev/null
+"$B" artifacts publish Initech "$W/docs/parts.csv" --title "Parts list" >/dev/null
+if [ -f "$W/docs/clip-9x16.mp4" ]; then
+  "$B" artifacts publish Initech "$W/docs/clip-9x16.mp4" --title "Launch reel" >/dev/null
+fi
 
 # Plan ML: Work › Resources — a note (FROM YOU), a PDF from outside (EXTERNAL, scoped to the engineering team) and a link.
 D="$(mktemp -d)"
@@ -128,6 +141,20 @@ D="$(mktemp -d)"
 printf 'Standup notes for @eng-1\n\n- Reminder bug: the timer registers on every launch.\n- Pair with QA on the flaky test.\n' >"$D/standup-notes.txt"
 BRAHMA_DEV=1 "$B" dev drop Initech --dm eng-1 --message "Notes from this morning's standup" "$D/standup-notes.txt" >/dev/null
 rm -rf "$D"
+
+# Plan 4a Task 10: the merge queue. The main check every candidate must pass, then `dev merge-scenario`: INITE-2 (claimed only
+# for streak.txt, so it runs beside INITE-3's reminder.txt) is claimed, worked, submitted, checked and approved through the real
+# tools and merged by the real queue (M-1, MERGED); a second item written on the old main that touches streak.txt too bounces
+# on the conflict (M-2, BOUNCED) and is back with its holder. The app's merge snapshots (`merge`, `item:INITE-2`) rely on it.
+# The queue lands nothing while the root checkout has uncommitted changes (3a quarantines them and waits for the owner), so the
+# PRD and the fixtures left in docs/ go on main first: the owner's own commit (its identity is the owner's, never the engine's;
+# `main accept` is what makes it the record), then `main accept`.
+git -C "$W" add docs
+git -C "$W" -c user.name=Owner -c user.email=owner@brahma.local -c commit.gpgsign=false commit -q -m "PRD and demo fixtures" >/dev/null
+"$B" main accept Initech >/dev/null
+"$B" merge settings Initech --main-check "test -f index.html" >/dev/null
+"$B" items edit Initech INITE-2 --status ready >/dev/null
+BRAHMA_DEV=1 "$B" dev merge-scenario Initech --item INITE-2 --file streak.txt >/dev/null
 
 # Plan L Task 12 (BRAHMA_DEV=1 only): R-1 deployed and R-2 proposed through the real deploy path against the dev host (a
 # folder under the data home served on loopback while the command runs; never a provider), plus two pending human tasks.

@@ -23,7 +23,7 @@ public enum GitError: Error, Equatable, CustomStringConvertible, LocalizedError 
 }
 
 /// A failure of a company's merge machinery (main's lock, moving `main`, the engine's merge checkout, a quarantine of the
-/// root checkout), not of the item being merged: it never counts against that item (`Store.noteMergeFailure`).
+/// root checkout), not of the item being merged: it never counts against that item (the queue requeues it uncounted).
 struct MergeInfrastructureError: Error, CustomStringConvertible, LocalizedError {
     let underlying: any Error
     var description: String { "\(underlying)" }
@@ -700,6 +700,8 @@ public struct GitWorkspace: Sendable {
     enum RebasePhase: Sendable { case before, after }
     /// Tests only: called right before `git rebase` runs in the merge checkout and right after it returns.
     var rebaseProbe: (@Sendable (RebasePhase) -> Void)?
+    /// Tests only: called by the merge queue's `fastForwardMain` right after `main` moved, before the root checkout follows.
+    var followProbe: (@Sendable () throws -> Void)?
     /// Tests only: called by the merge queue's self-heal with the path (relative to the workspace's git dir) of each directory
     /// it is about to walk into, and with each planted history file's name (`shallow`, `info/grafts`) right before it is removed.
     var healProbe: (@Sendable (String) -> Void)?
@@ -746,14 +748,14 @@ public struct GitWorkspace: Sendable {
     /// Every ref the engine reads is fully qualified, so a tag named `main` or `item/<KEY>` can never stand in for the branch.
     public static let mainRef = "refs/heads/main"
     public func branchRef(key: String) -> String { "refs/heads/item/\(key)" }
-    private var gitDir: URL { root.appending(path: ".git", directoryHint: .isDirectory) }
+    var gitDir: URL { root.appending(path: ".git", directoryHint: .isDirectory) }
     private func adminDir(key: String) -> URL { gitDir.appending(path: "worktrees/\(key)", directoryHint: .isDirectory) }
     /// `<root>/.brahma/hooks` for a company workspace; nil when the root lies inside a `.brahma` directory (a lab).
     private var engineHooksPath: String? {
         root.pathComponents.contains(".brahma") ? nil : root.appending(path: ".brahma/hooks").path
     }
 
-    private var main: GitCommand {
+    var main: GitCommand {
         var git = GitCommand(gitDir: gitDir, workTree: root, commonDir: nil, onRefused: onUnsafeRepository)
         git.engineHooksPath = engineHooksPath
         git.beforeRetry = gitRetryProbe
@@ -765,17 +767,17 @@ public struct GitWorkspace: Sendable {
 
     private static func resolved(_ url: URL) -> String { url.resolvingSymlinksInPath().standardizedFileURL.path }
 
-    private static func isSymlink(_ url: URL) -> Bool {
+    static func isSymlink(_ url: URL) -> Bool {
         (try? FileManager.default.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType == .typeSymbolicLink
     }
 
-    private static func validKey(_ key: String) throws {
+    static func validKey(_ key: String) throws {
         guard key.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) != nil else {
             throw GitError.failed(command: "worktree \(key)", status: -1, stderr: "invalid item key")
         }
     }
 
-    private static func validRef(_ ref: String) throws {
+    static func validRef(_ ref: String) throws {
         guard !ref.isEmpty, !ref.hasPrefix("-"), !ref.contains(where: { $0.isWhitespace || $0.isNewline || $0.asciiValue.map { $0 < 32 } ?? false }) else {
             throw GitError.failed(command: "ref \(ref.prefix(40))", status: -1, stderr: "invalid ref")
         }
@@ -988,7 +990,7 @@ public struct GitWorkspace: Sendable {
     /// a FIFO; another user's) is never read: the name gets a fresh file holding only the engine's entries. An oversized
     /// file, or one whose read fails part-way, is left as it is. Every odd shape is reported (`onUnsafeEngineFile`) and
     /// nothing throws, so an agent that can write `.git` cannot block `ensureRepo` or `quarantineRoot` (N5).
-    private func ensureExclude() {
+    func ensureExclude() {
         let dir = ".git/info", name = "exclude"
         let report = { (problem: UnsafeEngineFile) in onUnsafeEngineFile?(problem) }
         do {
@@ -1057,7 +1059,7 @@ public struct GitWorkspace: Sendable {
 
     /// Exclusion for everything that moves `refs/heads/main` or resets the root checkout (merges, quarantines, owner
     /// accepts), across processes. Taken after an item's lock when both are needed. (A key never starts with "+".)
-    private func withMainLock<T>(infrastructure: Bool = false, _ body: () throws -> T) throws -> T {
+    func withMainLock<T>(infrastructure: Bool = false, _ body: () throws -> T) throws -> T {
         try withLockFile(name: "+main", what: "main", infrastructure: infrastructure, body)
     }
 
@@ -1292,7 +1294,7 @@ public struct GitWorkspace: Sendable {
     /// The engine merge repository's git context: the shared `GitCommand` hardening and config allowlist (its git dir is
     /// pinned as its own common dir), with the engine's stronger attributes line (`engineAttributes`) kept in its
     /// `info/attributes`. A refusal there is the company's fault (the engine wrote that config), not a workspace alert.
-    private var engineCommand: GitCommand {
+    var engineCommand: GitCommand {
         var git = GitCommand(gitDir: mergeRepositoryPath, workTree: mergeWorktreePath, commonDir: nil)
         git.attributes = Self.engineAttributes
         git.tempRoot = gitTemp
@@ -1310,7 +1312,7 @@ public struct GitWorkspace: Sendable {
     }
 
     /// `-c` settings for the engine's rebase: nothing from the repository's config adds steps or moves other refs.
-    private static let rebaseConfig = [
+    static let rebaseConfig = [
         "-c", "rebase.updateRefs=false", "-c", "rebase.autoStash=false", "-c", "rebase.autoSquash=false",
         "-c", "rebase.backend=merge", "-c", "rebase.forkPoint=false", "-c", "rebase.rescheduleFailedExec=false",
         "-c", "rebase.missingCommitsCheck=ignore", "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
@@ -1429,7 +1431,7 @@ public struct GitWorkspace: Sendable {
     /// Throws unless `rebased` is exactly `verified` replayed on `onto`: `onto` is its ancestor, it adds as many commits as
     /// `verified` has (merges aside) since `base`, and its tree is what git merges `base..verified` into `onto` to. Everything
     /// is asked of the engine repository (whose config and attributes are written again right before the merge-tree).
-    private func checkRebase(_ git: GitCommand, _ rebased: String, of verified: String, base: String, onto: String, key: String) throws {
+    func checkRebase(_ git: GitCommand, _ rebased: String, of verified: String, base: String, onto: String, key: String) throws {
         func refuse(_ why: String) -> GitError {
             GitError.failed(command: "rebase item/\(key)", status: -1, stderr: "the rebased commit \(rebased.prefix(7)) \(why); nothing was moved")
         }
@@ -1448,7 +1450,7 @@ public struct GitWorkspace: Sendable {
     }
 
     /// `merge-base --is-ancestor` in `git`: only "yes" and "no" are answers; any other outcome throws.
-    private static func isAncestor(_ git: GitCommand, _ ancestor: String, of descendant: String) throws -> Bool {
+    static func isAncestor(_ git: GitCommand, _ ancestor: String, of descendant: String) throws -> Bool {
         let out = try git.run(["merge-base", "--is-ancestor", ancestor, descendant], allowFailure: true)
         guard out.status == 0 || out.status == 1 else {
             throw GitError.failed(command: "merge-base --is-ancestor", status: out.status, stderr: String(out.stderr.prefix(2000)))
@@ -1457,7 +1459,7 @@ public struct GitWorkspace: Sendable {
     }
 
     /// `merge-base` in `git`: nil when the two have no history in common; any other failure throws.
-    private static func mergeBase(_ git: GitCommand, _ a: String, _ b: String) throws -> String? {
+    static func mergeBase(_ git: GitCommand, _ a: String, _ b: String) throws -> String? {
         let out = try git.run(["merge-base", a, b], allowFailure: true)
         if out.status == 0, !out.text.isEmpty { return out.text }
         guard out.status == 1 else { throw GitError.failed(command: "merge-base", status: out.status, stderr: String(out.stderr.prefix(2000))) }
@@ -1503,7 +1505,7 @@ public struct GitWorkspace: Sendable {
 
     /// Removes every in-progress operation's state from the merge repository's git dir (the engine's own rebase, or one
     /// planted there) without asking git to undo it, and points its `HEAD` straight at `commit` (detached).
-    private func clearMergeState(admin: URL, detachAt commit: String) throws {
+    func clearMergeState(admin: URL, detachAt commit: String) throws {
         for name in ["rebase-merge", "rebase-apply", "sequencer", "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "MERGE_RR",
                      "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "AUTO_MERGE", "ORIG_HEAD", "BISECT_LOG", "BISECT_START",
                      "index.lock", "MERGE_AUTOSTASH"] {
@@ -1529,7 +1531,7 @@ public struct GitWorkspace: Sendable {
     ///   left alone: git may be using it; the step that needs it then fails as the company's fault and is retried);
     /// - a planted `shallow` (the engine never makes a shallow repository; merges need full history) and `info/grafts`.
     /// Nothing is followed through a link; a link in the way is removed as the file it stands for.
-    private func healWorkspaceRepositoryLocked() throws -> [String] {
+    func healWorkspaceRepositoryLocked() throws -> [String] {
         try clearStaleWorkspaceLocks() + removePlantedHistoryFiles()
     }
 
@@ -1603,7 +1605,7 @@ public struct GitWorkspace: Sendable {
 
     /// Exclusion for the engine's merge repository (landings and merge-check exports), across processes. Taken after main's
     /// lock when both are needed. A lock that cannot be taken is the company's fault.
-    private func withEngineLock<T>(_ body: () throws -> T) throws -> T {
+    func withEngineLock<T>(_ body: () throws -> T) throws -> T {
         try withLockFile(name: "+engine", what: "the merge repository", infrastructure: true, body)
     }
 
@@ -1612,7 +1614,7 @@ public struct GitWorkspace: Sendable {
     /// removed, never followed) and a new repository is initialized there, outside the workspace and every directory an agent
     /// is given. No object, ref, rebase state or setting from an earlier use (or written into it since) survives; objects come
     /// in only through `fetchIntoEngine`. Refuses to run on a git older than 2.43.
-    private func freshEngineRepository() throws -> GitCommand {
+    func freshEngineRepository() throws -> GitCommand {
         try GitCommand.requireAttributeSource()
         let fm = FileManager.default
         let repo = mergeRepositoryPath, tree = mergeWorktreePath, previous = previousRepositoryPath
@@ -1643,12 +1645,12 @@ public struct GitWorkspace: Sendable {
     /// descriptors from `<home>/run/merge` (`EngineFiles.removeNoFollow`): a link is removed, never followed, and nothing is
     /// removed through a part of the way that is a link. No path is rebuilt.
     @discardableResult
-    private func removeEngineItem(_ url: URL) throws -> EngineFiles.Removal {
+    func removeEngineItem(_ url: URL) throws -> EngineFiles.Removal {
         try EngineFiles.removeNoFollow(url, under: mergeDirectory.deletingLastPathComponent())
     }
 
     /// A fetch into the current engine repository worked: it holds `main`'s history now, so the previous one goes.
-    private func dropPreviousEngineRepository() {
+    func dropPreviousEngineRepository() {
         _ = try? removeEngineItem(previousRepositoryPath)
     }
 
@@ -1658,7 +1660,7 @@ public struct GitWorkspace: Sendable {
     /// the repository is made and again right before the checkout that starts a rebase, the merge-tree and the archive. Every
     /// command also runs through the shared `GitCommand` hardening (`engineCommand`): the forced `-c` overrides, no global or
     /// system config, `--attr-source` set to the empty tree, the config allowlist, and `engineAttributes` kept in place.
-    private func assertEngineState() throws {
+    func assertEngineState() throws {
         let fm = FileManager.default
         let repo = mergeRepositoryPath
         guard !Self.isSymlink(repo), fm.fileExists(atPath: repo.appending(path: "objects").path) else {
@@ -1715,7 +1717,7 @@ public struct GitWorkspace: Sendable {
     ///
     /// `main`'s history that cannot be fetched is first restored from the previous engine repository (`restoreMainHistory`,
     /// reported through `tamper`); only when that is not possible, or does not help, is it the company's fault.
-    private func fetchLandingInputs(_ engine: GitCommand, mainHead: String, verified: String, tamper: ([String]) -> Void) throws {
+    func fetchLandingInputs(_ engine: GitCommand, mainHead: String, verified: String, tamper: ([String]) -> Void) throws {
         try MergeInfrastructureError.wrapping { try refuseShallowWorkspace() }
         testHook?("fetch")
         do {
@@ -1778,7 +1780,7 @@ public struct GitWorkspace: Sendable {
     /// objects on top of `prerequisites` and the workspace repository unbundles them (`git bundle unbundle`, which only runs
     /// `index-pack`). No transport runs in the workspace, so nothing in its config (`url.*.insteadOf`, `core.sshCommand`,
     /// remotes) takes part.
-    private func handBack(_ engine: GitCommand, result: String, prerequisites: [String]) throws {
+    func handBack(_ engine: GitCommand, result: String, prerequisites: [String]) throws {
         let ref = "refs/brahma/result"
         try engine.run(["update-ref", "--no-deref", ref, result])
         let bundle = URL(fileURLWithPath: mergeDirectory.path + "-result.bundle")
@@ -1794,7 +1796,7 @@ public struct GitWorkspace: Sendable {
     /// Retires every merge checkout older engines registered in the workspace (`<ws>/.brahma/wt/.merge`, and the one that
     /// lived at `<mergeDirectory>/.merge` with its admin directory `<ws>/.git/worktrees/-merge`). Links are removed, never
     /// followed; never throws.
-    private func retireWorkspaceMergeCheckouts() {
+    func retireWorkspaceMergeCheckouts() {
         retireLegacyMergeCheckout()
         _ = try? removeEngineItem(mergeDirectory.appending(path: ".merge", directoryHint: .isDirectory))
         _ = try? withWorktreeRecords {
@@ -1893,8 +1895,11 @@ public struct GitWorkspace: Sendable {
     /// The owner accepts a quarantine: `main` takes exactly `commit`, the quarantine commit the engine recorded when it made
     /// `ref` (a fast-forward when `main` has not moved since, else a merge commit built with `merge-tree`, refused on a
     /// conflict). Under main's lock `ref` must still be `commit` (`refMoved` otherwise), `main` must be `expectedMain`, and
-    /// its checkout clean and on `main`. Only `commit` is ever merged, never what the ref holds.
-    func mergeQuarantine(ref: String, commit: String, expectedMain: String, recordPending: (String) throws -> Void) throws -> QuarantineOutcome {
+    /// its checkout clean and on `main`. Only `commit` is ever merged, never what the ref holds. `recordMerged` runs with the
+    /// new head while main's lock is still held (Plan 4a Task 3: the record is written under the lock the main guard's restore
+    /// re-reads it under, so the guard never sees the move without its record).
+    func mergeQuarantine(ref: String, commit: String, expectedMain: String, recordPending: (String) throws -> Void,
+                         recordMerged: (String) throws -> Void = { _ in }) throws -> QuarantineOutcome {
         guard Self.isQuarantineRef(ref) else { throw GitError.failed(command: "accept", status: -1, stderr: "not a quarantine ref") }
         try Self.validCommit(expectedMain)
         guard commit.range(of: "^[0-9a-f]{40}([0-9a-f]{24})?$", options: .regularExpression) != nil else {
@@ -1906,7 +1911,10 @@ public struct GitWorkspace: Sendable {
             guard let mainHead = try head(of: Self.mainRef), mainHead == expectedMain else {
                 throw GitError.failed(command: "accept", status: -1, stderr: "main is not where the engine expects it")
             }
-            if try isAncestor(commit, of: mainHead) { return .merged(mainHead: mainHead) }
+            if try isAncestor(commit, of: mainHead) {
+                try recordMerged(mainHead)      // nothing moves; the ask is still settled under the lock
+                return .merged(mainHead: mainHead)
+            }
             let checkedOut = try checkedOutRef()
             guard checkedOut == Self.mainRef else {
                 throw GitError.failed(command: "accept", status: -1, stderr: "the main checkout is on \(checkedOut ?? "a detached HEAD"); switch it back to main")
@@ -1926,6 +1934,7 @@ public struct GitWorkspace: Sendable {
                 try Self.validCommit(next)
             }
             try moveMainLocked(from: mainHead, to: next, recordPending: recordPending)
+            try recordMerged(next)
             return .merged(mainHead: next)
         }
     }
@@ -2007,7 +2016,7 @@ public struct GitWorkspace: Sendable {
         }
     }
 
-    private static func validCommit(_ commit: String) throws {
+    static func validCommit(_ commit: String) throws {
         guard commit.range(of: "^[0-9a-fA-F]{7,64}$", options: .regularExpression) != nil else {
             throw GitError.failed(command: "commit \(commit.prefix(40))", status: -1, stderr: "invalid commit")
         }
@@ -2388,7 +2397,7 @@ public struct GitWorkspace: Sendable {
     ///   after the feed), a listing that fails or is cut, or a file that changes size while it is fed, refuses the commit
     ///   (fail closed). A way the engine cannot open (EACCES, EMFILE, EIO, ...) is a refusal; only ENOTDIR / ELOOP delete.
     /// Nothing travels on argv: the listing and the entries both go over stdin / stdout with NUL separators (M3).
-    private func stage(_ git: GitCommand, in dir: URL, relative: String) throws {
+    func stage(_ git: GitCommand, in dir: URL, relative: String) throws {
         let listing = try git.run(["ls-files", "-z", "--others", "--modified", "--deleted", "--exclude-standard"], maxOutput: planBarrierOutputLimit)
         if listing.timedOut || listing.cut {
             throw GitError.failed(command: "stage", status: -1, stderr: "cannot list the files to commit (\(listing.timedOut ? "timed out" : "listing too long"))")

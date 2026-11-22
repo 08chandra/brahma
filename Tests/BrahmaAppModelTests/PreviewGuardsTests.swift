@@ -48,6 +48,28 @@ import BrahmaCore
         ])
     }
 
+    /// Plan 4a Task 9a: an artifact's web view loads `file:` only (fix 11). The list is a block on everything, then
+    /// `ignore-previous-rules` for `^file:` and `^about:`; nothing remote, no `data:` either (an inline image could be used
+    /// to smuggle a load past the frame, and an artifact needs none: its images sit beside it).
+    @Test func artifactRuleListIsFileAndAboutOnly() throws {
+        let json = PreviewGuards.artifactRuleList
+        let rules = try #require(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]])
+        let shape = rules.map { rule -> String in
+            let t = rule["trigger"] as? [String: Any] ?? [:]
+            let a = rule["action"] as? [String: Any] ?? [:]
+            return "\(a["type"] as? String ?? "?") \(t["url-filter"] as? String ?? "?")"
+        }
+        #expect(shape == ["block .*", "ignore-previous-rules ^file:", "ignore-previous-rules ^about:"])
+        for url in ["https://example.com/", "http://127.0.0.1:47100/", "ws://127.0.0.1:47100/socket", "data:text/html,<p>x",
+                    "blob:file:///x", "javascript:alert(1)", "ftp://example.com/x"] {
+            #expect(try Self.blocked(url, rules: json), "\(url)")
+        }
+        #expect(try Self.blocked("data:image/png;base64,iVBORw0KGgo=", as: "image", rules: json))
+        for url in ["file:///ws/.brahma/artifacts/1-mock/index.html", "file:///ws/.brahma/artifacts/1-mock/style.css", "about:blank"] {
+            #expect(try !Self.blocked(url, rules: json), "\(url)")
+        }
+    }
+
     @Test func pageCannotReachAnyOtherHost() throws {
         let json = try PreviewGuards.ruleList(origin: Self.loopback)
         for url in ["https://example.com/", "https://example.com/x.js", "http://127.0.0.1:47101/", "http://localhost:47100/",

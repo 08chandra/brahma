@@ -203,9 +203,11 @@ extension Store {
             guard let lease = try WorkLease.fetchOne(db, key: itemId), lease.agentId == agentId else {
                 throw WorkError.forbidden("you do not hold \(item.key)")
             }
+            try Store.refuseWhileMerging(db: db, item: item)
             guard item.status != .inReview else {
                 throw WorkError.conflict("\(item.key) is in review; the engine releases its lease when the review ends")
             }
+            try cancelMerge(db: db, itemId: itemId, now: now)
             try lease.delete(db)
             try Store.endSecretUses(db: db, itemId: itemId, now: now)
             try Store.releaseKBLeases(db: db, itemId: itemId)

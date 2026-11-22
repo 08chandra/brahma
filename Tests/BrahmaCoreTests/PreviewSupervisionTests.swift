@@ -90,6 +90,49 @@ import Glibc
         #expect(sandbox.calls.map(\.kind) == [.spawn, .run] && sandbox.calls[1].output == out)
     }
 
+    /// Plan 4a Task 8b: a one-shot's sealed output and a backend's OpenAPI copy are read through the same walk as the log.
+    @Test func outputTailAndOpenAPICopyShareTheLogWalk() throws {
+        let l = EngineLayout(workspace: try tempDir())
+        try FileManager.default.createDirectory(at: l.previewLogs, withIntermediateDirectories: true)
+        try Data("a\nb\nc\n".utf8).write(to: l.previewOutput(name: "demo"))
+        #expect(PreviewLog.outputTail(l, name: "demo", lines: 2) == ["b", "c"])
+        #expect(PreviewLog.outputTail(l, name: "demo", lines: 10) == ["a", "b", "c"])
+        #expect(PreviewLog.outputTail(l, name: "demo", lines: 0) == [])
+        #expect(PreviewLog.outputTail(l, name: "missing", lines: 3) == [])
+        #expect(PreviewLog.tail(l, name: "demo", lines: 3) == [], "the .out is not the .log")
+        // No trailing newline: the last line still counts. Past 64 KB: from the first whole line of the window.
+        try Data("x\ny".utf8).write(to: l.previewOutput(name: "cut"))
+        #expect(PreviewLog.outputTail(l, name: "cut", lines: 5) == ["x", "y"])
+        let long = String(repeating: String(repeating: "z", count: 999) + "\n", count: 100) + "end\n"   // ~100 KB
+        try Data(long.utf8).write(to: l.previewOutput(name: "long"))
+        let window = PreviewLog.outputTail(l, name: "long", lines: 1000)
+        #expect(window.last == "end" && window.count < 100 && window.allSatisfy { $0 == "end" || $0.count == 999 })
+        // A link planted at the output's name is never followed.
+        let target = try tempDir().appending(path: "target")
+        try Data("secret\n".utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(at: l.previewOutput(name: "linked"), withDestinationURL: target)
+        #expect(PreviewLog.outputTail(l, name: "linked", lines: 1) == [])
+
+        // The OpenAPI copy: whole, bounded, regular files only.
+        let spec = Data(#"{"paths":{}}"#.utf8)
+        try spec.write(to: l.previewOpenAPI(name: "api"))
+        #expect(PreviewLog.openAPICopy(l, name: "api", maxBytes: 2_097_152) == spec)
+        #expect(PreviewLog.openAPICopy(l, name: "api", maxBytes: spec.count) == spec)
+        #expect(PreviewLog.openAPICopy(l, name: "api", maxBytes: spec.count - 1) == nil, "over the cap")
+        #expect(PreviewLog.openAPICopy(l, name: "api", maxBytes: 0) == nil)
+        #expect(PreviewLog.openAPICopy(l, name: "missing", maxBytes: 1024) == nil)
+        try FileManager.default.createSymbolicLink(at: l.previewOpenAPI(name: "linked"), withDestinationURL: target)
+        #expect(PreviewLog.openAPICopy(l, name: "linked", maxBytes: 1024) == nil)
+        try FileManager.default.createDirectory(at: l.previewOpenAPI(name: "dir"), withIntermediateDirectories: true)
+        #expect(PreviewLog.openAPICopy(l, name: "dir", maxBytes: 1024) == nil)
+        // A link on the way (the logs folder itself) refuses everything under it.
+        let other = EngineLayout(workspace: try tempDir())
+        try FileManager.default.createDirectory(at: other.previewDir, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: other.previewLogs, withDestinationURL: l.previewLogs)
+        #expect(PreviewLog.openAPICopy(other, name: "api", maxBytes: 1024) == nil)
+        #expect(PreviewLog.outputTail(other, name: "demo", lines: 3) == [])
+    }
+
     /// A log for `name` with `text` in a workspace's `.brahma/preview/logs`.
     @discardableResult
     static func writeLog(_ l: EngineLayout, _ name: String, _ text: String) throws -> URL {

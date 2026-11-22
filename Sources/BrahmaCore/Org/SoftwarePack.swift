@@ -14,10 +14,13 @@ public enum SoftwarePack {
     public static let researchLine = "Write research as handbook pages under Research/ with kb_write, and list every source you used in sources."
 
     private static let exec = CompanyToolNames.base + CompanyToolNames.work + CompanyToolNames.lead + CompanyToolNames.executive
-        + CompanyToolNames.ops
+        + CompanyToolNames.ops + CompanyToolNames.design
     private static let ic = CompanyToolNames.base + CompanyToolNames.work
     /// Devops and architects: the ops tools too (previews, smoke checks, hosting, deploy proposals).
     private static let opsIC = ic + CompanyToolNames.ops
+    /// Architects (the ops tools too) and the designer: the design tool.
+    private static let architectIC = opsIC + CompanyToolNames.design
+    private static let designerIC = ic + CompanyToolNames.design
     private static func models(_ a: String, _ b: String, _ c: String) -> [String: String] { ["low": a, "balanced": b, "max": c] }
 
     // MARK: Role card bodies
@@ -476,7 +479,7 @@ public enum SoftwarePack {
     }
 
     public static let pack = IndustryPack(
-        id: "software", version: 5, title: "Software company",
+        id: "software", version: 6, title: "Software company",
         roles: [
             role("ceo", "CEO", .executive, "ceo", ceoBody, exec, models("sonnet", "sonnet", "sonnet"), 3),
             role("cpo", "CPO", .executive, "cpo", cpoBody, exec, models("sonnet", "sonnet", "sonnet"), 3),
@@ -484,14 +487,14 @@ public enum SoftwarePack {
             role("ceo-cpo", "CEO & CPO", .executive, "ceo", ceoCpoBody, exec, models("sonnet", "sonnet", "sonnet"), 3, covers: ["ceo", "cpo"]),
             role("cto-architect", "CTO & Architect", .executive, "cto", ctoArchitectBody, exec, models("sonnet", "sonnet", "sonnet"), 3,
                  covers: ["cto", "architect"]),
-            role("architect", "Architect", .architect, "arch", architectBody, opsIC, models("sonnet", "sonnet", "sonnet"), 2),
+            role("architect", "Architect", .architect, "arch", architectBody, architectIC, models("sonnet", "sonnet", "sonnet"), 2),
             role("director", "Director", .manager, "dir", directorBody, ic + CompanyToolNames.lead, models("sonnet", "sonnet", "sonnet"), 1,
                  playbooks: managerPlaybooks),
             role("manager", "Engineering manager", .manager, "mgr", managerBody, ic + CompanyToolNames.lead,
                  models("sonnet", "sonnet", "sonnet"), 1, playbooks: managerPlaybooks),
             role("engineer", "Engineer", .individual, "eng", engineerBody, ic, models("sonnet", "sonnet", "sonnet"), 0,
                  playbooks: engineerPlaybooks),
-            role("designer", "Designer", .individual, "design", designerBody, ic, models("haiku", "sonnet", "sonnet"), 0,
+            role("designer", "Designer", .individual, "design", designerBody, designerIC, models("haiku", "sonnet", "sonnet"), 0,
                  playbooks: designerPlaybooks),
             role("qa", "QA", .individual, "qa", qaBody, ic, models("haiku", "sonnet", "sonnet"), 0, playbooks: qaPlaybooks),
             role("devops", "DevOps/SRE", .individual, "devops", devopsBody, opsIC, models("sonnet", "sonnet", "sonnet"), 0),

@@ -1,0 +1,63 @@
+{
+  "devices" : {
+    "com.apple.CoreSimulator.SimRuntime.iOS-26-2" : [
+      {
+        "lastBootedAt" : "2026-06-10T13:43:45Z",
+        "dataPath" : "\/Users\/owner\/Library\/Developer\/CoreSimulator\/Devices\/742D0B6B-FC28-4602-9CB8-58AFB788F31B\/data",
+        "dataPathSize" : 3060719616,
+        "logPath" : "\/Users\/owner\/Library\/Logs\/CoreSimulator\/742D0B6B-FC28-4602-9CB8-58AFB788F31B",
+        "udid" : "742D0B6B-FC28-4602-9CB8-58AFB788F31B",
+        "isAvailable" : true,
+        "logPathSize" : 626688,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro",
+        "state" : "Booted",
+        "name" : "iPhone 17 Pro"
+      },
+      {
+        "dataPath" : "\/Users\/owner\/Library\/Developer\/CoreSimulator\/Devices\/73C73972-1D4E-4C1B-9B0E-3B6B4C4F8A11\/data",
+        "dataPathSize" : 13316096,
+        "logPath" : "\/Users\/owner\/Library\/Logs\/CoreSimulator\/73C73972-1D4E-4C1B-9B0E-3B6B4C4F8A11",
+        "udid" : "73C73972-1D4E-4C1B-9B0E-3B6B4C4F8A11",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max",
+        "state" : "Shutdown",
+        "name" : "iPhone 17 Pro Max"
+      },
+      {
+        "lastBootedAt" : "2026-06-11T08:02:19Z",
+        "dataPath" : "\/Users\/owner\/Library\/Developer\/CoreSimulator\/Devices\/A1B2C3D4-0000-4000-8000-00000000BEEF\/data",
+        "dataPathSize" : 20480000,
+        "logPath" : "\/Users\/owner\/Library\/Logs\/CoreSimulator\/A1B2C3D4-0000-4000-8000-00000000BEEF",
+        "udid" : "A1B2C3D4-0000-4000-8000-00000000BEEF",
+        "isAvailable" : true,
+        "logPathSize" : 4096,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-17",
+        "state" : "Booted",
+        "name" : "Brahma acme"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-18-5" : [
+      {
+        "dataPath" : "\/Users\/owner\/Library\/Developer\/CoreSimulator\/Devices\/0FFFADEA-7C3B-4E2A-9F1D-5A6B7C8D9E0F\/data",
+        "dataPathSize" : 13316096,
+        "logPath" : "\/Users\/owner\/Library\/Logs\/CoreSimulator\/0FFFADEA-7C3B-4E2A-9F1D-5A6B7C8D9E0F",
+        "udid" : "0FFFADEA-7C3B-4E2A-9F1D-5A6B7C8D9E0F",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro",
+        "state" : "Shutdown",
+        "name" : "iPhone 16 Pro"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/owner\/Library\/Developer\/CoreSimulator\/Devices\/DEADBEEF-1111-4222-8333-444455556666\/data",
+        "dataPathSize" : 0,
+        "logPath" : "\/Users\/owner\/Library\/Logs\/CoreSimulator\/DEADBEEF-1111-4222-8333-444455556666",
+        "udid" : "DEADBEEF-1111-4222-8333-444455556666",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-15",
+        "state" : "Shutdown",
+        "name" : "Brahma old"
+      }
+    ]
+  }
+}

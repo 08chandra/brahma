@@ -1,19 +1,26 @@
 import Foundation
 import GRDB
 
-/// What a preview surface shows. Plan L has only `web`; 4a adds cases.
+/// What a preview surface shows. Plan L has `web`; 4a adds `backend`, `cli`, `ios`, `macos` and `artifact` (artifacts are
+/// published, never set as a surface: `PreviewSurface.validate` refuses that kind).
 public enum PreviewKind: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {
-    case web
+    case web, backend, cli, ios, macos, artifact
 
     public var title: String {
         switch self {
         case .web: "Web"
+        case .backend: "Backend"
+        case .cli: "CLI"
+        case .ios: "iOS"
+        case .macos: "macOS"
+        case .artifact: "Artifacts"
         }
     }
 }
 
 public enum PreviewStatus: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {
-    case idle, building, starting, running, failed, stopped, unavailable
+    /// `ran`: a one-shot preview (a CLI demo) finished; terminal until `main` moves, it changes or a restart is flagged.
+    case idle, building, starting, running, failed, stopped, unavailable, ran
 
     public var title: String {
         switch self {
@@ -24,6 +31,7 @@ public enum PreviewStatus: String, Codable, CaseIterable, Sendable, DatabaseValu
         case .failed: "Failed"
         case .stopped: "Stopped"
         case .unavailable: "Unavailable"
+        case .ran: "Ran"
         }
     }
 }
@@ -101,7 +109,10 @@ public struct SmokeResult: Codable, Equatable, Sendable {
 }
 
 /// One preview a company runs from `main` (table `previewSurface`, Task 2's migration). Every command, URL and smoke path is
-/// agent-written. `kind` is stored as text so a row a later plan writes still loads; only `web` is valid here.
+/// agent-written. `kind` is stored as text so a row a later plan writes still loads. Plan 4a's fields (`demo`, `openapiPath`,
+/// `appPath`, `bundleId`, `device`) are agent-written too; `outsideSandboxAskId`/`outsideSandboxApprovedAt` are the engine's
+/// record of the owner's Simulator approval (`Store.requestSimulatorApproval`, `applySimulatorApprovalEffects`): no tool or
+/// CLI command writes them.
 public struct PreviewSurface: Codable, Equatable, Sendable, Identifiable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "previewSurface"
     /// Preview surfaces per company.
@@ -119,12 +130,29 @@ public struct PreviewSurface: Codable, Equatable, Sendable, Identifiable, Fetcha
     public var setById: String
     public var createdAt: Date
     public var updatedAt: Date
+    /// A CLI preview's demo command (Plan 4a).
+    public var demo: String? = nil
+    /// A backend's OpenAPI file, relative to the repo root.
+    public var openapiPath: String? = nil
+    /// An iOS or macOS preview's built `.app`, relative to the repo root.
+    public var appPath: String? = nil
+    public var bundleId: String? = nil
+    /// The Simulator device type an iOS preview asks for.
+    public var device: String? = nil
+    /// The engine's owner ask for an iOS preview (it runs outside the sandbox), and when the owner approved it. Cleared when
+    /// the kind, `build`, `appPath` or `bundleId` changes.
+    public var outsideSandboxAskId: String? = nil
+    public var outsideSandboxApprovedAt: Date? = nil
 
     public init(id: String, companyId: String, name: String, kind: String = PreviewKind.web.rawValue, position: Int, build: String?,
-                run: String?, url: String?, smoke: [SmokeRequest] = [], setById: String, createdAt: Date, updatedAt: Date) {
+                run: String?, url: String?, smoke: [SmokeRequest] = [], setById: String, createdAt: Date, updatedAt: Date,
+                demo: String? = nil, openapiPath: String? = nil, appPath: String? = nil, bundleId: String? = nil, device: String? = nil,
+                outsideSandboxAskId: String? = nil, outsideSandboxApprovedAt: Date? = nil) {
         self.id = id; self.companyId = companyId; self.name = name; self.kind = kind; self.position = position
         self.build = build; self.run = run; self.url = url; self.smoke = smoke; self.setById = setById
         self.createdAt = createdAt; self.updatedAt = updatedAt
+        self.demo = demo; self.openapiPath = openapiPath; self.appPath = appPath; self.bundleId = bundleId; self.device = device
+        self.outsideSandboxAskId = outsideSandboxAskId; self.outsideSandboxApprovedAt = outsideSandboxApprovedAt
     }
 
     /// The kind, when this engine knows it.
@@ -132,20 +160,21 @@ public struct PreviewSurface: Codable, Equatable, Sendable, Identifiable, Fetcha
 
     public static let maxCommand = 2000
 
-    /// Throws `WorkError.invalid` with the message for the first rule broken: the name, the kind, run and url present, each
-    /// command 1–2000 characters, the URL (`LoopbackURL.validate`), then the smoke requests.
+    /// Throws `WorkError.invalid` with the message for the first rule broken: the name, the kind and the fields it needs
+    /// (`validateKind`, Plan 4a), each command 1–2000 characters, the URL when there is one (`LoopbackURL.validate`), the
+    /// paths, bundle id and device (`validateAppleFields`), then the smoke requests.
     public func validate() throws {
         guard name.range(of: "^[a-z][a-z0-9-]{0,23}$", options: .regularExpression) != nil else {
             throw WorkError.invalid("preview names are lowercase letters, digits and dashes (max 24)")
         }
-        guard previewKind == .web else { throw WorkError.invalid("only web previews are available yet") }
-        guard let run, let url else { throw WorkError.invalid("a web preview needs run and url") }
-        for command in [build, run].compactMap({ $0 }) {
+        try validateKind()
+        for command in [build, run, demo].compactMap({ $0 }) {
             guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, command.count <= Self.maxCommand else {
                 throw WorkError.invalid("preview commands must be 1–2000 characters")
             }
         }
-        try LoopbackURL.validate(url)
+        if let url { try LoopbackURL.validate(url) }
+        try validateAppleFields()
         guard smoke.count <= SmokeRequest.max, smoke.allSatisfy(\.isValid) else {
             throw WorkError.invalid("up to 10 smoke requests, each path starting with /")
         }
@@ -163,7 +192,15 @@ public struct PreviewState: Codable, Equatable, Sendable, FetchableRecord, Persi
     public var commit: String?
     public var port: Int?
     public var resolvedURL: String?
-    public var pid: Int32?
+    /// The server's (or app's) process, the leader of its own group. A different pid drops `pidStart`, so a start time is
+    /// never paired with a process it was not read from.
+    public var pid: Int32? {
+        didSet { if pid != oldValue { pidStart = nil } }
+    }
+    /// `pid`'s exact start time (`ProcessTable`), read at the spawn while the child was still unreaped and so provably the
+    /// engine's (final review I2). Every stop path signals the group only when the live process has exactly this start; a
+    /// record without one (an older engine's) is never signalled.
+    public var pidStart: Double? = nil
     public var message: String?
     public var logPath: String?
     /// When the process exited on its own, recently (the crash-loop window).
@@ -171,13 +208,21 @@ public struct PreviewState: Codable, Equatable, Sendable, FetchableRecord, Persi
     public var restartRequestedAt: Date?
     public var startedAt: Date?
     public var updatedAt: Date
+    /// The Simulator device an iOS preview runs on (Plan 4a).
+    public var simulatorId: String? = nil
+    /// A one-shot preview's captured output (engine-written, redacted).
+    public var outputPath: String? = nil
+    /// A backend's smoke results (agent-controlled bodies).
+    public var smokeResults: [SmokeResult] = []
 
     public init(surfaceId: String, companyId: String, status: PreviewStatus = .idle, commit: String? = nil, port: Int? = nil,
                 resolvedURL: String? = nil, pid: Int32? = nil, message: String? = nil, logPath: String? = nil, exits: [Date] = [],
-                restartRequestedAt: Date? = nil, startedAt: Date? = nil, updatedAt: Date) {
+                restartRequestedAt: Date? = nil, startedAt: Date? = nil, updatedAt: Date, simulatorId: String? = nil,
+                outputPath: String? = nil, smokeResults: [SmokeResult] = [], pidStart: Double? = nil) {
         self.surfaceId = surfaceId; self.companyId = companyId; self.status = status; self.commit = commit; self.port = port
         self.resolvedURL = resolvedURL; self.pid = pid; self.message = message; self.logPath = logPath; self.exits = exits
         self.restartRequestedAt = restartRequestedAt; self.startedAt = startedAt; self.updatedAt = updatedAt
+        self.simulatorId = simulatorId; self.outputPath = outputPath; self.smokeResults = smokeResults; self.pidStart = pidStart
     }
 }
 

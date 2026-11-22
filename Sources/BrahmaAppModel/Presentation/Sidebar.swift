@@ -6,6 +6,8 @@ public enum SidebarItem: Hashable, Sendable {
     case backlog, board, inbox
     /// Work › Releases (symbol `shippingbox`; mono chip = open releases).
     case releases
+    /// Work › Merge queue (Plan 4a; symbol `arrow.triangle.merge`; mono chip = open requests).
+    case mergeQueue
     /// Work › Resources: the owner's files, folders and links (symbol `paperclip`).
     case resources
     /// Work › Handbook: the company handbook's pages and the memory browser (symbol `book.closed`).

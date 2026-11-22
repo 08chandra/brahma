@@ -373,6 +373,12 @@ extension Store {
         guard !specChanged.isEmpty || checkChanged || assignment != nil || !otherChanged.isEmpty || statusChange != nil else {
             return item
         }
+        // Leaving review (Plan 4a): an item the merge queue is checking or landing stays; one still queued is withdrawn.
+        if statusBefore == .inReview, item.status != .inReview {
+            try Store.refuseWhileMerging(db: db, item: item)
+            try cancelMerge(db: db, itemId: item.id, now: now)
+            item.mergeState = .none
+        }
         // The lease goes when the item leaves the holder's hands: back to ready or backlog, or given to someone else.
         var releasedLease: (lease: WorkLease, why: String)?
         if let lease = try WorkLease.fetchOne(db, key: item.id) {
@@ -583,6 +589,9 @@ extension Store {
         if from == .done { item.doneAt = nil }
         if to == .inProgress { item.everStarted = true }
         if to == .done { item.doneAt = now }
+        // An item that leaves review without landing (returned, blocked) loses its approval: a request still waiting in the
+        // merge queue is withdrawn, so a later approval queues the work it is about.
+        if from == .inReview, to != .done { try Self.cancelQueuedMerges(db: db, itemId: item.id, now: now) }
         // Merged: the escalation floor belongs to the work that just landed (design §3.4).
         if to.resetsRungFloor { item.rungFloor = 0 }
         item.updatedAt = now

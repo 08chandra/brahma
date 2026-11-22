@@ -29,6 +29,10 @@ final class ProcessGroupChild: @unchecked Sendable {
     typealias Observer = @Sendable (Event) -> Void
 
     let pid: pid_t
+    /// The leader's exact start time (`ProcessTable`), read right after the spawn, before anything could reap it (nothing
+    /// reaps it before `finish`): proof that a later process with this pid and this start is this child. Nil when the table
+    /// could not be read.
+    let leaderStart: Double?
     private let lock = NSLock()
     private var exited = false
     private var status: Int32?
@@ -36,8 +40,8 @@ final class ProcessGroupChild: @unchecked Sendable {
     private var lost = false
     private let observer: Observer?
 
-    private init(pid: pid_t, observer: Observer?) {
-        self.pid = pid; self.observer = observer
+    private init(pid: pid_t, leaderStart: Double?, observer: Observer?) {
+        self.pid = pid; self.leaderStart = leaderStart; self.observer = observer
     }
 
     /// Signals sent so far (tests).
@@ -97,7 +101,7 @@ final class ProcessGroupChild: @unchecked Sendable {
         var pid: pid_t = 0
         let spawned = posix_spawn(&pid, executable, &actions, &attr, &argv, &envp)
         guard spawned == 0 else { throw SpawnFailure(message: String(cString: strerror(spawned))) }
-        return ProcessGroupChild(pid: pid, observer: observer)
+        return ProcessGroupChild(pid: pid, leaderStart: ProcessTable.entry(pid)?.start, observer: observer)
     }
 
     struct SpawnFailure: Error, CustomStringConvertible {

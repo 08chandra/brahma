@@ -25,7 +25,9 @@ public enum PreviewLog {
     /// How much of the end of a log `tail` reads.
     static let tailWindow = 65_536
 
-    static func relative(_ name: String) -> String { ".brahma/preview/logs/\(name).log" }
+    /// A file of surface `name` in the logs folder, by extension: `log` (the server's log), `out` (a one-shot's sealed output),
+    /// `-openapi.json` (a backend's OpenAPI copy). The one place the folder's path is spelled beside `EngineLayout.previewLogs`.
+    static func relative(_ name: String, ext: String = "log") -> String { ".brahma/preview/logs/\(name).\(ext)" }
 
     /// Trims surface `name`'s log in place (same file, so the engine's open appender keeps writing to it) when it is over
     /// `cap`. A missing log is fine; a link on the way, a hard-linked or foreign file throws `UnsafeEngineFile`.
@@ -50,13 +52,35 @@ public enum PreviewLog {
     /// The last `lines` lines of surface `name`'s log (from its last 64 KB), without their newlines; empty when it is
     /// missing or refused (a link on the way, a hard-linked or foreign file). Agent-controlled text: quote or flatten it.
     public static func tail(_ l: EngineLayout, name: String, lines: Int) -> [String] {
-        guard lines > 0, let fd = try? EngineFiles.openFileNoFollow(under: l.workspace, relative(name), flags: O_RDONLY) else { return [] }
+        tail(l, relative: relative(name), shown: l.previewLog(name: name).path, lines: lines)
+    }
+
+    /// The same for a one-shot preview's sealed output (`EngineLayout.previewOutput`, the CLI demo; Plan 4a Task 8b).
+    public static func outputTail(_ l: EngineLayout, name: String, lines: Int) -> [String] {
+        tail(l, relative: relative(name, ext: "out"), shown: l.previewOutput(name: name).path, lines: lines)
+    }
+
+    /// The engine's OpenAPI copy of backend `name` (`EngineLayout.previewOpenAPI`), read whole through the same walk: a regular
+    /// file of at most `maxBytes`, else nil (missing, a link on the way, hard-linked, foreign or too large). Agent-authored
+    /// content: the app parses it under `RendererCaps.parse` and shows it with `Text(verbatim:)`.
+    public static func openAPICopy(_ l: EngineLayout, name: String, maxBytes: Int) -> Data? {
+        guard maxBytes > 0,
+              let fd = try? EngineFiles.openFileNoFollow(under: l.workspace, relative("\(name)-openapi", ext: "json"), flags: O_RDONLY)
+        else { return nil }
+        defer { close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size <= maxBytes else { return nil }
+        return try? read(fd, offset: 0, count: Int(st.st_size), path: l.previewOpenAPI(name: name).path)
+    }
+
+    private static func tail(_ l: EngineLayout, relative: String, shown: String, lines: Int) -> [String] {
+        guard lines > 0, let fd = try? EngineFiles.openFileNoFollow(under: l.workspace, relative, flags: O_RDONLY) else { return [] }
         defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0 else { return [] }
         let size = Int(st.st_size)
         let start = max(0, size - tailWindow)
-        guard var data = try? read(fd, offset: start, count: size - start, path: l.previewLog(name: name).path) else { return [] }
+        guard var data = try? read(fd, offset: start, count: size - start, path: shown) else { return [] }
         if start > 0, let newline = data.firstIndex(of: 10) { data = data[data.index(after: newline)...] }
         var all = String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         if all.last == "" { all.removeLast() }

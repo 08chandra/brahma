@@ -25,7 +25,8 @@ extension Store {
     }
 
     /// The processes of the turns still in progress, as the database recorded them (informational: no start-time check, so a
-    /// crash's leftover row could name a reused pid). The owner-command guard uses `recordedTurnLeaders` instead.
+    /// crash's leftover row could name a reused pid). The owner-command guard and every stop path use `recordedTurnLeaders`
+    /// instead; nothing signals from this set.
     public func runningTurnPids() throws -> Set<Int32> {
         try writer.read { db in try Self.runningTurnPids(db) }
     }
@@ -34,6 +35,7 @@ extension Store {
         Set(try Int32.fetchAll(db, sql: "SELECT pid FROM turn WHERE outcome = ? AND pid IS NOT NULL",
                                arguments: [TurnOutcome.inProgress.rawValue]))
     }
+
 
     /// The live leaders of the turns the runner recorded under `<runDir>/turns` (`TurnRecords`), read without changing
     /// anything (a damaged record is skipped, never quarantined): what an owner command run from a shell checks its ancestry

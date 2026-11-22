@@ -10,6 +10,8 @@ public enum SelectTarget: Equatable, Sendable {
     case grants, digest, companySettings
     /// Work › Releases.
     case releases
+    /// Work › Merge queue (Plan 4a; `merge`). `merge-settings` opens its sheet.
+    case mergeQueue
     /// Work › Resources (Plan ML).
     case resources
     /// Handbook › PAGES (Plan ML).
@@ -24,8 +26,10 @@ public enum SelectTarget: Equatable, Sendable {
     case replayItem(key: String)
     /// `kb:<path>`: Handbook › PAGES with that page open (the path as given; pages are found case-insensitively).
     case kb(path: String)
-    /// `preview:<name>` (a surface, lowercased) or `preview:live`: Mission Control's preview pane on that tab.
+    /// `preview:<name>` (a surface, lowercased), `preview:live` or `preview:artifacts`: Mission Control's preview pane on that tab.
     case preview(name: String)
+    /// `artifact:<AR-n>` (through `Artifact.parseRef`; `artifact:A-3` is rejected): the ARTIFACTS tab on that artifact.
+    case artifact(number: Int)
     case item(key: String)
     /// `release:<ref>`: Work › Releases with that release (`R-<n>`) selected in the inspector.
     case release(ref: String)
@@ -52,6 +56,8 @@ public enum SelectTarget: Equatable, Sendable {
         case "digest": self = .digest
         case "settings": self = .companySettings
         case "releases": self = .releases
+        case "merge": self = .mergeQueue
+        case "merge-settings": self = .sheet(.mergeSettings)
         case "resources": self = .resources
         case "handbook": self = .handbook
         case "memory": self = .memory
@@ -78,6 +84,9 @@ public enum SelectTarget: Equatable, Sendable {
                 guard let target = Self.replay(value) else { return nil }
                 self = target
             case "preview": self = .preview(name: value.lowercased())
+            case "artifact":
+                guard let number = Artifact.parseRef(value) else { return nil }
+                self = .artifact(number: number)
             default: return nil
             }
         }

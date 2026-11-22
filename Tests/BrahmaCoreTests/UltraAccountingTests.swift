@@ -6,7 +6,7 @@ import GRDB
 /// A sandboxed company whose engineer holds a confirmed tier-L item with an approved Ultra run, and an engine for which every
 /// hard gate holds: max20x (so a day allows several runs) confirmed by the CLI's `max`, calibrated, on pace, the Ultra probe
 /// gates recorded for the fake CLI build (V-9 as the owner's future probe would), a fake `claude` answering `get_usage`.
-private struct UltraWorld {
+struct UltraWorld {
     let g: GatedWorld
     var world: World { g.world }
     var store: Store { g.store }

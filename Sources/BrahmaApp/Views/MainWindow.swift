@@ -63,6 +63,7 @@ private struct Shell: View {
                 case .newItem: ItemEditorSheet(model: model)
                 case .vacancy(let managerHandle): VacancySheet(model: model, managerHandle: managerHandle)
                 case .fillVacancy(let handle): FillVacancySheet(model: model, handle: handle)
+                case .mergeSettings: MergeSettingsSheet(model: model)
                 }
             }
             .background(BrahmaTheme.bg1)

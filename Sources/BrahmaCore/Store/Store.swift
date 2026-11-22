@@ -37,6 +37,7 @@ public final class Store: Sendable {
     /// How long engine git waits for an item's lock before skipping the item (tests shorten it).
     let gitLockTimeout = GitLockTimeout()
     let mergeRefProbe = MergeRefProbe()
+    let journalProbe = JournalProbe()
     /// How much output a plan-turn barrier git call may produce before the barrier fails closed (tests shrink it).
     let planBarrierOutputLimit = GitOutputLimit()
     /// Called inside the kill transaction of every agent (Plan 5-lite revokes grants, Plan 7 reassigns threads).
@@ -142,6 +143,10 @@ public final class Store: Sendable {
         var git = GitWorkspace(root: root, lockDirectory: engineDir("locks", fallback: "brahma-locks"),
                                mergeDirectory: engineDir("merge", fallback: "brahma-merge"), exportHome: exportHome)
         git.lockTimeout = gitLockTimeout.seconds
+        git.followProbe = { [probe = mergeRefProbe] in
+            probe.call("follow")
+            if probe.fails("follow") { throw GitError.failed(command: "read-tree", status: -1, stderr: "the root checkout could not follow main") }
+        }
         git.planBarrierOutputLimit = planBarrierOutputLimit.bytes
         git.hasLease = { [self] key in try lease(companyId: companyId, key: key) != nil }
         git.onWorktreeTamper = { [self] key, detail in
@@ -236,8 +241,9 @@ public final class Store: Sendable {
                 // The engine's git output for this init goes under the data home (A-I1b), never the shared per-user temp dir.
                 let git = GitWorkspace(root: dir, exportHome: dataHome)
                 try git.ensureRepo()
-                // The head the engine expects `main` to have; every claim checks it is still an ancestor of the real one.
-                if let head = try git.head(of: GitWorkspace.mainRef) {
+                // The head the engine expects `main` to have (the engine's one automatic record, Plan 4a B6); a symbolic `main` is
+                // never the engine's and is not recorded: the main guard alerts the owner, who adopts a plain branch.
+                if let head = try git.head(of: GitWorkspace.mainRef), try !git.mainIsSymbolic() {
                     try db.execute(sql: "UPDATE company SET mainCommit = ? WHERE id = ?", arguments: [head, company.id])
                     company.mainCommit = head
                 }
@@ -298,6 +304,12 @@ public final class Store: Sendable {
                 kept.smokeCheck = stored.smokeCheck
                 kept.smokeCheckSetById = stored.smokeCheckSetById
                 kept.redBugItemId = stored.redBugItemId
+                // The merge queue's settings change only through their own setters and the engine's merge writes (Plan 4a).
+                kept.mainCheck = stored.mainCheck
+                kept.mainCheckSetById = stored.mainCheckSetById
+                kept.mergeBatchSize = stored.mergeBatchSize
+                kept.mergeStrategy = stored.mergeStrategy
+                kept.mergeHold = stored.mergeHold
                 // Set once at creation (Task 14).
                 kept.importedFrom = stored.importedFrom
                 kept.importedCommit = stored.importedCommit
@@ -428,13 +440,17 @@ final class GitOutputLimit: @unchecked Sendable {
     var bytes: Int { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
 }
 
-/// Tests only: called by a merge with each ref's name right before its stop check (`Store.performMerge`; "" for the check
-/// before anything is done), so a test can raise the owner's stop at exactly that seam.
+/// Tests only: called by the merge queue with each ref's name right before its stop check (`MergeQueue`), so a test can
+/// raise the owner's stop at exactly that seam.
 final class MergeRefProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var body: (@Sendable (String) -> Void)?
     func set(_ new: (@Sendable (String) -> Void)?) { lock.withLock { body = new } }
     func call(_ ref: String) { lock.withLock { body }?(ref) }
+    private var failing: Set<String> = []
+    /// Tests only: the named step reports a failure the next time it asks (`fails`), as if git could not run there.
+    func failOn(_ steps: Set<String>) { lock.withLock { failing = steps } }
+    func fails(_ step: String) -> Bool { lock.withLock { failing.contains(step) } }
 }
 
 final class GitLockTimeout: @unchecked Sendable {

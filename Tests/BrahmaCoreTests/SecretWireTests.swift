@@ -609,6 +609,7 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         #expect(back.status == .inProgress); #expect(back.mergeState == .none); #expect(back.verifiedCommit == nil)
         let event = try #require(try w.events(i).last { $0.kind == .verificationFailed })
         #expect(event.text.contains("known secret LEAK_KEY"), Comment(rawValue: event.text)); #expect(!event.text.contains(value))
+        #expect(try w.store.latestMergeRequest(itemId: i.id)?.failure == .secretFound)
         #expect(event.text.contains("commit \(leak.prefix(7))"), "the finding names the commit")
         #expect(try w.dms(to: w.eng).contains { $0.contains("known secret LEAK_KEY") && $0.lowercased().contains("rewrite") })
         #expect(try w.store.lease(itemId: i.id)?.agentId == w.eng.id)

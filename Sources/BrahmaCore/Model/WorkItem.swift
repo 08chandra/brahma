@@ -305,6 +305,8 @@ public enum WorkEventKind: String, Codable, CaseIterable, Sendable, DatabaseValu
     case branchBehind
     /// The engine could not merge an approved item `Store.maxMergeFailures` times in a row; it went back to its holder.
     case mergeFailed
+    /// An approved item was put in the merge queue (Plan 4a): `queued to merge as M-<n> (position <p>)`.
+    case mergeQueued
     // Work modes (W3).
     case planWritten, planTurnWrote, modeEscalated, specConfirmed
     // Human tasks (Plan L Task 9): the owner did or declined the task the item was blocked on. Both wake the assignee.
@@ -319,7 +321,7 @@ public enum WorkEventKind: String, Codable, CaseIterable, Sendable, DatabaseValu
     /// Kinds that also appear in the company activity feed.
     static let feed: Set<WorkEventKind> = [
         .statusChanged, .submitted, .verificationPassed, .verificationFailed, .reviewApproved, .merged, .mergeConflict,
-        .mergeFailed, .budgetExceeded, .watchdog, .leaseExpired, .aging, .humanTaskDone, .humanTaskDeclined,
+        .mergeFailed, .mergeQueued, .budgetExceeded, .watchdog, .leaseExpired, .aging, .humanTaskDone, .humanTaskDeclined,
     ]
 }
 

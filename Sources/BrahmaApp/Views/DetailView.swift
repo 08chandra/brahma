@@ -44,6 +44,8 @@ struct DetailView: View {
                     BackupsView(model: model.backups)
                 case .releases:
                     ReleasesView(model: model)
+                case .mergeQueue:
+                    MergeQueueView(model: model)
                 case .resources:
                     ResourcesView(model: model)
                 case .handbook:

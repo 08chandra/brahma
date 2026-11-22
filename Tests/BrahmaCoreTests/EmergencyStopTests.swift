@@ -392,11 +392,17 @@ private final class GroupEvents: @unchecked Sendable {
         let a = try store.hire(companyId: c.id, name: "ceo", role: "ceo", model: "sonnet")
         try store.transition(agentId: a.id, to: .ready, now: Date()) { _ in true }
         let (_, turn) = try #require(try store.beginTurn(agentId: a.id, now: Date()))
-        // A turn's process: the leader of its own group, recorded as the turn's pid. No engine runs.
+        // A turn's process: the leader of its own group, recorded as the turn's pid and, as the runner does at spawn, under
+        // `<runDir>/turns` with its exact start time (Task 9c fix round 2: the stop paths read only that record; the database
+        // row carries no start time and is never a source). No engine runs.
         let child = try ProcessGroupChild.spawn(executable: "/bin/sleep", arguments: ["sleep", "300"], environment: [:],
                                                 workingDirectory: try tempDir(), output: -1)
         defer { _ = child.signalGroup(SIGKILL); child.finish() }
         try store.setTurnPid(turnId: turn.id, pid: child.pid)
+        let turns = paths.runDir.appending(path: "turns", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: turns, withIntermediateDirectories: true)
+        let start = try #require(ProcessTable.entry(child.pid)?.start)
+        try TurnRecords.add(TurnRecord(leader: child.pid, leaderStart: start, since: start, machMarker: nil), agentId: a.id, in: turns)
 
         let stop = try cli(["stop", "--note", "test stop"], home: owner.url)
         #expect(stop.status == 0, "\(stop.stderr)")

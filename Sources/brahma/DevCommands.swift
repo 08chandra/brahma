@@ -18,8 +18,8 @@ private func refusing<T>(_ body: () throws -> T) throws -> T {
 struct DevGroup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dev", abstract: "Developer test hooks (BRAHMA_DEV=1).", shouldDisplay: false,
-        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, ReleaseScenario.self, Claim.self, Tool.self,
-                      SeedTurn.self, Drop.self, AutoPagesNow.self])
+        subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, ReleaseScenario.self, MergeScenario.self, Claim.self,
+                      Tool.self, SeedTurn.self, Drop.self, AutoPagesNow.self])
 
     /// `request_access` as an agent would call it (the seed's pending access ask). Owner-side approval stays `brahma access approve`.
     struct Access: ParsableCommand {
@@ -75,6 +75,29 @@ struct DevGroup: AsyncParsableCommand {
             print(safe("\(summary.deployed.ref) \(summary.deployed.status.rawValue) \(summary.deployed.productionURL ?? "-")"))
             print(safe("\(summary.proposed.ref) \(summary.proposed.status.rawValue) (\(summary.deployAsk.ref) waits on the owner)"))
             for ask in summary.humanTasks { print(safe("\(ask.ref) human task: \(ask.title)")) }
+        }
+    }
+
+    /// Plan 4a Task 10: one merged and one bounced (conflict) merge request, through the real tools, the engine's check path and
+    /// the real queue (`DevMergeScenario`).
+    struct MergeScenario: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(commandName: "merge-scenario",
+                                                        abstract: "Merge one item and bounce a conflicting one through the real merge queue.")
+        @Argument var company: String
+        @Option(help: "A ready work item with a check to merge first (default: one is created).") var item: String?
+        @Option(help: "The repo-relative file the first item's work writes; the second writes it too, so it conflicts.") var file = DevMergeScenario.defaultFile
+
+        func run() async throws {
+            try requireDev()
+            let (store, paths) = try openStore()
+            let c = try resolveCompany(store, company)
+            let summary: DevMergeScenario.Summary
+            do {
+                summary = try await DevMergeScenario.run(store: store, paths: paths, companyId: c.id, vault: try cliSecretVault(interactive: false),
+                                                         itemKey: item, file: file)
+            } catch let e as WorkError { throw fail(e.message) }
+            print(safe("\(summary.merged.ref) \(summary.mergedItem.key) merged at \((summary.merged.mergedCommit ?? "").prefix(7)); main \((summary.mainCommit ?? "-").prefix(7))"))
+            print(safe("\(summary.bounced.ref) \(summary.bouncedItem.key) bounced: \(summary.bounced.detail ?? "conflict")"))
         }
     }
 

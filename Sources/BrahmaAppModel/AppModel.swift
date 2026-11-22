@@ -52,6 +52,26 @@ public final class AppModel {
     public var highlightedMessageId: String?
     /// The preview pane's tab (a `PreviewTabID`); nil or an unknown id shows the default tab.
     public var selectedPreviewTab: String?
+    /// The artifact the ARTIFACTS tab shows (`selectArtifact`); nil or a deleted one shows the newest.
+    public var selectedArtifactId: String?
+    /// Artifact id → the owner's "PHONE FRAME" choice for a video (Plan 4a); unset keeps `VideoLayout`'s detection. Per company.
+    public var phoneFrameOverride: [String: Bool] = [:]
+    /// Artifact ids whose page the owner let run scripts ("Enable scripts for this artifact", `setArtifactScripts`): an agent's,
+    /// an outside or a tainted HTML artifact runs without them otherwise (`ArtifactScripts`). Read-only outside the model, kept
+    /// for this session and company only, never stored, and written by no agent path.
+    public internal(set) var scriptEnabledArtifacts: Set<String> = []
+    /// An artifact older than the snapshot's newest ones, opened by `artifact:AR-n` (`openArtifact(number:)`); per company.
+    var pinnedArtifact: PinnedArtifact?
+    /// Shown in the ARTIFACTS tab beside the list (never in its place): the pinned artifact was deleted outside the app
+    /// (`checkPinnedArtifact`). Cleared by the next artifact pick, tab pick or a refresh that has something selected.
+    public internal(set) var artifactNotice: String?
+    /// Bumped by every artifact selection, so a lookup result that lands after the owner picked something else is dropped.
+    @ObservationIgnored var artifactSelectionGeneration = 0
+    /// Surface id → the parsed OpenAPI copy of a running backend (`refreshOpenAPI`, through `RendererCaps.parse`).
+    var openAPICache: [String: OpenAPICacheEntry] = [:]
+    /// How a running backend's OpenAPI copy is parsed: `defaultOpenAPIParser` (the hardened read under `RendererCaps.parse`);
+    /// tests inject one on a manual clock.
+    @ObservationIgnored var openAPIParser: @Sendable (OpenAPICopy) async throws -> [OpenAPIOperation]? = AppModel.defaultOpenAPIParser
     /// The agent whose turn stream some view observes (`observeTurnStream`); loaded off-main per tick only while set.
     public internal(set) var turnStreamAgentId: String?
     var turnStreamCache: TurnStreamCache?
@@ -344,6 +364,12 @@ public final class AppModel {
         selectedAgentId = nil
         selectedItemKey = nil
         selectedPreviewTab = nil
+        selectedArtifactId = nil
+        pinnedArtifact = nil
+        artifactNotice = nil
+        phoneFrameOverride = [:]
+        scriptEnabledArtifacts = []
+        openAPICache = [:]
         stopObservingTurnStream()
         boardSprintId = nil
         activity = []
@@ -388,6 +414,7 @@ public final class AppModel {
         case .digest: select(.inboxDigest)
         case .companySettings: select(.companySettings)
         case .releases: select(.releases)
+        case .mergeQueue: select(.mergeQueue)
         case .resources: select(.resources)
         case .budget: select(.budget)
         case .replayAgent(let handle, let day):
@@ -410,12 +437,20 @@ public final class AppModel {
             selectedReleaseRef = ref
         case .preview(let name):
             select(.missionControl)
-            if name == PreviewTabID.live {
-                selectedPreviewTab = PreviewTabID.live
+            if name == PreviewTabID.live || name == PreviewTabID.artifacts {
+                selectPreviewTab(name)
             } else if let s = snapshot.preview.surfaces.first(where: { $0.name.lowercased() == name }) {
-                selectedPreviewTab = PreviewTabID.surface(s.id)
+                selectPreviewTab(PreviewTabID.surface(s.id))
             } else {
                 errorMessage = "No preview \(name)"
+            }
+        case .artifact(let number):
+            // In the snapshot: shown at once. Older than its newest ones: looked up and pinned (`openArtifact`), off-main.
+            select(.missionControl)
+            if let a = snapshot.preview.artifacts.first(where: { $0.number == number }) {
+                selectArtifact(a)
+            } else {
+                Task { await openArtifact(number: number) }
             }
         case .ask(let id):
             select(.inbox)
@@ -580,6 +615,10 @@ public final class AppModel {
         let new = try await Task.detached { try Snapshot.load(store: store, selectedCompanyId: id) }.value
         guard id == selectedCompanyId else { return }  // selection changed mid-load: the stale snapshot is dropped
         if new != snapshot { snapshot = new }
+        refreshOpenAPI()
+        await checkPinnedArtifact()
+        // The deleted-artifact notice lasts until something is selected again (a pick, a tab, or a refresh that left one selected).
+        if artifactNotice != nil, selectedArtifactId != nil { artifactNotice = nil }
         if let c = mapController, c.companyId == id { c.sync(snapshot: snapshot) }
         ticksSinceSnapshot = 0
         // The Handbook follows the database only while it is shown (its lists are read on demand, never kept in the snapshot).

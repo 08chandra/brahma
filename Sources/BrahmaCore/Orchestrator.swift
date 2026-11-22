@@ -80,6 +80,8 @@ public actor Orchestrator {
     var checkTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// Company id → its merge task (one approved item lands at a time per company). Merges are child processes too.
     var mergeTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
+    /// The merge queue (Plan 4a Task 1b): lands the company's queued requests, one batch per company at a time. A stop observer.
+    public nonisolated let mergeQueue: MergeQueue
     /// Companies whose last merge attempt did not land (HEAD not on main, git failed): not tried again before this time.
     var mergeBackoff: [String: Date] = [:]
     /// Company id → merge attempts in a row that failed for the company's own reasons (`MergeInfrastructureError`).
@@ -100,6 +102,11 @@ public actor Orchestrator {
     /// Consecutive lease turns that could not start for want of a worktree, per item.
     var worktreeFailures: [String: Int] = [:]
     static let maxWorktreeFailures = 3
+    /// Consecutive turns per agent the runner stopped before they ran because no exact record could name their process.
+    var unrecordedTurns: [String: Int] = [:]
+    static let maxUnrecordedTurns = 3
+    /// The reason that keys the engine alert raised after `maxUnrecordedTurns` such turns in a row.
+    static let unrecordedTurnReason = "turn-record"
     var lastSweep: [String: Date] = [:]
     /// Company-active time of each company's last deadlock/aging scan.
     var lastLiveness: [String: Double] = [:]
@@ -133,6 +140,8 @@ public actor Orchestrator {
     /// Plan L previews: the runner (one for the engine's life) and its reconcile pass in flight (`previewTick`).
     let previewRunner: PreviewRunner
     var previewTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
+    /// Whether the last preview pass was a sprint-review demo (Plan 4a Task 7): demos and reconciles alternate.
+    var lastPreviewTickWasDemo = false
     /// Plan L main smokes (`smokeTick`): what they run through, one slot per company shared with a release's smoke (PR-36),
     /// and the run in flight per company.
     nonisolated let smokeChecks: SmokeChecks
@@ -197,10 +206,18 @@ public actor Orchestrator {
         let previews = PreviewRunner(store: store, paths: paths, deps: previewDeps,
                                      sandboxLayout: { SandboxLayout(paths: paths, company: $0, agentHandle: "preview") },
                                      timeouts: PreviewTimeouts(), memory: { memory.current != .normal }, clock: clock,
-                                     blocking: engineBlocking, environment: checkBaseEnvironment)
+                                     blocking: engineBlocking, environment: checkBaseEnvironment, adapters: previewDeps.adapters)
         self.previewRunner = previews
-        // The owner's stop reaches the release executor (its steps and smokes) and every preview (L-5lite-A) too.
-        self.stopObservers = stopObservers + [executor, previews]
+        // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
+        let checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths, ceiling: profile)
+        // The merge queue (Plan 4a): it replaced 3a's one-item merge step. It shares this engine's `Blocking`, runs its checks
+        // through the same sandboxed runner, and scans a candidate for its own company's known secret values only.
+        let queue = MergeQueue(store: store, paths: paths, checks: checkRunner,
+                               knownValues: { [store] in store.knownSecretValues(companyId: $0) },
+                               clock: clock, blocking: engineBlocking, baseEnvironment: checkBaseEnvironment)
+        self.mergeQueue = queue
+        // The owner's stop reaches the release executor (its steps and smokes), every preview (L-5lite-A) and the merge queue too.
+        self.stopObservers = stopObservers + [executor, previews, queue]
         self.backupTools = backupTools; self.walSleeper = walSleeper; self.sleepGuard = sleepGuard
         // The engine reads the vault only in the background: never a prompt, whichever vault the host passed.
         let vault = vault.nonInteractive()
@@ -222,12 +239,21 @@ public actor Orchestrator {
                                                       baseline: Orchestrator.ownerSandboxBaseline(store: store, paths: paths)),
                                 runner: runner, claudePath: claudePath)
             : nil)
-        // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
-        self.checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths, ceiling: profile)
+        self.checkRunner = checkRunner
         self.checkBaseEnvironment = checkBaseEnvironment
         // Plan ML: a restore resets every memory cursor (every company's: the whole database was swapped), a full idempotent
         // re-scan on the next ticks.
         restoreHooks.register(afterRestore: { _ in try MemoryIngest.resetCursors(store: store) })
+        // Plan 4a Task 3: the engine's restore step re-affirms the record of a company whose `main` is exactly what the restored
+        // database recorded (`takeUpRestore` runs the hooks for those only; a stale pending head goes, 3a's alert closes). It
+        // adopts nothing else and never moves `main` (B6, I2: `adoptMain(by: .system)` re-affirms the live head only when it is
+        // the record, else refuses): a head the restored database did not record is the main guard's to restore. Git: in a
+        // Blocking body.
+        let blocking = self.blocking
+        restoreHooks.register(afterRestore: { event in
+            guard let head = event.mainHead, try store.company(id: event.companyId)?.mainCommit == head else { return }
+            _ = try await blocking.tryRun { try store.adoptMain(companyId: event.companyId, by: .system) }
+        })
     }
 
     /// Crash recovery: turns left in progress by a previous run are interrupted; their agents return to ready.
@@ -282,6 +308,9 @@ public actor Orchestrator {
             // Releases and rollbacks an earlier engine left in progress end without running again (Task 8, builder-check 5).
             try await releaseExecutor.recover(now: now)
             try await recoverMerges()
+            // The merge queue's journal: a batch an earlier engine left at some step is finished or abandoned before anything is
+            // claimed (the queue also does this by itself before its first batch, and after the owner's stop).
+            for company in try store.companies() { await mergeQueue.recover(company: company) }
             // The engine-owned pre-commit hook of every company workspace (Task 5a); a refusal is logged, never fatal.
             let companies = try store.companies()
             for failure in await blocking.run({ () -> [String] in
@@ -327,13 +356,20 @@ public actor Orchestrator {
             log("WAL shipping config could not be written: \(error)")
             return
         }
-        let shipper = WALShipper(executable: litestream, paths: paths, tools: backupTools, sleeper: walSleeper) { [self] in log($0) }
+        let store = self.store, clock = self.clock
+        let shipper = WALShipper(executable: litestream, paths: paths, tools: backupTools, sleeper: walSleeper, note: { [self] in log($0) },
+                                 onPaused: { reason in
+                                     // An unproven litestream for this database, or a child whose start could not be read (Task 9c fix
+                                     // rounds 2 and 3): shipping stays paused and the owner is told once a day, in engine-written text.
+                                     let notice = WALShipper.pausedNotice(reason)
+                                     try? BackupTargets.noticeOncePerDay(store: store, title: notice.title, body: notice.body, now: clock())
+                                 })
         walShipper = shipper
         shipper.start()
     }
 
-    /// Stops the litestream supervisor and its child (the engine is shutting down: `runForever` ends here, and the app's
-    /// `EngineHost.stop` calls it too). Blocking for at most `WALShipper.stopGrace` + 2 s.
+    /// Stops the litestream supervisor and its child. Since Task 9c the shutdown does this as a bounded step of its own
+    /// (`shutdown`, on a dedicated thread); this method remains for tests. Blocking for at most `WALShipper.stopGrace` + 2 s.
     public func stopWALShipping() {
         walShipper?.stop()
         walShipper = nil
@@ -344,7 +380,7 @@ public actor Orchestrator {
     /// Keeps the Mac awake while agents run (the owner's `preventSleep`); ended with the engine (`stopSleepPrevention`).
     nonisolated let sleepGuard: SleepGuard
 
-    /// Ends caffeinate (the engine is shutting down: `runForever` ends here, and the app's `EngineHost.stop` calls it too).
+    /// Ends caffeinate. Since Task 9c the shutdown does this as a bounded step of its own (`shutdown`); this method remains for tests.
     public func stopSleepPrevention() async { await sleepGuard.shutdown() }
 
     public func runningCount() -> Int { runningByCompany.values.reduce(0, +) }
@@ -433,23 +469,56 @@ public actor Orchestrator {
         }
     }
 
-    /// Ticks until cancelled, then cancels in-flight turns and waits for them to record their outcome.
-    public func runForever(interval: Duration = .seconds(1)) async {
+    /// Ticks until cancelled, then the bounded shutdown (`shutdown`): in-flight turns are cancelled and record their outcome,
+    /// every preview is stopped alongside them, and nothing holds the exit past `shutdownBound`.
+    public func runForever(interval: Duration = .seconds(1), shutdownBound: Duration = EngineShutdown.bound) async {
         while !Task.isCancelled {
             await tick()
             try? await Task.sleep(for: interval)
         }
-        // The engine is stopping: litestream stops with it (SIGTERM, then SIGKILL after the grace).
-        stopWALShipping()
-        await stopSleepPrevention()
-        let inFlight = Array(tasks.values) + Array(healthTasks.values) + Array(gitTasks.values) + Array(checkTasks.values) + Array(mergeTasks.values) + Array(timerTasks.values)
-            + Array(smokeTasks.values) + Array(releaseTasks.values)
-            + (secretsTask.map { [$0] } ?? []) + (pushTask.map { [$0] } ?? []) + (stopObserverTask.map { [$0] } ?? []) + (previewTask.map { [$0] } ?? [])
-        for t in inFlight { t.cancel() }
-        for t in inFlight { await t.value }
-        // Every preview's process group is stopped with the engine (the next engine starts them again).
-        await previewRunner.stopAll()
-        await runner.waitForChildren()
+        _ = await shutdown(bound: shutdownBound)
+    }
+
+    /// The engine is stopping (Plan 4a Task 9c). Every task in flight is cancelled (a turn's `claude` gets SIGTERM and, after
+    /// `killGrace`, SIGKILL) and waited for; `previewRunner.stopAll()` (every preview's process group stopped, recorded `engine
+    /// stopped`; the next engine starts them again), the runner's `waitForChildren`, litestream's stop (SIGTERM, then SIGKILL
+    /// after the grace, on its own thread so it never blocks the actor) and caffeinate's run at the same time, all under one
+    /// bound (`EngineShutdown.run`, fix round 1 I2: nothing runs before the clock starts). Past the bound the shutdown logs
+    /// what was still running, by engine-written name (task kinds and engine ids only), kills every process group the engine
+    /// recorded (`EngineShutdown.killEngineProcesses`, fix round 1 M1) and returns anyway. Returns those names (tests read them).
+    @discardableResult
+    func shutdown(bound: Duration = EngineShutdown.bound) async -> [String] {
+        let shipper = walShipper
+        walShipper = nil
+        var steps: [EngineShutdown.Step] = []
+        if let shipper { steps.append(EngineShutdown.Step(name: "litestream") { await EngineShutdown.onThread { shipper.stop() } }) }
+        steps.append(EngineShutdown.Step(name: "sleep guard") { [sleepGuard] in await sleepGuard.shutdown() })
+        func add(_ name: String, _ task: Task<Void, Never>?) {
+            guard let task else { return }
+            task.cancel()
+            steps.append(EngineShutdown.Step(name: name) { await task.value })
+        }
+        for (agentId, t) in tasks { add("turn of agent \(agentId)", t) }
+        for (key, t) in healthTasks { add("health \(key)", t) }
+        for (key, t) in gitTasks { add("git \(key)", t) }
+        for (runId, t) in checkTasks { add("check \(runId)", t) }
+        for (companyId, t) in mergeTasks { add("merge \(companyId)", t) }
+        for (timerId, t) in timerTasks { add("timer \(timerId)", t) }
+        for (companyId, t) in smokeTasks { add("smoke \(companyId)", t) }
+        for (companyId, t) in releaseTasks { add("release \(companyId)", t) }
+        add("secrets reload", secretsTask)
+        add("push", pushTask)
+        add("stop observers", stopObserverTask)
+        add("preview pass", previewTask)
+        steps.append(EngineShutdown.Step(name: "previews") { [previewRunner] in await previewRunner.stopAll() })
+        steps.append(EngineShutdown.Step(name: "turn children") { [runner] in await runner.waitForChildren() })
+        let left = await EngineShutdown.run(steps, bound: bound)
+        if !left.isEmpty {
+            let killed = EngineShutdown.killEngineProcesses(store: store, paths: paths)
+            log("shutdown bound of \(EngineShutdown.seconds(bound)) passed; still running: \(left.sorted().joined(separator: ", ")); "
+                + "killed \(killed.groups.terminated.count) recorded process group(s)\(killed.litestream.map { "; \($0)" } ?? ""); exiting anyway")
+        }
+        return left
     }
 
     /// Synchronous on the actor (no suspension points), so ticks never interleave with each other.
@@ -641,6 +710,8 @@ public actor Orchestrator {
 
         // 5. Engine-run checks first (cheap, and they unblock reviews), then select and launch turns around them.
         startChecks(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
+        // 5a. The main guard (Plan 4a Task 3): for every company, `main` is where the queue left it, before the merge step.
+        mainGuardTick(now: now, held: held, companies: companies)
         startMerges(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
         // 5b. Previews (Plan L): one reconcile pass at a time, after the merge step.
         previewTick(held: held)
@@ -1332,7 +1403,18 @@ public actor Orchestrator {
         } catch {
             failure = String(describing: error)
         }
-        if !launched, !spentGrants.isEmpty {
+        // The runner stopped the child it had just spawned because no exact record could name it (its start time unreadable,
+        // or its leader record unwritable). Its `.spawned` event made it look launched, but the turn never ran (Task 9c fix
+        // round 4): for every account it was not launched. Its one-use grants are given back, an Ultra turn gets no charge
+        // floor and keeps its approval, and the item is charged nothing. Taint and the lab still treat it as launched (fail
+        // closed: a process did exist).
+        let unrecorded: Bool
+        switch runnerError as? TurnError {
+        case .startNotRecorded?, .leaderNotRecorded?: unrecorded = true
+        default: unrecorded = false
+        }
+        let ran = launched && !unrecorded
+        if !ran, !spentGrants.isEmpty {
             let ids = spentGrants
             attempt { try store.restoreGrants(ids: ids) }
             log("@\(agent.name)'s turn did not start: its one-use grants were given back")
@@ -1344,6 +1426,9 @@ public actor Orchestrator {
         // Only a rejection or overage is a limit; `allowed_warning` (any window) is not.
         let limited = lastInfo.map(UsageGate.isHardLimit) ?? false
         let end: TurnEnd
+        // Set where the turn ends on the fixed infrastructure delay with no infrastructure class (a missing worktree, a turn
+        // that could not be recorded): the delay outlives `noteOutcome` (it would otherwise retry on the very next tick).
+        var infraDelayed = false
         // The hold for an active usage limit; HTTP 429 with no rejecting rate-limit event records one so the gate closes for
         // every company.
         func noteUsageLimit() -> Date {
@@ -1382,6 +1467,7 @@ public actor Orchestrator {
                                            error: WorktreeSetupError(reason: unavailable.reason), now: now)
             attempt { try store.noteReviewWorktreeFailure(itemId: unavailable.itemId, agentId: agent.id, reason: unavailable.reason, now: now) }
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
+            infraDelayed = true
             end = .interrupted()
         } else if let unavailable = worktreeUnavailable {
             // Not the agent's fault and nothing ran: back to ready after the short fixed infrastructure delay. After
@@ -1404,6 +1490,7 @@ public actor Orchestrator {
                 log("worktree of \(unavailable.key) unavailable for @\(agent.name): \(unavailable.reason)")
             }
             await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
+            infraDelayed = true
             end = .interrupted()
         } else if Task.isCancelled {
             end = .interrupted(partial: result)
@@ -1411,6 +1498,26 @@ public actor Orchestrator {
             end = .interrupted()
         } else if agentCapped {
             end = .interrupted(partial: result)
+        } else if unrecorded {
+            // Nothing ran: the runner killed the child it had just spawned because no exact record could name it (Task 9c fix
+            // rounds 3 and 4). The engine's fault, not the agent's: `interrupted`, so no charge to the agent or the item (no
+            // failure count, no backoff, the lease kept, nothing spent: `ran` above). It is retried after the short fixed
+            // infrastructure delay, never on the next tick, and after `maxUnrecordedTurns` in a row the owner is alerted.
+            let why = if case .startNotRecorded? = runnerError as? TurnError {
+                "the start time of its process could not be read, so the engine could not record it"
+            } else {
+                "the engine could not write the record of its process"
+            }
+            attempt {
+                try store.appendEvent(ActivityEvent(
+                    companyId: agent.companyId, agentId: agent.id, turnId: turn.id, kind: .error,
+                    text: "@\(agent.name)'s turn was stopped before it ran: \(why); it is retried in "
+                        + "\(Int(EngineHealth.infraCooldown)) s",
+                    createdAt: now))
+            }
+            await setInfraCooldown(agentId: agent.id, until: now.addingTimeInterval(EngineHealth.infraCooldown))
+            infraDelayed = true
+            end = .interrupted()
         } else if case .interrupted? = runnerError as? TurnError {
             // SIGTERM, or killed with background work pending (even after an early result): not the agent's doing.
             end = .interrupted(partial: result)
@@ -1482,9 +1589,9 @@ public actor Orchestrator {
             observation: state.observation,
             modeModel: modeDecision?.model, modeEffort: modeDecision?.effort,
             stopReason: agentCapped ? UltraAccounting.agentCapStop : nil,
-            chargeAtLeastLE: ultraReserved && launched
+            chargeAtLeastLE: ultraReserved && ran
                 ? Self.ultraChargeFloor(ultraPlan, end: end, runnerError: runnerError, agentCapped: agentCapped) : nil,
-            releasesUltra: ultraReserved && launched)
+            releasesUltra: ultraReserved && ran)
         attempt {
             infra = try store.endTurn(agentId: agent.id, turn: turn, end: end,
                                       deliveredItemIds: (ctx?.inboxItemIds ?? []) + (ctx?.quietItemIds ?? []),
@@ -1538,10 +1645,22 @@ public actor Orchestrator {
             }
         }
         if ultraReserved, let plan = ultraPlan {
-            await endUltraRun(plan, turnId: turn.id, companyId: agent.companyId, launched: launched)
+            await endUltraRun(plan, turnId: turn.id, companyId: agent.companyId, launched: ran)
+        }
+        // A persistent cause (the process table or the run directory failing the engine) would retry forever, every 15 s:
+        // after `maxUnrecordedTurns` such turns in a row the owner hears of it once (engine-written text only).
+        if await noteUnrecordedTurn(agentId: agent.id, unrecorded) == Self.maxUnrecordedTurns {
+            attempt {
+                try EngineAlerts.raise(
+                    store: store,
+                    text: "@\(agent.name)'s last \(Self.maxUnrecordedTurns) turns were stopped before they ran: the engine could not "
+                        + "record their process (its start time could not be read, or the record could not be written). It keeps "
+                        + "retrying every \(Int(EngineHealth.infraCooldown)) s. If this goes on, relaunch Brahma.",
+                    now: now, reason: Self.unrecordedTurnReason, companyId: agent.companyId)
+            }
         }
         let outcome = end.outcome
-        await noteOutcome(agentId: agent.id, infra: infra, interrupted: outcome == .interrupted, now: now)
+        await noteOutcome(agentId: agent.id, infra: infra, interrupted: outcome == .interrupted, keepCooldown: infraDelayed, now: now)
     }
 
     /// `markTainted`, and when that write fails the flag file (fail closed, M2) before the error ends the turn.

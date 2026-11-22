@@ -67,9 +67,19 @@ struct Run: AsyncParsableCommand {
         signal(SIGTERM, SIG_IGN)
         signal(SIGHUP, SIG_IGN)
         let engine = Task { await orchestrator.runForever() }
-        let sources = [SIGINT, SIGTERM, SIGHUP].map { sig in
+        // The first signal stops the engine (its bounded shutdown, `EngineShutdown.bound`); a second one forces the exit: the
+        // process groups the engine recorded are killed, in-flight turns recorded interrupted, and the process exits now (Task 9c).
+        let quitSignals = SignalCount()
+        let sources = [SIGINT, SIGTERM, SIGHUP].map { (sig: Int32) -> DispatchSourceSignal in
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
-            source.setEventHandler { engine.cancel() }
+            source.setEventHandler {
+                if quitSignals.add(Int(min(source.data, 1000))) > 1 {
+                    let killed = EngineShutdown.force(store: store, paths: paths)
+                    FileHandle.standardError.write(Data("brahma: second signal: \(killed.groups.terminated.count) process group(s) signalled; exiting now\n".utf8))
+                    Darwin.exit(130)
+                }
+                engine.cancel()
+            }
             source.resume()
             return source
         }
@@ -90,6 +100,15 @@ struct Run: AsyncParsableCommand {
         sources.forEach { $0.cancel() }
         print("stopped")
     }
+}
+
+/// How many quit signals `brahma run` has received (signal sources run on a concurrent queue).
+private final class SignalCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    /// Adds `n` and returns the new total.
+    func add(_ n: Int) -> Int { lock.withLock { count += max(n, 1); return count } }
 }
 
 /// Prints new activity events as `HH:mm:ss [company-slug] text`.

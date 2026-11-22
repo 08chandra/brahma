@@ -50,8 +50,15 @@ public enum TurnError: Error, Equatable {
     /// `waitedSeconds` of awake time: no new turn of it starts. No pid is involved: the earlier turn has not ended yet.
     case earlierTurnInFlight(waitedSeconds: Int)
     /// The turn's leader could not be recorded under the run directory right after the spawn (M8): the owner-command ancestry
-    /// check would not know it, so the turn is stopped (fail closed) and the reason logged.
+    /// check would not know it, so the turn is stopped (fail closed) before its prompt is written and the reason logged. The
+    /// engine books it as `startNotRecorded` (Task 9c fix round 4).
     case leaderNotRecorded(reason: String)
+    /// The leader's start time could not be read right after the spawn (Task 9c fix round 3), so no exact record could name it
+    /// and no stop set could ever prove it: the child was killed at once (the runner's own unreaped child) and the turn never
+    /// ran. The engine's fault, not the agent's: booked as not launched (nothing charged to the agent or the item, its one-use
+    /// grants and Ultra approval kept), retried after the fixed 15 s infrastructure delay (`EngineHealth.infraCooldown`), and
+    /// the owner alerted after `Orchestrator.maxUnrecordedTurns` in a row.
+    case startNotRecorded
 }
 
 extension TurnError: CustomStringConvertible {
@@ -67,6 +74,7 @@ extension TurnError: CustomStringConvertible {
         case .earlierTurnInFlight(let seconds):
             "an earlier turn of this agent was still in flight after \(seconds) s; this turn did not start"
         case .leaderNotRecorded(let reason): "the turn's leader could not be recorded (\(reason)); the turn was stopped"
+        case .startNotRecorded: "the start time of the turn's process could not be read, so it could not be recorded; the turn was stopped before it ran"
         }
     }
 }
@@ -83,6 +91,8 @@ public struct ClaudeProcessRunner: TurnRunning {
     /// condition holds, so the kill is deterministic rather than a race against a real timer.
     /// Production counts awake time (`AwakeTime`): a turn frozen by a system sleep is not killed on wake for the time it slept.
     public var wallClockSleep: @Sendable (Duration) async throws -> Void = { try await AwakeTime.sleep(for: $0) }
+    /// The leader's exact start time right after the spawn (`ProcessTable.entry(pid)?.start`); tests inject a failing read.
+    var startTimeProbe: @Sendable (pid_t) -> Double? = { ProcessTable.entry($0)?.start }
 
     private static let live = LiveCount()
     /// Every agent's turns in flight and what their sweeps could not kill.
@@ -288,16 +298,27 @@ public struct ClaudeProcessRunner: TurnRunning {
         // Fail closed (M8): a leader the records do not know is a hole in the owner-command ancestry check, so a turn whose
         // leader record cannot be written is stopped now and the owner told why.
         var leaderUnrecorded: String?
-        if let dir = request.turnRecordDirectory, let start = ProcessTable.entry(child.pid)?.start {
-            let withLeader = TurnRecord(leader: child.pid, leaderStart: start, since: since, machMarker: record.machMarker)
-            do {
-                try TurnRecords.replace(record, with: withLeader, agentId: agentId, in: dir)
-                record = withLeader
-            } catch {
-                leaderUnrecorded = Store.flat("\(error)", max: 300)
-                yield(.sandboxNote("@\(request.agent.name): the turn's leader (pid \(child.pid)) could not be recorded "
-                                   + "(\(leaderUnrecorded ?? "")); the owner-command guard would not see it, so the turn was stopped"))
-                child.terminate(grace: Self.killGrace)
+        var startUnreadable = false
+        if let dir = request.turnRecordDirectory {
+            if let start = startTimeProbe(child.pid) {
+                let withLeader = TurnRecord(leader: child.pid, leaderStart: start, since: since, machMarker: record.machMarker)
+                do {
+                    try TurnRecords.replace(record, with: withLeader, agentId: agentId, in: dir)
+                    record = withLeader
+                } catch {
+                    leaderUnrecorded = Store.flat("\(error)", max: 300)
+                    yield(.sandboxNote("@\(request.agent.name): the turn's leader (pid \(child.pid)) could not be recorded "
+                                       + "(\(leaderUnrecorded ?? "")); the owner-command guard would not see it, so the turn was stopped"))
+                    child.terminate(grace: Self.killGrace)
+                }
+            } else {
+                // No exact start, no record, no turn (Task 9c fix round 3): a placeholder record names no process, so no stop
+                // set could ever prove this child. It is the runner's own unreaped child, so it is provably ours right now:
+                // killed at once, through the child we hold, before it does anything.
+                startUnreadable = true
+                yield(.sandboxNote("@\(request.agent.name): the start time of the turn's process (pid \(child.pid)) could not be read, "
+                                   + "so it could not be recorded; the turn was stopped before it ran and will be retried"))
+                child.group.signalGroup(SIGKILL)
             }
         }
         let unrecorded = leaderUnrecorded
@@ -332,9 +353,11 @@ public struct ClaudeProcessRunner: TurnRunning {
         // Linux has no per-fd equivalent; a Linux host must ignore SIGPIPE process-wide.
         _ = fcntl(input.fileDescriptor, F_SETNOSIGPIPE, 1)
         #endif
-        let prompt = Data(request.prompt.utf8)
+        // A turn stopped because it could not be recorded never gets its prompt (Task 9c fix round 4): it is booked as not
+        // launched, so it must not do any work in the grace before its kill lands.
+        let prompt = unrecorded == nil && !startUnreadable ? Data(request.prompt.utf8) : Data()
         DispatchQueue.global().async {
-            try? input.write(contentsOf: prompt)
+            if !prompt.isEmpty { try? input.write(contentsOf: prompt) }
             try? input.close()
         }
 
@@ -351,7 +374,7 @@ public struct ClaudeProcessRunner: TurnRunning {
         var state = TurnStreamState()
         await withTaskCancellationHandler {
             for await line in lines {
-                guard unrecorded == nil else { continue }
+                guard unrecorded == nil, !startUnreadable else { continue }
                 if request.emitRawLines { yield(.raw(line)) }
                 guard let events = StreamParser.parseAll(line: line) else { continue }
                 for event in events {
@@ -389,6 +412,7 @@ public struct ClaudeProcessRunner: TurnRunning {
         if let requested = TurnAudit.effortCap(in: stderrTail) { yield(.effortCapped(requested: requested)) }
         try Task.checkCancellation()
         if let unrecorded { throw TurnError.leaderNotRecorded(reason: unrecorded) }
+        if startUnreadable { throw TurnError.startNotRecorded }
         let sawResult = state.sawResult
         // The last result is authoritative even if the process lingered past it and had to be killed ...
         if sawResult, !state.hasPendingWork { return }

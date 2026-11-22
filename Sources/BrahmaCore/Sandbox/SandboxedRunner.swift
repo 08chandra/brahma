@@ -64,6 +64,13 @@ public protocol SandboxedProcess: Sendable {
     func exitStatus() -> Int32?
     /// SIGTERM to the group, `grace` of awake time, then SIGKILL; returns once it is reaped.
     func terminate(grace: Duration) async
+    /// The leader's exact start time, read at the spawn while it was unreaped (`ProcessGroupChild.leaderStart`); nil when it
+    /// could not be read. A preview records it so a later stop signals only this process (final review I2).
+    var leaderStart: Double? { get }
+}
+
+extension SandboxedProcess {
+    public var leaderStart: Double? { nil }
 }
 
 /// What every sandboxed command is kept from, whatever its policy: the owner's home (except what the policy reads or writes

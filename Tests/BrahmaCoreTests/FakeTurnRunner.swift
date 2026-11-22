@@ -20,6 +20,9 @@ final class Gate: @unchecked Sendable {
         for w in toResume { w.resume() }
     }
 
+    /// Whether `open` has been called.
+    var opened: Bool { lock.withLock { isOpen } }
+
     func wait() async {
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
             let resumeNow = lock.withLock { () -> Bool in
@@ -28,6 +31,24 @@ final class Gate: @unchecked Sendable {
                 return false
             }
             if resumeNow { c.resume() }
+        }
+    }
+
+    /// `wait()` raced against `limit` (awake time): true when the gate opened, false when the limit passed first (the gate is
+    /// then opened, so the waiter it left behind resumes too). For a test's helper tasks, which must end even when the gate's
+    /// opener never ran (Task 10 fix round 1, I1).
+    @discardableResult
+    func wait(upTo limit: Duration) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask { await self.wait(); return true }
+            group.addTask {
+                try? await AwakeTime.sleep(for: limit)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            if !first { open() }
+            return first
         }
     }
 }
@@ -97,6 +118,18 @@ final class FakeTurnRunner: TurnRunning, @unchecked Sendable {
         return leftovers
     }
     var maxConcurrent: Int { lock.withLock { _maxConcurrent } }
+
+    /// Lingering children (Task 9c): when `childrenGate` is set, `waitForChildren` opens `childrenEntered` (if set) and waits
+    /// for the gate, as the real runner waits for a `claude` that takes its time to die.
+    var childrenGate: Gate? { get { lock.withLock { _childrenGate } } set { lock.withLock { _childrenGate = newValue } } }
+    private var _childrenGate: Gate?
+    var childrenEntered: Gate? { get { lock.withLock { _childrenEntered } } set { lock.withLock { _childrenEntered = newValue } } }
+    private var _childrenEntered: Gate?
+
+    func waitForChildren() async {
+        childrenEntered?.open()
+        if let gate = childrenGate { await gate.wait() }
+    }
 
     func script(_ handle: String, _ s: Script...) {
         lock.withLock { scripts[handle, default: []].append(contentsOf: s) }

@@ -96,7 +96,10 @@ extension Store {
             item.autoApproved = false
             item.reviewedRound = max(item.reviewRound - 1, 0)
             item.reviewAttempts = 0
-            if item.mergeState == .pending { item.mergeState = .none }
+            if item.mergeState == .pending {
+                item.mergeState = .none
+                try cancelQueuedMerges(db: db, itemId: item.id, now: now)   // the approval it queued under is gone
+            }
             item.updatedAt = now
             try item.update(db)
             try event(item, autoApprovalRevokedText)

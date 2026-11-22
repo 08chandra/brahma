@@ -31,6 +31,9 @@ public struct SeatbeltRunner: SandboxedRunner {
     /// ones that could not be killed or classified (the outcome is already inconclusive). The engine turns it into an
     /// owner-visible activity line.
     let onStraggler: (@Sendable (StragglerReport) -> Void)?
+    /// Tests only: runs between the policy check and the profile render (`prepare`), where a leftover process could swap a
+    /// checked path for a link (Task 7, obligation d).
+    let afterValidate: (@Sendable () -> Void)?
 
     public init(baseline: @escaping @Sendable () -> SandboxBaseline, proxies: EgressProxyPool,
                 onStraggler: (@Sendable (StragglerReport) -> Void)? = nil) {
@@ -38,9 +41,10 @@ public struct SeatbeltRunner: SandboxedRunner {
     }
 
     init(baseline: @escaping @Sendable () -> SandboxBaseline, proxies: EgressProxyPool, termGrace: TimeInterval,
-         clock: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() }, onStraggler: (@Sendable (StragglerReport) -> Void)? = nil) {
+         clock: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() }, onStraggler: (@Sendable (StragglerReport) -> Void)? = nil,
+         afterValidate: (@Sendable () -> Void)? = nil) {
         self.baseline = baseline; self.proxies = proxies; self.termGrace = termGrace; self.clock = clock
-        self.onStraggler = onStraggler
+        self.onStraggler = onStraggler; self.afterValidate = afterValidate
     }
 
     /// A unique per-run mach global name the profile allows and the sweep probes for (B-I4).
@@ -53,11 +57,14 @@ public struct SeatbeltRunner: SandboxedRunner {
     }
 
     /// Validates, renders and builds the argv and environment; creates `TMPDIR` (and, with `toolchain`, the cache's tool
-    /// directories) without following a link.
+    /// directories) without following a link. The profile is rendered from the very paths the check saw (no second resolve:
+    /// `resolvePolicyPaths: false`), so a link swapped in between the check and the render cannot widen it (Task 7, obligation
+    /// d); the `TMPDIR` step then opens the writable entry with `O_NOFOLLOW`, so a swapped writable entry fails here.
     func prepare(command: String, environment: [String: String], policy: SandboxPolicy, proxyPort: UInt16?, marker: String?) throws -> Prepared {
         let base = baseline()
         try SandboxPolicyCheck.validate(policy, baseline: base)
-        let profile = SeatbeltProfile.render(policy: policy, baseline: base, proxyPort: proxyPort, marker: marker)
+        afterValidate?()
+        let profile = SeatbeltProfile.render(policy: policy, baseline: base, proxyPort: proxyPort, marker: marker, resolvePolicyPaths: false)
         var env = environment
         let first = policy.writable[0]
         // B-I2: every engine file op is anchored at the parent of the writable entry and opened with O_NOFOLLOW, so an entry
@@ -222,6 +229,7 @@ public final class SeatbeltProcess: SandboxedProcess, @unchecked Sendable {
     }
 
     public var pid: Int32 { child.pid }
+    public var leaderStart: Double? { child.leaderStart }
 
     public func isAlive() -> Bool { !child.hasExited() }
 

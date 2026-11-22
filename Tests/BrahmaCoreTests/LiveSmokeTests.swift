@@ -1,6 +1,9 @@
 import Testing
 import Foundation
 import GRDB
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 @testable import BrahmaCore
 
 /// The live goal-to-URL test's owner policy (Plan L Task 15; fix round 1, I2): what it does with each pending-owner ask.
@@ -316,6 +319,209 @@ struct LiveSmokeTests {
         #expect(stall.running == 0)
         #expect(stall.reasons.contains { $0.contains("no Ready items in the backlog") }, "stall: \(stall.reasons)")
         #expect(await orchestrator.runningCount() == 0)
+        #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
+    }
+
+    // MARK: Plan 4a Task 10 — merge queue to deploy
+
+    /// Plan 4a Task 10: the merge queue end to end with real turns, then a deploy of what it landed. `eng` (haiku) claims
+    /// `SMOKE-1`, writes `hello.txt` and submits; the engine checks it; `lead` (haiku) reviews it in a fresh session; the
+    /// approval queues `M-1`, which the queue rebases, re-checks (the pinned item check and the owner's main check, both in
+    /// `.git`-free exports under the data home that are gone afterwards) and lands by fast-forward, journaling the batch and
+    /// `refs/brahma/pre-merge/1`. Then the main smoke for the new head passes, `cto` (sonnet) proposes `0.1.0`, the owner
+    /// approves it in the Inbox, and the release executor deploys it through L's `FakeHostingAdapter` (its `fake deploy` copies
+    /// the upload into a folder the loopback `DevHostServer` serves; nothing contacts a provider). Tier max5x, Balanced, never
+    /// opus. `BRAHMA_LIVE=1 DEVELOPER_DIR=… swift test --filter LiveSmokeTests/mergeQueueEndToEnd`.
+    @Test(.timeLimit(.minutes(10)))
+    func mergeQueueEndToEnd() async throws {
+        let root = try tempDir()
+        let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+        try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+        let store = try Store(path: paths.database.path)
+        try store.setPlanTier(.max5x)
+        let mcp = try brahmaExecutable()
+        let runner = ClaudeProcessRunner(maxTurnDuration: .seconds(150))
+        // As goalToLiveURL: `tools-present` fails on current Claude Code builds (no `Skill` in a `--disable-slash-commands` turn's
+        // init tools) and is reported, not gating; the mode-canary's control sessions may miss their deadline once on a busy machine.
+        func gating(_ r: DoctorReport) -> [DoctorItem] { r.items.filter { $0.status == .fail && $0.name != "tools-present" } }
+        var report = await Doctor.run(claudePath: "claude", runner: runner, hookExecutable: mcp)
+        if !gating(report).isEmpty { report = await Doctor.run(claudePath: "claude", runner: runner, hookExecutable: mcp) }
+        for item in report.items where item.status != .pass { print("DOCTOR \(item.name)=\(item.status): \(item.detail)") }
+        #expect(gating(report).isEmpty, "doctor: \(report.items.map { "\($0.name)=\($0.status) \($0.detail)" })")
+        guard gating(report).isEmpty else { return }
+        try store.saveProbe(report)
+
+        // 1. The company: eng (engineer, haiku), lead (manager, haiku), cto (sonnet). Balanced; pacing off (see workItemLoopEndToEnd).
+        var company = try store.createCompany(name: "Smoke", goal: "Ship small files.", workspacesRoot: paths.workspaces)
+        company.ownerReserve = -1
+        company.usageMode = .balanced
+        try store.updateCompany(company)
+        let companyId = company.id
+        let ws = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+        let lead = try store.hire(companyId: companyId, name: "lead", role: "manager", model: "haiku")
+        let eng = try store.hire(companyId: companyId, name: "eng", role: "engineer", model: "haiku", managerId: lead.id)
+        let cto = try store.hire(companyId: companyId, name: "cto", role: "cto", model: "sonnet")
+        // The default Sandboxed profile needs the owner's sandbox canary, which a temp home has no probes for (every turn would
+        // stay blocked): the turns run on the Workspace profile, as both sibling live tests do (I2). Merge checks, main smokes
+        // and the deploy still run under the real sandbox.
+        let userHome = root.appending(path: "user", directoryHint: .isDirectory)   // the home the sandbox patch protects: never the real one
+        try FileManager.default.createDirectory(at: userHome, withIntermediateDirectories: true)
+        try store.updateSandbox(companyId: companyId, SandboxPatch(profile: .workspace), userHome: userHome)
+        company = try #require(try store.company(id: companyId))
+        let oldMain = try #require(company.mainCommit, "no engine-accepted main")
+
+        // 2. The main check, L's smoke check, and the deploy config with a build into a subfolder (fix 5). The smoke check runs
+        //    at main's commit in an export, before any build: it checks the source file (the deploy's own smoke GETs dist/).
+        try store.setMergeSettings(companyId: companyId, MergeSettings(mainCheck: CheckSpec(command: "test -f hello.txt")), by: .owner)
+        try store.setSmokeCheck(companyId: companyId, by: cto.id, check: CheckSpec(command: "grep -qx hello hello.txt"))
+        try store.setHosting(companyId: companyId, by: .owner, project: "smoke", accountId: "acct-1")
+        try store.setDeployConfig(companyId: companyId, by: cto.id, build: "mkdir -p dist && cp hello.txt dist/", outputDir: "dist",
+                                  smoke: [SmokeRequest(method: "GET", path: "/hello.txt")], expectText: nil)
+
+        // 3. L's FakeHostingAdapter over a loopback dev host; its token in a MemoryVault through Store.setSecret (the engine's vault).
+        //    The token goes in once the turns are over: the turns' `brahma mcp` children read the home's file store (M6), not an
+        //    in-process vault, and a company secret they cannot load would make them refuse every tool call.
+        //    The deploy runs under the real platform sandbox (I3): the fake CLI is pre-placed in the release tools folder (the
+        //    executor then installs nothing, as goalToLiveURL's marker does), and `FakeHostGrant` opens the host folder to the exact
+        //    `…/.bin/fake deploy` command only, L's `DevHostSandbox` grant for this adapter; the build and the token step keep
+        //    their real policies.
+        let vault = MemoryVault()
+        let hostRoot = paths.home.appending(path: "dev-host", directoryHint: .isDirectory)
+        try BrahmaPaths.ensurePrivateDirectory(hostRoot)
+        let hostDir = try EngineFiles.directory(workspace: hostRoot, company.slug, mode: 0o700)
+        let server = try DevHostServer(base: hostDir)
+        defer { server.stop() }
+        let adapter = FakeHostingAdapter(server: server.url, hostRoot: hostDir)
+        let layout = try store.releaseLayout(companyId: companyId)
+        try BrahmaPaths.ensurePrivateDirectory(layout.root)
+        let binDir = "tools/\(adapter.cli)/node_modules/.bin"
+        try EngineFiles.directory(workspace: layout.root, binDir, mode: 0o700)
+        _ = try EngineFiles.create(Data(FakeTools.text(FakeHostingAdapter.cliScript).utf8), workspace: layout.root, dir: binDir, name: "fake",
+                                   mode: 0o700)
+        let fakeBin = layout.deployTools(cli: adapter.cli).appending(path: "node_modules/.bin/fake", directoryHint: .notDirectory)
+        let proxies = EgressProxyPool()
+        let platform = SandboxRunners.platformDefault(baseline: { Orchestrator.checkBaseline(store: store, paths: paths) }, proxies: proxies)
+        let releaseDeps = ReleaseDependencies(sandbox: FakeHostGrant(base: platform, hostDir: hostDir, deployBin: fakeBin),
+                                              http: URLSessionHTTPProbe(), adapters: { _ in adapter })
+
+        // 4. SMOKE-1, ready for eng with lead as reviewer; 5. the DM with 3a's live-test instruction.
+        let item = try store.createWorkItem(companyId: companyId, by: .owner, draft: WorkItemDraft(
+            type: "task", title: "Create hello.txt containing hello",
+            checkSpec: CheckSpec(command: "grep -qx hello hello.txt", paths: ["."]), tier: .s,
+            ownerId: eng.id, reviewerId: lead.id, status: .ready))
+        #expect(item.key == "SMOKE-1")
+        _ = try MessageRouter(store: store).sendDM(
+            companyId: companyId, from: .owner, to: "eng",
+            text: "Claim \(item.key) with claim_lease, work in the worktree it gives you, make its check pass, then call submit_for_review.")
+
+        // 6. The real engine until the item is done.
+        let orchestrator = Orchestrator(store: store, runner: runner, paths: paths, mcpExecutable: mcp, vault: vault, releaseDeps: releaseDeps,
+                                        mcpEnvironment: [SecretStore.environmentVariable: "file"])
+        try await orchestrator.start()
+        let loop = Task { await orchestrator.runForever(interval: .milliseconds(500)) }
+        func waitFor(_ what: String, seconds: Int, _ done: () throws -> Bool) async throws -> Bool {
+            let deadline = AwakeTime.now + .seconds(seconds)
+            while AwakeTime.now < deadline {
+                if try done() { return true }
+                try await Task.sleep(for: .seconds(2))
+            }
+            print("TIMED OUT waiting for \(what)")
+            return false
+        }
+        struct Progress { var finished = false; var deployed: Release? }
+        // The drive: 270 + 3 + 45 + 90 s of waits, which leave the doctor (above) and a normal teardown inside the 10-minute
+        // limit. A stalled teardown (engine stop ≤ 120 s, previews 30 s, proxies 15 s, wall-time bounds the limit does not cut
+        // short) can run past it: the limit's issue is then recorded and teardown still finishes. Whatever ends the drive (done,
+        // a throw, the limit's cancellation), teardown runs before anything is asserted, so the engine never keeps running real
+        // turns (I4).
+        let progress: Progress
+        do {
+            progress = try await withTaskCancellationHandler {
+                var p = Progress()
+                p.finished = try await waitFor("\(item.key) done", seconds: 270) { try store.workItem(id: item.id)?.status == .done }
+                guard p.finished else { return p }
+                try await Task.sleep(for: .seconds(3))   // the post-merge bookkeeping and the main smoke start
+                let mainHead = try GitFixture.plainGit(["rev-parse", "main"], in: ws).trimmingCharacters(in: .whitespacesAndNewlines)
+                // The main smoke for the new head (reason `merge`), then the deploy proposed by cto and approved by the owner.
+                let smoked = try await waitFor("the main smoke at \(mainHead.prefix(7))", seconds: 45) {
+                    try store.mainSmokeRuns(companyId: companyId).contains { $0.commit == mainHead && $0.status == .passed }
+                }
+                let smokes = try store.mainSmokeRuns(companyId: companyId).map { "\($0.reason.rawValue) \($0.status.rawValue) \($0.sha7)" }
+                #expect(smoked, "no passed main smoke at \(mainHead.prefix(7)): \(smokes)")
+                try store.setSecret(companyId: companyId, name: adapter.tokenSecret, value: Self.fakeHostToken, isTest: false, vault: vault)
+                try store.reloadRedactorIfNeeded(vault: vault)
+                let (release, ask) = try store.proposeDeploy(companyId: companyId, by: cto.id, version: "0.1.0", notes: "hello.txt on main",
+                                                             vault: vault, adapters: { _ in adapter }, npmPresent: true)
+                server.serve(folder: release.ref)
+                _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true)
+                let live = try await waitFor("\(release.ref) deployed", seconds: 90) {
+                    guard let r = try store.release(companyId: companyId, ref: release.ref) else { return false }
+                    return !r.status.isOpen
+                }
+                p.deployed = try store.release(companyId: companyId, ref: release.ref)
+                #expect(live, "\(release.ref) still open: \(p.deployed?.status.rawValue ?? "gone")")
+                return p
+            } onCancel: {
+                loop.cancel()   // the time limit cancels this task only; the engine's unstructured task is cancelled here
+            }
+        } catch {
+            let cancelled = Task.isCancelled
+            let td = await teardown(loop: loop, orchestrator: orchestrator, proxies: proxies, store: store, root: root, stopEngine: true)
+            print("ABORTED (cancelled \(cancelled)): \(error); teardown: \(td.summary)")
+            throw error
+        }
+        let td = await teardown(loop: loop, orchestrator: orchestrator, proxies: proxies, store: store, root: root, stopEngine: false)
+        print("TEARDOWN: \(td.summary)")
+        let dump = try store.events(afterId: 0).map(\.text).joined(separator: "\n")
+        guard progress.finished else { Issue.record("timed out; item not done. Events:\n\(dump)"); return }
+        #expect(td.stalled.isEmpty, "teardown stalled: \(td.stalled)")
+        #expect(td.killed.isEmpty, "processes outlived the engine's own stop: \(td.killed)")
+
+        // main holds hello.txt; the item is done because it merged.
+        let shown = try GitFixture.plainGit(["show", "main:hello.txt"], in: ws)
+        #expect(shown == "hello")
+        let done = try #require(try store.workItem(id: item.id))
+        #expect(done.status == .done && done.mergedCommit != nil, "events:\n\(dump)")
+        let mainHead = try GitFixture.plainGit(["rev-parse", "main"], in: ws).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // One merged request; its main and item merge runs passed, each in an export that is gone; its batch is done.
+        let requests = try store.mergeRequests(companyId: companyId)
+        #expect(requests.count == 1 && requests.first?.status == .merged, "requests: \(requests.map { "\($0.ref) \($0.status.rawValue) \($0.detail ?? "")" })\n\(dump)")
+        let request = try #require(requests.first)
+        #expect(request.mergedCommit == mainHead)
+        let runs = try store.mergeRuns(requestId: request.id)
+        let git = GitWorkspace(root: ws)
+        for kind in [MergeRun.Kind.main, .item] {
+            let run = runs.first { $0.kind == kind && $0.status == .passed }
+            #expect(run != nil, "no passed \(kind.rawValue) merge run: \(runs.map { "\($0.kind?.rawValue ?? "?") \($0.status?.rawValue ?? "?")" })")
+            if let run { #expect(!FileManager.default.fileExists(atPath: git.exportPath(runId: run.id).path), "export of \(run.id) left behind") }
+        }
+        let batches = try await store.writer.read { db in try MergeBatch.filter(Column("companyId") == companyId).fetchAll(db) }
+        #expect(batches.count == 1 && batches.first?.step == .done, "batches: \(batches.map { "#\($0.number) \($0.step.rawValue)" })")
+        #expect(try store.openMergeBatches(companyId: companyId).isEmpty)
+
+        // refs/brahma/pre-merge/1 is the old main; the record is main; the guard sees nothing foreign.
+        let preMerge = try GitFixture.plainGit(["rev-parse", "refs/brahma/pre-merge/1"], in: ws).trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(preMerge == oldMain, "pre-merge \(preMerge.prefix(7)) != old main \(oldMain.prefix(7))")
+        company = try #require(try store.company(id: companyId))
+        #expect(company.mainCommit == mainHead)
+        let guardResult = try MainGuard.check(company: company, store: store, git: store.gitWorkspace(root: ws, companyId: companyId),
+                                              paths: paths, now: Store.now())
+        #expect(guardResult == .ok, "main guard: \(guardResult)")
+
+        // The release deployed through the fake adapter, at main's head, with the fake host's URL.
+        let r1 = try #require(progress.deployed, "no release proposed\n\(dump)")
+        #expect(r1.status == .deployed, "\(r1.ref) \(r1.status.rawValue): \(r1.failedReason ?? "")\n\(dump)")
+        #expect(r1.commit == mainHead)
+        #expect(r1.productionURL?.hasPrefix("https://fake-") == true, "productionURL \(r1.productionURL ?? "nil")")
+        #expect(FileManager.default.fileExists(atPath: hostDir.appending(path: "\(r1.ref)/hello.txt").path), "the fake host has no hello.txt")
+
+        // Never opus; nothing left running.
+        for agent in try store.agents(companyId: companyId) { #expect(!agent.model.contains("opus"), "\(agent.name) on \(agent.model)") }
+        let turns = try await store.writer.read { db in try Turn.filter(Column("companyId") == companyId).fetchAll(db) }
+        #expect(!turns.contains { ($0.modelsUsed ?? "").lowercased().contains("opus") }, "an opus turn ran")
+        #expect(turns.filter { $0.kind == .review && $0.itemId == item.id }.count == 1, "review turns: \(turns.filter { $0.kind == .review }.count)")
+        if td.stalled.isEmpty { #expect(await orchestrator.runningCount() == 0) }
         #expect(try !processExists(matching: root.path), "a claude/brahma child process outlived the run")
     }
 
@@ -890,6 +1096,91 @@ struct LiveSmokeTests {
         let stall = try store.stallReport(companyId: companyId)
         print("STALL: running \(stall.running); reasons: \(stall.reasons.joined(separator: " | "))")
     }
+
+    // MARK: Plan 4a Task 7
+
+    /// A tiny AppKit app, built with `swiftc` into a run directory and launched through the real 5-lite `SeatbeltRunner`
+    /// under `PreviewPolicy.guiApp` (the macOS preview adapter's exact spawn), shows a window owned by the spawned pid within
+    /// 10 s. If this fails, macOS previews stay `unavailable` with the reason
+    /// `"macOS app previews need the sandbox to allow GUI apps"` (the brief's residual).
+    /// `BRAHMA_LIVE=1 DEVELOPER_DIR=… swift test --filter macAppShowsWindowUnderPolicy`.
+    @Test(.timeLimit(.minutes(3)), .enabled(if: Toolchain.seatbeltAvailable, "no /usr/bin/sandbox-exec"))
+    func macAppShowsWindowUnderPolicy() async throws {
+        #if canImport(CoreGraphics)
+        let home = try Scratch.homeDir().resolvedForSandbox
+        let paths = BrahmaPaths(home: home.appending(path: "data"), workspaces: home.appending(path: "wss"))
+        let ws = home.appending(path: "wss/acme", directoryHint: .isDirectory)
+        let run = home.appending(path: "data/run/exports/prev-live", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: run.appending(path: "Build/Live.app/Contents/MacOS"), withIntermediateDirectories: true)
+        // The fixture: one window, titled with the pid, kept open.
+        let source = run.appending(path: "main.swift")
+        try """
+            import AppKit
+            let app = NSApplication.shared
+            app.setActivationPolicy(.regular)
+            let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 320, height: 160), styleMask: [.titled, .closable],
+                                  backing: .buffered, defer: false)
+            window.title = "Brahma live \\(getpid())"
+            window.makeKeyAndOrderFront(nil)
+            app.run()
+            """.write(to: source, atomically: true, encoding: .utf8)
+        let plist: [String: Any] = ["CFBundleExecutable": "Live", "CFBundleIdentifier": "dev.brahma.live", "CFBundlePackageType": "APPL"]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            .write(to: run.appending(path: "Build/Live.app/Contents/Info.plist"))
+        let compile = Process()
+        compile.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        compile.arguments = ["swiftc", "-O", "-o", run.appending(path: "Build/Live.app/Contents/MacOS/Live").path, source.path]
+        compile.environment = ["DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer", "PATH": "/usr/bin:/bin"]
+        let err = Pipe(); compile.standardError = err; compile.standardOutput = FileHandle.nullDevice
+        try compile.run(); compile.waitUntilExit()
+        try #require(compile.terminationStatus == 0, Comment(rawValue: String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)))
+        ScratchScope.current?.allowExecutable(named: "Live")   // the built fixture app is what is under test
+
+        let now = Date()
+        let company = Company(id: "live", name: "Acme", slug: "acme", goal: "g", workspacePath: ws.path, status: .running,
+                              usageMode: .low, priorityWeight: 1, createdAt: now)
+        let layout = EngineLayout(workspace: ws)
+        try PreviewPolicy.prepareAppData(layout, surface: "mac")
+        let policy = PreviewPolicy.guiApp(layout, run: run, company: company, sandbox: SandboxLayout(paths: paths, company: company, agentHandle: "preview"),
+                                          surface: "mac")
+        let executable = try ProcessMacAppLauncher().executable(inApp: run.appending(path: "Build/Live.app"), run: run)
+        let baseline = SandboxBaseline.current(paths: paths, otherWorkspaces: [], backupTargets: [])
+        let proxies = EgressProxyPool()
+        let runner = SeatbeltRunner(baseline: { baseline }, proxies: proxies)
+        let log = home.appending(path: "data/mac.log")
+        let process = try runner.spawn(command: MacAppAdapter.launchCommand(executable), cwd: run,
+                                       environment: PreviewContext.environment(port: 0), logURL: log, policy: policy)
+        let deadline = AwakeTime.deadline(after: .seconds(10))
+        var seen = false
+        while !seen, AwakeTime.now < deadline {
+            seen = Self.windowOwned(by: process.pid)
+            if !seen { try await Task.sleep(for: .milliseconds(250)) }
+        }
+        let alive = process.isAlive()
+        await process.terminate(grace: .seconds(2))
+        try await Task.sleep(for: .seconds(1))   // the log is flushed by the reaper
+        let tail = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        print("LIVE macAppShowsWindowUnderPolicy: pid \(process.pid) alive \(alive) exit \(String(describing: process.exitStatus())) window \(seen); log: \(tail.suffix(400))")
+        #expect(seen, "no window owned by pid \(process.pid) (or its group) within 10 s; exit \(String(describing: process.exitStatus())); log tail: \(tail.suffix(400))")
+        await proxies.stopAll()
+        #else
+        Issue.record("macOS only")
+        #endif
+    }
+
+    #if canImport(CoreGraphics)
+    /// Whether any on-screen window belongs to `pid`, or to a process in `pid`'s own process group (sandbox-exec execs the
+    /// shell, which execs the app, so the pid normally stays the same).
+    static func windowOwned(by pid: Int32) -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return false }
+        for info in list {
+            guard let owner = info[kCGWindowOwnerPID as String] as? Int32 else { continue }
+            if owner == pid || getpgid(owner) == pid { return true }
+        }
+        return false
+    }
+    #endif
 }
 
 /// How the live test's owner loop ended.
@@ -988,5 +1279,36 @@ final class LiveRunMonitor: @unchecked Sendable {
             for pid in matching() where kill(pid, SIGKILL) == 0 { out.append("pid \(pid) SIGKILL") }
         }
         return out
+    }
+}
+
+/// The platform sandbox with the fake host's folder writable for exactly the fake provider CLI's deploy
+/// (`<release tools>/node_modules/.bin/fake deploy …`): L's `DevHostSandbox` grant (`DevHost.swift`) for `FakeHostingAdapter`
+/// (Plan 4a Task 10 fix round 1, I3). Every other command (the build in the export, the smoke on main) runs with its policy as it
+/// is; the token step keeps HOME + cwd writable, the tools readable, its network list and its token-only environment.
+private struct FakeHostGrant: SandboxedRunner {
+    let base: any SandboxedRunner
+    let hostDir: URL
+    let deployBin: URL
+
+    func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+             policy: SandboxPolicy) async -> CheckOutcome {
+        await base.run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL,
+                       policy: granted(command, policy))
+    }
+
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
+        try base.spawn(command: command, cwd: cwd, environment: environment, logURL: logURL, policy: granted(command, policy))
+    }
+
+    /// The deploy step's policy with the host folder writable (kept off `writable[0]`, the TMPDIR, and the last entry, the
+    /// toolchain HOME); any other command's policy as it is. The executor quotes the argv it was given, so both the logical and
+    /// the resolved path of the CLI are accepted.
+    func granted(_ command: String, _ policy: SandboxPolicy) -> SandboxPolicy {
+        let prefixes = [deployBin.path, SandboxPath.resolve(deployBin.path)].map { ShellQuote.joinArgv([$0, "deploy"], rawRefs: []) + " " }
+        guard prefixes.contains(where: { command.hasPrefix($0) }), !policy.writable.isEmpty else { return policy }
+        var p = policy
+        p.writable.insert(hostDir.resolvedForSandbox, at: 1)
+        return p
     }
 }

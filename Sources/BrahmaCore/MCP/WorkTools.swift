@@ -264,6 +264,12 @@ extension CompanyTools {
             return .object(o)
         }
         let parent = try i.parentId.flatMap { try store.workItem(id: $0)?.key }
+        // The item's newest merge request (Plan 4a). Its reason is the engine's own text, never agent output.
+        var merge: JSONValue = .null
+        if let request = try store.latestMergeRequest(itemId: i.id) {
+            merge = .object(["ref": .string(request.ref), "status": .string(request.status.rawValue),
+                             "failure": optional(request.failure?.rawValue), "detail": optional(request.detail)])
+        }
         return json(.object([
             "key": .string(i.key), "type": .string(i.type.rawValue), "title": .string(i.title), "status": .string(i.status.rawValue),
             "blockedReason": optional(i.blockedReason), "description": .string(i.description),
@@ -274,7 +280,7 @@ extension CompanyTools {
             "owner": optional(i.ownerId.flatMap { names[$0] }), "reviewer": optional(i.reviewerId.flatMap { names[$0] }),
             "team": optional(i.team), "parent": optional(parent), "linkedBranch": optional(i.linkedBranch), "notes": optional(i.notes),
             "reviewFlags": .array(i.reviewFlags.map { .string($0) }), "specConfirmed": .bool(i.specConfirmedBy != nil),
-            "stopped": optional(i.stopReason),
+            "stopped": optional(i.stopReason), "merge": merge,
             "lease": lease, "dependencies": .array(try store.dependencies(itemId: i.id).map(link)),
             "dependents": .array(try store.dependents(itemId: i.id).map(link)), "events": .array(events),
         ]))

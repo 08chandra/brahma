@@ -472,7 +472,7 @@ import GRDB
         let hooks = RestoreHooks()
         _ = Orchestrator(store: store, runner: FakeTurnRunner(), paths: w.paths, mcpExecutable: "/usr/local/bin/brahma",
                          restoreHooks: hooks)
-        #expect(hooks.afterRestore.count == 1)
+        #expect(hooks.afterRestore.count == 2)       // the cursor reset, and Plan 4a's main re-adoption (nothing to do without a head)
         for hook in hooks.afterRestore {
             try await hook(RestoreEvent(companyId: company.id, companyName: company.name, workspace: URL(fileURLWithPath: company.workspacePath),
                                         mainHead: nil, snapshotName: "snap.db"))

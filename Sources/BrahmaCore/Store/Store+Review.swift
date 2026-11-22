@@ -157,8 +157,11 @@ extension Store {
     /// The one way an item becomes approved for merge: its flags are cleared (the event lists them), the round is closed
     /// and `mergeState` is `pending`. `Store.review` and 9c's auto-approval both come here. `by` is an agent id or "system".
     /// `auto`: the engine's risk-tiered auto-approval (9c), counted and queued for audit when the item lands.
+    /// `enqueue`: the engine's measurement of the verified commit (`mergeEnqueueFacts`); with it, the item is put in the merge
+    /// queue (`enqueueApproved`) as part of the approval. Without it (no repository to measure) 3a's own merge step takes the item.
     @discardableResult
-    func approveForMerge(db: Database, item current: WorkItem, by: String, note: String, auto: Bool = false, now: Date) throws -> WorkItem {
+    func approveForMerge(db: Database, item current: WorkItem, by: String, note: String, auto: Bool = false,
+                         enqueue: MergeEnqueueFacts? = nil, now: Date) throws -> WorkItem {
         var item = current
         var text = note
         if !item.reviewFlags.isEmpty { text += " (approved flags: \(item.reviewFlags.joined(separator: "; ")))" }
@@ -170,7 +173,19 @@ extension Store {
         item.updatedAt = now
         try item.update(db)
         try recordItemEvent(db: db, item: item, actor: by, kind: .reviewApproved, text: text, now: now)
+        if let enqueue, enqueue.commit == item.verifiedCommit {
+            try enqueueApproved(db: db, item: item, ahead: enqueue.ahead, secretFindings: enqueue.secretFindings, now: now)
+            return try WorkItem.fetchOne(db, key: item.id) ?? item
+        }
         return item
+    }
+
+    /// Nothing of an approved item is ahead of `main`: it is complete without a merge (`finishMerge(.merged(main's head))`).
+    /// Runs git, so it is called after the approving transaction.
+    func completeIfAlreadyInMain(itemId: String, facts: MergeEnqueueFacts?, now: Date) throws {
+        guard let facts, facts.ahead == 0, let main = facts.mainHead,
+              let item = try workItem(id: itemId), item.status == .inReview, item.mergeState == .pending else { return }
+        try finishMerge(itemId: itemId, result: .merged(mainHead: main), now: now)
     }
 
     // MARK: Review
@@ -184,7 +199,9 @@ extension Store {
     @discardableResult
     public func review(itemId: String, by agentId: String, decision: ReviewDecision, notes: String, approveFlags: Bool,
                        currentHead: String?, now: Date = Store.now()) throws -> WorkItem {
-        try writer.write { db in
+        // An approval is measured (how far ahead of `main`, the leak scan) before the transaction: it runs git.
+        let facts = decision == .approve ? try workItem(id: itemId).flatMap { mergeEnqueueFacts(item: $0) } : nil
+        let reviewed = try writer.write { db -> WorkItem in
             guard let item = try WorkItem.fetchOne(db, key: itemId) else { throw WorkError.notFound("no such work item") }
             let actor = try resolveActor(db, .agent(agentId), companyId: item.companyId)
             let holder = try Self.leaseHolderId(db: db, itemId: item.id)
@@ -227,7 +244,7 @@ extension Store {
                 }
                 let flatNotes = body.components(separatedBy: .newlines).joined(separator: " ")
                 let note = flatNotes.isEmpty ? "approved by @\(actor.handle)" : "approved by @\(actor.handle): \(String(flatNotes.prefix(500)))"
-                return try approveForMerge(db: db, item: item, by: agentId, note: note, now: now)
+                return try approveForMerge(db: db, item: item, by: agentId, note: note, enqueue: facts, now: now)
 
             case .requestChanges:
                 guard !body.isEmpty else { throw WorkError.invalid("request_changes needs notes: say what to change") }
@@ -243,6 +260,8 @@ extension Store {
                 return returned
             }
         }
+        if decision == .approve { try completeIfAlreadyInMain(itemId: reviewed.id, facts: facts, now: now) }
+        return try workItem(id: reviewed.id) ?? reviewed
     }
 
     /// An item's check was edited while it was in review: it is unverified, so it goes back to its holder to resubmit.

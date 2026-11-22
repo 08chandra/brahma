@@ -76,7 +76,9 @@ import Foundation
         #expect(Self.message { try Self.surface(name: "w" + String(repeating: "x", count: 23)).validate() } == nil)
         #expect(Self.message { try Self.surface(run: nil).validate() } == "a web preview needs run and url")
         #expect(Self.message { try Self.surface(url: nil).validate() } == "a web preview needs run and url")
-        #expect(Self.message { try Self.surface(kind: "cli").validate() } == "only web previews are available yet")
+        // Plan 4a: other kinds have their own rules (PreviewKindsTests); an unknown kind is refused.
+        #expect(Self.message { try Self.surface(kind: "cli").validate() } == "a cli preview needs demo")
+        #expect(Self.message { try Self.surface(kind: "tv").validate() } == "kind must be web, backend, cli, ios or macos")
         let commands = "preview commands must be 1–2000 characters"
         #expect(Self.message { try Self.surface(run: "   ").validate() } == commands)
         #expect(Self.message { try Self.surface(run: String(repeating: "x", count: 2001)).validate() } == commands)
@@ -111,10 +113,10 @@ import Foundation
     }
 
     @Test func statusAndKindTitles() {
-        #expect(PreviewKind.allCases == [.web] && PreviewKind.web.title == "Web")
-        #expect(Self.surface().previewKind == .web && Self.surface(kind: "cli").previewKind == nil)
+        #expect(PreviewKind.allCases == [.web, .backend, .cli, .ios, .macos, .artifact] && PreviewKind.web.title == "Web")
+        #expect(Self.surface().previewKind == .web && Self.surface(kind: "cli").previewKind == .cli && Self.surface(kind: "tv").previewKind == nil)
         let titles: [PreviewStatus: String] = [.idle: "Idle", .building: "Building", .starting: "Starting", .running: "Running",
-                                               .failed: "Failed", .stopped: "Stopped", .unavailable: "Unavailable"]
+                                               .failed: "Failed", .stopped: "Stopped", .unavailable: "Unavailable", .ran: "Ran"]
         for (status, title) in titles { #expect(status.title == title) }
         #expect(PreviewSurface.databaseTableName == "previewSurface" && PreviewState.databaseTableName == "previewState")
         let t = PreviewTimeouts()
