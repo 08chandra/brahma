@@ -136,6 +136,10 @@ public final class MapController {
         var meetings: [Meeting]
         var items: [String: String]
         var blockers: [String: String]
+        var itemPhases: [String: MapItemPhase] = [:]
+        var reviewing: Set<String> = []
+        var people: MapPeople = .empty
+        var openAsks: Int = 0
         var traffic: SyntheticTraffic
         var rng: SplitMix64
         var rate: Double
@@ -173,7 +177,9 @@ public final class MapController {
             self.people = nil
             let made = SyntheticCompany.make(agents: agents, seed: seed, companyId: "demo")
             synthetic = SyntheticWorld(agents: made.agents, pack: made.pack, vacancies: made.vacancies, meetings: made.meetings,
-                                       items: made.currentItems, blockers: made.blockers, traffic: SyntheticTraffic(seed: seed),
+                                       items: made.currentItems, blockers: made.blockers,
+                                       itemPhases: made.itemPhases, reviewing: made.reviewing, people: made.people,
+                                       openAsks: made.openAsks, traffic: SyntheticTraffic(seed: seed),
                                        rng: SplitMix64(seed: seed &+ 0x5EED), rate: Swift.max(0, rate), last: now, lastReorg: now)
         }
         let unlocked = defaults.bool(forKey: Self.officeUnlockedKey)
@@ -394,7 +400,8 @@ public final class MapController {
 
     static func inputs(_ w: SyntheticWorld) -> MapInputs {
         MapInputs(agents: w.agents, pack: w.pack, currentItems: w.items, blockers: w.blockers, vacancies: w.vacancies,
-                  meetings: w.meetings, people: .empty)
+                  meetings: w.meetings, people: w.people, itemPhases: w.itemPhases, reviewing: w.reviewing,
+                  openAsks: w.openAsks)
     }
 
     // MARK: Poll

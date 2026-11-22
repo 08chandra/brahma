@@ -210,6 +210,17 @@ import Foundation
         #expect(c.model.agents[ceo.id]?.activity == .idle)
     }
 
+    /// The live demo office shows the synthetic company's item phases, reviewers, perks and open asks.
+    @Test func demoControllerCarriesOfficeFacets() {
+        let clock = MapTestClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let c = demo(agents: 120, defaults: suite(), clock: clock)
+        let agents = Array(c.model.agents.values)
+        #expect(c.model.openAsks == 3)
+        #expect(agents.contains { $0.activity == .reviewing })
+        #expect(agents.contains { $0.shipping != nil })
+        #expect(agents.contains { !$0.perks.isEmpty })
+    }
+
     @Test func officeModeTitle() {
         #expect(MapMode.office.title == "OFFICE")
         #expect(MapMode.allCases.first == .org)
