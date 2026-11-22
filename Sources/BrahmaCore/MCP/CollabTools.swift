@@ -119,25 +119,21 @@ extension CompanyTools {
         // Rulings 53/54: every text a hit shows is checked against the stored values, read from the injected vault; values that
         // can't be read refuse the search (fail closed, as `open_ref`).
         let known: [(name: String, value: String)]
-        do { known = try store.knownSecretValues(companyId: companyId, vault: vault ?? UnavailableVault()) } catch {
+        do { known = try store.allKnownSecretValues(companyId: companyId, vault: vault ?? UnavailableVault()) } catch {
             diagnostics("brahma mcp: could not read the stored secrets to check search results: \(error)")
             throw ToolError(message: "search results could not be checked for secrets right now, so nothing was shown; try again next turn")
         }
+        let gate = GlobalSearch.TextGate(knownValues: known)
         let resolver = ShowResolver(store: store, files: Self.searchFiles, commits: Self.searchCommits)
-        let result = try resolver.resolveNow(query, companyId: companyId, reader: .agent(agentId), gate: GlobalSearch.TextGate(knownValues: known),
-                                             forced: forced, now: now)
-        return Self.searchLines(result, limit: limit, now: now, tz: tz)
+        let result = try resolver.resolveNow(query, companyId: companyId, reader: .agent(agentId), gate: gate, forced: forced, now: now)
+        return Self.searchLines(result, limit: limit, now: now, tz: tz, gate: gate)
     }
 
-    /// Fix round 1 (I-5): an agent-written field on a hit line, inert: one line, quoted (`"` → `'`), brackets turned to
-    /// parentheses, so no title can close the line's `[…]` or open a forged one.
-    static func inert(_ s: String, max: Int) -> String {
-        "\"" + GlobalSearch.flatten(s, max: max).replacingOccurrences(of: "\"", with: "'")
-            .replacingOccurrences(of: "[", with: "(").replacingOccurrences(of: "]", with: ")") + "\""
-    }
-
-    /// The `search` tool's text for a result (also the concierge's, C4c).
-    static func searchLines(_ result: ShowResult, limit: Int, now: Date, tz: TimeZone) -> String {
+    /// The `search` tool's text for a result (also the concierge's, C4c). Ruling 55: every agent-written field is built as
+    /// it is printed (the display pipeline with the inert mapping: one line, `"` → `'`, `[` `]` → `(` `)`, so nothing can close
+    /// the line's `[…]` or forge another), then gated as that exact string, quotes included; a field holding a value is
+    /// withheld (a canonical: the whole hit). Nothing changes a field after its gate.
+    static func searchLines(_ result: ShowResult, limit: Int, now: Date, tz: TimeZone, gate: GlobalSearch.TextGate) -> String {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = tz
         func stamp(_ d: Date) -> String {
@@ -147,18 +143,28 @@ extension CompanyTools {
             f.dateFormat = cal.isDate(d, inSameDayAs: now) ? "HH:mm" : "yyyy-MM-dd"
             return f.string(from: d)
         }
+        func field(_ s: String, max: Int, quoted: Bool) -> String? {
+            guard let shown = gate.final(s, max: max, inert: true) else { return nil }
+            let out = quoted ? "\"" + shown + "\"" : shown
+            return gate.holdsSecret(out) ? nil : out
+        }
         var lines: [String] = []
-        for hit in result.hits.filter({ !$0.inlineOnly }).prefix(limit) {
+        var printed = 0
+        for hit in result.hits where !hit.inlineOnly && printed < limit {
             let kind = hit.kind?.rawValue ?? hit.ref.kind.rawValue
             // A canonical is one token (it opens with `open_ref`), unless it holds white space (a kb page name): then quoted.
-            let canonical = GlobalSearch.flatten(hit.ref.canonical, max: RefGrammar.maxLength)
-            let shownRef = canonical.contains(where: { $0.isWhitespace }) || canonical.contains("·") ? inert(canonical, max: RefGrammar.maxLength) : canonical
-            var line = "[\(kind) \(shownRef) · \(inert(hit.title, max: SafeTitle.max))"
+            let raw = hit.ref.canonical
+            guard let canonical = field(raw, max: RefGrammar.maxLength, quoted: raw.contains(where: { $0.isWhitespace }) || raw.contains("·"))
+            else { continue }
+            let title = field(hit.title, max: SafeTitle.max, quoted: true) ?? "\"(withheld)\""
+            var line = "[\(kind) \(canonical) · \(title)"
             if let at = hit.at { line += " · " + stamp(at) }
             lines.append(line + "]")
-            if let snippet = hit.snippet.map({ GlobalSearch.flatten($0, max: GlobalSearch.snippetMax) }), !snippet.isEmpty {
+            if let snippet = hit.snippet.flatMap({ gate.final($0, max: GlobalSearch.snippetMax) }), !snippet.isEmpty,
+               !gate.holdsSecret("    | " + snippet) {
                 lines.append("    | " + snippet)
             }
+            printed += 1
         }
         if lines.isEmpty { lines.append("Nothing found in what you can read.") }
         // Fix round 1 (I-3): what couldn't be searched in full is said, never dropped silently.
@@ -198,7 +204,7 @@ extension CompanyTools {
             throw ToolError(message: "shared content can't be read here")
         }
         let known: [(name: String, value: String)]
-        do { known = try store.knownSecretValues(companyId: companyId, vault: vault ?? UnavailableVault()) } catch {
+        do { known = try store.allKnownSecretValues(companyId: companyId, vault: vault ?? UnavailableVault()) } catch {
             diagnostics("brahma mcp: could not read the stored secrets to check shared content: \(error)")
             throw ToolError(message: "the content could not be checked for secrets right now, so nothing was shared or shown; try again next turn")
         }

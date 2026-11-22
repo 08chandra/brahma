@@ -83,36 +83,161 @@ public struct GlobalSearch: Sendable {
 
     // MARK: The secret gate on what a hit shows
 
-    /// Rulings 53 and 54: every piece of text a hit shows (its canonical, title, subtitle and snippet; much of it agent-written:
-    /// paths, subjects, titles, message text) is checked against the secret patterns and every form of every stored value
-    /// (`EncodedForms`, `ContentScan.redact`, as `SecretGate.shown` checks a name), read now: a value stored after the text was
-    /// written is caught too. A canonical holding one drops the hit (its ref can't be shown); a title or subtitle is shown
-    /// redacted (withheld: the engine's own words); a snippet holding one is dropped.
+    /// Rulings 53, 54 and 55: every piece of text a hit shows (its canonical, title, subtitle and snippet; much of it
+    /// agent-written: paths, subjects, titles, message text) is checked against the secret patterns and every form of every
+    /// stored value, read now (a value stored after the text was written is caught too), on the exact string that is shown:
+    /// `final` builds the display string first (NFKC, hidden and invisible characters dropped, white space one space, the
+    /// tool's quote and bracket mapping), gates the whole of it, cuts it, and gates the cut; nothing changes it afterwards. A
+    /// canonical holding a value drops the hit; a title or subtitle falls back to the engine's words; a snippet is dropped.
+    /// Matching (N-1) runs only on `matchText`, the display form with every value's span blanked, so no query can find a
+    /// value's characters.
     struct TextGate: Sendable {
         let expanded: [(name: String, value: String)]
+        /// Each value lowercased (and its NFKC form): the memory query drops any word that is part of one.
+        let lowered: [String]
+        /// Identifies the value set (memos keyed by it never hold a value).
+        let fingerprint: String
+        /// Every literal `ContentScan.redact` could find (each value form's `Redactor.forms`) plus a literal every secret
+        /// pattern starts with: a text holding none of them, in any spelling the gate checks, holds no secret, so the regexes
+        /// are skipped. Nil (always scan) if the patterns are not the ones these literals were written for.
+        let needles: [String]?
 
-        init(knownValues: [(name: String, value: String)]) { expanded = EncodedForms.expand(knownValues) }
+        static let patternTriggers: (patterns: [String], triggers: [String]) = (
+            ["AKIA[0-9A-Z]{16}", "-----BEGIN [A-Z ]*PRIVATE KEY-----", "gh[pousr]_[A-Za-z0-9]{36,}", "github_pat_[A-Za-z0-9_]{60,}",
+             "xox[abprs]-[A-Za-z0-9-]{10,}", "sk-[A-Za-z0-9_-]{20,}", "sk_live_[A-Za-z0-9]{20,}", "AIza[0-9A-Za-z_-]{35}"],
+            ["AKIA", "-----BEGIN ", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-",
+             "sk-", "sk_live_", "AIza"])
 
+        init(knownValues: [(name: String, value: String)]) {
+            var forms: [(name: String, value: String)] = []
+            var seen = Set<String>()
+            for (name, value) in knownValues {
+                let nfkc = value.precomposedStringWithCompatibilityMapping
+                // The value as the display pipeline would print it, so a form the pipeline produces is caught.
+                for form in [value, nfkc, Self.display(value, inert: false), Self.display(value, inert: true)]
+                where !form.isEmpty && seen.insert(name + "\u{0}" + form).inserted {
+                    forms.append((name, form))
+                }
+            }
+            expanded = EncodedForms.expand(forms)
+            lowered = knownValues.flatMap { [$0.value.lowercased(), $0.value.precomposedStringWithCompatibilityMapping.lowercased()] }
+                .filter { $0.count >= Redactor.minLength }
+            fingerprint = StableHash.fnv1a64(expanded.map { "\($0.name)\u{0}\($0.value)" }.joined(separator: "\u{1}"))
+            if SecretScan.patterns.map(\.ere) == Self.patternTriggers.patterns {
+                needles = Self.patternTriggers.triggers
+                    + expanded.filter { $0.value.count >= Redactor.minLength }.flatMap { Redactor.forms(of: $0.value) }.filter { !$0.isEmpty }
+            } else {
+                needles = nil
+            }
+        }
+
+        /// Whether `s` could hold a secret at all (exact UTF-16 search, as `ContentScan.redact` searches).
+        private func mayHold(_ s: String) -> Bool {
+            guard let needles else { return true }
+            let ns = s as NSString
+            return needles.contains { ns.range(of: $0, options: .literal).location != NSNotFound }
+        }
+
+        /// The display pipeline: NFKC; C0/C1 controls, bidi, zero-width, format characters, U+00AD and U+180E dropped; every
+        /// run of white space one space (trimmed); with `inert`, `"` → `'`, `[` → `(`, `]` → `)` (the tool's line fields).
+        static func display(_ raw: String, inert: Bool) -> String {
+            var out = String.UnicodeScalarView()
+            var pendingSpace = false
+            for scalar in raw.precomposedStringWithCompatibilityMapping.unicodeScalars {
+                let v = scalar.value
+                if scalar.properties.isWhitespace || v == 0x0A || v == 0x09 || v == 0x0D || v == 0x2028 || v == 0x2029 { pendingSpace = true; continue }
+                if RefText.isHidden(v) || scalar.properties.generalCategory == .format || v == 0x00AD || v == 0x180E { continue }
+                if pendingSpace, !out.isEmpty { out.append(" ") }
+                pendingSpace = false
+                if inert {
+                    switch scalar {
+                    case "\"": out.append("'")
+                    case "[": out.append("(")
+                    case "]": out.append(")")
+                    default: out.append(scalar)
+                    }
+                } else {
+                    out.append(scalar)
+                }
+            }
+            return String(out)
+        }
+
+        /// The text holds a pattern or a value: as written, without the characters a display drops, or in the inert
+        /// spelling (`"` ↔ `'`, brackets ↔ parentheses), so a value differing only by those is withheld everywhere.
         func holdsSecret(_ s: String) -> Bool {
-            if ContentScan.redact(text: s, findings: [], knownValues: expanded) != s { return true }
+            if mayHold(s), ContentScan.redact(text: s, findings: [], knownValues: expanded) != s { return true }
+            if skeletonHolds(s) { return true }
+            let inert = Self.display(s, inert: true)
+            return inert != s && mayHold(inert) && ContentScan.redact(text: inert, findings: [], knownValues: expanded) != inert
+        }
+
+        /// A value split by characters a display drops or turns into a space (`SecretGate.isInvisible`).
+        private func skeletonHolds(_ s: String) -> Bool {
             let skeleton = String(String.UnicodeScalarView(s.unicodeScalars.filter { !SecretGate.isInvisible($0) }))
-            return ContentScan.redact(text: skeleton, findings: [], knownValues: expanded) != skeleton
+            return mayHold(skeleton) && ContentScan.redact(text: skeleton, findings: [], knownValues: expanded) != skeleton
         }
 
-        /// `s` redacted (`SecretGate.shown`), or `fallback` when the whole of it is withheld.
-        func name(_ s: String, fallback: String) -> String {
-            guard holdsSecret(s) else { return s }
-            let shown = SecretGate.shown(s, expanded: expanded)
-            return shown == SecretGate.withheldName || holdsSecret(shown) ? fallback : GlobalSearch.flatten(shown, max: SafeTitle.max)
+        /// The final display string of `raw` (at most `max` characters, cut with `…`), or nil when the whole text or the cut
+        /// holds a value.
+        func final(_ raw: String, max: Int, inert: Bool = false) -> String? {
+            let full = Self.display(raw, inert: inert)
+            guard !holdsSecret(full) else { return nil }
+            let cut = full.count > max ? String(full.prefix(max - 1)) + "\u{2026}" : full
+            guard !holdsSecret(cut) else { return nil }
+            return cut
         }
 
+        /// What a query is matched against: the display form with every secret span blanked (a space: no query token can
+        /// match it), or "" when a value can't be located (split across dropped characters).
+        func matchText(_ raw: String) -> String {
+            let d = Self.display(raw, inert: false)
+            guard holdsSecret(d) else { return d }
+            let r = ContentScan.redact(text: d, findings: [], knownValues: expanded)
+            if r == d { return skeletonHolds(d) ? "" : d }
+            let blanked = r.replacingOccurrences(of: #"\[redacted [^\]]*\]"#, with: " ", options: .regularExpression)
+            return holdsSecret(blanked) ? "" : blanked
+        }
+
+        /// The company-memory query without any word that is part of a stored value (its full-text index holds texts as they
+        /// were written): a guess at a value's token confirms nothing.
+        func memoryQuery(_ q: String) -> String {
+            guard !lowered.isEmpty else { return q }
+            return q.split(whereSeparator: { $0.isWhitespace }).filter { word in
+                let parts = word.lowercased().precomposedStringWithCompatibilityMapping
+                    .split(whereSeparator: { !$0.isLetter && !$0.isNumber }).filter { $0.count >= 2 }
+                return !parts.contains { part in lowered.contains { $0.contains(part) } }
+            }.joined(separator: " ")
+        }
+
+        /// A snippet of `raw`: the whole display text is gated first (any value in it: no snippet at all, so no part of a value
+        /// is ever cut out and shown), then a window of at most `max` characters starting a little before the query's first
+        /// word, gated again.
+        func snippet(_ raw: String, around query: String, max: Int) -> String? {
+            let full = Self.display(raw, inert: false)
+            guard !full.isEmpty, !holdsSecret(full) else { return nil }
+            var start = full.startIndex
+            if let word = query.split(whereSeparator: { $0.isWhitespace }).first.map(String.init),
+               let r = full.range(of: word, options: [.caseInsensitive, .diacriticInsensitive]) {
+                start = full.index(r.lowerBound, offsetBy: -min(40, full.distance(from: full.startIndex, to: r.lowerBound)))
+            }
+            var window = String(full[start...])
+            if start != full.startIndex { window = "\u{2026}" + window }
+            let cut = window.count > max ? String(window.prefix(max - 1)) + "\u{2026}" : window
+            guard !holdsSecret(cut) else { return nil }
+            return cut
+        }
+
+        /// The hit as shown, every field gated as its final string; nil when its canonical holds a value.
         func hit(_ h: ShowHit) -> ShowHit? {
-            guard !holdsSecret(h.ref.canonical) else { return nil }
+            // The ref itself is handed on raw (it opens), and shown through the display pipeline: both are gated.
+            guard !holdsSecret(h.ref.canonical), final(h.ref.canonical, max: RefGrammar.maxLength) != nil,
+                  final(h.ref.canonical, max: RefGrammar.maxLength, inert: true) != nil else { return nil }
             var out = h
-            let engine = h.ref.kind == .commit ? "commit \(h.ref.id.prefix(7))" : GlobalSearch.flatten(h.ref.canonical, max: SafeTitle.max)
-            out.title = name(h.title, fallback: engine)
-            out.subtitle = name(h.subtitle, fallback: "")
-            if let snippet = h.snippet, holdsSecret(snippet) { out.snippet = nil }
+            let engine = h.ref.kind == .commit ? "commit \(h.ref.id.prefix(7))" : (final(h.ref.canonical, max: SafeTitle.max) ?? h.ref.kind.rawValue)
+            out.title = final(h.title, max: SafeTitle.max) ?? engine
+            out.subtitle = final(h.subtitle, max: SafeTitle.max) ?? ""
+            out.snippet = h.snippet.flatMap { final($0, max: GlobalSearch.snippetMax) }.flatMap { $0.isEmpty ? nil : $0 }
             return out
         }
     }
@@ -140,7 +265,7 @@ public struct GlobalSearch: Sendable {
         /// An activity line's row id.
         var activityId: Int64? = nil
         /// An item hit's own key and title (as company memory indexed them), to tell a title match from a body match.
-        var matchText: String? = nil
+        var ownTitle: String? = nil
     }
 
     /// The search itself, synchronously (the `search` tool and `ShowResolver` call it on their own thread). `totals` are the
@@ -164,11 +289,14 @@ public struct GlobalSearch: Sendable {
 
         var found: [Candidate] = []
         let q = listing ? "" : text
-        if !listing { found += try memoryCandidates(q, kinds: kinds, filters: filters, actorId: actorId, companyId: companyId, reader: reader, now: now) }
+        let memoryQ = gate.memoryQuery(q)
+        if !listing, !memoryQ.isEmpty {
+            found += try memoryCandidates(memoryQ, kinds: kinds, filters: filters, actorId: actorId, companyId: companyId, reader: reader, now: now, gate: gate)
+        }
         var incomplete = Set<ShowGroup>()
         found += try gitCandidates(q, kinds: kinds, filters: filters, company: company, reader: reader, state: git ?? gitState(company: company),
-                                   incomplete: &incomplete)
-        found += try sqlCandidates(q, kinds: kinds, filters: filters, actorId: actorId, companyId: companyId, reader: reader)
+                                   gate: gate, incomplete: &incomplete)
+        found += try sqlCandidates(q, kinds: kinds, filters: filters, actorId: actorId, companyId: companyId, reader: reader, gate: gate)
 
         // Group, dedupe by canonical (best score kept), order.
         var byGroup: [ShowGroup: [Candidate]] = [:]
@@ -185,7 +313,7 @@ public struct GlobalSearch: Sendable {
             // query, else the event (the item's memory doc holds its comments too); at the better of the two scores.
             var best: [String: Double] = [:]
             for c in list where c.kind == .item || c.kind == .event { best[c.ref.canonical] = max(best[c.ref.canonical] ?? 0, c.score) }
-            let titled = Set(list.filter { $0.kind == .item && (q.isEmpty || FuzzyScorer.words(q, $0.matchText ?? "") > 0) }.map(\.ref.canonical))
+            let titled = Set(list.filter { $0.kind == .item && (q.isEmpty || FuzzyScorer.words(q, gate.matchText($0.ownTitle ?? "")) > 0) }.map(\.ref.canonical))
             let evented = Set(list.filter { $0.kind == .event }.map(\.ref.canonical))
             list = list.compactMap { c in
                 guard c.kind == .item || c.kind == .event, evented.contains(c.ref.canonical) else { return c }
@@ -203,6 +331,8 @@ public struct GlobalSearch: Sendable {
             }
             var seen = Set<String>()
             list = list.filter { seen.insert($0.inlineOnly ? $0.ref.canonical + "\u{0}\($0.title ?? "")" : $0.ref.canonical).inserted }
+            // Ruling 56: counted over what can be shown (a candidate whose ref holds a value never is).
+            list = list.filter { !gate.holdsSecret($0.ref.canonical) }
             if reader == .owner { totals[group] = list.count }
             var kept = 0
             for c in list.prefix(Self.groupCandidates) where kept < limitPerGroup {
@@ -237,8 +367,15 @@ public struct GlobalSearch: Sendable {
     // MARK: Company memory
 
     /// `MemoryIndex` per group of sources (messages apart, so they never crowd out the rest), with the reader's own scope.
+    /// A memory doc's whole indexed text (bound to the company).
+    private func docBody(_ docId: Int64, companyId: String) throws -> String? {
+        try store.writer.read { db in
+            try String.fetchOne(db, sql: "SELECT body FROM memoryDoc WHERE companyId = ? AND id = ? AND removedAt IS NULL", arguments: [companyId, docId])
+        }
+    }
+
     private func memoryCandidates(_ q: String, kinds: Set<SearchKind>, filters: SearchFilters, actorId: String?, companyId: String,
-                                  reader: Reader, now: Date) throws -> [Candidate] {
+                                  reader: Reader, now: Date, gate: TextGate) throws -> [Candidate] {
         var calls: [Set<MemorySource>] = []
         if kinds.contains(.message) { calls.append([.message]) }
         var rest = Set<MemorySource>()
@@ -259,11 +396,15 @@ public struct GlobalSearch: Sendable {
                 if let w = filters.window, !w.contains(hit.updatedAt) { continue }
                 if let actorId, hit.authorId != actorId { continue }
                 var c = Candidate(ref: ref, kind: kind, score: 0.9 * max(hit.score, 0) / (max(hit.score, 0) + 1))
-                c.snippet = hit.tainted ? nil : hit.snippet
+                // I-1: the snippet is cut by the engine from the doc's whole text, after the whole text is gated; never the
+                // index's own cut (`MemoryHit.snippet`, which the reader's access decided: only then is the body read).
+                if !hit.tainted, hit.snippet != nil, let body = try docBody(hit.docId, companyId: companyId) {
+                    c.snippet = gate.snippet(body, around: q, max: Self.snippetMax)
+                }
                 c.tainted = hit.tainted
                 c.at = hit.updatedAt
-                if kind == .message { c.subtitle = Self.flatten(hit.title, max: SafeTitle.max) }
-                if hit.source == .item, !hit.tainted { c.matchText = hit.title }
+                if kind == .message { c.subtitle = hit.title }
+                if hit.source == .item, !hit.tainted { c.ownTitle = hit.title }
                 out.append(c)
             }
         }
@@ -395,7 +536,7 @@ public struct GlobalSearch: Sendable {
     /// Files and commits. What can't be read (no repository, an index that failed or hit its cap) is named in `incomplete`,
     /// never dropped silently.
     private func gitCandidates(_ q: String, kinds: Set<SearchKind>, filters: SearchFilters, company: Company, reader: Reader,
-                               state: GitState?, incomplete: inout Set<ShowGroup>) throws -> [Candidate] {
+                               state: GitState?, gate: TextGate, incomplete: inout Set<ShowGroup>) throws -> [Candidate] {
         let wantFiles = kinds.contains(.file) && !q.isEmpty
         let wantCommits = kinds.contains(.commit)
         guard wantFiles || wantCommits else { return [] }
@@ -412,17 +553,25 @@ public struct GlobalSearch: Sendable {
             if mainIndex?.truncated != false { incomplete.insert(.files) }
         }
         if let mainIndex {
-            for f in mainIndex.scored(q, limit: Self.groupCandidates, where: nil) {
+            // Ruling 56: a path holding a value is never shown, so it never takes part in matching or ranking either.
+            for f in mainIndex.scored(q, limit: Self.groupCandidates, where: nil, excluding: { gate.holdsSecret($0) }) {
                 out.append(fileCandidate(path: f.path, branch: nil, score: f.score, time: f.time, filters: filters))
             }
             for (branch, head) in heads.sorted(by: { $0.key < $1.key }) where branch != "main" {
+                // N-5: an item branch the reader can't read never colours the flag (or the hits: each is checked anyway).
+                let readable = try store.writer.read { db in
+                    try RefAccess.canRead(reader, WorkRef(kind: .item, id: String(branch.dropFirst(5))), companyId: company.id, db: db,
+                                          catalog: store.catalog)
+                }
+                guard case .allowed = readable else { continue }
                 guard let index = try? files.indexNow(companyId: company.id, branch: branch, head: head, git: git) else {
                     incomplete.insert(.files)
                     continue
                 }
                 if index.truncated { incomplete.insert(.files) }
                 // An item branch adds only what differs from main.
-                for f in index.scored(q, limit: Self.groupCandidates, where: { index.sha(of: $0) != mainIndex.sha(of: $0) }) {
+                for f in index.scored(q, limit: Self.groupCandidates, where: { index.sha(of: $0) != mainIndex.sha(of: $0) },
+                                      excluding: { gate.holdsSecret($0) }) {
                     out.append(fileCandidate(path: f.path, branch: branch, score: f.score, time: f.time, filters: filters))
                 }
             }
@@ -435,11 +584,12 @@ public struct GlobalSearch: Sendable {
         }
         if let index = commitIndex {
             var diffs = Set<String>()
-            for (c, score) in index.scored(q, filters: filters, limit: Self.groupCandidates, listingScore: Self.listingScore) {
+            for (c, score) in index.scored(q, filters: filters, limit: Self.groupCandidates, listingScore: Self.listingScore, gate: gate,
+                                                subjects: reader == .owner) {
                 let short = String(c.sha.prefix(7))
                 var cand = Candidate(ref: WorkRef(kind: .commit, id: c.sha), kind: .commit, score: score)
                 // Ruling 54: the subject is agent-written; only the owner sees it (gated), an agent sees the engine's title.
-                cand.title = reader == .owner ? Self.flatten(c.subject, max: SafeTitle.max) : "commit \(short)"
+                cand.title = reader == .owner ? c.subject : "commit \(short)"
                 cand.taintedTitle = "commit \(short)"
                 cand.subtitle = "commit \(short) · " + (c.author == CommitIndex.unverified ? "unverified author" : "@\(c.author)") + " · \(c.branch)"
                 cand.at = c.at
@@ -473,12 +623,14 @@ public struct GlobalSearch: Sendable {
     // MARK: Rows
 
     private func sqlCandidates(_ q: String, kinds: Set<SearchKind>, filters: SearchFilters, actorId: String?, companyId: String,
-                               reader: Reader) throws -> [Candidate] {
+                               reader: Reader, gate: TextGate) throws -> [Candidate] {
         let listing = q.isEmpty
         let tokens = q.lowercased().split(whereSeparator: { $0.isWhitespace }).map(String.init).filter { $0.count >= FuzzyScorer.minQuery }
         let folded = tokens.map(FuzzyScorer.foldQuery)
+        // N-1: a row is matched on its text with every stored value blanked, never on the raw text.
         func score(_ text: String) -> Double {
-            listing ? Self.listingScore : FuzzyScorer.words(folded, text.split(whereSeparator: { $0.isWhitespace }).map { FuzzyScorer.Folded(String($0)) })
+            listing ? Self.listingScore
+                : FuzzyScorer.words(folded, gate.matchText(text).split(whereSeparator: { $0.isWhitespace }).map { FuzzyScorer.Folded(String($0)) })
         }
         /// `instr(lower(<column>), ?) > 0` for every token (a substring prefilter; the scorer ranks what passes).
         func contains(_ column: String) -> (String, [DatabaseValueConvertible]) {
@@ -504,7 +656,7 @@ public struct GlobalSearch: Sendable {
                         if let states, !states.contains(state) { continue }
                         let words = [name, row["role"] as String, (row["team"] as String?) ?? "", (row["current"] as String?) ?? ""].joined(separator: " ")
                         var s = score(words)
-                        if !listing, name.hasPrefix(q.lowercased().trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "@", with: "")) {
+                        if !listing, gate.matchText(name) == name, name.hasPrefix(q.lowercased().trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "@", with: "")) {
                             s = max(s, 0.9)
                         }
                         guard s > 0 else { continue }
@@ -534,7 +686,7 @@ public struct GlobalSearch: Sendable {
                     var c = Candidate(ref: WorkRef(kind: .message, id: id), kind: .message, score: Self.listingScore)
                     c.at = at
                     c.tainted = try Self.authorTainted(db, row["senderId"], at: at)
-                    c.snippet = c.tainted ? nil : text
+                    c.snippet = c.tainted ? nil : gate.snippet(text, around: q, max: Self.snippetMax)
                     out.append(c)
                 }
             }
@@ -596,7 +748,7 @@ public struct GlobalSearch: Sendable {
                     c.at = at
                     let authorTainted = try Self.authorTainted(db, actor, at: at)
                     c.tainted = (row["taintedOrigin"] as Bool) || authorTainted
-                    c.snippet = c.tainted ? nil : text
+                    c.snippet = c.tainted ? nil : gate.snippet(text, around: q, max: Self.snippetMax)
                     out.append(c)
                 }
             }
@@ -639,7 +791,7 @@ public struct GlobalSearch: Sendable {
                     var c = Candidate(ref: WorkRef(kind: .release, id: String(row["number"] as Int)), kind: .release, score: s)
                     c.at = at
                     c.tainted = try Self.authorTainted(db, row["proposedById"], at: at)
-                    c.snippet = notes.isEmpty || c.tainted ? nil : notes
+                    c.snippet = notes.isEmpty || c.tainted ? nil : gate.snippet(notes, around: q, max: Self.snippetMax)
                     out.append(c)
                 }
             }
@@ -658,7 +810,7 @@ public struct GlobalSearch: Sendable {
                     c.at = at
                     let lead: String? = row["leadId"]
                     c.tainted = try lead.map { try Self.authorTainted(db, $0, at: at) } ?? false
-                    c.snippet = c.tainted ? nil : goal
+                    c.snippet = c.tainted ? nil : gate.snippet(goal, around: q, max: Self.snippetMax)
                     out.append(c)
                 }
             }
@@ -672,7 +824,8 @@ public struct GlobalSearch: Sendable {
                     for request in surface.smoke {
                         let path = String(request.path.prefix { $0 != "?" && $0 != "#" })
                         guard paths.insert(path).inserted, let params = PreviewRefParams.validate(path: path, viewport: nil) else { continue }
-                        let ps = FuzzyScorer.words(folded, path.split(whereSeparator: { $0 == "/" || $0 == "-" || $0 == "_" }).map { FuzzyScorer.Folded(String($0)) })
+                        let ps = FuzzyScorer.words(folded, gate.matchText(path).split(whereSeparator: { $0 == "/" || $0 == "-" || $0 == "_" || $0 == " " })
+                            .map { FuzzyScorer.Folded(String($0)) })
                         if ps > 0 { out.append(Candidate(ref: WorkRef(kind: .preview, id: surface.name, params: params), kind: .preview, score: ps)) }
                     }
                 }
@@ -701,7 +854,7 @@ public struct GlobalSearch: Sendable {
                     let s = score(text)
                     guard s > 0 else { continue }
                     var c = Candidate(ref: WorkRef(kind: .fact, id: "activity:\(id)"), kind: .activity, score: s)
-                    c.title = Self.flatten(text, max: SafeTitle.max)
+                    c.title = text
                     c.subtitle = "activity"
                     c.at = row["createdAt"]
                     c.activityId = id
@@ -803,30 +956,12 @@ public struct GlobalSearch: Sendable {
             title = tainted ? (c.taintedTitle ?? resolved.title) : (c.title ?? resolved.title)
             subtitle = c.subtitle ?? resolved.subtitle
         }
-        var snippet = c.snippet.map { Self.flatten($0, max: Self.snippetMax) }
-        if snippet?.isEmpty == true { snippet = nil }
+        // Raw fields: `TextGate.hit` builds and gates each one's final string (Ruling 55).
+        var snippet = c.snippet
         if tainted {
             snippet = nil
             subtitle = Self.taintedSubtitle
         }
-        return ShowHit(ref: c.ref, title: Self.flatten(title, max: SafeTitle.max), subtitle: Self.flatten(subtitle, max: SafeTitle.max),
-                       snippet: snippet, at: c.at, group: c.kind.group, score: c.score, kind: c.kind)
-    }
-
-    /// One line: NFC, hidden characters dropped, every run of whitespace (newlines included) one space, at most `max`
-    /// characters (cut with `…`).
-    static func flatten(_ s: String, max: Int) -> String {
-        var out = String.UnicodeScalarView()
-        var pendingSpace = false
-        for scalar in s.precomposedStringWithCanonicalMapping.unicodeScalars {
-            let v = scalar.value
-            if scalar.properties.isWhitespace || v == 0x0A || v == 0x09 || v == 0x0D { pendingSpace = true; continue }
-            if RefText.isHidden(v) || v == 0x00AD || v == 0x180E { continue }
-            if pendingSpace, !out.isEmpty { out.append(" ") }
-            pendingSpace = false
-            out.append(scalar)
-        }
-        let text = String(out)
-        return text.count > max ? String(text.prefix(max - 1)) + "\u{2026}" : text
+        return ShowHit(ref: c.ref, title: title, subtitle: subtitle, snippet: snippet, at: c.at, group: c.kind.group, score: c.score, kind: c.kind)
     }
 }

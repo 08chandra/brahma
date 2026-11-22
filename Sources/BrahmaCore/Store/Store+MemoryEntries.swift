@@ -33,6 +33,17 @@ public struct MemoryEntryFilter: Sendable {
 extension Store {
     /// The company's stored secrets as `(name, value)`, read from `vault` (`SecretScan.textFindings` matches them). A vault that
     /// cannot be read throws: the caller refuses what it was about to check (fail closed).
+    /// Plan C Task C4a (R-3): every stored secret's value, or a refusal when the vault can't give one of them (search never
+    /// checks its output against a partial list).
+    public func allKnownSecretValues(companyId: String, vault: any SecretVault) throws -> [(name: String, value: String)] {
+        try secrets(companyId: companyId).map { meta in
+            guard let value = try vault.value(companyId: companyId, name: meta.name) else {
+                throw WorkError.invalid("a stored secret's value can't be read")
+            }
+            return (name: meta.name, value: value)
+        }
+    }
+
     public func knownSecretValues(companyId: String, vault: any SecretVault) throws -> [(name: String, value: String)] {
         try secrets(companyId: companyId).compactMap { meta in
             try vault.value(companyId: companyId, name: meta.name).map { (name: meta.name, value: $0) }

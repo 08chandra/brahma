@@ -276,7 +276,10 @@ public struct FileIndex: Sendable {
     }
 
     /// The best `limit` entries passing `include` (by index), with their recency.
-    func scored(_ q: String, limit: Int, where include: ((String) -> Bool)?) -> [(path: String, score: Double, time: Int)] {
+    /// `excluding`: checked on the ranked entries only, skipped without taking a place (a path a reader is never shown
+    /// neither ranks nor displaces another: Ruling 56).
+    func scored(_ q: String, limit: Int, where include: ((String) -> Bool)?,
+                excluding exclude: ((String) -> Bool)? = nil) -> [(path: String, score: Double, time: Int)] {
         let query = FuzzyScorer.foldQuery(q)
         guard query.count >= FuzzyScorer.minQuery, limit > 0 else { return [] }
         var found: [(i: Int, base: Double)] = []
@@ -303,7 +306,12 @@ public struct FileIndex: Sendable {
             if pa.utf8.count != pb.utf8.count { return pa.utf8.count < pb.utf8.count }
             return pa < pb
         }
-        return found.prefix(limit).map { (s.paths[$0.i], FuzzyScorer.normalize($0.base, queryLength: query.count), s.recency[$0.i]) }
+        var out: [(path: String, score: Double, time: Int)] = []
+        for f in found where out.count < limit {
+            if let exclude, exclude(s.paths[f.i]) { continue }
+            out.append((s.paths[f.i], FuzzyScorer.normalize(f.base, queryLength: query.count), s.recency[f.i]))
+        }
+        return out
     }
 }
 

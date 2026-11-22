@@ -24,12 +24,20 @@ public struct CommitIndex: Sendable {
 
     let commits: [CommitHit]
     let words: [[FuzzyScorer.Folded]]
+    /// Ruling 56: what an agent sees of a commit (`commit <sha7>`, its verified author, its branch), the only text an agent's
+    /// query is matched against.
+    let shownWords: [[FuzzyScorer.Folded]]
     let id: UUID
+    /// Per stored-value set (`TextGate.fingerprint`): the commits whose subject holds a value, scored on blanked text (N-1).
+    let secretMemo = SearchCacheStorage<Set<Int>>(capacity: 4)
 
     init(commits: [CommitHit]) {
         let sorted = commits.sorted { $0.at != $1.at ? $0.at > $1.at : $0.sha < $1.sha }
         self.commits = Array(sorted.prefix(Self.maxCommits))
         words = self.commits.map { c in (c.subject + " " + c.author).split(whereSeparator: { $0.isWhitespace }).map { FuzzyScorer.Folded(String($0)) } }
+        shownWords = self.commits.map { c in
+            ["commit", String(c.sha.prefix(7)), c.author == Self.unverified ? "unverified" : c.author, c.branch].map { FuzzyScorer.Folded($0) }
+        }
         id = UUID()
     }
 
@@ -78,17 +86,39 @@ public struct CommitIndex: Sendable {
         scored(q, filters: filters, limit: limit).map(\.hit)
     }
 
-    func scored(_ q: String, filters: SearchFilters, limit: Int, listingScore: Double = 0.7) -> [(hit: CommitHit, score: Double)] {
+    /// `subjects`: false for a reader who is never shown the subject (an agent): only `shownWords` are matched.
+    func scored(_ q: String, filters: SearchFilters, limit: Int, listingScore: Double = 0.7,
+                gate: GlobalSearch.TextGate? = nil, subjects: Bool = true) -> [(hit: CommitHit, score: Double)] {
         guard limit > 0 else { return [] }
         let tokens = q.split(whereSeparator: { $0.isWhitespace }).map { FuzzyScorer.foldQuery(String($0)) }
             .filter { $0.count >= FuzzyScorer.minQuery }
         let listing = tokens.isEmpty
         if listing, filters.actor == nil, filters.window == nil { return [] }
+        // N-1: a subject holding a stored value is matched with the value blanked, so no query finds its characters.
+        var holding = Set<Int>()
+        if let gate, !listing, subjects {
+            if let known = secretMemo.get(gate.fingerprint) {
+                holding = known
+            } else {
+                for (i, c) in commits.enumerated() where gate.holdsSecret(GlobalSearch.TextGate.display(c.subject, inert: false)) { holding.insert(i) }
+                secretMemo.put(gate.fingerprint, holding)
+            }
+        }
         var out: [(hit: CommitHit, score: Double)] = []
         for (i, c) in commits.enumerated() {
             if let actor = filters.actor, c.author == Self.unverified || c.author != actor { continue }
             if let window = filters.window, !window.contains(c.at) { continue }
-            let score = listing ? listingScore : FuzzyScorer.words(tokens, words[i])
+            let score: Double
+            if listing {
+                score = listingScore
+            } else if !subjects {
+                score = FuzzyScorer.words(tokens, shownWords[i])
+            } else if holding.contains(i), let gate {
+                score = FuzzyScorer.words(tokens, (gate.matchText(c.subject) + " " + c.author).split(whereSeparator: { $0.isWhitespace })
+                    .map { FuzzyScorer.Folded(String($0)) })
+            } else {
+                score = FuzzyScorer.words(tokens, words[i])
+            }
             guard score > 0 else { continue }
             out.append((c, score))
         }

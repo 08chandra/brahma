@@ -220,7 +220,7 @@ public struct ShowResolver: Sendable {
 
         // Phrases.
         if let phrase = ShowPhrases.match(stripped, original: normalized) {
-            let phraseHits = try phraseHits(phrase, company: company, reader: reader).compactMap(gate.hit)
+            let phraseHits = try phraseHits(phrase, company: company, reader: reader, gate: gate).compactMap(gate.hit)
             if !phraseHits.isEmpty {
                 // Refs typed inside the phrase rank below it (unless the ref is the whole query or what the phrase opens).
                 let opened = Set(phraseHits.map(\.ref.canonical))
@@ -299,7 +299,7 @@ public struct ShowResolver: Sendable {
             let decision = try store.writer.read { db in try RefAccess.canRead(reader, ref, companyId: companyId, db: db, catalog: store.catalog) }
             guard case .allowed = decision else { return nil }
             let tainted = (try? store.refTaint(ref, companyId: companyId).tainted) ?? true
-            return ShowHit(ref: ref, title: GlobalSearch.flatten(ref.canonical, max: SafeTitle.max),
+            return ShowHit(ref: ref, title: ref.canonical,
                            subtitle: tainted ? GlobalSearch.taintedSubtitle : "main", snippet: nil, at: nil, group: .top, score: 1.0, kind: .file)
         }
         return try resolvedHit(ref, score: 1.0, group: .top, companyId: companyId, reader: reader)
@@ -308,8 +308,8 @@ public struct ShowResolver: Sendable {
     /// `ref` as `reader` reads it, or nil (anything but `.full`).
     func resolvedHit(_ ref: WorkRef, score: Double, group: ShowGroup, companyId: String, reader: Reader, title: String? = nil) throws -> ShowHit? {
         guard let r = try? store.resolveRef(ref, for: reader, companyId: companyId), r.visibility == .full else { return nil }
-        return ShowHit(ref: ref, title: GlobalSearch.flatten(r.tainted ? r.title : (title ?? r.title), max: SafeTitle.max),
-                       subtitle: r.tainted ? GlobalSearch.taintedSubtitle : GlobalSearch.flatten(r.subtitle, max: SafeTitle.max),
+        return ShowHit(ref: ref, title: r.tainted ? r.title : (title ?? r.title),
+                       subtitle: r.tainted ? GlobalSearch.taintedSubtitle : r.subtitle,
                        snippet: nil, at: nil, group: group, score: score, kind: Self.searchKind(ref.kind))
     }
 
@@ -335,7 +335,7 @@ public struct ShowResolver: Sendable {
 
     // MARK: Phrases
 
-    private func phraseHits(_ phrase: PhraseMatch, company: Company, reader: Reader) throws -> [ShowHit] {
+    private func phraseHits(_ phrase: PhraseMatch, company: Company, reader: Reader, gate: GlobalSearch.TextGate) throws -> [ShowHit] {
         let companyId = company.id
         var refs: [WorkRef] = []
         switch phrase.action {
@@ -378,7 +378,7 @@ public struct ShowResolver: Sendable {
             var scored: [(n: Int, s: Double)] = []
             for row in rows {
                 let n: Int = row["number"]
-                let s = subject.isEmpty ? 0.5 : FuzzyScorer.words(subject, row["title"] as String)
+                let s = subject.isEmpty ? 0.5 : FuzzyScorer.words(subject, gate.matchText(row["title"] as String))
                 if s > 0 { scored.append((n, s)) }
             }
             refs = scored.sorted { $0.s != $1.s ? $0.s > $1.s : $0.n > $1.n }.prefix(3).map { WorkRef(kind: .artifact, id: String($0.n)) }

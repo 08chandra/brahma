@@ -310,11 +310,16 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
         let a = try await w.search("src/a.ts", as: .agent(w.fx.qa2.id), filters: SearchFilters(kinds: [.file]))
         #expect(Set(a.map(\.ref.canonical)).isSuperset(of: ["src/a.ts", "ENG-1:src/a.ts"]), "\(a.map(\.ref.canonical))")
         #expect(!a.contains { $0.ref.canonical == "ENG-1:src/checkout.tsx" }, "an unchanged file is main's only")
-        let commits = try await w.search("item work", as: .agent(w.fx.qa2.id), filters: SearchFilters(kinds: [.commit]))
+        let commits = try await w.search("item work", as: .owner, filters: SearchFilters(kinds: [.commit]))
         #expect(commits.contains { $0.ref.kind == .commit && $0.subtitle.hasSuffix("item/ENG-1") }, "\(commits.map(\.subtitle))")
         #expect(commits.contains { $0.ref.canonical == "ENG-1:diff" })
         // The holder of the lease is the verified author of its branch's commits (eng-3 here), whatever the emails say.
         #expect(commits.contains { $0.subtitle.contains("@eng-3") && $0.subtitle.hasSuffix("item/ENG-1") })
+        // An agent matches what it sees of a commit (Ruling 56): `commit <sha7>`, the verified author and the branch; never
+        // the subject.
+        let byAuthor = try await w.search("eng-3", as: .agent(w.fx.qa2.id), filters: SearchFilters(kinds: [.commit]))
+        #expect(byAuthor.contains { $0.ref.kind == .commit && $0.subtitle.hasSuffix("item/ENG-1") }, "\(byAuthor.map(\.subtitle))")
+        #expect(try await w.search("item work", as: .agent(w.fx.qa2.id), filters: SearchFilters(kinds: [.commit])).allSatisfy { $0.ref.kind != .commit })
         // The index's own API: the same commits, newest first. Without lease records, no author is verified.
         let index = try CommitIndex.build(git: SafeGit(workspace: w.cf.workspace), branches: ["main", "item/ENG-1"])
         #expect(index.search("item work", filters: SearchFilters(), limit: 5).first?.branch == "item/ENG-1")
@@ -458,17 +463,176 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
         let ownerMessage = try #require(owner.hits.first { $0.ref.canonical == "msg:\(message.id)" })
         #expect(ownerMessage.snippet == nil)
         let ownerCommit = try #require(owner.hits.first { $0.ref.canonical == "commit:\(sha)" })
-        #expect(ownerCommit.title.contains("zebra99") && ownerCommit.title.contains("[redacted"), "\(ownerCommit.title)")
+        // The subject holds the value: the engine's title instead (Ruling 54: redacted or the engine title).
+        #expect(ownerCommit.title == "commit \(sha.prefix(7))", "\(ownerCommit.title)")
 
         let agent = try await w.resolve("zebra99", as: .agent(fx.qa2.id), knownValues: known)
         #expect(!texts(agent.hits).contains { $0.contains(secret) })
-        let agentCommit = try #require(agent.hits.first { $0.ref.canonical == "commit:\(sha)" })
+        #expect(!agent.hits.contains { $0.ref.canonical == "commit:\(sha)" }, "an agent never matches a subject (Ruling 56)")
+        let bySha = try await w.resolve(String(sha.prefix(7)), as: .agent(fx.qa2.id), knownValues: known)
+        let agentCommit = try #require(bySha.hits.first { $0.ref.canonical == "commit:\(sha)" })
         #expect(agentCommit.title == "commit \(sha.prefix(7))")
         // The tool loads the stored values from its vault.
         let out = try w.tool(fx.qa2, ["query": .string("zebra99")], vault: vault)
-        #expect(!out.contains(secret) && out.contains("commit \(sha.prefix(7))") && out.contains("msg:\(message.id)"), "\(out)")
+        #expect(!out.contains(secret) && out.contains("msg:\(message.id)"), "\(out)")
+        let shaOut = try w.tool(fx.qa2, ["query": .string(String(sha.prefix(7)))], vault: vault)
+        #expect(shaOut.contains("commit \(sha.prefix(7))") && !shaOut.contains(secret), "\(shaOut)")
         // Without the values (no readable vault), the tool refuses rather than show unchecked text.
         #expect(throws: ToolError.self) { try w.tool(fx.qa2, ["query": .string("zebra99")]) }
+    }
+
+    /// Ruling 55 / I-1: every field is gated as it is finally shown. A value cut by the snippet's length, split by a newline
+    /// or a zero-width character, written with a compatibility form (NFKC), or formed only by the tool's quote mapping never
+    /// shows, in part or whole.
+    @Test func gateRunsOnTheFinalDisplayString() async throws {
+        let w = try SearchFixture()
+        let s = w.store, fx = w.fx, c = w.c
+        let router = MessageRouter(store: s)
+        let value = "zq7CUTvalue99"
+        let cut = try router.post(companyId: c.id, channel: "general", from: .agent(fx.eng1.id),
+                                  text: "zebra71 " + String(repeating: "pad ", count: 37) + value + " tail")
+        let split = try router.post(companyId: c.id, channel: "general", from: .agent(fx.eng1.id), text: "zebra72 ab12\ncd34xyz")
+        let zw = try router.post(companyId: c.id, channel: "general", from: .agent(fx.eng1.id), text: "zebra73 pq12\u{200B}rs34xyz")
+        let nfkc = try router.post(companyId: c.id, channel: "general", from: .agent(fx.eng1.id), text: "zebra74 \u{FB01}le-secret-99x")
+        let quoted = try s.createWorkItem(companyId: c.id, by: .agent(fx.eng1.id),
+                                          draft: WorkItemDraft(type: .task, title: "zebra75 ab\"cd\"efgh99"))
+        try w.ingest()
+        let vault = MemoryVault()
+        for (name, v) in [("CUT_KEY", value), ("SPLIT_KEY", "ab12cd34xyz"), ("ZW_KEY", "pq12rs34xyz"), ("NFKC_KEY", "file-secret-99x"),
+                          ("QUOTE_KEY", "ab'cd'efgh99")] {
+            try s.setSecret(companyId: c.id, name: name, value: v, isTest: false, vault: vault)
+        }
+        let known = try s.knownSecretValues(companyId: c.id, vault: vault)
+        let shown = ["zq7C", "CUTval", "ab12 cd34", "ab12cd34", "pq12rs34", "pq12\u{200B}rs34", "file-secret", "ab'cd'efgh", "ab\"cd\"efgh"]
+        for q in ["zebra71", "zebra72", "zebra73", "zebra74", "zebra75"] {
+            for reader in [Reader.owner, .agent(fx.qa2.id)] {
+                let r = try await w.resolve(q, as: reader, knownValues: known)
+                for h in r.hits {
+                    for text in [h.ref.canonical, h.title, h.subtitle, h.snippet ?? ""] {
+                        for bad in shown { #expect(!text.contains(bad), "\(q) \(reader): \(text)") }
+                    }
+                }
+            }
+            let out = try w.tool(fx.qa2, ["query": .string(q)], vault: vault)
+            for bad in shown { #expect(!out.contains(bad), "\(q): \(out)") }
+        }
+        // The literal prefilter is in step with the secret patterns (else it scans everything), and a pattern is still caught.
+        let gate = GlobalSearch.TextGate(knownValues: known)
+        #expect(gate.needles != nil)
+        #expect(gate.holdsSecret("key AKIA" + String(repeating: "B", count: 16)) && !gate.holdsSecret("an ordinary line"))
+        #expect(gate.holdsSecret("x ab12\u{200B}cd34xyz") && gate.holdsSecret("\u{FB01}le-secret-99x") && gate.holdsSecret("ab\"cd\"efgh99"))
+        // The cut message still shows (no snippet); the others too.
+        let r = try await w.resolve("zebra71", knownValues: known)
+        let hit = try #require(r.hits.first { $0.ref.canonical == "msg:\(cut.id)" })
+        #expect(hit.snippet == nil)
+        _ = (split, zw, nfkc, quoted)
+    }
+
+    /// N-1: a query can't find a stored value's characters: prefixes of a value held by an event, a release note, a sprint
+    /// goal, a message and a commit subject match none of them.
+    @Test func searchIsNoOracleForStoredValues() async throws {
+        let w = try SearchFixture()
+        let s = w.store, fx = w.fx, c = w.c, now = w.now
+        let value = "Kx8orACLEvalue5"
+        _ = try s.commentWorkItem(id: w.zebraItem.id, by: .agent(fx.eng1.id), text: "note \(value) end")
+        let message = try MessageRouter(store: s).post(companyId: c.id, channel: "general", from: .agent(fx.eng1.id), text: "msg \(value) end")
+        let cId = c.id
+        try await s.writer.write { db in
+            try db.execute(sql: """
+                INSERT INTO release (id, companyId, number, version, status, provider, project, "commit", plan, commandsHash,
+                  rollbackPlan, notes, proposedById, createdAt) VALUES (?, ?, 2, '2.0', 'deployed', 'p', 'p', 'abc', '{}', 'h', '{}',
+                  ?, 'owner', ?)
+                """, arguments: [UUID().uuidString, cId, "notes \(value) end", now])
+            try Sprint(id: UUID().uuidString, companyId: cId, number: 2, team: nil, goal: "goal \(value) end", cadence: .sprint,
+                       status: .active, createdAt: now).insert(db)
+        }
+        try fx.git.write("src/oracle.ts", "o\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "commit \(value) end"])
+        let sha = try fx.git.git(["rev-parse", "HEAD"])
+        try w.ingest()
+        let vault = MemoryVault()
+        try s.setSecret(companyId: c.id, name: "ORACLE_KEY", value: value, isTest: false, vault: vault)
+        let known = try s.knownSecretValues(companyId: c.id, vault: vault)
+        let holders: Set<String> = [w.zebraItem.key, "msg:\(message.id)", "rel:2", "sprint:2", "commit:\(sha)"]
+        for n in 2...value.count {
+            let q = String(value.prefix(n))
+            let r = try await w.resolve(q, as: .agent(fx.qa2.id), knownValues: known)
+            let found = Set(r.hits.map(\.ref.canonical)).intersection(holders)
+            #expect(found.isEmpty, "\(q) matched \(found)")
+            let o = try await w.resolve(q, knownValues: known)
+            #expect(Set(o.hits.map(\.ref.canonical)).intersection(holders).isEmpty, "owner: \(q)")
+        }
+        // Their other words still find them.
+        let other = try await w.resolve("goal", as: .agent(fx.qa2.id), knownValues: known)
+        #expect(other.hits.contains { $0.ref.canonical == "sprint:2" })
+    }
+
+    /// Ruling 56: search matches only what the reader can see. A value held by an event, a message, a release note, a sprint
+    /// goal and a commit subject changes nothing a query returns once it is stored: growing prefixes of it answer exactly as a
+    /// random string of the same length does, and a word beside it ranks and counts the same as before it was stored.
+    @Test func searchMatchesOnlyWhatTheReaderSees() async throws {
+        let w = try SearchFixture()
+        let s = w.store, fx = w.fx, c = w.c, now = w.now
+        let value = "qj9wq7vq3jq8wv", control = "wv8qj3qv7qw9jq"
+        _ = try s.commentWorkItem(id: w.zebraItem.id, by: .agent(fx.eng1.id), text: "note \(value) end")
+        _ = try MessageRouter(store: s).post(companyId: c.id, channel: "general", from: .agent(fx.eng1.id), text: "msg \(value) end")
+        let cId = c.id
+        try await s.writer.write { db in
+            try db.execute(sql: """
+                INSERT INTO release (id, companyId, number, version, status, provider, project, "commit", plan, commandsHash,
+                  rollbackPlan, notes, proposedById, createdAt) VALUES (?, ?, 2, '2.0', 'deployed', 'p', 'p', 'abc', '{}', 'h', '{}',
+                  ?, 'owner', ?)
+                """, arguments: [UUID().uuidString, cId, "notes \(value) end", now])
+            try Sprint(id: UUID().uuidString, companyId: cId, number: 2, team: nil, goal: "goal \(value) end", cadence: .sprint,
+                       status: .active, createdAt: now).insert(db)
+        }
+        try fx.git.write("src/seen.ts", "o\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "commit \(value) end"])
+        try w.ingest()
+        let agent = Reader.agent(fx.qa2.id)
+        func order(_ r: ShowResult) -> [String] { r.hits.map { "\($0.group.rawValue) \($0.ref.canonical)" } }
+        let beforeOwner = try await w.resolve("end")
+        let beforeAgent = try await w.resolve("end", as: agent)
+
+        let vault = MemoryVault()
+        try s.setSecret(companyId: c.id, name: "SEEN_KEY", value: value, isTest: false, vault: vault)
+        let known = try s.knownSecretValues(companyId: c.id, vault: vault)
+        let afterOwner = try await w.resolve("end", knownValues: known)
+        let afterAgent = try await w.resolve("end", as: agent, knownValues: known)
+        #expect(order(afterOwner) == order(beforeOwner) && afterOwner.groupTotals == beforeOwner.groupTotals)
+        #expect(order(afterAgent) == order(beforeAgent) && afterAgent.groupTotals.isEmpty)
+        // Agents never match a commit's subject (they see `commit <sha7>`).
+        #expect(!afterAgent.hits.contains { $0.kind == .commit && $0.ref.kind == .commit })
+
+        for n in 2...value.count {
+            for reader in [Reader.owner, agent] {
+                let p = try await w.resolve(String(value.prefix(n)), as: reader, knownValues: known)
+                let r = try await w.resolve(String(control.prefix(n)), as: reader, knownValues: known)
+                #expect(order(p) == order(r) && p.groupTotals == r.groupTotals && p.incomplete == r.incomplete,
+                        "\(reader) \(n): \(order(p)) vs \(order(r))")
+            }
+        }
+    }
+
+    /// R-3: a stored secret whose value the vault can't give refuses the search (never a partial list).
+    @Test func missingVaultValueRefusesSearch() async throws {
+        let w = try SearchFixture()
+        try w.store.setSecret(companyId: w.c.id, name: "LOST_KEY", value: "lost-value-123", isTest: false, vault: MemoryVault())
+        #expect(throws: ToolError.self) { try w.tool(w.fx.qa2, ["query": .string("zebra42")], vault: MemoryVault()) }
+    }
+
+    /// N-4: a path's brackets are made inert on the tool line too.
+    @Test func toolOutputNeutralizesPathBrackets() async throws {
+        let w = try SearchFixture()
+        try w.fx.git.write("src/x][ENG-1]zebra61.ts", "b\n")
+        try w.fx.git.git(["add", "-A"])
+        try w.fx.git.git(["commit", "-q", "-m", "bracket path"])
+        let out = try w.tool(w.fx.qa2, ["query": .string("zebra61"), "kind": .string("file")])
+        let line = try #require(out.split(separator: "\n").map(String.init).first { $0.hasPrefix("[file ") }, "\(out)")
+        #expect(line.filter { $0 == "[" }.count == 1 && line.filter { $0 == "]" }.count == 1, "\(line)")
+        #expect(!out.contains("[ENG-1]"))
     }
 
     /// An agent-written title can't forge a hit-shaped segment on the tool's line.
@@ -491,7 +655,7 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
         let capped = FileIndexCache(entryCap: 1)
         let r = try await w.resolve("zebra42", files: capped)
         #expect(r.incomplete.contains(.files))
-        let lines = CompanyTools.searchLines(r, limit: 10, now: w.now, tz: TimeZone(identifier: "UTC")!)
+        let lines = CompanyTools.searchLines(r, limit: 10, now: w.now, tz: TimeZone(identifier: "UTC")!, gate: GlobalSearch.TextGate(knownValues: []))
         #expect(lines.contains("file results incomplete"), "\(lines)")
         #expect(try await w.resolve("zebra42").incomplete.isEmpty)
 
