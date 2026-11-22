@@ -103,6 +103,41 @@ public enum OfficeTextures {
         c.drawRadialGradient(gradient, startCenter: center, startRadius: 0, endCenter: center, endRadius: 24, options: [])
     }
 
+    /// The light a lit screen throws on its desk, 40 pt: a white core that holds near full strength, then a soft falloff.
+    /// White, tinted by the status colour.
+    public static let screenGlow: SKTexture = render(40, 40) { c in
+        let white = NSColor.white
+        let colors = [white.cgColor, white.withAlphaComponent(0.92).cgColor, white.withAlphaComponent(0.3).cgColor,
+                      white.withAlphaComponent(0).cgColor] as CFArray
+        guard let gradient = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB), colors: colors,
+                                        locations: [0, 0.4, 0.7, 1]) else { return }
+        let center = CGPoint(x: 20, y: 20)
+        c.drawRadialGradient(gradient, startCenter: center, startRadius: 0, endCenter: center, endRadius: 20, options: [])
+    }
+
+    /// A desk lamp's shade seen from above, 6 pt: a white disc, tinted `officeLamp` when on and `lineStrong` when off.
+    public static let lamp: SKTexture = render(6, 6) { c in
+        c.setFillColor(NSColor.white.cgColor)
+        c.fillEllipse(in: CGRect(x: 0.5, y: 0.5, width: 5, height: 5))
+    }
+
+    /// An open seat's desk (spec §5.2): the 36 pt top and 6 pt face as dashed one-pixel `lineStrong` outlines over a
+    /// `bg1` fill, unlit, 36 × 30 pt.
+    public static let deskDashed: SKTexture = render(36, 30) { c in
+        let top = CGRect(x: 0, y: 6, width: 36, height: 24), face = CGRect(x: 0, y: 0, width: 36, height: 6)
+        fill(c, top, ThemeHex.bg1, radius: 1)
+        fill(c, face, ThemeHex.bg1, radius: 1)
+        c.setStrokeColor(cg(ThemeHex.lineStrong))
+        c.setLineWidth(hair)
+        c.setLineDash(phase: 0, lengths: [2, 1.5])
+        for r in [top, face] {
+            c.addPath(CGPath(roundedRect: r.insetBy(dx: hair / 2, dy: hair / 2), cornerWidth: 0.75, cornerHeight: 0.75,
+                             transform: nil))
+        }
+        c.strokePath()
+        c.setLineDash(phase: 0, lengths: [])
+    }
+
     // MARK: - Figure
 
     /// The figure's body in a `figureSize` frame: a rounded peg and two 2 pt hands, white (tinted by department).
@@ -435,6 +470,9 @@ public enum OfficeTextures {
         sheet.add("lit.run", sprite(monitor(.lit), tint: ThemeHex.running))
         sheet.add("lit.blk", sprite(monitor(.lit), tint: ThemeHex.blocked))
         sheet.add("glow", sprite(lampGlow, mag: 1, tint: ThemeHex.officeLamp))
+        sheet.add("screen", sprite(screenGlow, mag: 1, tint: ThemeHex.running))
+        sheet.add("lamp", sprite(lamp, tint: ThemeHex.officeLamp))
+        sheet.add("dashed", sprite(deskDashed))
         sheet.add("head", sprite(figureHead))
         for (i, pose) in FigurePose.allCases.enumerated() {
             sheet.add("\(pose)", figure(pose, tint: ThemeHex.series[i % ThemeHex.series.count], mag: 2))
@@ -555,8 +593,12 @@ public enum OfficeTextures {
             node.addChild(s)
         }
         // Desk origin at (0, 10): the chair and figure sit in front of (below) it.
-        add(deskFace, at: CGPoint(x: 0, y: 10), z: 0)
-        add(deskTop, at: CGPoint(x: 0, y: 16), z: 0)
+        if showPlacard {
+            add(deskDashed, at: CGPoint(x: 0, y: 10), z: 0)
+        } else {
+            add(deskFace, at: CGPoint(x: 0, y: 10), z: 0)
+            add(deskTop, at: CGPoint(x: 0, y: 16), z: 0)
+        }
         if let color {
             add(lampGlow, at: CGPoint(x: 18 - 24, y: 34.5 - 24), tint: color, alpha: 0.8, z: 1)
         }

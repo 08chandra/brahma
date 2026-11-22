@@ -524,3 +524,12 @@ extension OrgScene {
     /// The next `update(controller:…)` rebuilds the cards whatever changed.
     func forceRebuild() { builtRevision = -1 }
 }
+
+// MARK: - MapScene
+
+extension OrgScene: MapScene {
+    public var mode: MapMode { .org }
+
+    /// The card's rect (`cardRect`).
+    public func targetRect(_ id: String) -> CGRect? { cardRect(id) }
+}
