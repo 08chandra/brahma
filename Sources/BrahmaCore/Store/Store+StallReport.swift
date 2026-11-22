@@ -31,8 +31,9 @@ extension Store {
 
             var groups: [String: Int] = [:]
             for a in live where a.state == .blocked {
-                if let target = StallExplainer.blockerTarget(a.blocker, ownerWord: "you",
-                                                              handle: { id in (try? Agent.fetchOne(db, key: id))?.name }) {
+                // A read that fails fails the report, as before the shared helper.
+                if let target = try StallExplainer.blockerTarget(a.blocker, ownerWord: "you",
+                                                                  handle: { id in try Agent.fetchOne(db, key: id)?.name }) {
                     groups[target, default: 0] += 1
                 }
             }

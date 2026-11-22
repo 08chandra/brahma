@@ -132,6 +132,40 @@ import GRDB
         #expect(resolved.visibility == .full && resolved.tainted && resolved.taintReason == Self.reason)
     }
 
+    /// C4b fix round 2: the orchestrator's turn end records a clean holder turn's commits as the holder's (`recordTurnCommits`,
+    /// the only source of commit authorship). A second turn that merges a branch in is credited with its merge commit only
+    /// (Ruling 59): the merged-in commits keep their first recorder (the manager's), or stay unverified.
+    @Test func turnEndRecordsTheTurnsCommitsAsItsAuthor() async throws {
+        let h = try Holder()
+        let (store, wt, root, companyId) = (h.store, h.worktree(h.item), h.root, h.company.id)
+        let shas = ShaBox()
+        try await h.turn {
+            shas.append(try Holder.commit(wt, "src/p1/a.ts", "a\n"))
+            shas.append(try Holder.commit(wt, "src/p1/b.ts", "b\n"))
+        }
+        #expect(try h.rows().isEmpty, "a clean turn records no taint")
+        let first = try #require(try h.turns().last)
+        #expect(try store.recordedCommitAuthors(companyId: companyId, shas: shas.all) == Dictionary(uniqueKeysWithValues: shas.all.map { ($0, "eng-1") }))
+        let rowTurns = try await store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT DISTINCT turnId FROM turnCommit WHERE companyId = ?", arguments: [companyId])
+        }
+        #expect(rowTurns == [first.id])
+        // A side branch: one commit recorded as the manager's, one nobody's. The holder's next turn merges it.
+        try GitFixture.plainGit(["checkout", "-q", "-b", "side", "main"], in: root)
+        let managers = try Holder.commit(root, "src/side/m.ts", "m\n")
+        let nobodys = try Holder.commit(root, "src/side/n.ts", "n\n")
+        try GitFixture.plainGit(["checkout", "-q", "main"], in: root)
+        try store.recordCommitAuthors(companyId: companyId, itemId: nil, agentId: h.mgr.id, turnId: nil, shas: [managers], now: Date())
+        let merge = ShaBox()
+        try await h.turn {
+            try GitFixture.plainGit(["merge", "-q", "--no-ff", "-m", "merge side", "side"], in: wt)
+            merge.append(try GitFixture.plainGit(["rev-parse", "HEAD"], in: wt))
+        }
+        let mergeSha = try #require(merge.all.first)
+        #expect(try store.recordedCommitAuthors(companyId: companyId, shas: [mergeSha, managers, nobodys])
+                == [mergeSha: "eng-1", managers: "mgr"])
+    }
+
     @Test func taintFollowsSessionNotTurn() async throws {
         let h = try Holder(claim: false)
         let (store, engId, companyId) = (h.store, h.eng.id, h.company.id)

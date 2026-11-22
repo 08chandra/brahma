@@ -8,8 +8,9 @@ import GRDB
 /// (`CommitIndex.unverified`) and matches no `by @…` filter.
 extension Store {
     /// Records the commits one turn made: for each item it held as it started (`heldAtStart`: item id → its branch head
-    /// then, read by the engine) and each item it claimed during the turn (the claim log's trusted claim head), the commits of
-    /// `<start>..head(item/<KEY>)` that neither `main` nor any other item branch holds. An item whose start head is unknown,
+    /// then, read by the engine) and each item it claimed during the turn (the claim log's trusted claim head), the commits on
+    /// the first-parent chain of `<start>..head(item/<KEY>)` (Ruling 59: never a merge's second-parent ancestry) that neither
+    /// `main` nor any other item branch holds. An item whose start head is unknown,
     /// or whose start is no longer an ancestor of its head (the turn rewrote the branch), is skipped (its commits stay
     /// unverified: attribution fails closed, unlike taint). The first record of a sha wins. Never throws (git, off the
     /// cooperative pool).
@@ -42,7 +43,9 @@ extension Store {
                 // unverified. (`recordTurnEndHead` flags the same rewrite as a moved branch.)
                 guard try git.isAncestor(start, of: head) else { continue }
                 let others = [main] + branches.filter { $0.key != "item/\(item.key)" }.map(\.value)
-                let shas = try git.revList(start, head, excluding: others)
+                // Fix round 2 (Ruling 59): only the turn's first-parent chain from its start; what a merge brought in keeps its
+                // first recorder, or stays unverified (the merge commit itself is the turn's).
+                let shas = try git.revList(start, head, excluding: others, firstParent: true)
                 try recordCommitAuthors(companyId: companyId, itemId: itemId, agentId: agentId, turnId: turnId, shas: shas, now: now)
             }
         } catch {

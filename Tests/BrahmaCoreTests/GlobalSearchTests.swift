@@ -437,6 +437,39 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
         #expect(try s.recordedCommitAuthors(companyId: cId, shas: [more, qaWork]) == [more: "qa-2"])
     }
 
+    /// C4b fix round 2 (Ruling 59): a turn is credited only with its first-parent chain from its start head. An agent that
+    /// merges a branch into its item branch is the author of its merge commit (and its own commits), never of what it merged in:
+    /// an unrecorded merged-in commit stays unverified, a recorded one keeps its first recorder.
+    @Test func mergedInCommitsAreNeverTheMergersCredit() async throws {
+        let w = try SearchFixture()
+        let s = w.store, fx = w.fx, cId = w.c.id, now = w.now
+        let (itemId, eng3Id, qa2Id) = (fx.item.id, fx.eng3.id, fx.qa2.id)
+        let itemWork = try fx.git.git(["rev-parse", "item/ENG-1"])
+        // A side branch off main: one commit eng-3's turn was recorded making, one nobody's.
+        try fx.git.git(["checkout", "-q", "-b", "side", "main"])
+        try fx.git.write("src/side1.ts", "1\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "side one"])
+        let recordedSide = try fx.git.git(["rev-parse", "HEAD"])
+        try fx.git.write("src/side2.ts", "2\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "side two"])
+        let unrecordedSide = try fx.git.git(["rev-parse", "HEAD"])
+        try s.recordCommitAuthors(companyId: cId, itemId: nil, agentId: eng3Id, turnId: "t-side", shas: [recordedSide], now: now)
+        // qa-2's turn starts at "item work", merges the side branch, then commits on top.
+        try fx.git.git(["checkout", "-q", "item/ENG-1"])
+        try fx.git.git(["merge", "-q", "--no-ff", "-m", "merge side", "side"])
+        let merge = try fx.git.git(["rev-parse", "HEAD"])
+        try fx.git.write("src/own.ts", "o\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "own work"])
+        let own = try fx.git.git(["rev-parse", "HEAD"])
+        try fx.git.git(["checkout", "-q", "main"])
+        s.recordTurnCommits(companyId: cId, agentId: qa2Id, turnId: "t-qa", heldAtStart: [itemId: itemWork], now: now)
+        let recorded = try s.recordedCommitAuthors(companyId: cId, shas: [merge, own, recordedSide, unrecordedSide])
+        #expect(recorded == [merge: "qa-2", own: "qa-2", recordedSide: "eng-3"], "\(recorded)")
+    }
+
     @Test func blockedAloneListsBlockedWork() async throws {
         let w = try SearchFixture()
         let (itemId, eng3Id) = (w.zebraItem.id, w.fx.eng3.id)

@@ -373,7 +373,7 @@ extension FactsResolver {
             var agentLines: [FactLine] = []
             for a in agents {
                 var refs = [agent(a.name)]
-                var why = StallExplainer.agentReason(a.blocker, ownerWord: isAgent ? "the owner" : "you", handle: { names[$0] }, timeZone: tz)
+                var why = StallExplainer.agentReason(a.blocker, ownerWord: isAgent ? "the owner" : "you", handle: { names[$0] }, timeZone: tz, now: now)
                 switch a.blocker {
                 case .agent(let id)?: if let h = names[id] { refs.append(agent(h)) }
                 case .workItem(let id, _)?:

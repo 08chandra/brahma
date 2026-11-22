@@ -86,7 +86,7 @@ extension CompanyTools {
     /// `search {query, kind?, since?, by?, limit?}`: `ShowResolver` for this agent (never the owner's view), one line per hit
     /// `[<kind> <canonical> · <title> · <HH:mm or yyyy-mm-dd>]` with its snippet quoted on the next line (`    | `); nothing
     /// found: `"Nothing found in what you can read."`. No count of what the agent can't read is ever printed. C4b: a fact
-    /// answer for the agent comes first (`FactsResolver.lines`).
+    /// answer for the agent comes first (`FactsResolver.block`, gated as the assembled block).
     func searchTool(_ args: [String: JSONValue]) throws -> String {
         let query = try string(args, "query")
         var forced = SearchFilters()

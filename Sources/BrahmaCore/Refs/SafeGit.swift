@@ -300,9 +300,11 @@ public struct SafeGit: Sendable {
         Self.lines(try output(["rev-list", "--end-of-options", "\(try Self.sha(from))..\(try Self.sha(to))"]))
     }
 
-    /// Plan C Task C4b: the commits in `from..to` reachable from none of `excluding` (all shas), newest first.
-    public func revList(_ from: String, _ to: String, excluding: [String]) throws -> [String] {
-        var args = ["rev-list", "--end-of-options", "\(try Self.sha(from))..\(try Self.sha(to))"]
+    /// Plan C Task C4b: the commits in `from..to` reachable from none of `excluding` (all shas), newest first. `firstParent`
+    /// (fix round 2, Ruling 59): only `to`'s first-parent chain (`--first-parent`), so a merge commit's second-parent ancestry
+    /// is never listed.
+    public func revList(_ from: String, _ to: String, excluding: [String], firstParent: Bool = false) throws -> [String] {
+        var args = ["rev-list"] + (firstParent ? ["--first-parent"] : []) + ["--end-of-options", "\(try Self.sha(from))..\(try Self.sha(to))"]
         for sha in excluding { args.append("^" + (try Self.sha(sha))) }
         return Self.lines(try output(args))
     }

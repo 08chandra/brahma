@@ -232,10 +232,32 @@ struct ShowFactsFixture {
         let cto = try #require(a.lines.first { $0.refs.first == WorkRef(kind: .agent, id: "cto") })
         // Fix round 1: the agent's reason is the stall report's (`StallExplainer`), in the report's own words.
         #expect(cto.text == "@cto " + StallExplainer.agentReason(.workItem(id: w.payments.id, key: w.payments.key), ownerWord: "the owner",
-                                                                 handle: { _ in nil }, timeZone: w.tz), "\(cto.text)")
+                                                                 handle: { _ in nil }, timeZone: w.tz, now: w.now), "\(cto.text)")
         #expect(cto.text.contains("blocked on \(w.payments.key)"), "\(cto.text)")
         #expect(try w.store.stallReport(companyId: w.c.id).reasons.contains("1 agent blocked on \(w.payments.key)"))
         #expect(cto.refs.contains(WorkRef(kind: .item, id: w.payments.key)))
+        // Fix round 2: a time on another day carries its date; today's is HH:mm.
+        let (ctoId, now, tz) = (w.fx.cto.id, w.now, w.tz)
+        let later = now.addingTimeInterval(3 * ShowFactsFixture.day)
+        try await w.store.writer.write { db in
+            var cto = try #require(try Agent.fetchOne(db, key: ctoId))
+            cto.blocker = .usageLimit(until: later)
+            try cto.update(db)
+        }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = tz
+        f.dateFormat = "yyyy-MM-dd"
+        let limited = try #require(try await w.answer("what's blocked")?.lines.first { $0.refs.first == WorkRef(kind: .agent, id: "cto") })
+        #expect(limited.text == "@cto blocked on usage limit until \(f.string(from: later))", "\(limited.text)")
+        f.dateFormat = "HH:mm"
+        let soon = now.addingTimeInterval(60)
+        if cal.isDate(soon, inSameDayAs: now) {
+            #expect(StallExplainer.agentReason(.retry(until: soon, failures: 2), ownerWord: "you", handle: { _ in nil }, timeZone: tz, now: now)
+                    == "blocked: retrying at \(f.string(from: soon)) after 2 failures")
+        }
     }
 
     @Test func whoIsOnKeyNamesHolderAndReviewer() async throws {
