@@ -44,6 +44,47 @@ public enum ThemeHex {
     // MARK: Charts / series
     public static let series: [UInt32] = [0x4C90F0, 0x32A467, 0xEC9A3C, 0xC774E8, 0x2EC4B6, 0xE76A6E]
 
+    // MARK: Office (Plan 4c)
+    /// The desk lamp's warm glow.
+    public static let officeLamp: UInt32 = 0xF2C572
+    /// The CEO office's glass wall.
+    public static let officeGlass: UInt32 = 0x2EC4B6
+    /// A pod's carpet: its department colour at this alpha over `officeFloor`.
+    public static let officeCarpetAlpha: Double = 0.12
+    public static let officeFloor = bg0
+    public static let officeRoomFloor = bg2
+    public static let officeWall = lineStrong
+    public static let officeDeskTop = bg3
+    public static let officeDeskFace = bg2
+
+    // MARK: Colour math
+
+    /// `fg` composited at `alpha` (clamped to 0…1) over the opaque `bg`, per channel, rounded.
+    public static func blend(_ fg: UInt32, over bg: UInt32, alpha: Double) -> UInt32 {
+        let a = min(1, max(0, alpha))
+        var out: UInt32 = 0
+        for shift: UInt32 in [16, 8, 0] {
+            let f = Double((fg >> shift) & 0xFF), b = Double((bg >> shift) & 0xFF)
+            out |= UInt32((f * a + b * (1 - a)).rounded()) << shift
+        }
+        return out
+    }
+
+    /// The WCAG 2 contrast ratio of two opaque colours, 1…21, symmetric in its arguments.
+    public static func contrastRatio(_ a: UInt32, _ b: UInt32) -> Double {
+        let la = relativeLuminance(a), lb = relativeLuminance(b)
+        return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+    }
+
+    /// WCAG relative luminance of an sRGB `0xRRGGBB`.
+    static func relativeLuminance(_ hex: UInt32) -> Double {
+        func linear(_ shift: UInt32) -> Double {
+            let c = Double((hex >> shift) & 0xFF) / 255
+            return c <= 0.03928 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(16) + 0.7152 * linear(8) + 0.0722 * linear(0)
+    }
+
     // MARK: Semantic helpers
 
     /// The status color of an agent. Paused non-killed agents render like sleeping (Plan 2's `AgentNode` rule).

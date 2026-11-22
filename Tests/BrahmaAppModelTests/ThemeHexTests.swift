@@ -77,4 +77,30 @@ import Foundation
         #expect((0..<ThemeHex.series.count).contains(unknown))
         #expect(ThemeHex.roleSeriesIndex("zzz") == unknown)
     }
+
+    /// Plan 4c's office tokens: the lamp and glass accents, the carpet alpha, and the aliases onto the ops palette. The
+    /// pod label (`text2`) stays readable on every department carpet, and the lamp and room text on their floors.
+    @Test func officeTokensAndContrast() {
+        #expect(ThemeHex.officeLamp == 0xF2C572)
+        #expect(ThemeHex.officeGlass == 0x2EC4B6)
+        #expect(ThemeHex.officeCarpetAlpha == 0.12)
+        #expect(ThemeHex.officeFloor == ThemeHex.bg0)
+        #expect(ThemeHex.officeRoomFloor == ThemeHex.bg2)
+        #expect(ThemeHex.officeWall == ThemeHex.lineStrong)
+        #expect(ThemeHex.officeDeskTop == ThemeHex.bg3)
+        #expect(ThemeHex.officeDeskFace == ThemeHex.bg2)
+
+        #expect(ThemeHex.blend(ThemeHex.text2, over: ThemeHex.bg0, alpha: 1) == ThemeHex.text2)
+        #expect(ThemeHex.blend(ThemeHex.text2, over: ThemeHex.bg0, alpha: 0) == ThemeHex.bg0)
+        #expect(ThemeHex.blend(0xFFFFFF, over: 0x000000, alpha: 0.5) == 0x808080)
+
+        #expect(abs(ThemeHex.contrastRatio(0xFFFFFF, 0x000000) - 21) < 0.001)
+        #expect(ThemeHex.contrastRatio(ThemeHex.bg0, ThemeHex.text0) == ThemeHex.contrastRatio(ThemeHex.text0, ThemeHex.bg0))
+        #expect(ThemeHex.contrastRatio(ThemeHex.text0, ThemeHex.bg2) >= 4.5)
+        for (i, family) in ThemeHex.series.enumerated() {
+            let carpet = ThemeHex.blend(family, over: ThemeHex.bg0, alpha: ThemeHex.officeCarpetAlpha)
+            #expect(ThemeHex.contrastRatio(ThemeHex.text2, carpet) >= 3, "series[\(i)] carpet")
+        }
+        #expect(ThemeHex.contrastRatio(ThemeHex.officeLamp, ThemeHex.bg0) >= 4.5)
+    }
 }
