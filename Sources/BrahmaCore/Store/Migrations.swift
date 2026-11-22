@@ -1987,6 +1987,12 @@ enum Migrations {
                 t.column("endedAt", .datetime)
             }
         }
+        m.registerMigration("vC-show-fix") { db in
+            // C4c fix round 1. Ruling 60 (1): the taint of what a concierge run read (its answer carries it). M3: the owner's DM
+            // that carries an agent's request, whose thread is the only place a DM reply answers the request.
+            try db.alter(table: "conciergeRun") { t in t.add(column: "taintSource", .text) }
+            try db.alter(table: "showRequest") { t in t.add(column: "requestMessageId", .text) }
+        }
     }
 }
 

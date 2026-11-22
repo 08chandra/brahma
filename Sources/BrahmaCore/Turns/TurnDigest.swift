@@ -267,17 +267,25 @@ public enum TurnDigest {
     }
 
     /// One request: `- @owner SHOW REQUEST: "<query>"` (one line, at most 300 characters, `"` shown as `'`), the engine
-    /// candidates already filtered for this agent joined by ` · ` (with `<n> more the owner can see` last when some were left
-    /// out), and how to answer. Each line is gated as built against the stored values (Rulings 53–55): a query holding one
-    /// reads `(withheld)`, a candidate holding one is left out.
+    /// candidates already filtered for this agent, and how to answer. Fix round 1 (I-2, Ruling 60 (2)): the candidates carry
+    /// agent-written titles, so they are quoted one per line inside an `UntrustedBlock` (gated as rendered, as
+    /// `ConciergePrompt.input` does); the engine's own count line (`<n> more the owner can see`) follows outside it. Fix round 1
+    /// (M3): a DM answers the request only as a reply in its thread, so the block names that thread (`msg:<id>`, the engine's
+    /// id). Every line is gated as built against the stored values (Rulings 53–55): a query holding one reads `(withheld)`.
     public static func showRequestBlock(_ r: ShowRequest, gate: GlobalSearch.TextGate = GlobalSearch.TextGate(knownValues: [])) -> String {
         let query = ReviewDigest.flat(r.query, max: ShowQuery.maxQuery).replacingOccurrences(of: "\"", with: "'")
         var head = "- @owner SHOW REQUEST: \"\(query)\""
         if gate.holdsSecret(head) { head = "- @owner SHOW REQUEST: \"(withheld)\"" }
-        let candidates = r.candidateLines.map { ReviewDigest.flat($0, max: 400) }.filter { !$0.isEmpty && !gate.holdsSecret($0) }
-        var line = "      " + (candidates.isEmpty ? "(none)" : candidates.joined(separator: " · "))
-        if gate.holdsSecret(line) { line = "      (none)" }
-        return [head, "    Engine candidates (pick, combine or find better):", line, showAnswerLine].joined(separator: "\n")
+        let all = r.candidateLines.map { ReviewDigest.flat($0, max: 400) }.filter { !$0.isEmpty }
+        let isCount: (String) -> Bool = { $0.range(of: #"^[0-9]+ more the owner can see$"#, options: .regularExpression) != nil }
+        let candidates = all.filter { !isCount($0) }
+        var out = [head, "    Engine candidates (pick, combine or find better):"]
+        out.append(candidates.isEmpty ? "      (none)"
+                   : ConciergePrompt.block(source: "engine candidates (titles written by agents)", lines: candidates, gate: gate))
+        out += all.filter(isCount).map { "      " + $0 }
+        if let root = r.requestMessageId { out.append("    A DM answer goes in this request's thread: send_dm to owner with reply_to msg:\(root).") }
+        out.append(showAnswerLine)
+        return out.joined(separator: "\n")
     }
 
     /// The orientation every turn opens with: role card, operating rules, org, previews, roster, sprint, notes, done tasks.

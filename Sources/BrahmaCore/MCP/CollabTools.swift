@@ -103,21 +103,31 @@ extension CompanyTools {
         do {
             return try collabGeneric {
                 switch name {
+                // Fix round 1 (I-1, Ruling 60 (1)): what the run reads from a tainted source is recorded on the run (before any
+                // byte of it is read), and the run's answer carries it. A record that can't be written refuses the read.
                 case "find_refs":
-                    return try findRefsTool(args)
+                    return try findRefsTool(args, onResult: { try noteTaintedHits($0, request: request) })
                 case "search":
-                    return try searchTool(args, reader: .concierge)
+                    return try searchTool(args, reader: .concierge, onResult: { try noteTaintedHits($0, request: request) })
                 case "open_ref":
                     var copy = false
                     if let v = args["copy"], v != .null {
                         guard case .bool(let b) = v else { throw ToolError(message: "argument copy must be true or false") }
                         copy = b
                     }
+                    let raw = try string(args, "ref")
+                    let context = try conciergeContext()
+                    if let ref = WorkRef.parse(PasteableRef.decode(raw) ?? raw, context: context),
+                       let resolved = try? store.resolveRef(ref, for: .concierge, companyId: companyId), resolved.visibility == .full,
+                       resolved.tainted {
+                        try markRunTainted(request, "ref:\(ref.canonical)" + (resolved.taintReason.map { " (\($0))" } ?? ""))
+                    }
                     let env = try collabEnvironment()
-                    return try store.openRef(companyId: companyId, reader: .concierge, ref: try string(args, "ref"),
-                                             lines: try optionalString(args, "lines"), copy: copy, turnId: nil,
-                                             context: try conciergeContext(), knownValues: env.known, paths: env.paths, now: Store.now(),
-                                             archives: env.archives).text
+                    let opened = try store.openRef(companyId: companyId, reader: .concierge, ref: raw, lines: try optionalString(args, "lines"),
+                                                   copy: copy, turnId: nil, context: context, knownValues: env.known, paths: env.paths,
+                                                   now: Store.now(), archives: env.archives)
+                    if opened.tainted { try markRunTainted(request, "ref:\(opened.canonical)") }
+                    return opened.text
                 case "show":
                     return try showTool(args, caller: .concierge, request: request)
                 default:
@@ -128,6 +138,21 @@ extension CompanyTools {
             throw ToolError(message: e.message)
         } catch let e as RouterError {
             throw ToolError(message: Self.describe(e))
+        }
+    }
+
+    /// The concierge's run read tainted content: recorded, or the read is refused (fail closed).
+    func markRunTainted(_ request: String, _ source: String) throws {
+        do { try store.markConciergeTainted(companyId: companyId, requestId: request, source: source) } catch {
+            diagnostics("brahma mcp: could not record the concierge's taint: \(error)")
+            throw ToolError(message: "this content could not be shown safely right now")
+        }
+    }
+
+    /// A search result that lists a tainted source counts as reading it (conservative: only its engine title is shown).
+    func noteTaintedHits(_ result: ShowResult, request: String) throws {
+        if let hit = result.hits.first(where: { $0.subtitle == GlobalSearch.taintedSubtitle }) {
+            try markRunTainted(request, "search hit \(hit.ref.canonical)")
         }
     }
 
@@ -148,7 +173,7 @@ extension CompanyTools {
     }
 
     /// `find_refs {query}`: the Show bar's resolver for the concierge, printed as `search` prints.
-    func findRefsTool(_ args: [String: JSONValue]) throws -> String {
+    func findRefsTool(_ args: [String: JSONValue], onResult: (ShowResult) throws -> Void = { _ in }) throws -> String {
         let query = try string(args, "query")
         let known: [(name: String, value: String)]
         do { known = try store.allKnownSecretValues(companyId: companyId, vault: vault ?? UnavailableVault()) } catch {
@@ -159,6 +184,7 @@ extension CompanyTools {
         let now = Store.now()
         let resolver = ShowResolver(store: store, files: Self.searchFiles, commits: Self.searchCommits)
         let result = try resolver.resolveNow(query, companyId: companyId, reader: .concierge, gate: gate, now: now)
+        try onResult(result)
         return Self.searchLines(result, limit: Self.searchDefaultLimit, now: now, tz: store.ownerTimeZone(), gate: gate)
     }
 
@@ -223,7 +249,7 @@ extension CompanyTools {
     /// `[<kind> <canonical> · <title> · <HH:mm or yyyy-mm-dd>]` with its snippet quoted on the next line (`    | `); nothing
     /// found: `"Nothing found in what you can read."`. No count of what the agent can't read is ever printed. C4b: a fact
     /// answer for the agent comes first (`FactsResolver.block`, gated as the assembled block).
-    func searchTool(_ args: [String: JSONValue], reader: Reader? = nil) throws -> String {
+    func searchTool(_ args: [String: JSONValue], reader: Reader? = nil, onResult: (ShowResult) throws -> Void = { _ in }) throws -> String {
         let query = try string(args, "query")
         var forced = SearchFilters()
         let tz = store.ownerTimeZone()
@@ -263,6 +289,7 @@ extension CompanyTools {
         let gate = GlobalSearch.TextGate(knownValues: known)
         let resolver = ShowResolver(store: store, files: Self.searchFiles, commits: Self.searchCommits)
         let result = try resolver.resolveNow(query, companyId: companyId, reader: reader ?? .agent(agentId), gate: gate, forced: forced, now: now)
+        try onResult(result)
         return Self.searchLines(result, limit: limit, now: now, tz: tz, gate: gate)
     }
 

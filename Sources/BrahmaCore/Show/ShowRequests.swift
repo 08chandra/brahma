@@ -57,6 +57,9 @@ public struct ShowRequest: Codable, Equatable, Sendable, FetchableRecord, Persis
     public var autoOpenedAt: Date?
     public var createdAt: Date
     public var createdActive: Double
+    /// C4c fix round 1 (M3): the owner's DM that carried an agent target's request; a DM answers the request only as a reply
+    /// in its thread.
+    public var requestMessageId: String? = nil
 
     public var showTarget: ShowTarget { targetAgentId.map(ShowTarget.agent) ?? .concierge }
 
@@ -205,14 +208,16 @@ extension Store {
                 target: type, targetAgentId: agentId, routedBy: ShowRouting.isOwnerRouted(routed) ? "owner" : "rule",
                 reason: routed.reason, candidates: encoded, status: .open, answerMessageId: nil, turnId: nil, costUSD: nil,
                 costShare5h: nil, autoOpenedAt: nil, createdAt: now, createdActive: active)
-            try request.insert(db)
+            var stored = request
             if let agentId, let handle = try String.fetchOne(db, sql: "SELECT name FROM agent WHERE id = ?", arguments: [agentId]) {
-                try router.sendDM(db: db, companyId: companyId, from: .owner, to: handle, text: "Show request: " + normalized, now: now,
-                                  kind: .showRequest)
+                let dm = try router.sendDM(db: db, companyId: companyId, from: .owner, to: handle, text: "Show request: " + normalized,
+                                           now: now, kind: .showRequest)
+                stored.requestMessageId = dm.id
             }
+            try stored.insert(db)
             try ActivityEvent(companyId: companyId, agentId: agentId, turnId: nil, kind: .show,
                               text: "show request \(number) to \(who) (\(routed.reason))", createdAt: now).insert(db)
-            return request
+            return stored
         }
     }
 
@@ -333,7 +338,10 @@ extension Store {
                 if let r, r.status == .open, Self.matches(r, caller) { open = r }
             }
             let message = try router.sendDM(db: db, companyId: companyId, from: sender, to: "owner", text: storedNote, now: now, kind: .showAnswer)
-            try db.execute(sql: "UPDATE message SET answerVerified = ? WHERE id = ?", arguments: [verified, message.id])
+            try db.execute(sql: "UPDATE message SET answerVerified = ? WHERE id = ?", arguments: [verified ? 1 : 0, message.id])
+            if caller == .concierge {
+                try Self.markConciergeAnswer(db: db, companyId: companyId, messageId: message.id, requestId: request, text: storedNote, now: now)
+            }
             for var row in rows {
                 row.messageId = message.id
                 try row.insert(db)
@@ -367,6 +375,39 @@ extension Store {
         return "answered"
     }
 
+    /// The concierge's identity on its answers (C4c fix round 1, Ruling 60 (1)). The message travels in the owner's Brahma
+    /// thread (`dm:owner:system`) but is never engine text: its sender is `ConciergeCaps.agentId` (agent-derived, rendered as
+    /// "Brahma (concierge)"), it carries the taint of every source its run read (`conciergeRun.taintSource`: the untrusted chip
+    /// and the relay rules apply), and a claim to be the owner is flagged as for any agent (`OwnerImpersonation`). Without a
+    /// run row (a run that can't be read), the answer counts as tainted (fail closed).
+    static func markConciergeAnswer(db: Database, companyId: String, messageId: String, requestId: String?, text: String, now: Date) throws {
+        let run = try requestId.flatMap {
+            try Row.fetchOne(db, sql: "SELECT taintSource FROM conciergeRun WHERE requestId = ? AND companyId = ?", arguments: [$0, companyId])
+        }
+        let source: String? = run == nil ? "an unrecorded concierge run" : run?["taintSource"]
+        let impersonates = OwnerImpersonation.flags(text: text, sender: .agent(ConciergeCaps.agentId))
+        try db.execute(sql: """
+            UPDATE message SET senderId = ?, flag = ?, taintedOrigin = ?, fromTaintedSession = ?, taintSource = ? WHERE id = ? AND companyId = ?
+            """, arguments: [ConciergeCaps.agentId, impersonates ? OwnerImpersonation.flag : nil, source != nil, source != nil,
+                             source.map { "concierge read \($0)" }, messageId, companyId])
+        if impersonates {
+            try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .error,
+                              text: "Brahma (concierge)'s answer claims to be the owner; flagged unverified (it changes nothing)",
+                              createdAt: now).insert(db)
+        }
+    }
+
+    /// Records that the concierge's run of `requestId` read tainted content (`source`); the first source is kept. Throws when
+    /// it can't be recorded, so the read is refused (fail closed).
+    public func markConciergeTainted(companyId: String, requestId: String, source: String) throws {
+        try writer.write { db in
+            try db.execute(sql: """
+                UPDATE conciergeRun SET taintSource = COALESCE(taintSource, ?) WHERE requestId = ? AND companyId = ? AND endedAt IS NULL
+                """, arguments: [Store.flat(source, max: 300), requestId, companyId])
+            guard db.changesCount > 0 else { throw WorkError.invalid("the concierge's run is over") }
+        }
+    }
+
     static func matches(_ r: ShowRequest, _ caller: Reader) -> Bool {
         switch caller {
         case .concierge: return r.target == "concierge"
@@ -396,6 +437,7 @@ extension Store {
                                                    arguments: [request.companyId, request.id]), r.status == .open else { return false }
             let message = try router.sendDM(db: db, companyId: r.companyId, from: .system, to: "owner", text: final, now: now, kind: .showAnswer)
             try db.execute(sql: "UPDATE message SET answerVerified = 0 WHERE id = ?", arguments: [message.id])
+            try Self.markConciergeAnswer(db: db, companyId: r.companyId, messageId: message.id, requestId: r.id, text: final, now: now)
             try db.execute(sql: "UPDATE showRequest SET status = 'answered', answerMessageId = ? WHERE companyId = ? AND id = ?",
                            arguments: [message.id, r.companyId, r.id])
             try ActivityEvent(companyId: r.companyId, agentId: nil, turnId: nil, kind: .show,
@@ -426,12 +468,15 @@ extension Store {
         try writer.read { db in
             var out: [AutoOpen] = []
             for r in try ShowRequest.fetchAll(db, sql: """
-                SELECT * FROM showRequest WHERE companyId = ? AND status = 'answered' AND answerMessageId IS NOT NULL AND autoOpenedAt IS NULL
-                ORDER BY createdAt, rowid
+                SELECT r.* FROM showRequest r JOIN message m ON m.id = r.answerMessageId AND m.companyId = r.companyId
+                WHERE r.companyId = ? AND r.status = 'answered' AND r.autoOpenedAt IS NULL AND m.kind = 'showAnswer'
+                ORDER BY r.createdAt, r.rowid
                 """, arguments: [companyId]) {
                 guard let messageId = r.answerMessageId else { continue }
-                let refs = try MessageRef.fetchAll(db, sql: "SELECT * FROM messageRef WHERE companyId = ? AND messageId = ? ORDER BY position, rowid",
-                                                   arguments: [companyId, messageId]).compactMap(\.workRef)
+                // Fix round 1 (I-3, Ruling 60 (3)): only the refs `show` itself checked, never a message's inline chips.
+                let refs = try MessageRef.fetchAll(db, sql: """
+                    SELECT * FROM messageRef WHERE companyId = ? AND messageId = ? AND inline = 0 ORDER BY position, rowid
+                    """, arguments: [companyId, messageId]).compactMap(\.workRef)
                 guard !refs.isEmpty else { continue }
                 let by = try r.targetAgentId.flatMap { try String.fetchOne(db, sql: "SELECT name FROM agent WHERE id = ?", arguments: [$0]) }
                     .map { "@" + $0 } ?? "Brahma"
@@ -566,8 +611,9 @@ extension Store {
         }
     }
 
-    /// The end of a `.show` turn: its cost lands on its requests; one still open is answered by the agent's DM to the owner
-    /// made during the turn (no refs, so it never opens the preview), else it expires (`"@<h>'s turn ended without an answer"`).
+    /// The end of a `.show` turn: its cost lands on its requests; one still open is answered by the agent's DM reply in the
+    /// request's thread made during the turn (it never opens the preview), else it expires (`"@<h>'s turn ended without an
+    /// answer"`).
     func finishShowTurn(turnId: String, agentId: String, startedAt: Date, costUSD: Double?, now: Date) throws {
         let requests = try writer.read { db in
             try ShowRequest.fetchAll(db, sql: "SELECT * FROM showRequest WHERE turnId = ? AND targetAgentId = ?", arguments: [turnId, agentId])
@@ -578,11 +624,15 @@ extension Store {
             let handle = try String.fetchOne(db, sql: "SELECT name FROM agent WHERE id = ?", arguments: [agentId]) ?? "agent"
             for r in requests where r.status == .open {
                 guard try ShowRequest.fetchOne(db, key: r.id)?.status == .open else { continue }
-                let reply = try String.fetchOne(db, sql: """
-                    SELECT m.id FROM message m JOIN channel c ON c.id = m.channelId
-                    WHERE m.companyId = ? AND m.senderId = ? AND c.kind = 'dm' AND c.name = ? AND m.createdAt >= ?
-                    ORDER BY m.createdAt DESC, m.rowid DESC LIMIT 1
-                    """, arguments: [companyId, agentId, "dm:" + ["owner", handle].sorted().joined(separator: ":"), startedAt])
+                // Fix round 1 (M3): only a reply in the request's own thread answers it (never an unrelated DM). It carries the
+                // agent's session taint as every agent message does, and it never auto-opens (`pendingAutoOpens`).
+                let reply = try r.requestMessageId.flatMap { root in
+                    try String.fetchOne(db, sql: """
+                        SELECT m.id FROM message m JOIN channel c ON c.id = m.channelId
+                        WHERE m.companyId = ? AND m.senderId = ? AND c.kind = 'dm' AND c.name = ? AND m.createdAt >= ? AND m.parentId = ?
+                        ORDER BY m.createdAt DESC, m.rowid DESC LIMIT 1
+                        """, arguments: [companyId, agentId, "dm:" + ["owner", handle].sorted().joined(separator: ":"), startedAt, root])
+                }
                 if let reply {
                     try db.execute(sql: "UPDATE showRequest SET status = 'answered', answerMessageId = ? WHERE id = ? AND status = 'open'",
                                    arguments: [reply, r.id])

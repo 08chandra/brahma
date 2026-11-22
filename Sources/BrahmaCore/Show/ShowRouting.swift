@@ -92,6 +92,8 @@ public enum ShowRouting {
                                     firstOnly: Bool) throws -> [RoutedTarget] {
         let subjects: [WorkRef] = attachedRef.map { [$0] } ?? result.hits.filter { !$0.inlineOnly }.map(\.ref)
         func first(_ kinds: Set<WorkRefKind>) -> WorkRef? { subjects.first { kinds.contains($0.kind) } }
+        // Fix round 1 (M2): the file's newest commits on `main` are read from git before (never inside) the read transaction.
+        let fileShas = try first([.file]).map { try recentCommits(store: store, companyId: companyId, path: $0.id) } ?? []
         return try store.writer.read { db in
             var out: [RoutedTarget] = []
             func agent(_ id: String?) throws -> Agent? {
@@ -115,7 +117,7 @@ public enum ShowRouting {
                 for item in covering {
                     if let t = try itemRule(db, item: item, agent: agent) { picked = t; break }
                 }
-                if picked == nil, let author = try lastCommitAuthor(db, store: store, companyId: companyId, path: ref.id),
+                if picked == nil, let author = try lastCommitAuthor(db, companyId: companyId, shas: fileShas),
                    let a = try agent(author) {
                     picked = RoutedTarget(target: .agent(a.id), reason: "made the last commit on this file", busy: !idle(a))
                 }
@@ -174,12 +176,16 @@ public enum ShowRouting {
         return nil
     }
 
-    /// The agent the engine recorded for the newest commit on `main` that touched `path` (C4b's `turnCommit`), among the
-    /// newest 20 such commits; nil when none is recorded or git can't be read.
-    private static func lastCommitAuthor(_ db: Database, store: Store, companyId: String, path: String) throws -> String? {
-        guard RefGrammar.isPath(path), let company = try Company.fetchOne(db, key: companyId),
+    /// The newest 20 commits on `main` that touched `path` (none when git can't be read). Git, outside any transaction.
+    private static func recentCommits(store: Store, companyId: String, path: String) throws -> [String] {
+        guard RefGrammar.isPath(path), let company = try store.company(id: companyId),
               let git = try? store.refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true)),
-              let main = try? git.head("main"), let shas = try? git.logShas(range: main, path: path, max: 20) else { return nil }
+              let main = try? git.head("main"), let shas = try? git.logShas(range: main, path: path, max: 20) else { return [] }
+        return shas
+    }
+
+    /// The agent the engine recorded (C4b's `turnCommit`) for the newest of `shas` that has a record; nil when none has.
+    private static func lastCommitAuthor(_ db: Database, companyId: String, shas: [String]) throws -> String? {
         for sha in shas {
             if let id = try String.fetchOne(db, sql: "SELECT agentId FROM turnCommit WHERE companyId = ? AND sha = ?", arguments: [companyId, sha]) {
                 return id
