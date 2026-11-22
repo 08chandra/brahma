@@ -370,8 +370,131 @@ import GRDB
         #expect(out.contains("msg:\(m.id)") && !out.contains("the heron findings"), "\(out)")
     }
 
+    // MARK: Fix round 1
+
+    /// The share copies (private snapshots, redacted copies) of the company: `resource` rows added by a share.
+    private func shareCopies(_ w: W) throws -> [Resource] {
+        let cId = w.c.id
+        return try w.store.writer.read { db in
+            try Resource.fetchAll(db, sql: "SELECT * FROM resource WHERE companyId = ? AND addedVia = 'share'", arguments: [cId])
+        }
+    }
+
+    /// I-1 (Ruling 43): a refused share leaves nothing readable behind: every ref is gated before any snapshot or copy is
+    /// made, and whatever a later step made is removed (rows, vault files, index docs, share refs).
+    @Test func refusedShareLeavesNoSnapshot() throws {
+        let w = try W()
+        try w.cf.commit(["src/keys.ts": Data("let key = \"\(SecretGateTests.value)\"\n".utf8)])
+        let refused = try #require(w.refusal { try w.share(w.fx.eng1, [".brahma/labs/eng-1/mine.txt", "src/keys.ts"], to: "@qa-2",
+                                                            knownValues: SecretGateTests.known) })
+        #expect(refused.contains("contains a stored secret"), "\(refused)")
+        #expect(try shareCopies(w).isEmpty, "the snapshot of the first ref was made before the second was gated")
+        #expect(try w.store.newResourceLines(agent: try #require(try w.store.agent(id: w.fx.qa2.id))).isEmpty)
+        // A step after the snapshot fails (the second ref's share ref can't be written): the snapshot is removed again.
+        w.store.refHooks.setGitRunner(UpdateRefFailingRunner())
+        defer { w.store.refHooks.setGitRunner(nil) }
+        _ = w.refusal { try w.share(w.fx.eng1, [".brahma/labs/eng-1/mine.txt", "ENG-1:src/a.ts"], to: "@qa-2") }
+        #expect(try shareCopies(w).isEmpty)
+        w.store.refHooks.setGitRunner(nil)
+        // The post itself fails after everything was made: nothing remains, no share ref either.
+        w.store.refHooks.setFailSharePost(true)
+        _ = w.refusal { try w.share(w.fx.eng1, [".brahma/labs/eng-1/mine.txt", "ENG-1:src/a.ts"], to: "@qa-2") }
+        w.store.refHooks.setFailSharePost(false)
+        #expect(try shareCopies(w).isEmpty)
+        #expect(try w.fx.git.git(["for-each-ref", "refs/brahma/shares/"]).isEmpty)
+        #expect(try w.messages(kind: .share).isEmpty)
+        let docs = try w.store.writer.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memoryDoc WHERE companyId = ? AND source = 'resource'", arguments: [w.c.id])
+        }
+        #expect(docs == 0)
+        // A share that goes keeps its snapshot.
+        _ = try w.share(w.fx.eng1, [".brahma/labs/eng-1/mine.txt"], to: "@qa-2")
+        #expect(try shareCopies(w).count == 1)
+    }
+
+    /// I-1: a copy no share message points at (a crash between the snapshot and the post) is swept at a later tick, after
+    /// `ShareLimits.orphanGrace`; one a message points at, or one younger than the grace, stays.
+    @Test func orphanShareCopiesSwept() throws {
+        let w = try W()
+        _ = try w.share(w.fx.eng1, [".brahma/labs/eng-1/mine.txt"], to: "@qa-2")
+        let kept = try #require(try shareCopies(w).first)
+        let old = w.cf.now.addingTimeInterval(-2 * ShareLimits.orphanGrace)
+        let orphan = try w.store.vaultShareCopy(companyId: w.c.id, data: Data("left behind\n".utf8), fileName: "left.txt", sourceDetail: "left.txt",
+                                                scope: .agent(w.fx.eng1.id), readerSet: [w.fx.eng1.id, w.fx.qa2.id], futureHolders: false,
+                                                provenance: .agent(w.fx.eng1.id), taint: nil, secretScan: .none, paths: w.cf.paths, now: old)
+        let fresh = try w.store.vaultShareCopy(companyId: w.c.id, data: Data("in flight\n".utf8), fileName: "fresh.txt", sourceDetail: "fresh.txt",
+                                               scope: .agent(w.fx.eng1.id), readerSet: [w.fx.eng1.id], futureHolders: false,
+                                               provenance: .agent(w.fx.eng1.id), taint: nil, secretScan: .none, paths: w.cf.paths, now: w.cf.now)
+        let cId = w.c.id
+        try w.store.writer.write { db in try db.execute(sql: "UPDATE resource SET createdAt = ? WHERE companyId = ? AND number = ?",
+                                                        arguments: [old, cId, kept.number]) }
+        let orphanPath = try #require(try w.store.resource(companyId: cId, number: orphan)?.vaultPath)
+        #expect(try w.store.sweepShareOrphans(companyId: cId, paths: w.cf.paths, now: w.cf.now) == 1)
+        #expect(try w.store.resource(companyId: cId, number: orphan) == nil)
+        #expect(!FileManager.default.fileExists(atPath: w.cf.vault.root.appending(path: orphanPath).path))
+        #expect(try w.store.resource(companyId: cId, number: kept.number) != nil, "a shared copy was swept")
+        #expect(try w.store.resource(companyId: cId, number: fresh) != nil, "an in-flight copy was swept")
+        #expect(w.cf.failure { try w.cf.open(.qa2, "F-\(orphan)") } == "that ref isn't available to you")
+    }
+
+    /// I-2: what an agent shares is never listed as a new resource "from the owner" (the share message delivers it).
+    @Test func agentShareNotListedAsOwnerResource() throws {
+        let w = try W()
+        _ = try w.share(w.fx.eng1, [".brahma/labs/eng-1/mine.txt"], to: "@qa-2")
+        // A worktree file with a secret pattern is shared as a redacted company copy.
+        let wt = try w.fx.git.ws.addWorktree(key: "ENG-1")
+        try w.fx.git.write("src/a.ts", "key = \(SecretGateTests.aws)\n", in: wt)
+        _ = try w.share(w.fx.eng1, ["ENG-1:src/a.ts@worktree"], to: "#team")
+        #expect(try shareCopies(w).count == 2)
+        for agent in [w.fx.qa2, w.fx.cto, w.fx.eng3] {
+            let lines = try w.store.newResourceLines(agent: try #require(try w.store.agent(id: agent.id)))
+            #expect(lines.isEmpty, "@\(agent.name): \(lines)")
+        }
+        // An owner drop is still listed.
+        try w.cf.addResource(50, name: "owner.md", ext: "md", bytes: Data("x\n".utf8))
+        let cId = w.c.id
+        try w.store.writer.write { db in
+            try db.execute(sql: "UPDATE resource SET createdAt = ? WHERE companyId = ? AND number = 50", arguments: [Date().addingTimeInterval(60), cId])
+        }
+        #expect(try w.store.newResourceLines(agent: try #require(try w.store.agent(id: w.fx.qa2.id))).contains { $0.contains("from the owner") })
+    }
+
+    /// I-3: an engine failure (git, the vault, the database) reaches the agent only as the generic text; the detail goes to
+    /// the owner's activity feed.
+    @Test func engineFailuresAreGeneric() throws {
+        let w = try W()
+        w.store.refHooks.setGitRunner(UpdateRefFailingRunner())
+        defer { w.store.refHooks.setGitRunner(nil) }
+        #expect(w.refusal { try w.share(w.fx.eng1, ["ENG-1:src/a.ts"], to: "@qa-2") } == "that ref isn't available to you")
+        #expect(w.refusal { try w.share(w.fx.eng1, ["src/a.ts", "ENG-1:src/a.ts"], to: "@qa-2") } == "ref 2 isn't available to you")
+        let viaTool = w.refusal { try w.tools(w.fx.eng1).call(name: "share", arguments: [
+            "refs": .array([.string("ENG-1:src/a.ts")]), "to": .string("@qa-2"),
+        ]) }
+        #expect(viaTool == "that ref isn't available to you")
+        #expect(try w.activity(.error).contains { $0.contains("injected") }, "the detail is the owner's")
+        // A failing post (the database) is generic too.
+        w.store.refHooks.setGitRunner(nil)
+        w.store.refHooks.setFailSharePost(true)
+        defer { w.store.refHooks.setFailSharePost(false) }
+        #expect(w.refusal { try w.share(w.fx.eng1, ["src/a.ts"], to: "@qa-2") } == "that ref isn't available to you")
+        #expect(w.refusal { try w.tools(w.fx.eng1).call(name: "post_message", arguments: [
+            "channel": .string("team"), "text": .string("x"), "attachments": .array([.string("src/a.ts")]),
+        ]) } == "that ref isn't available to you")
+    }
+
     @Test func everyToolClassified() {
         #expect(Set(CompanyToolNames.all).subtracting(TaintPolicy.taintSafeTools) == TaintPolicy.reviewedHighRisk)
         #expect(TaintPolicy.taintSafeTools.contains("share") && TaintPolicy.taintSafeTools.contains("open_ref"))
+    }
+}
+
+/// A git runner that fails `update-ref` (writing a share ref) and runs every other call for real.
+struct UpdateRefFailingRunner: GitProcessRunning {
+    func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int) throws -> (status: Int32, stdout: Data, stderr: Data) {
+        try run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap, workTreeDescriptor: nil)
+    }
+    func run(args: [String], env: [String: String], stdin: Data?, timeout: Duration, outputCap: Int, workTreeDescriptor: Int32?) throws -> (status: Int32, stdout: Data, stderr: Data) {
+        if args.contains("update-ref") { return (128, Data(), Data("fatal: injected update-ref failure\n".utf8)) }
+        return try LiveGitRunner().run(args: args, env: env, stdin: stdin, timeout: timeout, outputCap: outputCap, workTreeDescriptor: workTreeDescriptor)
     }
 }

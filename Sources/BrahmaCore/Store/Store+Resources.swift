@@ -389,7 +389,8 @@ extension Store {
     /// start and its orientation may be listed twice (a repeat is safer than a silent miss). The running turn, whose
     /// orientation this is, has no `endedAt` yet and is not the previous one. A tainted row (or a
     /// file of a tainted folder) shows no name: `- F-<n> · (untrusted) · <kind> — recall(ref: "F-<n>")`; a link never shows
-    /// its address: `- F-<n> · link — recall(ref: "F-<n>")`.
+    /// its address: `- F-<n> · link — recall(ref: "F-<n>")`. A copy an agent's share made (`addedVia = share`: a private
+    /// snapshot, a redacted copy) is never listed: it is not the owner's, and its share message delivers it (C3b fix round 1).
     func newResourceLines(agent: Agent) throws -> [String] {
         try writer.read { db in
             // Review and audit turns build no orientation, so they never start the window.
@@ -398,7 +399,7 @@ extension Store {
                 """, arguments: [agent.id]) ?? agent.createdAt
             let rows = try Resource.fetchAll(db, sql: """
                 SELECT * FROM resource WHERE companyId = ? AND createdAt > ? AND purgedAt IS NULL AND removedAt IS NULL
-                  AND secretScan != 'flagged' ORDER BY number
+                  AND secretScan != 'flagged' AND addedVia != 'share' ORDER BY number
                 """, arguments: [agent.companyId, since])
             guard !rows.isEmpty else { return [] }
             let ctx = try ReaderContext.load(db: db, catalog: catalog, companyId: agent.companyId, reader: .agent(agent.id))

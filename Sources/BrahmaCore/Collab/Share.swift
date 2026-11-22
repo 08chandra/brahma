@@ -5,6 +5,8 @@ import GRDB
 public enum ShareLimits {
     public static let maxRefs = 6
     public static let noteMax = 600
+    /// How long a share copy may stand with no share message pointing at it before a tick sweeps it.
+    public static let orphanGrace: TimeInterval = 600
 }
 
 /// Where a message that names a ref is, for one reader (`Store.backlinks`): the message id and an engine-written title, or
@@ -50,11 +52,22 @@ enum ShareTarget: Equatable {
     }
 }
 
-/// One ref made ready for a message: its row (without the message), what the reply calls it, and the share ref made for it.
+/// Something a share made before its post (fix round 1, Ruling 43): removed again when the share fails, and swept by a tick
+/// when no share message points at it.
+enum ShareArtifact: Equatable {
+    /// A private snapshot or a redacted copy: `F-<number>` (`addedVia = share`).
+    case resource(Int)
+    /// A worktree diff's vault snapshot (`refSnapshot` id).
+    case snapshot(String)
+    /// `refs/brahma/shares/<messageRef id>`.
+    case shareRef(String)
+}
+
+/// One ref made ready for a message: its row (without the message), what the reply calls it, and what was made for it.
 struct PreparedRef {
     var row: MessageRef
     var shown: String
-    var shareRefMade: Bool
+    var created: [ShareArtifact]
 }
 
 extension Store {
@@ -91,9 +104,10 @@ extension Store {
         guard (1...ShareLimits.maxRefs).contains(refs.count) else { throw WorkError.invalid("share takes 1 to \(ShareLimits.maxRefs) refs") }
         guard note.count <= ShareLimits.noteMax else { throw WorkError.invalid("the note is at most \(ShareLimits.noteMax) characters") }
         let target = try ShareTarget.parse(to)
-        let (_, prepared) = try postRefs(companyId: companyId, by: agentId, refs: refs, target: target, text: note, kind: .share,
-                                         replyTo: replyTo, context: context, knownValues: knownValues, paths: paths, now: now,
-                                         archives: archives)
+        let (_, prepared) = try generic(companyId: companyId, now: now) {
+            try postRefs(companyId: companyId, by: agentId, refs: refs, target: target, text: note, kind: .share, replyTo: replyTo,
+                         context: context, knownValues: knownValues, paths: paths, now: now, archives: archives)
+        }
         if prepared.count == 1, let one = prepared.first { return "Shared \(one.shown) with \(target.shown)." }
         return "Shared \(prepared.count) refs with \(target.shown)."
     }
@@ -113,8 +127,21 @@ extension Store {
         guard attachments.count <= ShareLimits.maxRefs else { throw WorkError.invalid("attachments takes at most \(ShareLimits.maxRefs) refs") }
         guard !attachments.isEmpty else { throw WorkError.invalid("attachments takes 1 to \(ShareLimits.maxRefs) refs") }
         let target = try ShareTarget.parse(to)
-        return try postRefs(companyId: companyId, by: agentId, refs: attachments, target: target, text: text, kind: .text, replyTo: replyTo,
-                            context: context, knownValues: knownValues, paths: paths, now: now, archives: archives).result
+        return try generic(companyId: companyId, now: now) {
+            try postRefs(companyId: companyId, by: agentId, refs: attachments, target: target, text: text, kind: .text, replyTo: replyTo,
+                         context: context, knownValues: knownValues, paths: paths, now: now, archives: archives).result
+        }
+    }
+
+    /// Fix round 1 (I-3): the share's own refusals (`WorkError`, `RouterError`, `ThreadError`) reach the agent as they are;
+    /// any other failure (git, the vault, the database) only as the generic text, its detail in the owner's activity feed.
+    func generic<T>(companyId: String, now: Date, _ body: () throws -> T) throws -> T {
+        do { return try body() } catch let e as WorkError { throw e } catch let e as RouterError { throw e } catch let e as ThreadError {
+            throw e
+        } catch {
+            refTrace(companyId: companyId, "a share failed (\(Store.flat("\(error)", max: 300))); the agent was told the ref isn't available", now: now)
+            throw WorkError.notFound(Self.refUnavailable)
+        }
     }
 
     /// The rows of a message's refs (attachments, shares, quotes and inline chips), in their order. Bound to the company.
@@ -127,9 +154,12 @@ extension Store {
 
     // MARK: Steps
 
+    /// A tests-only failure of a share's post (`RefHooks.failSharePost`).
+    struct SharePostInjectedFailure: Error {}
+
     /// Prepares `refs` (steps 1–5), then posts `text` with them in one write transaction. A transaction that fails leaves no
-    /// message and drops the share refs made for it (best effort; a private snapshot already written stays in the vault,
-    /// readable only by its readers).
+    /// message, and everything made for it (snapshots, redacted copies, share refs) is removed again (fix round 1, Ruling 43;
+    /// what a crash leaves is swept by `sweepShareOrphans`).
     private func postRefs(companyId: String, by agentId: String, refs: [String], target: ShareTarget, text: String, kind: MessageKind,
                           replyTo: String?, context: RefContext, knownValues: [(name: String, value: String)], paths: BrahmaPaths,
                           now: Date, archives: any ArchiveReader) throws -> (result: PostResult, prepared: [PreparedRef]) {
@@ -144,6 +174,7 @@ extension Store {
         let inline = try inlineRefs(companyId: companyId, sender: .agent(agentId), text: text, channelId: channelId)
         do {
             let result = try writer.write { db -> PostResult in
+                if refHooks.failSharePost { throw SharePostInjectedFailure() }
                 let result: PostResult
                 switch target {
                 case .channel(let name):
@@ -173,9 +204,7 @@ extension Store {
             }
             return (result, prepared)
         } catch {
-            if let company = try? company(id: companyId), let git = try? refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true)) {
-                for p in prepared where p.shareRefMade { try? git.deleteShareRef(p.row.id) }
-            }
+            discardShareArtifacts(companyId: companyId, prepared.flatMap(\.created), paths: paths, now: now)
             throw error
         }
     }
@@ -281,8 +310,10 @@ extension Store {
             }
         }
 
-        // 4. The secret gate on what the pin will not read itself (files, diffs and commits are gated by `pinRef`).
-        for (i, c) in candidates.enumerated() where !c.privateFile && ![.file, .diff, .commit].contains(c.ref.kind) {
+        // 4. The secret gate on every ref, before anything is made (fix round 1, Ruling 43: no snapshot or copy exists for a
+        //    share a later ref refuses). The pin and the snapshot gate their own bytes again (a file over the shown cap is
+        //    read whole only there).
+        for (i, c) in candidates.enumerated() {
             guard let subject = c.resolution.subject, let company = c.resolution.company else { throw unavailable(i + 1) }
             let content: Content
             do {
@@ -290,56 +321,69 @@ extension Store {
             } catch let e as WorkError {
                 throw e
             } catch {
+                refTrace(companyId: companyId, "a share's ref \(i + 1) couldn't be read (\(Store.flat("\(error)", max: 200)))", now: now)
                 throw unavailable(i + 1)
             }
             _ = try gatedBytes(content.data, ext: content.ext, canonical: c.ref.canonical, companyId: companyId, archives: archives,
                                knownValues: knownValues, paths: paths)
         }
 
-        // 5. Pin (or snapshot) each ref; a commit off `main` is held by its share ref.
+        // 5. Pin (or snapshot) each ref; a commit off `main` is held by its share ref. Whatever was made is removed again when
+        //    a later step fails; an engine failure is the generic text (fix round 1, I-3).
         var prepared: [PreparedRef] = []
+        var made: [ShareArtifact] = []
         do {
             for (i, c) in candidates.enumerated() {
-                var pinned: WorkRef
-                var shareRefMade = false
-                if c.privateFile {
-                    pinned = try snapshotPrivateFile(companyId: companyId, agentId: agentId, workspacePath: c.ref.id,
-                                                     readers: recipients + [agentId], knownValues: knownValues, paths: paths, now: now,
-                                                     archives: archives)
-                } else {
-                    do {
-                        pinned = try pinRef(c.ref, for: reader, companyId: companyId, messageRefId: c.rowId, knownValues: knownValues,
-                                            paths: paths, archives: archives)
-                    } catch let e as WorkError {
-                        if case .forbidden = e { throw unavailable(i + 1) }
-                        throw e
-                    } catch is SafeGitError, is SafeFSError, is VaultError {
-                        throw unavailable(i + 1)
-                    }
-                    shareRefMade = pinned.params["share"] == c.rowId
-                    if [.file, .diff, .commit].contains(pinned.kind), !pinned.isWorktree, pinned.params["share"] == nil,
-                       let rev = pinned.rev, let company = c.resolution.company {
-                        let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
-                        if !(try git.isAncestor(rev, of: "main")) {
-                            try git.updateShareRef(c.rowId, to: rev)
-                            shareRefMade = true
+                do {
+                    var pinned: WorkRef
+                    var created: [ShareArtifact] = []
+                    if c.privateFile {
+                        pinned = try snapshotPrivateFile(companyId: companyId, agentId: agentId, workspacePath: c.ref.id,
+                                                         readers: recipients + [agentId], knownValues: knownValues, paths: paths, now: now,
+                                                         archives: archives)
+                        if let n = Int(pinned.id) { created.append(.resource(n)) }
+                    } else {
+                        do {
+                            pinned = try pinRef(c.ref, for: reader, companyId: companyId, messageRefId: c.rowId, knownValues: knownValues,
+                                                paths: paths, archives: archives)
+                        } catch let e as WorkError {
+                            if case .forbidden = e { throw unavailable(i + 1) }
+                            throw e
+                        }
+                        if pinned.params["share"] == c.rowId { created.append(.shareRef(c.rowId)) }
+                        if pinned.kind == .resource, c.ref.kind != .resource, let n = Int(pinned.id) { created.append(.resource(n)) }
+                        if let snapshot = pinned.params["snapshot"], c.ref.params["snapshot"] == nil { created.append(.snapshot(snapshot)) }
+                        made += created
+                        created = []
+                        if [.file, .diff, .commit].contains(pinned.kind), !pinned.isWorktree, pinned.params["share"] == nil,
+                           let rev = pinned.rev, let company = c.resolution.company {
+                            let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
+                            if !(try git.isAncestor(rev, of: "main")) {
+                                made.append(.shareRef(c.rowId))
+                                try git.updateShareRef(c.rowId, to: rev)
+                            }
                         }
                     }
+                    made += created
+                    // The row: what the pin is, for the sender now (access class, sensitivity, restrictions, reader set, taint).
+                    let r = try resolveDetailed(pinned, reader: reader, companyId: companyId, messageRefId: c.rowId)
+                    guard r.resolved.visibility == .full, let subject = r.subject else { throw unavailable(i + 1) }
+                    let row = try Self.refRow(id: c.rowId, companyId: companyId, pinned: pinned, subject: subject, resolved: r.resolved,
+                                              inline: false, now: now)
+                    prepared.append(PreparedRef(row: row, shown: Self.shown(pinned), created: []))
+                } catch let e as WorkError {
+                    throw e
+                } catch {
+                    refTrace(companyId: companyId, "a share's ref \(i + 1) couldn't be pinned (\(Store.flat("\(error)", max: 200)))", now: now)
+                    throw unavailable(i + 1)
                 }
-                // The row: what the pin is, for the sender now (access class, sensitivity, restrictions, reader set, taint).
-                let r = try resolveDetailed(pinned, reader: reader, companyId: companyId, messageRefId: c.rowId)
-                guard r.resolved.visibility == .full, let subject = r.subject else { throw unavailable(i + 1) }
-                let row = try Self.refRow(id: c.rowId, companyId: companyId, pinned: pinned, subject: subject, resolved: r.resolved,
-                                          inline: false, now: now)
-                prepared.append(PreparedRef(row: row, shown: Self.shown(pinned), shareRefMade: shareRefMade))
             }
         } catch {
-            if let company = candidates.first?.resolution.company,
-               let git = try? refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true)) {
-                for c in candidates { try? git.deleteShareRef(c.rowId) }
-            }
+            discardShareArtifacts(companyId: companyId, made, paths: paths, now: now)
             throw error
         }
+        // What was made rides with the first prepared ref, so a failed post removes all of it.
+        if !prepared.isEmpty { prepared[0].created = made }
         return prepared
     }
 
@@ -578,6 +622,77 @@ extension Store {
             }
             return out
         }
+    }
+
+    // MARK: Orphans
+
+    /// Removes what a failed share made (fix round 1, Ruling 43): a copy's `resource` row, its index doc and its vault file; a
+    /// worktree diff snapshot's row and vault file; a share ref. Best effort, each on its own; a failure is logged for the
+    /// owner, and `sweepShareOrphans` takes what is left.
+    func discardShareArtifacts(companyId: String, _ artifacts: [ShareArtifact], paths: BrahmaPaths, now: Date) {
+        guard !artifacts.isEmpty else { return }
+        let vault = Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths))
+        for artifact in artifacts {
+            do {
+                switch artifact {
+                case .resource(let n):
+                    try discardShareCopy(companyId: companyId, number: n, vault: vault)
+                case .snapshot(let id):
+                    let path = try writer.write { db -> String? in
+                        let path = try String.fetchOne(db, sql: "SELECT vaultPath FROM refSnapshot WHERE companyId = ? AND id = ? AND kind = ?",
+                                                       arguments: [companyId, id, RefSnapshot.worktreeDiff])
+                        try db.execute(sql: "DELETE FROM refSnapshot WHERE companyId = ? AND id = ? AND kind = ?",
+                                       arguments: [companyId, id, RefSnapshot.worktreeDiff])
+                        return path
+                    }
+                    if let path { try? vault.remove(path) }
+                case .shareRef(let id):
+                    guard let company = try company(id: companyId) else { continue }
+                    try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true)).deleteShareRef(id)
+                }
+            } catch {
+                refTrace(companyId: companyId, "what a failed share made couldn't all be removed (\(Store.flat("\(error)", max: 200))); "
+                         + "the next tick sweeps it", now: now)
+            }
+        }
+    }
+
+    /// Deletes a share copy `F-<number>` (only a row `addedVia = share`): its row and index doc in one transaction, then its
+    /// vault file.
+    private func discardShareCopy(companyId: String, number: Int, vault: Vault) throws {
+        let path = try writer.write { db -> String? in
+            guard let r = try Store.resource(db: db, companyId: companyId, number: number), r.addedVia == "share" else { return nil }
+            try db.execute(sql: "DELETE FROM memoryDoc WHERE companyId = ? AND source = ? AND sourceId = ?",
+                           arguments: [companyId, MemorySource.resource.rawValue, r.id])
+            try db.execute(sql: "DELETE FROM resource WHERE companyId = ? AND id = ?", arguments: [companyId, r.id])
+            return r.vaultPath
+        }
+        if let path { try vault.remove(path) }
+    }
+
+    /// Fix round 1 (Ruling 43): the share copies (`resource` rows `addedVia = share`) and worktree diff snapshots no share
+    /// message points at (no non-inline `messageRef` row names them) that are older than `ShareLimits.orphanGrace`, removed
+    /// as `discardShareArtifacts` does: what a share left when it crashed between its snapshot and its post. The grace is
+    /// wall-clock on purpose: it covers a share in flight in another process (`brahma mcp`), not company time (a stopped
+    /// company's active clock would never let it pass). Returns how many were removed. Run by the engine's tick.
+    @discardableResult
+    public func sweepShareOrphans(companyId: String, paths: BrahmaPaths, now: Date) throws -> Int {
+        let cutoff = now.addingTimeInterval(-ShareLimits.orphanGrace)
+        let (copies, snapshots) = try writer.read { db -> ([Int], [String]) in
+            let copies = try Int.fetchAll(db, sql: """
+                SELECT r.number FROM resource r WHERE r.companyId = ? AND r.addedVia = 'share' AND r.createdAt < ?
+                  AND NOT EXISTS (SELECT 1 FROM messageRef m WHERE m.companyId = r.companyId AND m.kind = 'resource' AND m.inline = 0
+                                  AND m.refId = CAST(r.number AS TEXT))
+                """, arguments: [companyId, cutoff])
+            let snapshots = try String.fetchAll(db, sql: """
+                SELECT s.id FROM refSnapshot s WHERE s.companyId = ? AND s.kind = ? AND s.createdAt < ?
+                  AND NOT EXISTS (SELECT 1 FROM messageRef m WHERE m.companyId = s.companyId AND m.id = s.cacheKey)
+                """, arguments: [companyId, RefSnapshot.worktreeDiff, cutoff])
+            return (copies, snapshots)
+        }
+        let artifacts = copies.map(ShareArtifact.resource) + snapshots.map(ShareArtifact.snapshot)
+        discardShareArtifacts(companyId: companyId, artifacts, paths: paths, now: now)
+        return artifacts.count
     }
 
     // MARK: Review digest

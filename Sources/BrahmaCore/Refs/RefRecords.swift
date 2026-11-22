@@ -235,4 +235,8 @@ final class RefHooks: @unchecked Sendable {
     /// Makes the redacted copies the gate checks again (a redaction that misses something), in place of `RedactedCopy.make`.
     var redactedCopy: (@Sendable (Data) -> Data)? { lock.withLock { redaction } }
     func setRedactedCopy(_ body: (@Sendable (Data) -> Data)?) { lock.withLock { redaction = body } }
+    private var sharePostFails = false
+    /// C3b fix round 1: a share's or attachment's post fails inside its write transaction (after every pin and snapshot).
+    var failSharePost: Bool { lock.withLock { sharePostFails } }
+    func setFailSharePost(_ fails: Bool) { lock.withLock { sharePostFails = fails } }
 }

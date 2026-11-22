@@ -28,6 +28,21 @@ extension CompanyTools {
     }
 
     func dispatchCollab(_ name: String, _ args: [String: JSONValue]) throws -> String? {
+        try collabGeneric { try dispatchCollabTool(name, args) }
+    }
+
+    /// Fix round 1 (I-3): what reaches the agent from a collab tool is its own refusal or the generic text; an engine failure's
+    /// detail goes to diagnostics only.
+    func collabGeneric<T>(_ body: () throws -> T) throws -> T {
+        do { return try body() } catch let e as ToolError { throw e } catch let e as WorkError { throw e } catch let e as RouterError {
+            throw e
+        } catch let e as ThreadError { throw e } catch {
+            diagnostics("brahma mcp: a collab tool failed: \(error)")
+            throw ToolError(message: Store.refUnavailable)
+        }
+    }
+
+    private func dispatchCollabTool(_ name: String, _ args: [String: JSONValue]) throws -> String? {
         switch name {
         case "share":
             let refs = try stringArray(args, "refs")
@@ -53,10 +68,12 @@ extension CompanyTools {
 
     /// `post_message` / `send_dm` with `attachments` (`Store.postWithAttachments`); `to` is `#channel` or `@handle`.
     func postAttachments(to: String, text: String, attachments: [String], replyTo: String?) throws -> PostResult {
-        let env = try collabEnvironment()
-        return try store.postWithAttachmentsDetailed(companyId: companyId, by: agentId, to: to, text: text, attachments: attachments,
-                                                     replyTo: replyTo, context: try refContext(), knownValues: env.known, paths: env.paths,
-                                                     now: Store.now(), archives: env.archives)
+        try collabGeneric {
+            let env = try collabEnvironment()
+            return try store.postWithAttachmentsDetailed(companyId: companyId, by: agentId, to: to, text: text, attachments: attachments,
+                                                         replyTo: replyTo, context: try refContext(), knownValues: env.known, paths: env.paths,
+                                                         now: Store.now(), archives: env.archives)
+        }
     }
 
     /// The `attachments` argument: nil when absent, null or empty; at most `ShareLimits.maxRefs`.

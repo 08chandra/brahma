@@ -598,6 +598,8 @@ public actor Orchestrator {
         if stopped == nil, !store.secretsHeld {
             for c in companies { attempt { try MemoryIngest.run(store: store, companyId: c.id, paths: paths, now: now) } }
         }
+        // C3b fix round 1 (Ruling 43): what a share made and never posted (a crash between its snapshot and its post).
+        for c in companies { attempt { try store.sweepShareOrphans(companyId: c.id, paths: paths, now: now) } }
         // The pack's handbook sections, once per company per engine start (companies made before Plan ML get theirs here).
         for c in companies where !handbookSkeletons.contains(c.id) {
             do {
