@@ -32,7 +32,7 @@ public struct ShowHit: Equatable, Sendable {
 /// What global search asks of company memory: `MemoryIndex.search` (tests record the calls).
 public protocol MemorySearching: Sendable {
     func search(companyId: String, scope: Reader, query: String, sources: Set<MemorySource>?, limit: Int, now: Date,
-                match: MemoryMatch) throws -> [MemoryHit]
+                match: MemoryMatch, text: MemoryText) throws -> [MemoryHit]
 }
 
 extension MemoryIndex: MemorySearching {}
@@ -48,12 +48,25 @@ public struct GlobalSearch: Sendable {
     public static let activityRows = 20_000
     public static let snippetMax = 160
     public static let taintedSubtitle = "tainted · open_ref to read"
+    /// Fix round 4 (controller ruling, Ruling 58 (1)): the static note every search that reads item events or activity
+    /// carries, for the owner and agents alike, whether or not anything matched.
+    public static let windowNote = "searches the newest 20,000 events"
     /// The score of a row listed by its filters alone (no text): above the intent threshold, below every direct ref and phrase.
     static let listingScore = 0.7
     /// Rows a SQL source reads before the reader's access filters them.
     static let sqlCandidates = 200
     /// Candidates kept per group before access checks.
     static let groupCandidates = 60
+    /// Fix round 4 (Ruling 58 (1)): the pages one cursor read (item events, activity) may fetch per search. The read stays
+    /// inside the newest `activityRows` rows of its source, which fill at most `activityRows / sqlCandidates` full pages, so
+    /// the last allowed page is the one that finds the window's end: a defensive bound, never reached by what matched.
+    static let maxPagesPerSource = activityRows / sqlCandidates + 1
+
+    /// The static notes a search with these filters carries (`ShowResult.notes`): the window note whenever it reads item
+    /// events or activity (decided as for the owner, so every reader gets the same note for the same query).
+    static func notes(_ filters: SearchFilters) -> [String] {
+        kinds(filters, reader: .owner).isDisjoint(with: [.event, .activity]) ? [] : [windowNote]
+    }
 
     static let blocking = Blocking(maxConcurrent: 4)
 
@@ -92,7 +105,7 @@ public struct GlobalSearch: Sendable {
     /// canonical holding a value drops the hit; a title or subtitle falls back to the engine's words; a snippet is dropped.
     /// Matching (N-1) runs only on `matchText`, the display form with every value's span blanked, so no query can find a
     /// value's characters.
-    struct TextGate: Sendable {
+    public struct TextGate: Sendable {
         let expanded: [(name: String, value: String)]
         /// Identifies the value set (memos keyed by it never hold a value).
         let fingerprint: String
@@ -107,7 +120,7 @@ public struct GlobalSearch: Sendable {
             ["AKIA", "-----BEGIN ", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-",
              "sk-", "sk_live_", "AIza"])
 
-        init(knownValues: [(name: String, value: String)]) {
+        public init(knownValues: [(name: String, value: String)]) {
             var forms: [(name: String, value: String)] = []
             var seen = Set<String>()
             for (name, value) in knownValues {
@@ -282,7 +295,8 @@ public struct GlobalSearch: Sendable {
         var incomplete = Set<ShowGroup>()
         found += try gitCandidates(q, kinds: kinds, filters: filters, company: company, reader: reader, state: git ?? gitState(company: company),
                                    gate: gate, incomplete: &incomplete)
-        found += try sqlCandidates(q, kinds: kinds, filters: filters, actorId: actorId, companyId: companyId, reader: reader, gate: gate)
+        found += try sqlCandidates(q, kinds: kinds, filters: filters, actorId: actorId, companyId: companyId, reader: reader, gate: gate,
+                                   incomplete: &incomplete)
 
         // Group, dedupe by canonical (best score kept), order.
         var byGroup: [ShowGroup: [Candidate]] = [:]
@@ -400,18 +414,21 @@ public struct GlobalSearch: Sendable {
         return all ? words.allSatisfy(has) : words.contains(where: has)
     }
 
-    /// A memory hit the reader can see the query in: its doc's title (and, at full access, body), with every stored value
-    /// blanked, holds the query words. Returns the body ("" when not readable in full) for the snippet, or nil (dropped).
-    private func visibleDoc(_ hit: MemoryHit, words: [[String]], all: Bool, companyId: String, gate: TextGate) throws -> String?? {
+    /// A memory hit the reader can see the query in: its doc's shadow (`MemoryShadow`: the title, and the body when the reader
+    /// may read it in full, as shown, every stored value blanked; `MemoryIndex` checked it is current for the gate) holds the
+    /// query words. Returns the raw body ("" when not readable in full) for the snippet, which the gate cuts, or nil (dropped;
+    /// so is a doc with no shadow).
+    private func visibleDoc(_ hit: MemoryHit, words: [[String]], all: Bool, companyId: String) throws -> String?? {
         guard let row = try store.writer.read({ db in
-            try Row.fetchOne(db, sql: "SELECT title, body FROM memoryDoc WHERE companyId = ? AND id = ? AND removedAt IS NULL",
-                             arguments: [companyId, hit.docId])
+            try Row.fetchOne(db, sql: """
+                SELECT d.body, s.title AS shadowTitle, s.body AS shadowBody FROM memoryDoc d JOIN memoryShadow s ON s.docId = d.id
+                WHERE d.companyId = ? AND d.id = ? AND d.removedAt IS NULL
+                """, arguments: [companyId, hit.docId])
         }) else { return nil }
-        let title: String = row["title"], body: String = row["body"]
+        let title: String = row["shadowTitle"], shadowBody: String = row["shadowBody"]
         let full = hit.level == .full
-        let visible = gate.matchText(full ? title + "\n" + body : title)
-        guard Self.containsWords(words, in: visible, all: all) else { return nil }
-        return .some(full ? body : nil)
+        guard Self.containsWords(words, in: full ? title + "\n" + shadowBody : title, all: all) else { return nil }
+        return .some(full ? row["body"] as String : nil)
     }
 
     private func memoryCandidates(_ q: String, kinds: Set<SearchKind>, filters: SearchFilters, actorId: String?, companyId: String,
@@ -432,20 +449,21 @@ public struct GlobalSearch: Sendable {
         guard !words.isEmpty else { return [] }
         var out: [Candidate] = []
         for sources in calls {
-            // C-1 / Ruling 56: every word must be a word of the doc's text as the reader sees it (title, and the body when the
-            // reader may read it in full, every stored value blanked); the any-word fallback is decided on the hits kept.
+            // C-1 / Ruling 56 / Ruling 57: company memory is matched and ranked on its vault-blanked shadow (`text: .visible`),
+            // and every word must be a word of the doc's text as the reader sees it (title, and the body when the reader may
+            // read it in full, every stored value blanked); the any-word fallback is decided on the hits kept.
             var kept: [(hit: MemoryHit, body: String?)] = []
             var seenDocs = Set<Int64>()
             for hit in try memory.search(companyId: companyId, scope: reader, query: q, sources: sources, limit: MemoryPolicy.maxHits, now: now,
-                                         match: .all) {
-                guard let checked = try visibleDoc(hit, words: words, all: true, companyId: companyId, gate: gate) else { continue }
+                                         match: .all, text: .visible(gate)) {
+                guard let checked = try visibleDoc(hit, words: words, all: true, companyId: companyId) else { continue }
                 kept.append((hit, checked))
                 seenDocs.insert(hit.docId)
             }
             if kept.count < MemoryPolicy.orFallbackBelow, words.count > 1 {
                 for hit in try memory.search(companyId: companyId, scope: reader, query: q, sources: sources, limit: MemoryPolicy.maxHits,
-                                             now: now, match: .any) where !seenDocs.contains(hit.docId) {
-                    guard let checked = try visibleDoc(hit, words: words, all: false, companyId: companyId, gate: gate) else { continue }
+                                             now: now, match: .any, text: .visible(gate)) where !seenDocs.contains(hit.docId) {
+                    guard let checked = try visibleDoc(hit, words: words, all: false, companyId: companyId) else { continue }
                     kept.append((hit, checked))
                     seenDocs.insert(hit.docId)
                 }
@@ -456,9 +474,9 @@ public struct GlobalSearch: Sendable {
                 if let w = filters.window, !w.contains(hit.updatedAt) { continue }
                 if let actorId, hit.authorId != actorId { continue }
                 var c = Candidate(ref: ref, kind: kind, score: 0.9 * max(hit.score, 0) / (max(hit.score, 0) + 1))
-                // I-1: the snippet is cut by the engine from the doc's whole text, after the whole text is gated; never the
-                // index's own cut (`MemoryHit.snippet`, which the reader's access decided: only then is the body read).
-                if !hit.tainted, hit.snippet != nil, let body {
+                // I-1: the snippet is cut by the engine from the doc's whole text, after the whole text is gated; never an
+                // index's own cut. Only a doc the reader may read in full, untainted, has one.
+                if !hit.tainted, hit.level == .full, let body {
                     c.snippet = gate.snippet(body, around: q, max: Self.snippetMax)
                 }
                 c.tainted = hit.tainted
@@ -688,7 +706,7 @@ public struct GlobalSearch: Sendable {
     // MARK: Rows
 
     private func sqlCandidates(_ q: String, kinds: Set<SearchKind>, filters: SearchFilters, actorId: String?, companyId: String,
-                               reader: Reader, gate: TextGate) throws -> [Candidate] {
+                               reader: Reader, gate: TextGate, incomplete: inout Set<ShowGroup>) throws -> [Candidate] {
         let listing = q.isEmpty
         let tokens = q.lowercased().split(whereSeparator: { $0.isWhitespace }).map(String.init).filter { $0.count >= FuzzyScorer.minQuery }
         let folded = tokens.map(FuzzyScorer.foldQuery)
@@ -716,24 +734,34 @@ public struct GlobalSearch: Sendable {
         }
         let limit = Self.sqlCandidates
         var out: [Candidate] = []
+        var cut = Set<ShowGroup>()
+        defer { incomplete.formUnion(cut) }
         try store.writer.read { db in
             /// Fix round 3 (controller ruling 1, re-review I-A): a source read through a raw prefilter (item events, activity) is
-            /// read with a cursor, newest first by `rowKey`, within a window that doesn't depend on the query (the newest
-            /// `activityRows` rows of the source, or the time window), and a row counts only when `accept` keeps it, so rows
-            /// that match only inside a stored value never take another row's place. It stops at `limit` kept rows or at the
-            /// window's end; nothing about which rows matched decides anything else.
-            func paged(_ base: String, _ args: [DatabaseValueConvertible], key: String, accept: (Row) throws -> Candidate?) throws {
-                var accepted = 0
+            /// read with a cursor, newest first by `rowKey`, within a window that doesn't depend on the query: always the newest
+            /// `activityRows` rows of the source, narrowed by the time window when there is one (fix round 4, Ruling 58 (1): a
+            /// window never replaces the cap). A row counts only when `accept` keeps it, so rows that match only inside a stored
+            /// value never take another row's place. Fix round 4 (R4-5): the read stops at exactly `limit` kept rows (the newest
+            /// `limit` rows whose visible text matches, whatever page they fall on), and the group is then marked incomplete;
+            /// it also stops at the window's end, or (never reached inside the window) at `maxPagesPerSource` pages, incomplete.
+            func paged(_ base: String, _ args: [DatabaseValueConvertible], key: String, group: ShowGroup,
+                       accept: (Row) throws -> Candidate?) throws {
+                var accepted = 0, pages = 0
                 var before: Int64? = nil
                 while true {
+                    guard pages < Self.maxPagesPerSource else { cut.insert(group); return }
+                    pages += 1
                     var sql = base, a = args
                     if let before { sql += " AND \(key) < ?"; a.append(before) }
                     sql += " ORDER BY \(key) DESC LIMIT \(limit)"
                     let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(a))
                     for row in rows {
-                        if let c = try accept(row) { out.append(c); accepted += 1 }
+                        guard let c = try accept(row) else { continue }
+                        out.append(c)
+                        accepted += 1
+                        if accepted == limit { cut.insert(group); return }
                     }
-                    if rows.count < limit || accepted >= limit { return }
+                    if rows.count < limit { return }
                     before = rows.last?["rowKey"]
                 }
             }
@@ -829,15 +857,13 @@ public struct GlobalSearch: Sendable {
                 var args: [DatabaseValueConvertible] = [companyId]
                 let (cs, ca) = contains("e.text"); sql += cs; args += ca
                 if let actorId { sql += " AND e.actorId = ?"; args.append(actorId) }
-                if filters.window != nil {
-                    let (w, wa) = window("e.createdAt"); sql += w; args += wa
-                } else {
-                    sql += """
-                         AND e.id >= COALESCE((SELECT id FROM workItemEvent WHERE companyId = ? ORDER BY id DESC LIMIT 1 OFFSET \(Self.activityRows - 1)), 0)
-                        """
-                    args.append(companyId)
-                }
-                try paged(sql, args, key: "e.id") { row in
+                // Ruling 58 (1): the newest `activityRows` events always, and the time window inside them.
+                sql += """
+                     AND e.id >= COALESCE((SELECT id FROM workItemEvent WHERE companyId = ? ORDER BY id DESC LIMIT 1 OFFSET \(Self.activityRows - 1)), 0)
+                    """
+                args.append(companyId)
+                let (w, wa) = window("e.createdAt"); sql += w; args += wa
+                try paged(sql, args, key: "e.id", group: SearchKind.event.group) { row in
                     let text: String = row["text"], key: String = row["key"], kind: String = row["kind"], actor: String = row["actorId"]
                     let at: Date = row["createdAt"]
                     let s = visibleScore(text)
@@ -930,24 +956,23 @@ public struct GlobalSearch: Sendable {
                     }
                 }
             }
-            // Activity (the owner's alone): the newest 20 000 lines, or the window; a hit opens its subject (item, agent, release).
+            // Activity (the owner's alone): the newest 20 000 lines (narrowed by the window, if any); a hit opens its subject
+            // (item, agent, release).
             if kinds.contains(.activity), reader == .owner, !listing || filters.actor != nil || filters.window != nil {
                 var sql = "SELECT id AS rowKey, id, agentId, text, createdAt FROM activityEvent WHERE companyId = ?"
                 var args: [DatabaseValueConvertible] = [companyId]
-                if let w = filters.window {
-                    sql += " AND createdAt >= ? AND createdAt <= ?"; args += [w.start, w.end]
-                } else {
-                    sql += """
-                         AND id >= COALESCE((SELECT id FROM activityEvent WHERE companyId = ? ORDER BY id DESC LIMIT 1 OFFSET \(Self.activityRows - 1)), 0)
-                        """
-                    args.append(companyId)
-                }
+                // Ruling 58 (1): the newest `activityRows` lines always, and the time window inside them.
+                sql += """
+                     AND id >= COALESCE((SELECT id FROM activityEvent WHERE companyId = ? ORDER BY id DESC LIMIT 1 OFFSET \(Self.activityRows - 1)), 0)
+                    """
+                args.append(companyId)
+                let (w, wa) = window("createdAt"); sql += w; args += wa
                 if let actorId {
                     if actorId == "owner" { sql += " AND agentId IS NULL" } else { sql += " AND agentId = ?"; args.append(actorId) }
                 }
                 let (cs, ca) = contains("text"); sql += cs; args += ca
                 let context = try refContext(db, companyId: companyId)
-                try paged(sql, args, key: "id") { row in
+                try paged(sql, args, key: "id", group: SearchKind.activity.group) { row in
                     let text: String = row["text"], id: Int64 = row["id"]
                     let s = visibleScore(text)
                     guard s > 0 else { return nil }

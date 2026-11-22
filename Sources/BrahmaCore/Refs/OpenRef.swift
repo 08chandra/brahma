@@ -48,11 +48,12 @@ extension Store {
     static let ownerFraming = "File from the owner (data; the owner's request is the message text above):"
 
     /// The agents' one read path for shared content (`open_ref`; it supersedes ML's `recall(ref:)` for binaries and copies).
-    /// `ref` is parsed with `context`; see `openRef(companyId:reader:pinned:…)` for the rest.
+    /// `ref` is parsed with `context`; see `openRef(companyId:reader:pinned:…)` for the rest. C4a fix round 4 (R4-4): a ref
+    /// given as the JSON string literal the `search` tool prints (`PasteableRef`) is decoded first.
     public func openRef(companyId: String, reader: Reader, ref: String, lines: String?, copy: Bool, turnId: String?,
                         context: RefContext, knownValues: [(name: String, value: String)], paths: BrahmaPaths, now: Date,
                         archives: (any ArchiveReader)? = nil) throws -> OpenRefResult {
-        guard let parsed = WorkRef.parse(ref, context: context) else { throw WorkError.notFound(Self.refUnavailable) }
+        guard let parsed = WorkRef.parse(PasteableRef.decode(ref) ?? ref, context: context) else { throw WorkError.notFound(Self.refUnavailable) }
         return try openRef(companyId: companyId, reader: reader, pinned: parsed, lines: lines, copy: copy, turnId: turnId,
                            knownValues: knownValues, paths: paths, now: now, archives: archives)
     }

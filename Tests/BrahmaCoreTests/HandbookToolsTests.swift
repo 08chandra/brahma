@@ -105,13 +105,14 @@ import GRDB
         let out = w.call(w.eng1, "search_kb", ["query": .string("heron")])
         #expect(out.ok)
         let lines = out.text.split(separator: "\n").map(String.init)
-        #expect(lines.first == "2 result(s) for \"heron\" in the handbook (only what you can read):")
+        // C4a fix round 4: the query is not echoed.
+        #expect(lines.first == "2 result(s) in the handbook (only what you can read):")
         let hits = lines.filter { $0.range(of: #"^\d+\. kb:"#, options: .regularExpression) != nil }
         #expect(Set(hits.map { $0.replacingOccurrences(of: #"^\d+\. "#, with: "", options: .regularExpression) })
                 == ["kb:Eng/Deploy#staging — Deploy › Staging", "kb:Eng/Deploy#rollback — Deploy › Rollback"])
         #expect(lines.filter { $0.hasPrefix("    | ") }.count == 2)
         #expect(lines.last == "Open one with kb_read.")
-        #expect(w.call(w.eng1, "search_kb", ["query": .string("zzzz")]).text == "No results you can read for \"zzzz\" in the handbook.")
+        #expect(w.call(w.eng1, "search_kb", ["query": .string("zzzz")]).text == "No results you can read in the handbook.")
         // Only kb docs: a remembered fact with the word is not a handbook hit.
         #expect(w.call(w.eng1, "remember", ["fact": .string("the heron is grey"), "scope": .string("company")]).ok)
         #expect(w.call(w.eng1, "search_kb", ["query": .string("heron")]).text.hasPrefix("2 result(s)"))

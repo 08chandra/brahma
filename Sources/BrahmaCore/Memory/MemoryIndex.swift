@@ -8,6 +8,15 @@ public enum MemoryMatch: Sendable {
     case andThenOr, all, any
 }
 
+/// Which text a search matches, ranks and counts on. `raw` is ML's index over the stored text (the owner's and the engine's
+/// own callers). `visible` (Plan C Task C4a fix round 4, Ruling 57) is the vault-blanked shadow (`memoryShadowFts`): every
+/// stored value the gate knows is blanked before anything is matched, so a value's tokens answer like random text. The
+/// shadow is brought up to date with the gate's values before the search reads it.
+public enum MemoryText: Sendable {
+    case raw
+    case visible(GlobalSearch.TextGate)
+}
+
 /// The company-memory index: one scoped full-text index over every source, read through the access engine. Every query is
 /// bound to one company (`companyId = ?`); a ref of another company answers exactly like a missing one.
 public struct MemoryIndex: Sendable {
@@ -27,22 +36,51 @@ public struct MemoryIndex: Sendable {
     ///    snippet and its title.
     /// 5. Score `-bm25 × recency × weight`. Fewer than `MemoryPolicy.orFallbackBelow` hits: steps 2–4 again with OR, merged.
     /// 6. Score descending, then newest first.
+    ///
+    /// With `text: .visible(gate)` (C4a fix round 4, Ruling 57) every step reads the vault-blanked shadow instead
+    /// (`MemoryShadow`, synced with the gate's values first): matching, bm25's statistics and the AND→OR decision see only
+    /// what a reader sees. Only a doc the reader may read in full is matched on its body (one it may read in summary only is
+    /// matched on its title, in step 3), no snippet is cut (callers cut theirs from the gated text), and every hit's shadow
+    /// is checked against its doc as the gate blanks it now: a stale one blanks the company again and searches once more,
+    /// then drops what is still stale (fail closed).
     public func search(companyId: String, scope: Reader, query: String, sources: Set<MemorySource>? = nil,
-                       limit: Int = MemoryPolicy.defaultHits, now: Date, match: MemoryMatch = .andThenOr) throws -> [MemoryHit] {
+                       limit: Int = MemoryPolicy.defaultHits, now: Date, match: MemoryMatch = .andThenOr,
+                       text: MemoryText = .raw) throws -> [MemoryHit] {
+        guard case .visible(let gate) = text else {
+            return try searchOnce(companyId: companyId, scope: scope, query: query, sources: sources, limit: limit, now: now,
+                                  match: match, gate: nil, dropStale: false)
+        }
+        // The reader first (another company's agent is refused before anything is written), then the shadow brought current.
+        _ = try ReaderContext.load(store: store, companyId: companyId, reader: scope)
+        try MemoryShadow.sync(store: store, companyId: companyId, gate: gate)
+        do {
+            return try searchOnce(companyId: companyId, scope: scope, query: query, sources: sources, limit: limit, now: now,
+                                  match: match, gate: gate, dropStale: false)
+        } catch is MemoryShadow.Stale {
+            try MemoryShadow.sync(store: store, companyId: companyId, gate: gate, force: true)
+            return try searchOnce(companyId: companyId, scope: scope, query: query, sources: sources, limit: limit, now: now,
+                                  match: match, gate: gate, dropStale: true)
+        }
+    }
+
+    private func searchOnce(companyId: String, scope: Reader, query: String, sources: Set<MemorySource>?, limit: Int, now: Date,
+                            match: MemoryMatch, gate: GlobalSearch.TextGate?, dropStale: Bool) throws -> [MemoryHit] {
         try store.writer.read { db in
             let ctx = try ReaderContext.load(db: db, catalog: store.catalog, companyId: companyId, reader: scope)
             guard let expr = MemoryQuery.expression(query) else { return [] }
             let activeNow = try Store.activeNow(db: db, companyId: companyId)
+            let visible = gate != nil
 
             var hits: [Int64: MemoryHit] = [:]
             func merge(_ found: [MemoryHit]) {
                 for hit in found where (hits[hit.docId]?.score ?? -.infinity) < hit.score { hits[hit.docId] = hit }
             }
             func passes(_ match: String) throws -> [MemoryHit] {
-                var found = try rows(db: db, ctx: ctx, match: match, summaryPass: false, sources: sources, activeNow: activeNow, now: now)
+                var found = try rows(db: db, ctx: ctx, match: match, summaryPass: false, sources: sources, activeNow: activeNow, now: now,
+                                     visible: visible)
                 if case .agent = ctx.reader, !ctx.reportIds.isEmpty {
                     found += try rows(db: db, ctx: ctx, match: "{title} : (" + match + ")", summaryPass: true, sources: sources,
-                                      activeNow: activeNow, now: now)
+                                      activeNow: activeNow, now: now, visible: visible)
                 }
                 return found
             }
@@ -59,15 +97,36 @@ public struct MemoryIndex: Sendable {
             let sorted = hits.values.sorted { a, b in
                 a.score != b.score ? a.score > b.score : a.updatedAt != b.updatedAt ? a.updatedAt > b.updatedAt : a.docId > b.docId
             }
-            return Array(sorted.prefix(max(0, min(limit, MemoryPolicy.maxHits))))
+            var out = Array(sorted.prefix(max(0, min(limit, MemoryPolicy.maxHits))))
+            if let gate {
+                // Every hit's shadow is its doc as the gate blanks it now; one that isn't was blanked for other values.
+                var fresh: [MemoryHit] = []
+                for hit in out {
+                    guard let row = try Row.fetchOne(db, sql: """
+                        SELECT d.title, d.body, s.title AS shadowTitle, s.body AS shadowBody FROM memoryDoc d
+                        JOIN memoryShadow s ON s.docId = d.id WHERE d.companyId = ? AND d.id = ?
+                        """, arguments: [companyId, hit.docId]) else { continue }
+                    let current = MemoryShadow.blanked(row["title"], gate: gate) == row["shadowTitle"] as String
+                        && MemoryShadow.blanked(row["body"], gate: gate) == row["shadowBody"] as String
+                    if current { fresh.append(hit) } else if !dropStale { throw MemoryShadow.Stale() }
+                }
+                out = fresh
+            }
+            return out
         }
     }
 
-    /// One pass over the index, filtered by the access engine.
+    /// One pass over the index (`memoryFts`, or with `visible` the shadow's `memoryShadowFts`), filtered by the access engine.
     private func rows(db: Database, ctx: ReaderContext, match: String, summaryPass: Bool, sources: Set<MemorySource>?,
-                      activeNow: Double, now: Date) throws -> [MemoryHit] {
+                      activeNow: Double, now: Date, visible: Bool) throws -> [MemoryHit] {
         let w = MemoryPolicy.bm25Weights
-        var sql = """
+        var sql = visible ? """
+            SELECT d.*, bm25(memoryShadowFts, \(w.title), \(w.body)) AS rank, NULL AS snip
+            FROM memoryShadowFts JOIN memoryShadow s ON s.docId = memoryShadowFts.rowid
+            JOIN memoryDoc d ON d.id = s.docId AND d.companyId = s.companyId
+            WHERE memoryShadowFts MATCH ? AND d.companyId = ? AND d.removedAt IS NULL
+              AND (d.expiresActive IS NULL OR d.expiresActive > ?)
+            """ : """
             SELECT d.*, bm25(memoryFts, \(w.title), \(w.body)) AS rank,
                    snippet(memoryFts, 1, '', '', '…', \(MemoryPolicy.snippetTokens)) AS snip
             FROM memoryFts JOIN memoryDoc d ON d.id = memoryFts.rowid
@@ -96,6 +155,8 @@ public struct MemoryIndex: Sendable {
             guard let doc = StoredDoc(row: row) else { continue }
             let level = doc.level(for: ctx)
             guard level != .none else { continue }
+            // Visible text: a body is matched only for a reader who may read it; a summary reader matches titles (step 3).
+            if visible, !summaryPass, level != .full { continue }
             let rank: Double = row["rank"]
             let recency = MemoryPolicy.recency(now.timeIntervalSince(doc.lastTouched))
             var hit = doc.hit(level: level, score: -rank * recency * doc.weight)

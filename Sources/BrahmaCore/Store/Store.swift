@@ -51,6 +51,8 @@ public final class Store: Sendable {
     /// `reloadRedactorIfNeeded(vault:)`; until its first complete load (when the database had secrets at open) every
     /// redacting write throws (`secretsHeld`, `SecretError.secretsNotLoaded`).
     public let redactor = Redactor()
+    /// C4a fix round 4 (Ruling 57): what this process last blanked each company's memory shadow for (`MemoryShadow.sync`).
+    let memoryShadowMemo = MemoryShadowMemo()
 
     /// How long a write waits for another connection's write lock (the engine, every agent's `brahma mcp`, the CLI and the app
     /// share one database) before it fails with "database is locked". SQLite's busy handler is not first-come-first-served:

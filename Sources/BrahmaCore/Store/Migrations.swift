@@ -1879,6 +1879,55 @@ enum Migrations {
             // so a number whose row goes before the kind's first allocation is never handed out again.
             try seedRefCounters(db)
         }
+        m.registerMigration("vC-memory-shadow") { db in
+            // C4a fix round 4 (Ruling 57): the vault-blanked shadow of company memory. Agent-facing search (global search, the
+            // `search_memory`, `recall` and `search_kb` tools) matches, ranks and counts only on it: each doc's title and body
+            // as the reader sees them, every stored value blanked (`MemoryShadow`). The values live in the vault, so the shadow
+            // is written by the search side, with the values it gates with: `memoryShadowPending` queues every doc whose text
+            // changed, and `memoryShadowState` names the set of stored secrets the company's shadow was blanked for (their
+            // names and change times, never a value or a hash of one). A doc whose text changes loses its shadow row in the
+            // same statement (its old text never outlives the doc's own), so it can't be found by its old text in between. The
+            // triggers never rely on `OR REPLACE` (an outer upsert's conflict policy would override it).
+            try db.create(table: "memoryShadow") { t in
+                t.primaryKey("docId", .integer)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("title", .text).notNull()
+                t.column("body", .text).notNull()
+            }
+            try db.create(index: "memoryShadow_company", on: "memoryShadow", columns: ["companyId"])
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE memoryShadowFts USING fts5(title, body, content='memoryShadow', content_rowid='docId',
+                    tokenize='unicode61 remove_diacritics 2')
+                """)
+            try db.create(table: "memoryShadowPending") { t in
+                t.primaryKey("docId", .integer)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+            }
+            try db.create(index: "memoryShadowPending_company", on: "memoryShadowPending", columns: ["companyId"])
+            try db.create(table: "memoryShadowState") { t in
+                t.primaryKey("companyId", .text).references("company", onDelete: .cascade)
+                t.column("valueKey", .text).notNull()
+            }
+            try db.execute(sql: """
+                CREATE TRIGGER memoryShadow_ai AFTER INSERT ON memoryShadow BEGIN INSERT INTO memoryShadowFts(rowid,title,body) VALUES(new.docId,new.title,new.body); END;
+                CREATE TRIGGER memoryShadow_ad AFTER DELETE ON memoryShadow BEGIN INSERT INTO memoryShadowFts(memoryShadowFts,rowid,title,body) VALUES('delete',old.docId,old.title,old.body); END;
+                CREATE TRIGGER memoryShadow_au AFTER UPDATE OF title, body ON memoryShadow BEGIN
+                  INSERT INTO memoryShadowFts(memoryShadowFts,rowid,title,body) VALUES('delete',old.docId,old.title,old.body);
+                  INSERT INTO memoryShadowFts(rowid,title,body) VALUES(new.docId,new.title,new.body); END;
+                CREATE TRIGGER memoryDoc_shadow_ai AFTER INSERT ON memoryDoc BEGIN
+                  INSERT INTO memoryShadowPending(docId, companyId) SELECT new.id, new.companyId
+                    WHERE NOT EXISTS (SELECT 1 FROM memoryShadowPending WHERE docId = new.id); END;
+                CREATE TRIGGER memoryDoc_shadow_au AFTER UPDATE OF title, body ON memoryDoc BEGIN
+                  DELETE FROM memoryShadow WHERE docId = old.id;
+                  INSERT INTO memoryShadowPending(docId, companyId) SELECT new.id, new.companyId
+                    WHERE NOT EXISTS (SELECT 1 FROM memoryShadowPending WHERE docId = new.id); END;
+                CREATE TRIGGER memoryDoc_shadow_ad AFTER DELETE ON memoryDoc BEGIN
+                  DELETE FROM memoryShadow WHERE docId = old.id;
+                  DELETE FROM memoryShadowPending WHERE docId = old.id; END;
+                """)
+            // Every doc indexed before this migration is queued; its company's first search blanks it.
+            try db.execute(sql: "INSERT INTO memoryShadowPending(docId, companyId) SELECT id, companyId FROM memoryDoc")
+        }
     }
 }
 

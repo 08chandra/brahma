@@ -163,11 +163,14 @@ extension CompanyTools {
             // M-2: the assembled line is gated as printed too.
             guard !gate.holdsSecret(line) else { continue }
             lines.append(line)
-            // Fix round 3 (controller ruling 2): when the line had to show the ref changed (brackets mapped, quoted), the ref
-            // itself follows on its own line, exactly as `open_ref` takes it. It is the engine's canonical of a ref that passed
-            // every gate (`TextGate.hit`), one line already (grammar-checked), and is gated again as printed.
-            if canonical != raw, GlobalSearch.TextGate.display(raw, inert: false) == raw {
-                let refLine = "    ref: " + raw
+            // Fix round 3 (controller ruling 2) and fix round 4 (R4-4, Ruling 58 (3)): when the line had to show the ref changed
+            // (brackets mapped, quoted), the ref itself follows on its own line as an escaped JSON string literal
+            // (`PasteableRef`: no `[`, `]`, `"`, `·` or any non-ASCII character survives unescaped, so nothing on the line can
+            // read as a hit), which `open_ref` takes. It is the engine's canonical of a ref that passed every gate
+            // (`TextGate.hit`, the raw canonical included), printed only when the display pipeline leaves it unchanged (no
+            // hidden characters) and the literal fits `RefGrammar.maxLength`, and gated again as printed.
+            if canonical != raw, GlobalSearch.TextGate.display(raw, inert: false) == raw, let literal = PasteableRef.literal(raw) {
+                let refLine = "    ref: " + literal
                 if !gate.holdsSecret(refLine) { lines.append(refLine) }
             }
             if let snippet = hit.snippet.flatMap({ gate.final($0, max: GlobalSearch.snippetMax) }), !snippet.isEmpty,
@@ -187,6 +190,8 @@ extension CompanyTools {
             }
             lines.append("(\(name) results incomplete)")
         }
+        // Fix round 4 (Ruling 58 (1)): static notes, the same for every reader, matched or not.
+        for note in result.notes { lines.append("(\(note))") }
         return lines.joined(separator: "\n")
     }
 

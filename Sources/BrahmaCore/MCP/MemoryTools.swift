@@ -73,42 +73,76 @@ extension CompanyTools {
     }
 
     /// Search and its rendering, shared by `search_memory` and `recall(query:)` (`memoryLines`: `mem:` lines with the fact).
+    ///
+    /// C4a fix round 4 (R4-2, Rulings 53, 55-57): the search matches, ranks and counts only on the vault-blanked shadow
+    /// (`MemoryText.visible`, with every stored value read now from the injected vault; values that can't be read refuse the
+    /// search), and every field is shown as its gated final display string: a ref holding a value drops the hit, a title
+    /// falls back to the ref, and a snippet (or a fact) is cut by the engine from the doc's whole text only when that text
+    /// holds no value at all. The query itself is never echoed: the reply's redactor would otherwise answer whether it was a
+    /// stored value.
     private func renderSearch(query: String, sources: Set<MemorySource>?, limit: Int, memoryLines: Bool) throws -> String {
-        let shownQuery = Store.flat(query, max: 60)
         guard MemoryQuery.expression(query) != nil else { return "Search needs at least one word." }
+        let gate = try memorySearchGate()
         let now = Store.now()
         let hits = try MemoryIndex(store: store).search(companyId: companyId, scope: .agent(agentId), query: query,
-                                                        sources: sources, limit: limit, now: now)
-        guard !hits.isEmpty else { return "No results you can read for \"\(shownQuery)\"." }
+                                                        sources: sources, limit: limit, now: now, text: .visible(gate))
         let labels = try MemoryLabels(store: store, companyId: companyId)
         let entries = memoryLines ? try memoryEntriesByRef(hits) : [:]
-        var lines = ["\(hits.count) result(s) for \"\(shownQuery)\" (only what you can read):"]
-        var read: [Int64] = []
-        for (i, hit) in hits.enumerated() {
-            let ref = Store.flat(hit.ref, max: 200)
+        var shown: [(lines: [String], read: Int64?)] = []
+        for hit in hits {
+            guard let ref = gate.final(hit.ref, max: 200) else { continue }
+            let n = shown.count + 1
             if hit.tainted {
-                lines.append("\(i + 1). \(ref) · \(hit.source) (untrusted) — read it with recall(ref: \"\(ref)\"); that marks this session as having read outside content")
+                let line = "\(n). \(ref) · \(hit.source) (untrusted) — read it with recall(ref: \"\(ref)\"); that marks this session as having read outside content"
+                if !gate.holdsSecret(line) { shown.append(([line], nil)) }
                 continue
             }
+            let body = hit.level == .full ? try memoryDocBody(hit.docId) : nil
             if memoryLines, let entry = entries[hit.ref] {
-                var line = "\(i + 1). \(ref) · \(entry.type.rawValue) · confidence \(Self.confidenceText(entry.confidence)) · \(labels.date(hit.updatedAt))"
+                var line = "\(n). \(ref) · \(entry.type.rawValue) · confidence \(Self.confidenceText(entry.confidence)) · \(labels.date(hit.updatedAt))"
                 if let old = entry.contradictsId, let number = entries.oldNumbers[old] { line += " · contradicts mem:\(number)" }
-                lines.append(line)
-                if hit.snippet != nil {
-                    lines.append("    | " + Store.flat(entry.fact, max: MemoryPolicy.maxFactChars))
-                    read.append(hit.docId)
+                guard !gate.holdsSecret(line) else { continue }
+                var lines = [line]
+                // The fact is the doc's whole text: shown only when it holds no value at all.
+                if body != nil, let fact = gate.final(entry.fact, max: MemoryPolicy.maxFactChars), !gate.holdsSecret("    | " + fact) {
+                    lines.append("    | " + fact)
                 }
+                shown.append((lines, lines.count > 1 ? hit.docId : nil))
                 continue
             }
-            lines.append("\(i + 1). \(ref) · \(hit.source) · \(labels.author(hit.authorId)) · \(labels.date(hit.updatedAt)) — \(Store.flat(hit.title, max: MemoryPolicy.maxTitleChars))")
-            if let snippet = hit.snippet {
-                lines.append("    | " + Store.flat(snippet, max: MemoryPolicy.snippetChars))
-                read.append(hit.docId)
+            let title = gate.final(hit.title, max: MemoryPolicy.maxTitleChars) ?? ref
+            let line = "\(n). \(ref) · \(hit.source) · \(labels.author(hit.authorId)) · \(labels.date(hit.updatedAt)) — \(title)"
+            guard !gate.holdsSecret(line) else { continue }
+            var lines = [line]
+            if let body, let snippet = gate.snippet(body, around: query, max: MemoryPolicy.snippetChars), !gate.holdsSecret("    | " + snippet) {
+                lines.append("    | " + snippet)
             }
+            shown.append((lines, lines.count > 1 ? hit.docId : nil))
         }
+        guard !shown.isEmpty else { return "No results you can read." }
+        var lines = ["\(shown.count) result(s) (only what you can read):"]
+        lines += shown.flatMap(\.lines)
         lines.append("Open one with recall(ref: \"<ref>\"), kb_read or show_work_item.")
-        try store.recordRead(companyId: companyId, docIds: read, agentId: agentId, turnId: try runningTurnId(), via: .search, now: now)
+        try store.recordRead(companyId: companyId, docIds: shown.compactMap(\.read), agentId: agentId, turnId: try runningTurnId(),
+                             via: .search, now: now)
         return lines.joined(separator: "\n")
+    }
+
+    /// The secret gate of an agent's memory search: every stored value, read now from the injected vault. Values that can't
+    /// be read refuse the search (fail closed, as the `search` tool and `open_ref`).
+    func memorySearchGate() throws -> GlobalSearch.TextGate {
+        do { return GlobalSearch.TextGate(knownValues: try store.allKnownSecretValues(companyId: companyId, vault: vault ?? UnavailableVault())) } catch {
+            diagnostics("brahma mcp: could not read the stored secrets to check memory search results: \(error)")
+            throw ToolError(message: "search results could not be checked for secrets right now, so nothing was shown; try again next turn")
+        }
+    }
+
+    /// A live doc's stored body, bound to the company (for a snippet the gate cuts).
+    func memoryDocBody(_ docId: Int64) throws -> String? {
+        try store.writer.read { [companyId] db in
+            try String.fetchOne(db, sql: "SELECT body FROM memoryDoc WHERE companyId = ? AND id = ? AND removedAt IS NULL",
+                                arguments: [companyId, docId])
+        }
     }
 
     /// The memory entries the hits cite (`mem:<n>`), and the numbers of the entries they contradict.

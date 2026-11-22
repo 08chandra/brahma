@@ -35,11 +35,14 @@ public struct ShowResult: Equatable, Sendable {
     /// Fix round 1 (I-3): groups whose source couldn't be read in full (`.files`: no repository, an index past its cap or
     /// one that failed; `.commits`: likewise). A property of the repository, so every reader sees it; it names no object.
     public var incomplete: Set<ShowGroup>
+    /// Fix round 4 (Ruling 58 (1)): static notes about what was searched (`GlobalSearch.windowNote`), the same for every
+    /// reader and whether or not anything matched.
+    public var notes: [String]
 
     public init(normalized: String, stripped: String, filters: SearchFilters, answer: FactAnswer?, hits: [ShowHit], topScore: Double,
-                intent: ShowIntent, groupTotals: [ShowGroup: Int], incomplete: Set<ShowGroup> = []) {
+                intent: ShowIntent, groupTotals: [ShowGroup: Int], incomplete: Set<ShowGroup> = [], notes: [String] = []) {
         self.normalized = normalized; self.stripped = stripped; self.filters = filters; self.answer = answer; self.hits = hits
-        self.topScore = topScore; self.intent = intent; self.groupTotals = groupTotals; self.incomplete = incomplete
+        self.topScore = topScore; self.intent = intent; self.groupTotals = groupTotals; self.incomplete = incomplete; self.notes = notes
     }
 }
 
@@ -265,7 +268,7 @@ public struct ShowResolver: Sendable {
         }
         return ShowResult(normalized: normalized, stripped: stripped, filters: filters, answer: answer, hits: ordered, topScore: topScore,
                           intent: ShowIntent.classify(stripped: stripped, topScore: topScore, hasFact: answer != nil), groupTotals: totals,
-                          incomplete: found.incomplete)
+                          incomplete: found.incomplete, notes: GlobalSearch.notes(filters))
     }
 
     // MARK: Direct refs

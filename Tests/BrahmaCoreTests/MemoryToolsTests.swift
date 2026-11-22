@@ -95,7 +95,8 @@ import BrahmaKeychain
         // A later turn is a new server process: new tools, same store.
         let found = w.call(w.eng1, "recall", ["query": .string("staging port")])
         #expect(found.ok)
-        #expect(found.text.hasPrefix("1 result(s) for \"staging port\" (only what you can read):"), "\(found.text)")
+        // C4a fix round 4: the query is not echoed (the reply's redactor would answer whether it was a stored value).
+        #expect(found.text.hasPrefix("1 result(s) (only what you can read):"), "\(found.text)")
         #expect(found.text.contains("mem:1 · fact · confidence 0.7 · "), "\(found.text)")
         #expect(found.text.contains("    | The staging database listens on port 6543"), "\(found.text)")
         let read = w.call(w.eng1, "recall", ["ref": .string("mem:1")])
@@ -310,7 +311,7 @@ import BrahmaKeychain
         let r = w.call(w.eng2, "search_memory", ["query": .string("ocelot rollout")])
         #expect(r.ok)
         let lines = r.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        #expect(lines.first == "1 result(s) for \"ocelot rollout\" (only what you can read):")
+        #expect(lines.first == "1 result(s) (only what you can read):")
         #expect(lines[1].hasPrefix("1. mem:1 · memory · @eng-1 · "), "\(r.text)")
         #expect(lines[1].hasSuffix(" — Memory mem:1 · fact · @eng-1"), "\(r.text)")
         #expect(lines[2].hasPrefix("    | "))
@@ -321,11 +322,11 @@ import BrahmaKeychain
         #expect(w.call(w.eng2, "search_memory", ["query": .string("ocelot"), "sources": .array([.string("memory"), .string("bogus")])])
                 .text.contains("mem:1"))
         #expect(w.call(w.eng2, "search_memory", ["query": .string("ocelot"), "sources": .array([.string("message")])])
-                .text == "No results you can read for \"ocelot\".")
+                .text == "No results you can read.")
         #expect(w.call(w.eng2, "search_memory", ["query": .string("a ! ?")]).text == "Search needs at least one word.")
         let long = String(repeating: "zebra ", count: 20)
-        #expect(w.call(w.eng2, "search_memory", ["query": .string(long)]).text
-                == "No results you can read for \"\(Store.flat(long, max: 60))\".")
+        // C4a fix round 4: no echo of the query, however long.
+        #expect(w.call(w.eng2, "search_memory", ["query": .string(long)]).text == "No results you can read.")
     }
 
     @Test func taintedHitHasNoSnippet() throws {

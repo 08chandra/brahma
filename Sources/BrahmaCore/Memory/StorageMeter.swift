@@ -85,6 +85,8 @@ public enum StorageMeter {
     static let textColumns: [(table: String, column: String)] = [
         ("message", "text"), ("memoryDoc", "title"), ("memoryDoc", "body"), ("kbRevision", "body"), ("workItemEvent", "text"),
         ("turn", "summary"), ("activityEvent", "text"), ("ask", "summary"), ("ask", "payload"),
+        // C4a fix round 4: memory's vault-blanked shadow (`MemoryShadow`).
+        ("memoryShadow", "title"), ("memoryShadow", "body"),
     ]
 
     /// Blocking (a walk of the company's directories): call it off the main actor.

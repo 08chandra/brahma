@@ -106,7 +106,8 @@ extension Store {
     /// 1. `PRAGMA secure_delete = ON` for the connection (freed pages and cells are zeroed);
     /// 2. in one transaction, every doc's title becomes `"[purged]"`, its body `""`, and `removedAt` is set (the FTS
     ///    trigger removes its terms);
-    /// 3. `INSERT INTO memoryFts(memoryFts) VALUES('optimize')`: the segments are merged, dropping the deleted terms;
+    /// 3. `INSERT INTO memoryFts(memoryFts) VALUES('optimize')`: the segments are merged, dropping the deleted terms; the same
+    ///    for the vault-blanked shadow (`memoryShadowFts`, C4a fix round 4), whose rows the doc's update already deleted;
     /// 4. `PRAGMA wal_checkpoint(TRUNCATE)`: the WAL frames holding the old pages go;
     /// 5. `secure_delete` is restored.
     public func purgeMemoryDocs(companyId: String, source: MemorySource, sourceIds: [String], now: Date) throws {
@@ -142,6 +143,7 @@ extension Store {
                 return .commit
             }
             try db.execute(sql: "INSERT INTO memoryFts(memoryFts) VALUES('optimize')")
+            try db.execute(sql: "INSERT INTO memoryShadowFts(memoryShadowFts) VALUES('optimize')")
             let checkpoint = try Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(TRUNCATE)")
             guard let result else { throw ResourceError.invalid("the purge did not run") }
             return (result, checkpoint)

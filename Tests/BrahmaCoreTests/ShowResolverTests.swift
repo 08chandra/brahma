@@ -190,11 +190,18 @@ struct ShowFixture {
             }
         }
         let resolver = ShowResolver(store: s, files: FileIndexCache(), commits: CommitIndexCache())
+        let warm = DispatchTime.now().uptimeNanoseconds
         _ = try await resolver.resolve("checkout", companyId: c.id, reader: .owner, knownValues: [])     // builds the indexes
+        // C4a fix round 4: the first search also blanks the whole memory shadow (every doc queued at ingest).
+        print("ShowResolver first search (indexes and memory shadow built) \(Double(DispatchTime.now().uptimeNanoseconds - warm) / 1e6) ms")
         let queries = (0..<100).map { i in ["checkout", "src/mod\(i)", "payment flaky", "ENG-1", "deploy this week", "by @eng-1 retry",
                                             "file\(i * 37)", "invoice", "kind:commit change", "what's @eng-3 doing"][i % 10] }
         // The owner, then an agent (every hit checked for its access, every text gated against a stored value).
         let known = [(name: "PERF_KEY", value: "perf-secret-value-123")]
+        // A new value set blanks the whole shadow again (once).
+        let reblank = DispatchTime.now().uptimeNanoseconds
+        _ = try await resolver.resolve("checkout", companyId: c.id, reader: .owner, knownValues: known)
+        print("ShowResolver first search with a new value set (memory shadow re-blanked) \(Double(DispatchTime.now().uptimeNanoseconds - reblank) / 1e6) ms")
         for reader in [Reader.owner, .agent(fx.eng1.id)] {
             var times: [Double] = []
             for q in queries {

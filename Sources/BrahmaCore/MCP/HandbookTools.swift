@@ -56,28 +56,37 @@ extension CompanyTools {
             guard let n = v.numberValue, n.isFinite else { throw ToolError(message: "argument limit must be a number") }
             limit = Int(min(max(n, 1), Double(MemoryPolicy.maxHits)))
         }
-        let shownQuery = Store.flat(query, max: 60)
+        // C4a fix round 4 (R4-2): matched, ranked and counted on the vault-blanked shadow; every field shown as its gated final
+        // display string; a snippet only from a section holding no stored value; the query never echoed (`renderSearch`).
         guard MemoryQuery.expression(query) != nil else { return "Search needs at least one word." }
+        let gate = try memorySearchGate()
         let now = Store.now()
         let hits = try MemoryIndex(store: store).search(companyId: companyId, scope: .agent(agentId), query: query, sources: [.kb],
-                                                        limit: limit, now: now)
-        guard !hits.isEmpty else { return "No results you can read for \"\(shownQuery)\" in the handbook." }
-        var lines = ["\(hits.count) result(s) for \"\(shownQuery)\" in the handbook (only what you can read):"]
-        var read: [Int64] = []
-        for (i, hit) in hits.enumerated() {
-            let ref = Store.flat(hit.ref, max: 200)
+                                                        limit: limit, now: now, text: .visible(gate))
+        var shown: [(lines: [String], read: Int64?)] = []
+        for hit in hits {
+            guard let ref = gate.final(hit.ref, max: 200) else { continue }
+            let n = shown.count + 1
             if hit.tainted {
-                lines.append("\(i + 1). \(ref) (untrusted) — read it with kb_read; that marks this session as having read outside content")
+                let line = "\(n). \(ref) (untrusted) — read it with kb_read; that marks this session as having read outside content"
+                if !gate.holdsSecret(line) { shown.append(([line], nil)) }
                 continue
             }
-            lines.append("\(i + 1). \(ref) — \(Store.flat(hit.title, max: MemoryPolicy.maxTitleChars))")
-            if let snippet = hit.snippet {
-                lines.append("    | " + Store.flat(snippet, max: MemoryPolicy.snippetChars))
-                read.append(hit.docId)
+            let line = "\(n). \(ref) — \(gate.final(hit.title, max: MemoryPolicy.maxTitleChars) ?? ref)"
+            guard !gate.holdsSecret(line) else { continue }
+            var lines = [line]
+            if hit.level == .full, let body = try memoryDocBody(hit.docId),
+               let snippet = gate.snippet(body, around: query, max: MemoryPolicy.snippetChars), !gate.holdsSecret("    | " + snippet) {
+                lines.append("    | " + snippet)
             }
+            shown.append((lines, lines.count > 1 ? hit.docId : nil))
         }
+        guard !shown.isEmpty else { return "No results you can read in the handbook." }
+        var lines = ["\(shown.count) result(s) in the handbook (only what you can read):"]
+        lines += shown.flatMap(\.lines)
         lines.append("Open one with kb_read.")
-        try store.recordRead(companyId: companyId, docIds: read, agentId: agentId, turnId: try runningTurnId(), via: .search, now: now)
+        try store.recordRead(companyId: companyId, docIds: shown.compactMap(\.read), agentId: agentId, turnId: try runningTurnId(),
+                             via: .search, now: now)
         return lines.joined(separator: "\n")
     }
 
