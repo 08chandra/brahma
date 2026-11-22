@@ -309,6 +309,21 @@ public struct SafeGit: Sendable {
         return Self.lines(try output(args))
     }
 
+    /// Plan C Task C4b fix round 3 (Ruling 59): whether `start` is on `end`'s first-parent chain (both shas). Walks
+    /// `rev-list --first-parent --parents end ^start` (at most `max` commits): the walk stops at the first commit reachable
+    /// from `start`, and that commit is `start` itself exactly when `start` is on the chain, so the last listed commit's first
+    /// parent is `start`. `start == end` is on it. A walk that reaches `max` answers false (callers fail closed).
+    public func isOnFirstParentChain(_ start: String, of end: String, max: Int = 10_000) throws -> Bool {
+        let (s, e) = (try Self.sha(start), try Self.sha(end))
+        if s == e { return true }
+        let lines = Self.lines(try output(["rev-list", "--first-parent", "--parents", "-n", String(Swift.max(1, max) + 1),
+                                           "--end-of-options", e, "^" + s]))
+        guard !lines.isEmpty, lines.count <= max, let last = lines.last else { return false }
+        let fields = last.split(separator: " ").map(String.init)
+        guard fields.count >= 2 else { return false }
+        return fields[1] == s
+    }
+
     /// The commits of `range` (`a..b`, or one rev) touching `path`, newest first.
     /// Plan C Task C4b fix round 1: `max` bounds the listing (`-n`), so a lookup of the newest commit reads one.
     public func logShas(range: String, path: String, max: Int? = nil) throws -> [String] {

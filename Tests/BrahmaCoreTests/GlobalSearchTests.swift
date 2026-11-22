@@ -470,6 +470,45 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
         #expect(recorded == [merge: "qa-2", own: "qa-2", recordedSide: "eng-3"], "\(recorded)")
     }
 
+    /// C4b fix round 3 (Ruling 59): a turn whose start head is not on its end head's first-parent chain is credited with
+    /// nothing. `reset --hard <foreign>` then `merge <start>` keeps the start an ancestor, but only through the second parent:
+    /// neither the foreign commits nor the merge become the turn's, and a recorded foreign commit keeps its first recorder.
+    @Test func swappedParentMergeCreditsNothing() async throws {
+        let w = try SearchFixture()
+        let s = w.store, fx = w.fx, cId = w.c.id, now = w.now
+        let (itemId, eng3Id, qa2Id) = (fx.item.id, fx.eng3.id, fx.qa2.id)
+        let itemWork = try fx.git.git(["rev-parse", "item/ENG-1"])
+        try fx.git.git(["checkout", "-q", "-b", "foreign", "main"])
+        try fx.git.write("src/f1.ts", "1\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "foreign one"])
+        let recordedForeign = try fx.git.git(["rev-parse", "HEAD"])
+        try fx.git.write("src/f2.ts", "2\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "foreign two"])
+        let unrecordedForeign = try fx.git.git(["rev-parse", "HEAD"])
+        try s.recordCommitAuthors(companyId: cId, itemId: nil, agentId: eng3Id, turnId: "t-f", shas: [recordedForeign], now: now)
+        // qa-2's turn starts at "item work", resets its branch onto the foreign commits, merges its start back in (start is now
+        // the second parent), and commits on top.
+        try fx.git.git(["checkout", "-q", "item/ENG-1"])
+        try fx.git.git(["reset", "-q", "--hard", "foreign"])
+        try fx.git.git(["merge", "-q", "--no-ff", "-m", "merge start back", itemWork])
+        let merge = try fx.git.git(["rev-parse", "HEAD"])
+        try fx.git.write("src/after.ts", "a\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "after"])
+        let after = try fx.git.git(["rev-parse", "HEAD"])
+        try fx.git.git(["checkout", "-q", "main"])
+        #expect(try SafeGit(workspace: w.cf.workspace).isAncestor(itemWork, of: after), "the start is still an ancestor")
+        s.recordTurnCommits(companyId: cId, agentId: qa2Id, turnId: "t-qa", heldAtStart: [itemId: itemWork], now: now)
+        let recorded = try s.recordedCommitAuthors(companyId: cId, shas: [recordedForeign, unrecordedForeign, merge, after, itemWork])
+        #expect(recorded == [recordedForeign: "eng-3"], "\(recorded)")
+        // The first-parent check itself.
+        let git = try SafeGit(workspace: w.cf.workspace)
+        #expect(try git.isOnFirstParentChain(itemWork, of: after) == false)
+        #expect(try git.isOnFirstParentChain(recordedForeign, of: after) == true)
+    }
+
     @Test func blockedAloneListsBlockedWork() async throws {
         let w = try SearchFixture()
         let (itemId, eng3Id) = (w.zebraItem.id, w.fx.eng3.id)

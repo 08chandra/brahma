@@ -11,7 +11,8 @@ extension Store {
     /// then, read by the engine) and each item it claimed during the turn (the claim log's trusted claim head), the commits on
     /// the first-parent chain of `<start>..head(item/<KEY>)` (Ruling 59: never a merge's second-parent ancestry) that neither
     /// `main` nor any other item branch holds. An item whose start head is unknown,
-    /// or whose start is no longer an ancestor of its head (the turn rewrote the branch), is skipped (its commits stay
+    /// or whose start is not on its head's first-parent chain (the turn rewrote the branch, or reset it onto other commits
+    /// and merged its start back in), is skipped (its commits stay
     /// unverified: attribution fails closed, unlike taint). The first record of a sha wins. Never throws (git, off the
     /// cooperative pool).
     ///
@@ -42,6 +43,11 @@ extension Store {
                 // replayed, which must never become the rewriter's; the rewritten commits stay with their first recorder, or
                 // unverified. (`recordTurnEndHead` flags the same rewrite as a moved branch.)
                 guard try git.isAncestor(start, of: head) else { continue }
+                // Fix round 3 (Ruling 59): and the start must be on the end's FIRST-parent chain. A branch reset onto foreign
+                // commits that then merges its start back in keeps the start an ancestor, but only through a second parent:
+                // its first-parent walk would be the foreign commits. Not on the chain (or a check that fails or runs past its
+                // bound): nothing is recorded.
+                guard (try? git.isOnFirstParentChain(start, of: head)) == true else { continue }
                 let others = [main] + branches.filter { $0.key != "item/\(item.key)" }.map(\.value)
                 // Fix round 2 (Ruling 59): only the turn's first-parent chain from its start; what a merge brought in keeps its
                 // first recorder, or stays unverified (the merge commit itself is the turn's).
