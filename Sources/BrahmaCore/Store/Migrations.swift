@@ -1827,6 +1827,26 @@ enum Migrations {
             // Plan C Task C3b: an item event names the message it came from (`referenced`: a message named the item).
             try db.alter(table: "workItemEvent") { t in t.add(column: "sourceMessageId", .text) }
         }
+        m.registerMigration("vC-gate-requests") { db in
+            // C3b fix round 2, Ruling 48: a turn's MCP server asks the engine to gate a ref (it names only the ref; the engine
+            // reads and gates the bytes outside the turn's sandbox and writes back only the verdict and the gated bytes).
+            try db.create(table: "gateRequest") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("agentId", .text).notNull()
+                t.column("turnId", .text).notNull()
+                t.column("purpose", .text).notNull()
+                t.column("ref", .text).notNull()                 // the WorkRef, JSON
+                t.column("status", .text).notNull()              // pending|working|done|refused|unavailable|withdrawn
+                t.column("message", .text)
+                t.column("result", .blob)
+                t.column("resultExt", .text)
+                t.column("verdict", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("finishedAt", .datetime)
+            }
+            try db.create(index: "gateRequest_pending", on: "gateRequest", columns: ["status", "createdAt"])
+        }
     }
 }
 

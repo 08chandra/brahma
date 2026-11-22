@@ -375,6 +375,14 @@ public struct SafeGit: Sendable {
         try output(["update-ref", "--end-of-options", try Self.shareRef(messageRefId), sha])
     }
 
+    /// The ids of every `refs/brahma/shares/<id>` of this repository (engine-shaped names only; anything else is skipped).
+    public func shareRefIds() throws -> [String] {
+        Self.lines(try output(["for-each-ref", "--format=%(refname)", Self.sharesPrefix]))
+            .filter { $0.hasPrefix(Self.sharesPrefix) }
+            .map { String($0.dropFirst(Self.sharesPrefix.count)) }
+            .filter { (try? Self.shareRef($0)) != nil }
+    }
+
     public func deleteShareRef(_ messageRefId: String) throws {
         try output(["update-ref", "-d", "--end-of-options", try Self.shareRef(messageRefId)])
     }

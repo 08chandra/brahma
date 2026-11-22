@@ -2,9 +2,9 @@ import Foundation
 
 /// Plan C Task C3b's agent tools: `share` (refs to a teammate or channel, pinned and gated) and `open_ref` (the one read path
 /// for shared content), plus the `attachments` argument of `post_message` and `send_dm`. Every secret-gate read point here
-/// gets the injected vault's stored values (`Store.knownSecretValues`) and the archive reader (`archives`: the sandboxed
-/// unzip reader with the PDF helper in `brahma mcp`; none refuses archives and PDFs). Owner-only paths (`purge`,
-/// `viewOriginal`) have no tool.
+/// gets the injected vault's stored values (`Store.knownSecretValues`) and the archive reader (`archives`: in `brahma mcp`,
+/// `EngineGateArchives`, which has the engine run the sandboxed helpers outside the turn's sandbox (Ruling 48); none refuses
+/// archives and PDFs). Owner-only paths (`purge`, `viewOriginal`) have no tool.
 extension CompanyTools {
     static func refsProp(_ description: String) -> JSONValue {
         .object(["type": .string("array"), "items": .object(["type": .string("string")]), "description": .string(description)])
@@ -108,14 +108,5 @@ extension CompanyTools {
     func refContext() throws -> RefContext {
         guard let company = try store.company(id: companyId) else { throw ToolError(message: "this agent is not active in the company") }
         return RefContext(companyId: companyId, keyPrefixes: [Store.keyPrefix(slug: company.slug)], actingAgentId: agentId)
-    }
-
-    /// `brahma mcp`'s archive reader: `unzip` and the PDF helper (`brahma-pdf` beside `executable`) under the owner's sandbox
-    /// runner, each read in a fresh private vault temp directory. Where no sandbox or helper exists it refuses what it can't
-    /// read (fail closed).
-    public static func liveArchives(store: Store, paths: BrahmaPaths, companyId: String, executable: URL) -> any ArchiveReader {
-        let vault = Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths))
-        return SandboxedUnzipReader(runner: Orchestrator.ownerSandboxRunner(store: store, paths: paths), scratch: { try vault.makeTempDir() },
-                                    pdfHelper: SandboxedPDFReader.locate(executable: executable))
     }
 }

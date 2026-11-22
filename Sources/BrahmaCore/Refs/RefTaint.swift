@@ -866,8 +866,10 @@ extension Store {
         // The secret gate, before anything is written: a stored secret's value refuses; a secret pattern in text stores a
         // redacted copy (REDACTED), in a binary refuses (it can't be redacted). C3b (Ruling 41): through `gatedBytes`, so a PDF
         // the owner vouched for is snapshotted as its flattened copy, never itself.
-        let gated = try gatedBytes(data, ext: ArtifactKind.ext(of: fileName), canonical: fileName, companyId: companyId,
-                                   archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, paths: paths)
+        // (Ruling 48: in a turn's server the engine gates what needs a helper, and its bytes are what is stored.)
+        let gated = try gateRef(data, ext: ArtifactKind.ext(of: fileName), canonical: fileName, companyId: companyId,
+                                ref: WorkRef(kind: .file, id: workspacePath), reader: .agent(agentId), purpose: .snapshot,
+                                archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, paths: paths)
         data = gated.data
         let verdict = gated.verdict
         var secretScan = SecretScanState.none

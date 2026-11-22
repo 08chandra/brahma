@@ -66,17 +66,12 @@ extension Store {
             // are scanned and hashed (never read again from the file).
             var data = try file.readAll()
             let ext = ArtifactKind.ext(of: ref.id)
-            let verdict: ScanVerdict
-            if let paths, SecretGate.isFlattenTarget(data, ext: ext) {
-                // C3b (Ruling 41): a PDF the owner vouched for is pinned as its flattened copy, never itself.
-                let gated = try gatedBytes(data, ext: ext, canonical: ref.canonical, companyId: companyId,
-                                           archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, paths: paths)
-                data = gated.data
-                verdict = gated.verdict
-            } else {
-                verdict = try SecretGate.check(data, ext: ext, canonical: ref.canonical, archives: archives ?? UnavailableArchiveReader(),
-                                               knownValues: knownValues, store: self, companyId: companyId)
-            }
+            // C3b (Ruling 41): a PDF the owner vouched for is pinned as its flattened copy, never itself; (Ruling 48) in a turn's
+            // server, the engine gates what needs a helper and its bytes are pinned.
+            let gated = try gateRef(data, ext: ext, canonical: ref.canonical, companyId: companyId, ref: ref, reader: reader, purpose: .pin,
+                                    archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, paths: paths)
+            data = gated.data
+            let verdict = gated.verdict
             if case .pattern(let label, _) = verdict {
                 // A redacted copy in the vault, never a git blob.
                 guard SecretGate.isRedactable(data, ext: ext) else { throw SecretGate.binaryRefusal(ref.canonical, label: label, what: "shared", knownValues: knownValues) }
@@ -105,6 +100,7 @@ extension Store {
             let git = try refGit(workspace)
             let blob = try git.hashObject(data: data)
             try git.updateShareRef(messageRefId, to: blob)
+            if refHooks.failAfterShareRef { throw SafeGitError.git("injected failure after the share ref was written") }
             pinned.rev = blob
             pinned.params["share"] = messageRefId
             // `@worktree` content keeps the taint it has now (the holder's session, the item's mark, the branch's commits).
@@ -153,16 +149,11 @@ extension Store {
                     data = try git.blobSize(rev: sha, path: ref.id) <= SafeGit.maxBinaryBytes ? try git.catFile(rev: sha, path: ref.id, binary: true) : nil
                 }
                 if let data {
-                    let ext = ArtifactKind.ext(of: ref.id)
-                    if let paths, SecretGate.isFlattenTarget(data, ext: ext) {
-                        // C3b (Ruling 41): a vouched PDF passes only as its flattened copy (what `openRef` serves).
-                        _ = try gatedBytes(data, ext: ext, canonical: Self.unpinned(ref).canonical, companyId: companyId,
-                                           archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, paths: paths)
-                    } else {
-                        _ = try SecretGate.check(data, ext: ext, canonical: Self.unpinned(ref).canonical,
-                                                 archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, store: self,
-                                                 companyId: companyId)
-                    }
+                    // C3b (Ruling 41): a vouched PDF passes only as its flattened copy (what `openRef` serves); (Ruling 48) the
+                    // engine gates it for a turn's server.
+                    _ = try gateRef(data, ext: ArtifactKind.ext(of: ref.id), canonical: Self.unpinned(ref).canonical, companyId: companyId,
+                                    ref: pinned, reader: reader, purpose: .checkCommitted, archives: archives ?? UnavailableArchiveReader(),
+                                    knownValues: knownValues, paths: paths)
                 }
             }
         case .commit:

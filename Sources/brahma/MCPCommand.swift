@@ -117,11 +117,9 @@ struct MCP: ParsableCommand {
                                                    taintFlag: TaintFlag.url(home: secretPaths.home, agentId: me.id),
                                                    // `remember` refuses a fact holding a stored secret's value.
                                                    vault: vault,
-                                                   // C3b: `share`, `open_ref` and attachments read archives and PDFs only
-                                                   // through the sandboxed unzip reader and the PDF helper.
-                                                   archives: CompanyTools.liveArchives(
-                                                       store: store, paths: secretPaths, companyId: company,
-                                                       executable: Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))),
+                                                   // C3b (Ruling 48): archives and PDFs in `share`, `open_ref` and attachments
+                                                   // are gated by the engine, outside the turn's sandbox; no helper runs here.
+                                                   archives: EngineGateArchives(broker: QueuedRefGate(store: store, turnId: context.turnId))),
                                beforeCall: check)
         server.serve(input: .standardInput, output: .standardOutput)
     }

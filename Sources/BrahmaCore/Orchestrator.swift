@@ -123,6 +123,10 @@ public actor Orchestrator {
     var timerTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// The background reload of the store's redactor (vault reads never run on the actor: `reloadSecretsIfDue`).
     var secretsTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
+    /// C3b Ruling 48: the pass answering turns' gate requests (`Store.serveGateRequests`), off the actor; never overlaps itself.
+    var gateTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
+    /// When the tick last swept what failed shares left (`gateTick`).
+    var lastShareSweep: Date?
     /// The companies whose system timers have been ensured; a change re-runs `SystemTimers.ensure`.
     var ensuredTimerCompanies: Set<String>?
     /// Phone alerts (Task 7b): one dispatcher for the engine's life, and its pass in flight (a pass never overlaps itself).
@@ -419,7 +423,7 @@ public actor Orchestrator {
     private var isIdle: Bool {
         tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty && timerTasks.isEmpty
             && secretsTask == nil && pushTask == nil && stopObserverTask == nil && previewTask == nil && smokeTasks.isEmpty
-            && releaseTasks.isEmpty
+            && releaseTasks.isEmpty && gateTask == nil
     }
 
     private func resumeIdleWaitersIfIdle() {
@@ -598,8 +602,10 @@ public actor Orchestrator {
         if stopped == nil, !store.secretsHeld {
             for c in companies { attempt { try MemoryIngest.run(store: store, companyId: c.id, paths: paths, now: now) } }
         }
-        // C3b fix round 1 (Ruling 43): what a share made and never posted (a crash between its snapshot and its post).
-        for c in companies { attempt { try store.sweepShareOrphans(companyId: c.id, paths: paths, now: now) } }
+        // C3b: turns' gate requests (Ruling 48), answered outside every turn's sandbox, and every `shareSweepInterval` the
+        // sweep of what a share made and never posted (Rulings 43 and 49: copies, snapshots, share refs); both run git, so
+        // off the actor.
+        gateTick(companies: companies.map(\.id), now: now)
         // The pack's handbook sections, once per company per engine start (companies made before Plan ML get theirs here).
         for c in companies where !handbookSkeletons.contains(c.id) {
             do {
@@ -773,6 +779,56 @@ public actor Orchestrator {
     }
 
     private func secretsReloadDone() { secretsTask = nil }
+
+    /// Starts the pass that answers turns' gate requests when one is pending and none runs (Ruling 48). The helpers run under
+    /// the owner's sandbox runner (`Orchestrator.gateArchives`), in this engine's process tree, never a turn's.
+    private func gateTick(companies: [String], now: Date) {
+        guard gateTask == nil else { return }
+        let pending = (try? store.writer.read { db in
+            try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM gateRequest WHERE status = 'pending')") ?? false
+        }) ?? false
+        let sweep = lastShareSweep.map { now.timeIntervalSince($0) >= Self.shareSweepInterval || now < $0 } ?? true
+        guard pending || sweep else { return }
+        if sweep { lastShareSweep = now }
+        let (store, paths, vault, blocking) = (self.store, self.paths, self.vault.nonInteractive(), self.blocking)
+        gateTask = Task.detached { [self] in   // scope-escape: the engine's gate pass and share sweep
+            let failures: [String] = await blocking.run {
+                var failures: [String] = []
+                if pending {
+                    do {
+                        try store.serveGateRequests(archives: { Orchestrator.gateArchives(store: store, paths: paths, companyId: $0) },
+                                                    knownValues: { try store.knownSecretValues(companyId: $0, vault: vault) },
+                                                    paths: paths, now: Store.now())
+                    } catch { failures.append("gate requests failed: \(error)") }
+                }
+                if sweep {
+                    for c in companies {
+                        do { try store.sweepShareOrphans(companyId: c, paths: paths, now: now) } catch {
+                            failures.append("share sweep of \(c) failed: \(error)")
+                        }
+                    }
+                }
+                return failures
+            }
+            for f in failures { log(f) }
+            await gateDone()
+        }
+    }
+
+    /// How often the tick sweeps what failed shares left (wall-clock seconds between passes).
+    static let shareSweepInterval: TimeInterval = 60
+
+    private func gateDone() { gateTask = nil }
+
+    /// The engine's archive reader for gate requests: `unzip` and the PDF helper (`brahma-pdf` beside the engine's binary)
+    /// under the owner's sandbox runner, each read in a fresh private vault temp directory. Where no sandbox or helper
+    /// exists it refuses what it can't read (fail closed).
+    nonisolated static func gateArchives(store: Store, paths: BrahmaPaths, companyId: String) -> any ArchiveReader {
+        let vault = Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths))
+        let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+        return SandboxedUnzipReader(runner: Orchestrator.ownerSandboxRunner(store: store, paths: paths), scratch: { try vault.makeTempDir() },
+                                    pdfHelper: SandboxedPDFReader.locate(executable: executable))
+    }
 
     private func logPressure(_ level: MemoryPressure, now: Date) {
         guard level != lastPressure else { return }

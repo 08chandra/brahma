@@ -71,6 +71,12 @@ struct PreparedRef {
 }
 
 extension Store {
+    /// A share's `messageRef` id, which also names its git share ref: the time it was made (ms since 1970) first, so the
+    /// tick's sweep can tell an orphan share ref's age with no row to read it from (fix round 2, Ruling 49).
+    static func shareRowId(now: Date) -> String {
+        "\(Int64((now.timeIntervalSince1970 * 1000).rounded(.down)))-\(UUID().uuidString.lowercased())"
+    }
+
     static let taintedPrivateRefusal = "you've read external content this session, so you can't send private files; start fresh or share a workspace file"
 
     // MARK: share
@@ -166,13 +172,15 @@ extension Store {
         let prepared = try prepareRefs(companyId: companyId, agentId: agentId, refs: refs, target: target, replyTo: replyTo,
                                        context: context, knownValues: knownValues, paths: paths, now: now, archives: archives)
         let router = MessageRouter(store: self)
-        let channelId: String?
-        switch target {
-        case .channel(let name): channelId = try channel(companyId: companyId, name: name)?.id
-        case .dm: channelId = nil
-        }
-        let inline = try inlineRefs(companyId: companyId, sender: .agent(agentId), text: text, channelId: channelId)
         do {
+            // N-1: inside the cleanup, so a failure here removes what the preparation made.
+            try refHooks.afterSharePrepared?()
+            let channelId: String?
+            switch target {
+            case .channel(let name): channelId = try channel(companyId: companyId, name: name)?.id
+            case .dm: channelId = nil
+            }
+            let inline = try inlineRefs(companyId: companyId, sender: .agent(agentId), text: text, channelId: channelId)
             let result = try writer.write { db -> PostResult in
                 if refHooks.failSharePost { throw SharePostInjectedFailure() }
                 let result: PostResult
@@ -280,7 +288,7 @@ extension Store {
                 guard RefAccess.privatePlace(ref) != nil else { throw unavailable(n) }
                 own = true
             }
-            let rowId = UUID().uuidString
+            let rowId = Self.shareRowId(now: now)
             let r: Resolution
             do { r = try resolveDetailed(ref, reader: reader, companyId: companyId, messageRefId: rowId) } catch { throw unavailable(n) }
             guard r.resolved.visibility == .full, r.subject != nil, r.resolved.state != .purged else { throw unavailable(n) }
@@ -317,15 +325,17 @@ extension Store {
             guard let subject = c.resolution.subject, let company = c.resolution.company else { throw unavailable(i + 1) }
             let content: Content
             do {
-                content = try readContent(c.resolution, subject: subject, company: company, paths: paths, whole: false, knownValues: knownValues)
+                // M-1: the whole bytes (up to the binary cap), as the pin and the snapshot read them.
+                content = try readContent(c.resolution, subject: subject, company: company, paths: paths, whole: true, knownValues: knownValues)
             } catch let e as WorkError {
                 throw e
             } catch {
                 refTrace(companyId: companyId, "a share's ref \(i + 1) couldn't be read (\(Store.flat("\(error)", max: 200)))", now: now)
                 throw unavailable(i + 1)
             }
-            _ = try gatedBytes(content.data, ext: content.ext, canonical: c.ref.canonical, companyId: companyId, archives: archives,
-                               knownValues: knownValues, paths: paths)
+            _ = try gateRef(content.data, ext: content.ext, canonical: c.privateFile ? (c.ref.id.split(separator: "/").last.map(String.init) ?? c.ref.id)
+                                : c.ref.canonical, companyId: companyId, ref: c.ref, reader: reader, purpose: c.privateFile ? .snapshot : .check,
+                            archives: archives, knownValues: knownValues, paths: paths)
         }
 
         // 5. Pin (or snapshot) each ref; a commit off `main` is held by its share ref. Whatever was made is removed again when
@@ -339,10 +349,13 @@ extension Store {
                     var created: [ShareArtifact] = []
                     if c.privateFile {
                         pinned = try snapshotPrivateFile(companyId: companyId, agentId: agentId, workspacePath: c.ref.id,
-                                                         readers: recipients + [agentId], knownValues: knownValues, paths: paths, now: now,
-                                                         archives: archives)
+                                                         readers: recipients + [agentId], knownValues: knownValues, paths: paths,
+                                                         now: Store.now(), archives: archives)   // M-2: stamped when made
                         if let n = Int(pinned.id) { created.append(.resource(n)) }
                     } else {
+                        // Ruling 49: recorded before the pin, so a pin that fails after writing it still has its share ref
+                        // removed (deleting one that was never written is harmless).
+                        made.append(.shareRef(c.rowId))
                         do {
                             pinned = try pinRef(c.ref, for: reader, companyId: companyId, messageRefId: c.rowId, knownValues: knownValues,
                                                 paths: paths, archives: archives)
@@ -350,7 +363,6 @@ extension Store {
                             if case .forbidden = e { throw unavailable(i + 1) }
                             throw e
                         }
-                        if pinned.params["share"] == c.rowId { created.append(.shareRef(c.rowId)) }
                         if pinned.kind == .resource, c.ref.kind != .resource, let n = Int(pinned.id) { created.append(.resource(n)) }
                         if let snapshot = pinned.params["snapshot"], c.ref.params["snapshot"] == nil { created.append(.snapshot(snapshot)) }
                         made += created
@@ -358,10 +370,7 @@ extension Store {
                         if [.file, .diff, .commit].contains(pinned.kind), !pinned.isWorktree, pinned.params["share"] == nil,
                            let rev = pinned.rev, let company = c.resolution.company {
                             let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
-                            if !(try git.isAncestor(rev, of: "main")) {
-                                made.append(.shareRef(c.rowId))
-                                try git.updateShareRef(c.rowId, to: rev)
-                            }
+                            if !(try git.isAncestor(rev, of: "main")) { try git.updateShareRef(c.rowId, to: rev) }
                         }
                     }
                     made += created
@@ -379,7 +388,10 @@ extension Store {
                 }
             }
         } catch {
-            discardShareArtifacts(companyId: companyId, made, paths: paths, now: now)
+            // Ruling 49: every candidate's share ref goes too (a fallback for one no record names).
+            let refs = Set(made.compactMap { if case .shareRef(let id) = $0 { id } else { nil } })
+            discardShareArtifacts(companyId: companyId, made + candidates.map(\.rowId).filter { !refs.contains($0) }.map(ShareArtifact.shareRef),
+                                  paths: paths, now: now)
             throw error
         }
         // What was made rides with the first prepared ref, so a failed post removes all of it.
@@ -629,16 +641,21 @@ extension Store {
     /// Removes what a failed share made (fix round 1, Ruling 43): a copy's `resource` row, its index doc and its vault file; a
     /// worktree diff snapshot's row and vault file; a share ref. Best effort, each on its own; a failure is logged for the
     /// owner, and `sweepShareOrphans` takes what is left.
-    func discardShareArtifacts(companyId: String, _ artifacts: [ShareArtifact], paths: BrahmaPaths, now: Date) {
+    func discardShareArtifacts(companyId: String, _ artifacts: [ShareArtifact], paths: BrahmaPaths, now: Date, onlyOrphans: Bool = false) {
         guard !artifacts.isEmpty else { return }
         let vault = Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths))
         for artifact in artifacts {
             do {
                 switch artifact {
                 case .resource(let n):
-                    try discardShareCopy(companyId: companyId, number: n, vault: vault)
+                    try discardShareCopy(companyId: companyId, number: n, vault: vault, onlyOrphan: onlyOrphans)
                 case .snapshot(let id):
                     let path = try writer.write { db -> String? in
+                        // M-2: the sweep re-checks, in the deleting transaction, that no row points at it.
+                        if onlyOrphans, try Bool.fetchOne(db, sql: """
+                            SELECT EXISTS(SELECT 1 FROM refSnapshot s JOIN messageRef m ON m.companyId = s.companyId AND m.id = s.cacheKey
+                                          WHERE s.companyId = ? AND s.id = ?)
+                            """, arguments: [companyId, id]) == true { return nil }
                         let path = try String.fetchOne(db, sql: "SELECT vaultPath FROM refSnapshot WHERE companyId = ? AND id = ? AND kind = ?",
                                                        arguments: [companyId, id, RefSnapshot.worktreeDiff])
                         try db.execute(sql: "DELETE FROM refSnapshot WHERE companyId = ? AND id = ? AND kind = ?",
@@ -648,6 +665,9 @@ extension Store {
                     if let path { try? vault.remove(path) }
                 case .shareRef(let id):
                     guard let company = try company(id: companyId) else { continue }
+                    if onlyOrphans, try writer.read({ db in
+                        try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM messageRef WHERE companyId = ? AND id = ?)", arguments: [companyId, id])
+                    }) == true { continue }
                     try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true)).deleteShareRef(id)
                 }
             } catch {
@@ -659,9 +679,13 @@ extension Store {
 
     /// Deletes a share copy `F-<number>` (only a row `addedVia = share`): its row and index doc in one transaction, then its
     /// vault file.
-    private func discardShareCopy(companyId: String, number: Int, vault: Vault) throws {
+    private func discardShareCopy(companyId: String, number: Int, vault: Vault, onlyOrphan: Bool) throws {
         let path = try writer.write { db -> String? in
             guard let r = try Store.resource(db: db, companyId: companyId, number: number), r.addedVia == "share" else { return nil }
+            // M-2: the sweep re-checks, in this transaction, that no share message points at it.
+            if onlyOrphan, try Bool.fetchOne(db, sql: """
+                SELECT EXISTS(SELECT 1 FROM messageRef WHERE companyId = ? AND kind = 'resource' AND inline = 0 AND refId = ?)
+                """, arguments: [companyId, String(number)]) == true { return nil }
             try db.execute(sql: "DELETE FROM memoryDoc WHERE companyId = ? AND source = ? AND sourceId = ?",
                            arguments: [companyId, MemorySource.resource.rawValue, r.id])
             try db.execute(sql: "DELETE FROM resource WHERE companyId = ? AND id = ?", arguments: [companyId, r.id])
@@ -670,8 +694,8 @@ extension Store {
         if let path { try vault.remove(path) }
     }
 
-    /// Fix round 1 (Ruling 43): the share copies (`resource` rows `addedVia = share`) and worktree diff snapshots no share
-    /// message points at (no non-inline `messageRef` row names them) that are older than `ShareLimits.orphanGrace`, removed
+    /// Fix round 1 (Ruling 43): the share copies (`resource` rows `addedVia = share`), worktree diff snapshots and (fix round
+    /// 2, Ruling 49) git share refs no share message points at (no non-inline `messageRef` row names them) that are older than `ShareLimits.orphanGrace`, removed
     /// as `discardShareArtifacts` does: what a share left when it crashed between its snapshot and its post. The grace is
     /// wall-clock on purpose: it covers a share in flight in another process (`brahma mcp`), not company time (a stopped
     /// company's active clock would never let it pass). Returns how many were removed. Run by the engine's tick.
@@ -690,9 +714,28 @@ extension Store {
                 """, arguments: [companyId, RefSnapshot.worktreeDiff, cutoff])
             return (copies, snapshots)
         }
-        let artifacts = copies.map(ShareArtifact.resource) + snapshots.map(ShareArtifact.snapshot)
-        discardShareArtifacts(companyId: companyId, artifacts, paths: paths, now: now)
+        var artifacts = copies.map(ShareArtifact.resource) + snapshots.map(ShareArtifact.snapshot)
+        // Ruling 49: share refs of the company's repository no `messageRef` row names, older than the grace (by the time their
+        // id starts with; an id without one is taken as old).
+        if let company = try company(id: companyId) {
+            let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
+            let ids = try git.shareRefIds()
+            let named = try writer.read { db in
+                Set(try String.fetchAll(db, sql: "SELECT id FROM messageRef WHERE companyId = ?", arguments: [companyId]))
+            }
+            for id in ids where !named.contains(id) {
+                if let made = Self.shareRowTime(id), made > cutoff { continue }
+                artifacts.append(.shareRef(id))
+            }
+        }
+        discardShareArtifacts(companyId: companyId, artifacts, paths: paths, now: now, onlyOrphans: true)
         return artifacts.count
+    }
+
+    /// When a share row id (`shareRowId`) was made, or nil for an id that doesn't start with its time.
+    static func shareRowTime(_ id: String) -> Date? {
+        guard let dash = id.firstIndex(of: "-"), let ms = Int64(id[..<dash]), ms > 0 else { return nil }
+        return Date(timeIntervalSince1970: Double(ms) / 1000)
     }
 
     // MARK: Review digest

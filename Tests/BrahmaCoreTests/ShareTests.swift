@@ -482,6 +482,79 @@ import GRDB
         ]) } == "that ref isn't available to you")
     }
 
+    // MARK: Fix round 2 (Ruling 49)
+
+    /// A pin that fails after it wrote its share ref leaves no share ref behind.
+    @Test func failedPinLeavesNoShareRef() throws {
+        let w = try W()
+        let wt = try w.fx.git.ws.addWorktree(key: "ENG-1")
+        try w.fx.git.write("src/a.ts", "work in progress\n", in: wt)
+        w.store.refHooks.setFailAfterShareRef(true)
+        defer { w.store.refHooks.setFailAfterShareRef(false) }
+        #expect(w.refusal { try w.share(w.fx.eng1, ["ENG-1:src/a.ts@worktree"], to: "@qa-2") } == "that ref isn't available to you")
+        #expect(try w.fx.git.git(["for-each-ref", "refs/brahma/shares/"]).isEmpty)
+        #expect(try w.messages(kind: .share).isEmpty)
+    }
+
+    /// The tick's sweep also removes share refs no `messageRef` row names, once older than the grace.
+    @Test func orphanShareRefsSwept() throws {
+        let w = try W()
+        _ = try w.share(w.fx.eng1, ["ENG-1:src/a.ts"], to: "@qa-2")
+        let kept = try #require(try w.fx.git.git(["for-each-ref", "--format=%(refname)", "refs/brahma/shares/"]).split(separator: "\n").first)
+        let head = try w.fx.head("item/ENG-1")
+        let old = Store.shareRowId(now: w.cf.now.addingTimeInterval(-2 * ShareLimits.orphanGrace))
+        let fresh = Store.shareRowId(now: w.cf.now)
+        try w.fx.git.git(["update-ref", "refs/brahma/shares/\(old)", head])
+        try w.fx.git.git(["update-ref", "refs/brahma/shares/\(fresh)", head])
+        _ = try w.store.sweepShareOrphans(companyId: w.c.id, paths: w.cf.paths, now: w.cf.now)
+        let left = Set(try w.fx.git.git(["for-each-ref", "--format=%(refname)", "refs/brahma/shares/"]).split(separator: "\n").map(String.init))
+        #expect(!left.contains("refs/brahma/shares/\(old)"), "an orphan share ref older than the grace stayed")
+        #expect(left.contains("refs/brahma/shares/\(fresh)"), "an in-flight share ref was swept")
+        #expect(left.contains(String(kept)), "a referenced share ref was swept")
+        // The referenced one stays even once it is old: its row names it.
+        _ = try w.store.sweepShareOrphans(companyId: w.c.id, paths: w.cf.paths, now: w.cf.now.addingTimeInterval(10 * ShareLimits.orphanGrace))
+        let later = Set(try w.fx.git.git(["for-each-ref", "--format=%(refname)", "refs/brahma/shares/"]).split(separator: "\n").map(String.init))
+        #expect(later == [String(kept)])
+    }
+
+    /// N-1: a failure after the refs were prepared (reading the channel or the inline refs) removes the snapshot again.
+    @Test func failureAfterPreparationLeavesNothing() throws {
+        let w = try W()
+        w.store.refHooks.setAfterSharePrepared { throw SafeGitError.io("injected: the channel can't be read") }
+        defer { w.store.refHooks.setAfterSharePrepared(nil) }
+        #expect(w.refusal { try w.share(w.fx.eng1, [".brahma/labs/eng-1/mine.txt", "ENG-1:src/a.ts"], to: "#team") } == "that ref isn't available to you")
+        #expect(try shareCopies(w).isEmpty)
+        #expect(try w.fx.git.git(["for-each-ref", "refs/brahma/shares/"]).isEmpty)
+    }
+
+    /// M-1: step 4 gates the whole bytes (past the shown cap), so a large file with a secret refuses the share before an
+    /// earlier ref's snapshot exists.
+    @Test func largeSecretFileRefusedBeforeSnapshot() throws {
+        let w = try W()
+        let big = String(repeating: "x", count: SafeGit.maxTextBytes + 10) + "\nkey = \(SecretGateTests.value)\n"
+        try w.cf.commit(["src/big.txt": Data(big.utf8)])
+        let refused = try #require(w.refusal { try w.share(w.fx.eng1, [".brahma/labs/eng-1/mine.txt", "src/big.txt"], to: "@qa-2",
+                                                            knownValues: SecretGateTests.known) })
+        #expect(refused.contains("contains a stored secret"), "\(refused)")
+        #expect(try shareCopies(w).isEmpty)
+    }
+
+    /// M-2: a copy is stamped when it is made, and the sweep re-checks in its deleting transaction that nothing points at it.
+    @Test func sweepSparesCopiesInFlight() throws {
+        let w = try W()
+        let started = w.cf.now.addingTimeInterval(-2 * ShareLimits.orphanGrace)
+        _ = try w.store.share(companyId: w.c.id, by: w.fx.eng1.id, refs: [".brahma/labs/eng-1/mine.txt"], to: "@qa-2", note: nil, replyTo: nil,
+                              context: w.fx.ctx, knownValues: [], paths: w.cf.paths, now: started)
+        let copy = try #require(try shareCopies(w).first)
+        #expect(copy.createdAt > started.addingTimeInterval(ShareLimits.orphanGrace), "stamped with the share's start")
+        // Even when old, a copy a row names is never deleted (the delete re-checks).
+        let cId = w.c.id
+        try w.store.writer.write { db in try db.execute(sql: "UPDATE resource SET createdAt = ? WHERE companyId = ? AND number = ?",
+                                                        arguments: [started, cId, copy.number]) }
+        w.store.discardShareArtifacts(companyId: cId, [.resource(copy.number)], paths: w.cf.paths, now: w.cf.now, onlyOrphans: true)
+        #expect(try w.store.resource(companyId: cId, number: copy.number) != nil)
+    }
+
     @Test func everyToolClassified() {
         #expect(Set(CompanyToolNames.all).subtracting(TaintPolicy.taintSafeTools) == TaintPolicy.reviewedHighRisk)
         #expect(TaintPolicy.taintSafeTools.contains("share") && TaintPolicy.taintSafeTools.contains("open_ref"))

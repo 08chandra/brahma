@@ -239,4 +239,12 @@ final class RefHooks: @unchecked Sendable {
     /// C3b fix round 1: a share's or attachment's post fails inside its write transaction (after every pin and snapshot).
     var failSharePost: Bool { lock.withLock { sharePostFails } }
     func setFailSharePost(_ fails: Bool) { lock.withLock { sharePostFails = fails } }
+    private var shareRefFails = false
+    /// C3b fix round 2 (Ruling 49): `pinRef` fails right after it wrote a share ref.
+    var failAfterShareRef: Bool { lock.withLock { shareRefFails } }
+    func setFailAfterShareRef(_ fails: Bool) { lock.withLock { shareRefFails = fails } }
+    private var prepared: (@Sendable () throws -> Void)?
+    /// C3b fix round 2 (N-1): runs after a share's refs are prepared, before its post (where the channel and inline refs are read).
+    var afterSharePrepared: (@Sendable () throws -> Void)? { lock.withLock { prepared } }
+    func setAfterSharePrepared(_ body: (@Sendable () throws -> Void)?) { lock.withLock { prepared = body } }
 }

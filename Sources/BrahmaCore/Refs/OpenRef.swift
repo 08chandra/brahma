@@ -131,17 +131,19 @@ extension Store {
         }
         // The secret gate (C2b), before a byte is shown or copied: a stored secret's value refuses. C3b (Ruling 41): bytes that
         // may be a PDF are served only through `gatedBytes`, so one the owner vouched for is its flattened copy, never itself.
+        // Fix round 2 (Ruling 48): a turn's server (`EngineGateArchives`) has the engine gate what needs a helper; the engine's
+        // bytes (a copy) or text (what is shown) replace the read here.
         let verdict: ScanVerdict
-        if case .bytes(let data, let ext) = content.body, SecretGate.isFlattenTarget(data, ext: ext) {
-            let gated = try gatedBytes(data, ext: ext, canonical: canonical, companyId: companyId, archives: archives ?? UnavailableArchiveReader(),
-                                       knownValues: knownValues, paths: paths)
+        let gated = try gateRef(content.data, ext: content.ext, canonical: canonical, companyId: companyId, ref: ref, reader: reader,
+                                purpose: copy ? .copy : .render, archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues,
+                                paths: paths)
+        verdict = gated.verdict
+        if archives is EngineGateArchives, gated.data != content.data || gated.ext != content.ext {
+            content.body = copy ? .bytes(gated.data, ext: gated.ext) : .text(String(decoding: gated.data, as: UTF8.self))
+            if copy { content.ext = gated.ext }
+        } else if gated.data != content.data {
             content.body = .bytes(gated.data, ext: gated.ext)
             content.ext = gated.ext
-            verdict = gated.verdict
-        } else {
-            verdict = try SecretGate.check(content.data, ext: content.ext, canonical: canonical,
-                                           archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, store: self,
-                                           companyId: companyId)
         }
         if let copier {
             // A copy with a secret pattern is the redacted copy; a binary one can't be redacted and is refused.
@@ -163,18 +165,8 @@ extension Store {
         switch content.body {
         case .text(let text): body = text
         case .bytes(let data, let ext):
-            let kind = ArtifactKind.from(ext: ext)
-            let binary = data.prefix(OpenRefLimits.binarySniffBytes).contains(0)
-            let textish = kind == nil || kind?.isText == true || ArtifactKind.isText(ext: ext)
-            if !binary, textish {
-                body = String(decoding: data, as: UTF8.self)
-            } else if binary, textish {
-                // NUL in the first 8 KB is binary whatever the extension says.
-                body = TextExtract.metadata(kind: kind, bytes: data.count)
-            } else {
-                do { body = try TextExtract.extract(kind: kind, ext: ext, data: data, archives: archives ?? UnavailableArchiveReader()) }
-                catch let e as ArchiveReadError { body = e.message }
-            }
+            // NUL in the first 8 KB is binary whatever the extension says (`renderBody`).
+            body = try Self.renderBody(data, ext: ext, archives: archives ?? UnavailableArchiveReader())
         }
         // What is shown never holds a secret: every secret pattern and stored secret's value is redacted.
         body = ContentScan.redact(text: body, findings: [], knownValues: EncodedForms.expand(knownValues))
