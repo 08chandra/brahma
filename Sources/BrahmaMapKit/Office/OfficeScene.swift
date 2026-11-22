@@ -73,7 +73,9 @@ public final class OfficeScene: SKScene, MapScene {
     /// No typing frames or pulses, and a state badge on every desk (spec §5.6). Starts at the system setting.
     public var reduceMotion = false {
         didSet {
-            guard reduceMotion != oldValue, let builtModel else { return }
+            guard reduceMotion != oldValue else { return }
+            if reduceMotion { releaseParticles() }
+            guard let builtModel else { return }
             rebuild(model: builtModel, replaying: builtReplaying)
             advanceFigures(now: nil)
         }

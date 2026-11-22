@@ -682,9 +682,10 @@ final class OfficeRoomNode: SKNode {
         return s
     }
 
-    private func put(_ texture: SKTexture, at p: CGPoint, flipY: Bool = false, rotate: CGFloat = 0) {
+    private func put(_ texture: SKTexture, at p: CGPoint, flipY: Bool = false, rotate: CGFloat = 0, name: String? = nil) {
         let s = SKSpriteNode(texture: texture, size: OfficeTextures.points(texture))
         s.position = p
+        s.name = name
         if flipY { s.yScale = -1 }
         s.zRotation = rotate
         furniture.addChild(s)
@@ -694,6 +695,7 @@ final class OfficeRoomNode: SKNode {
     private func buildBoard(_ r: CGRect) {
         let table = stretched(OfficeTextures.table, to: CGSize(width: 120, height: 36))
         table.position = CGPoint(x: r.midX, y: r.midY - 4)
+        table.name = "obstacle"
         furniture.addChild(table)
         for k in 0..<4 {
             let x = r.midX - 45 + CGFloat(k) * 30
@@ -737,6 +739,7 @@ final class OfficeRoomNode: SKNode {
         let size = CGSize(width: ends.1.x - ends.0.x - 20, height: sides.1.y - sides.0.y - 16)
         let table = stretched(OfficeTextures.table, to: size)
         table.position = CGPoint(x: (ends.0.x + ends.1.x) / 2, y: -(sides.0.y + sides.1.y) / 2)
+        table.name = "obstacle"
         furniture.addChild(table)
         let mid = room.rect.mid
         for i in 0..<OfficeLayout.reviewSeats {
@@ -795,14 +798,17 @@ final class OfficeRoomNode: SKNode {
         countLabel = backing
     }
 
-    /// The sofa's centre in a break room of rect `r` (scene coordinates): idle figures stroll here (OfficeMotion.swift).
+    /// The furniture routes walk around, as drawn (scene coordinates): it must match `OfficeLayout.furniture`.
+    var obstacleFrames: [CGRect] { furniture.children.filter { $0.name == "obstacle" }.map(\.frame) }
+
+    /// The sofa's centre in a break room of rect `r` (scene coordinates); idle figures sit on it (`OfficeLayout.sofaSeat`).
     static func sofaCenter(_ r: CGRect) -> CGPoint { CGPoint(x: r.maxX - 36, y: r.midY + 6) }
 
     /// A counter, the sofa, and the wall of fame on its shelf.
     private func buildBreak(_ r: CGRect, _ layout: OfficeLayout) {
         let counter = OfficeTextures.counter
-        put(counter, at: CGPoint(x: r.minX + 12 + OfficeTextures.points(counter).width / 2, y: r.maxY - 32))
-        put(OfficeTextures.sofa, at: Self.sofaCenter(r))
+        put(counter, at: CGPoint(x: r.minX + 12 + OfficeTextures.points(counter).width / 2, y: r.maxY - 32), name: "obstacle")
+        put(OfficeTextures.sofa, at: Self.sofaCenter(r), name: "obstacle")
         let spot = layout.fameShelf()
         let board = SKSpriteNode(texture: OfficeTextures.shelf, size: OfficeTextures.points(OfficeTextures.shelf))
         board.position = CGPoint(x: spot.x, y: -spot.y)
@@ -832,6 +838,7 @@ final class OfficeRoomNode: SKNode {
     private func buildMail(_ r: CGRect) {
         let counter = stretched(OfficeTextures.counter, to: CGSize(width: r.width - 16, height: 52))
         counter.position = CGPoint(x: r.midX, y: r.midY - 3)
+        counter.name = "obstacle"
         furniture.addChild(counter)
         mail.zPosition = 1
         addChild(mail)

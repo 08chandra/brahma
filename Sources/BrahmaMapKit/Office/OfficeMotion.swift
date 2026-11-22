@@ -374,12 +374,12 @@ extension OfficeScene {
         switch e.kind {
         case .message:
             guard let to, let end = endLocation(to) else { return }
-            route = corridorRoute(start, end)
+            route = officeRoute(start, end)
             // Aggregate mode and desk-only LOD: the org chart's dots.
             kind = aggregate || deskOnly ? .dot : .note
         case .handoff:
             let end = to.flatMap(endLocation) ?? Self.point(layout.mailCounter(0))
-            route = corridorRoute(start, end)
+            route = officeRoute(start, end)
             kind = deskOnly ? .square : .folder
         default:
             // A broadcast: a note pinned on the sender's pod board, or a ring at an executive's (or the board room's)
@@ -407,6 +407,11 @@ extension OfficeScene {
         particle.configure(event: e, from: from, to: to, route: route, version: 0, kind: kind)
         m.used[e.id] = particle
         m.routeStart[e.id] = 0
+    }
+
+    /// Reduce Motion came on: no travelling notes, so the ones in flight go.
+    func releaseParticles() {
+        for p in Array(motion.used.values) { release(p) }
     }
 
     private func release(_ p: MotionParticle) {
@@ -454,7 +459,7 @@ extension OfficeScene {
                     continue
                 }
                 if hypot(end.x - route.end.x, end.y - route.end.y) > 1 {
-                    p.route = corridorRoute(p.sprite.position, end)
+                    p.route = officeRoute(p.sprite.position, end)
                     m.routeStart[e.id] = f
                 }
                 let f0 = m.routeStart[e.id] ?? 0
@@ -479,9 +484,9 @@ extension OfficeScene {
 
     // MARK: Routes
 
-    /// The corridor route between two scene points (`OfficeLayout.route`), cached per layout with the layout's corridor
-    /// graph.
-    func corridorRoute(_ a: CGPoint, _ b: CGPoint) -> MotionRoute {
+    /// The route between two scene points (`OfficeLayout.route`: out of rooms through their doors, out of pods sideways,
+    /// along the corridors), cached per layout with the layout's corridor graph. Walks and notes both take it.
+    func officeRoute(_ a: CGPoint, _ b: CGPoint) -> MotionRoute {
         let m = motion
         let key = OfficeMotionState.RouteKey(ax: a.x, ay: a.y, bx: b.x, by: b.y)
         if let hit = m.routes[key] { return hit }
@@ -491,17 +496,6 @@ extension OfficeScene {
         let route = MotionRoute(layoutPoints: points) ?? MotionRoute(layoutPoints: [MapPoint2(x: b.x, y: -b.y)])!
         m.routes[key] = route
         return route
-    }
-
-    /// A walk's path: straight within one pod or room (a seat to the next), else along the corridors.
-    private func walkRoute(_ a: CGPoint, _ b: CGPoint) -> MotionRoute {
-        let pa = MapPoint2(x: a.x, y: -a.y), pb = MapPoint2(x: b.x, y: -b.y)
-        func inside(_ r: MapRect, _ p: MapPoint2) -> Bool { p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h }
-        let areas = layout.pods.values.map(\.rect) + layout.rooms.values.map(\.rect)
-        if areas.contains(where: { inside($0, pa) && inside($0, pb) }) {
-            return MotionRoute(layoutPoints: [pa, pb])!
-        }
-        return corridorRoute(a, b)
     }
 
     // MARK: Figures
@@ -529,7 +523,7 @@ extension OfficeScene {
                 m.targets[id] = dest
                 if animate, let now {
                     m.walks[id] = OfficeMotionState.Walk(from: node.position, to: dest, start: now,
-                                                         route: walkRoute(node.position, dest))
+                                                         route: officeRoute(node.position, dest))
                 } else {
                     m.walks[id] = nil
                     node.position = dest
@@ -579,7 +573,9 @@ extension OfficeScene {
     private func scheduleStrolls(now: TimeInterval) {
         let m = motion
         guard layout.rooms["room:break"] != nil else { return }
-        for (id, rest) in m.rests where figures[id] != nil {
+        // In id order, so two strollers starting on one frame always get the same seats.
+        for id in m.rests.keys.sorted() {
+            guard let rest = m.rests[id], figures[id] != nil else { continue }
             guard rest.idle, m.leaving[id] == nil else {
                 m.strolls[id] = nil
                 m.strolling[id] = nil
@@ -612,16 +608,8 @@ extension OfficeScene {
         return Self.strollRange.lowerBound + u * (Self.strollRange.upperBound - Self.strollRange.lowerBound)
     }
 
-    /// The `k`th stroller's place: three seats on the sofa, then standing spots across the room.
-    func sofaSpot(_ k: Int) -> CGPoint {
-        guard let r = roomRect("room:break") else { return .zero }
-        let sofa = OfficeRoomNode.sofaCenter(r)
-        if k < 3 { return CGPoint(x: sofa.x + CGFloat(k - 1) * 12, y: sofa.y + 2) }
-        let j = k - 3
-        let step: CGFloat = 14
-        let perLine = Swift.max(1, Int((r.width - 48) / step))
-        return CGPoint(x: r.minX + 24 + CGFloat(j % perLine) * step, y: r.midY - 16)
-    }
+    /// The `k`th stroller's place (`OfficeLayout.sofaSeat`): three seats on the sofa, then standing spots.
+    func sofaSpot(_ k: Int) -> CGPoint { Self.point(layout.sofaSeat(k)) }
 
     // MARK: Effects
 

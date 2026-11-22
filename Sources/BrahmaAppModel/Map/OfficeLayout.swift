@@ -518,6 +518,49 @@ public struct OfficeLayout: Equatable, Sendable {
         return MapPoint2(x: room.x + 20 + Double(i % 9) * 15, y: room.mid.y + Double((i / 9) % 3 - 1) * 14)
     }
 
+    // MARK: - Furniture
+
+    /// How far inside a room's door wall its lane runs: a route inside a room walks to the lane, along it to the door's x,
+    /// and out through the door (`OfficeLayout.route`).
+    static let roomLane = 14.0
+    /// How far a route inside a room keeps clear of furniture it walks around.
+    static let furnitureMargin = 20.0
+
+    /// The furniture a room's routes go around (layout coordinates), as the scene draws it: the board table, the review
+    /// table, the mail counter, the break room's counter and sofa. Empty for an office.
+    public func furniture(_ roomId: String) -> [MapRect] {
+        guard let room = rooms[roomId] else { return [] }
+        let r = room.rect, mid = r.mid
+        switch room.kind {
+        case .board:
+            return [MapRect(x: mid.x - 60, y: mid.y + 4 - 18, w: 120, h: 36)]
+        case .review:
+            let t = OfficeLayout.reviewTable
+            return [MapRect(x: mid.x - t.w / 2, y: mid.y - t.h / 2, w: t.w, h: t.h)]
+        case .mail:
+            return [MapRect(x: r.x + 8, y: mid.y + 3 - 26, w: r.w - 16, h: 52)]
+        case .breakRoom:
+            return [MapRect(x: r.x + 12, y: r.y + 32 - 9, w: 64, h: 18), Self.sofa(r)]
+        case .ceo, .executive, .director:
+            return []
+        }
+    }
+
+    /// The break room's sofa (40 × 16), right of its middle.
+    static func sofa(_ r: MapRect) -> MapRect { MapRect(x: r.x + r.w - 36 - 20, y: r.y + r.h / 2 - 6 - 8, w: 40, h: 16) }
+
+    /// Where the `k`th idle stroller rests in the break room: three seats on the sofa, then standing spots across the
+    /// room's middle.
+    public func sofaSeat(_ k: Int) -> MapPoint2 {
+        guard let r = rooms["room:break"]?.rect else { return MapPoint2(x: 0, y: 0) }
+        let sofa = Self.sofa(r)
+        let i = max(0, k)
+        if i < 3 { return MapPoint2(x: sofa.mid.x + Double(i - 1) * 12, y: sofa.mid.y - 2) }
+        let j = i - 3
+        let perLine = max(1, Int((r.w - 48) / OfficeLayout.spotSpacing))
+        return MapPoint2(x: r.x + 24 + Double(j % perLine) * OfficeLayout.spotSpacing, y: r.mid.y + 16)
+    }
+
     // MARK: - Routes
 
     /// A corridor's centreline: horizontal (y fixed, x in lo…hi) or vertical (x fixed, y in lo…hi).
@@ -585,14 +628,95 @@ public struct OfficeLayout: Equatable, Sendable {
         return RouteGraph(lines: lines, junctions: junctions, onLine: onLine)
     }
 
-    /// Manhattan: start → the nearest corridor point → along corridor centrelines (shortest) → the nearest corridor point
-    /// to the end → end. Every segment but the first and last lies inside the corridors.
+    /// Manhattan: start → out of its room (through the door) or pod (sideways) → the nearest corridor point → along
+    /// corridor centrelines (shortest) → the nearest corridor point to the end → into its pod or room → end. Every segment
+    /// lies in the corridors or in the two ends' pods or rooms, and none crosses a wall (outside a door), a desk, a pod's
+    /// title band or a room's furniture (but the piece an end stands on).
     public func route(from a: MapPoint2, to b: MapPoint2) -> [MapPoint2] {
         route(from: a, to: b, graph: corridors.isEmpty ? nil : routeGraph())
     }
 
     /// `route(from:to:)` over a graph built by `routeGraph()` from this layout's corridors.
+    ///
+    /// An end inside a room leaves only through its door: it walks to the room's lane (going around the room's furniture,
+    /// spec R28), along the lane to the door's x and out through the door; two ends in one room meet on its lane. An end
+    /// in a pod leaves sideways along its chair row to the pod's nearer side, where an aisle corridor runs, so no route
+    /// crosses a desk or a pod's title band.
     public func route(from a: MapPoint2, to b: MapPoint2, graph: RouteGraph?) -> [MapPoint2] {
+        guard a != b else { return [a] }
+        let ra = room(containing: a), rb = room(containing: b)
+        var points: [MapPoint2]
+        if let ra, let rb, ra.id == rb.id {
+            points = roomLeg(a, ra) + roomLeg(b, rb).reversed()
+        } else {
+            let xa = exit(a, ra), xb = exit(b, rb)
+            points = Array(xa.dropLast()) + corridorRoute(from: xa.last!, to: xb.last!, graph: graph)
+                + Array(xb.reversed().dropFirst())
+        }
+        var result: [MapPoint2] = []
+        for p in points where result.last != p { result.append(p) }
+        // Merge straight runs (a lane point on the door's column, say).
+        var merged: [MapPoint2] = []
+        for p in result {
+            if merged.count >= 2 {
+                let u = merged[merged.count - 2], v = merged[merged.count - 1]
+                let sameLine = (u.x == v.x && v.x == p.x) || (u.y == v.y && v.y == p.y)
+                let onward = sameLine && ((v.x - u.x) * (p.x - v.x) + (v.y - u.y) * (p.y - v.y)) > 0
+                if onward { merged[merged.count - 1] = p; continue }
+            }
+            merged.append(p)
+        }
+        return merged
+    }
+
+    /// The room `p` is in (its door included), nil outside every room.
+    func room(containing p: MapPoint2) -> OfficeRoom? {
+        rooms.values.sorted { $0.id < $1.id }.first { Self.inside($0.rect, p) }
+    }
+
+    /// From `p` to a point where it can join the corridors: out of its room through the door (to the door point itself,
+    /// on the wall), or out of its pod sideways; else `p`.
+    func exit(_ p: MapPoint2, _ room: OfficeRoom?) -> [MapPoint2] {
+        if let room {
+            if p == room.door { return [p] }
+            return roomLeg(p, room) + [room.door]
+        }
+        if let pod = pods.values.sorted(by: { $0.id < $1.id }).first(where: { Self.inside($0.rect, p) }) {
+            let side = p.x <= pod.rect.mid.x ? pod.rect.x : pod.rect.x + pod.rect.w
+            return [p, MapPoint2(x: side, y: p.y)]
+        }
+        return [p]
+    }
+
+    /// Inside `room`: from `p` to its lane at the door's x. When the straight step to the lane would cross a piece of
+    /// furniture (not the one `p` is on), it first steps sideways past that piece's nearer end.
+    func roomLeg(_ p: MapPoint2, _ room: OfficeRoom) -> [MapPoint2] {
+        let r = room.rect
+        let doorOnTop = room.door.y <= r.y
+        let lane = doorOnTop ? r.y + Self.roomLane : r.y + r.h - Self.roomLane
+        var obstacles = furniture(room.id)
+        obstacles += desks.values.filter { $0.roomId == room.id }.map(\.rect)
+        obstacles.removeAll { Self.inside($0, p) }
+        // Already on the door's column between the lane and the door: straight out.
+        if p.x == room.door.x, doorOnTop ? p.y <= lane : p.y >= lane { return [p] }
+        var leg = [p]
+        var x = p.x
+        let lo = min(p.y, lane), hi = max(p.y, lane)
+        if let block = obstacles.filter({ $0.x < x && x < $0.x + $0.w && $0.y < hi && lo < $0.y + $0.h })
+            .min(by: { abs($0.mid.y - p.y) < abs($1.mid.y - p.y) }) {
+            let left = block.x - Self.furnitureMargin, right = block.x + block.w + Self.furnitureMargin
+            x = abs(left - x) <= abs(right - x) ? left : right
+            x = min(r.x + r.w - 6, max(r.x + 6, x))
+            leg.append(MapPoint2(x: x, y: p.y))
+        }
+        leg.append(MapPoint2(x: x, y: lane))
+        leg.append(MapPoint2(x: room.door.x, y: lane))
+        return leg
+    }
+
+    /// The corridor part of a route: start → the nearest corridor point → along corridor centrelines (shortest) → the
+    /// nearest corridor point to the end → end.
+    func corridorRoute(from a: MapPoint2, to b: MapPoint2, graph: RouteGraph?) -> [MapPoint2] {
         guard a != b else { return [a] }
         guard !corridors.isEmpty, let graph, graph.lines.count == corridors.count else {
             return a.x == b.x || a.y == b.y ? [a, b] : [a, MapPoint2(x: b.x, y: a.y), b]

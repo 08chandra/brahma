@@ -869,6 +869,116 @@ import AppKit
         #expect(scene.figureNode(victim) == nil && scene.deskNode(victim) == nil, "the leave played out")
     }
 
+    /// Spec §5.7 (carry): item phases are not in the replay timeline, so while the controller replays the office shows
+    /// states only — no one walks to or sits in the review room, no parcels, the meeting light is off, and a phase change
+    /// is ignored — also after Reduce Motion is toggled. (`enterReplay()` reads a live store's history and is a no-op for
+    /// a synthetic controller; the scene reads only `isReplaying`, set here through `@testable`.)
+    @Test func replayIgnoresItemFacets() throws {
+        let made = SyntheticCompany.make(agents: 12)
+        let shipper = try #require(made.agents.first { $0.state != .killed && made.currentItems[$0.id] != nil }?.id)
+        let (c, base) = Self.officeController(12) { $0.itemPhases[shipper] = .checking }
+        let scene = OfficeScene(size: Self.size)
+        scene.reduceMotion = false
+        Self.run(scene, c, to: 1.5)
+        let inRoom = c.model.tree.order.filter {
+            guard let a = c.model.agents[$0] else { return false }
+            if case .meeting = a.activity { return true }
+            return a.activity == .reviewing
+        }
+        #expect(!inRoom.isEmpty && !scene.reviewOccupants.isEmpty, "live: reviewers and the meeting are in the room")
+        #expect(scene.parcelCount > 0)
+        #expect(scene.roomNode("room:review")?.doorLit == true)
+
+        func expectStatesOnly(_ when: String) throws {
+            #expect(scene.reviewOccupants.isEmpty, "\(when): nobody in the review room")
+            for id in inRoom {
+                let seat = Self.scenePoint(try #require(scene.layout.desks[id]?.seat))
+                #expect(scene.figureNode(id) == nil || scene.figureTarget(id) == seat, "\(when): \(id) at its desk")
+            }
+            #expect(scene.parcelCount == 0, "\(when): no parcels")
+            #expect(scene.roomNode("room:review")?.doorLit == false, "\(when): the meeting light is off")
+        }
+        c.isReplaying = true
+        Self.run(scene, c, from: 1.5, to: 2.0)
+        try expectStatesOnly("replay")
+
+        var inputs = base
+        inputs.itemPhases[shipper] = .passed
+        c.model.apply(inputs, now: 2.0)
+        var sawPhase = false
+        Self.run(scene, c, from: 2.0, to: 2.4) { _, events in
+            sawPhase = sawPhase || events.contains { if case .phaseChange = $0.kind { return true }; return false }
+        }
+        #expect(sawPhase, "the phase change reached the scene")
+        try expectStatesOnly("replay, after a phase change")
+        #expect(scene.roomNode("room:mail")?.stampedParcels.isEmpty == true)
+
+        scene.reduceMotion = true
+        try expectStatesOnly("replay, Reduce Motion on")
+        Self.run(scene, c, from: 2.4, to: 2.8)
+        try expectStatesOnly("replay, Reduce Motion on, later")
+        scene.reduceMotion = false
+        Self.run(scene, c, from: 2.8, to: 3.2)
+        try expectStatesOnly("replay, Reduce Motion off again")
+
+        c.isReplaying = false
+        Self.run(scene, c, from: 3.2, to: 3.6)
+        #expect(!scene.reviewOccupants.isEmpty && scene.parcelCount > 0, "live again: the facets are back")
+    }
+
+    /// The hire's slide (spec §5.4): the new desk starts at its pod's aisle and reaches its rect in `moveDuration`,
+    /// fading in. SKActions advance only when rendered, so frames are rendered as `movedDeskGlidesOverMoveDuration` does.
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "no Metal device"))
+    func hireSlidesInFromTheAisle() throws {
+        let probe = OfficeLayout.make(model: Self.model(agents: 12))
+        let made = SyntheticCompany.make(agents: 12)
+        let hired = try #require(made.agents.last { a in
+            a.state != .killed && a.managerId != nil && !made.agents.contains { $0.managerId == a.id }
+                && probe.desks[a.id]?.podId != nil
+        })
+        let (c, base) = Self.officeController(12) { $0.meetings = []; $0.reviewing = [] }
+        var without = base
+        without.agents.removeAll { $0.id == hired.id }
+        c.model.apply(without, now: 0, emitEvents: false)
+        let scene = OfficeScene(size: Self.size)
+        scene.reduceMotion = false
+        Self.run(scene, c, to: 0.1)
+        c.model.apply(base, now: 0.1)
+        Self.run(scene, c, from: 0.1, to: 0.15)
+        let desk = try #require(scene.deskNode(hired.id))
+        let rect = try #require(scene.layout.desks[hired.id]?.rect)
+        let podId = try #require(scene.layout.desks[hired.id]?.podId)
+        let pod = try #require(scene.layout.pods[podId])
+        let aisle = pod.rect.x + OfficeLayout.pod.padding + OfficeLayout.desk.w + OfficeLayout.pod.aisle / 2
+        let target = CGPoint(x: rect.x + rect.w / 2, y: -(rect.y + rect.h / 2))
+        #expect(abs(desk.position.x - aisle) < 0.5 && abs(desk.position.y - target.y) < 0.5, "starts at the aisle")
+        #expect(desk.alpha == 0, "and fades in")
+        #expect(abs(aisle - target.x) > 10, "a real slide")
+
+        let half = Int((OfficeScene.moveDuration / 2 * 60).rounded())
+        _ = try #require(MapSnapshotter.render(scene: scene, size: scene.size, steps: half + 1))
+        let progress = (desk.position.x - aisle) / (target.x - aisle)
+        #expect(progress > 0.3 && progress < 0.95, "on its way at moveDuration / 2: \(progress)")
+        _ = try #require(MapSnapshotter.render(scene: scene, size: scene.size, steps: 36))
+        #expect(Self.near(desk.position, target, within: 0.5), "\(desk.position) vs \(target)")
+        #expect(desk.alpha > 0.99)
+    }
+
+    /// Routes walk around the furniture `OfficeLayout.furniture` lists; the rooms draw it there.
+    @Test func furnitureIsDrawnWhereRoutesGoAround() throws {
+        let scene = Self.scene(Self.model(agents: 50))
+        for id in ["room:board", "room:review", "room:mail", "room:break"] {
+            let node = try #require(scene.roomNode(id))
+            let drawn = node.obstacleFrames.sorted { ($0.minX, $0.minY) < ($1.minX, $1.minY) }
+            let planned = scene.layout.furniture(id).map(OfficeScene.sceneRect).sorted { ($0.minX, $0.minY) < ($1.minX, $1.minY) }
+            #expect(drawn.count == planned.count, "\(id)")
+            for (d, p) in zip(drawn, planned) {
+                #expect(abs(d.minX - p.minX) <= 1 && abs(d.minY - p.minY) <= 1 && abs(d.width - p.width) <= 1
+                        && abs(d.height - p.height) <= 1, "\(id): drawn \(d) vs routed around \(p)")
+            }
+        }
+    }
+
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "no Metal device"))
     func officeFlowSnapshot() throws {
         let (c, _) = Self.officeController(50)

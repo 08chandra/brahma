@@ -452,7 +452,10 @@ import Foundation
         for (p, q) in zip(route, route.dropFirst()) {
             #expect(p.x == q.x || p.y == q.y, "diagonal segment \(p) → \(q)")
         }
-        let allowed = layout.corridors + ends
+        // A route leaves its start's room or pod and enters its end's: both areas are allowed besides the corridors.
+        let areas = (Array(layout.rooms.values.map(\.rect)) + layout.pods.values.map(\.rect))
+            .filter { contains($0, from) || contains($0, to) }
+        let allowed = layout.corridors + ends + areas
         let segments = Array(zip(route, route.dropFirst()))
         guard segments.count > 2 else { return }
         for (p, q) in segments[1..<(segments.count - 1)] {
@@ -482,6 +485,108 @@ import Foundation
         checkRoute(layout, from: layout.doorSpot(2), to: any.seat, ends: [endArea(layout, any)].compactMap { $0 })
         // Same point: a one-point route.
         #expect(layout.route(from: any.seat, to: any.seat) == [any.seat])
+    }
+
+    /// The walls of `room` as segments, with the door's 16 pt gap left out of its wall.
+    func walls(_ room: OfficeRoom) -> [(MapPoint2, MapPoint2)] {
+        let r = room.rect, d = room.door, gap = 8.0
+        let top = r.y, bottom = r.y + r.h, left = r.x, right = r.x + r.w
+        var walls = [(MapPoint2(x: left, y: top), MapPoint2(x: left, y: bottom)),
+                     (MapPoint2(x: right, y: top), MapPoint2(x: right, y: bottom))]
+        for y in [top, bottom] {
+            if d.y == y {
+                walls.append((MapPoint2(x: left, y: y), MapPoint2(x: d.x - gap, y: y)))
+                walls.append((MapPoint2(x: d.x + gap, y: y), MapPoint2(x: right, y: y)))
+            } else {
+                walls.append((MapPoint2(x: left, y: y), MapPoint2(x: right, y: y)))
+            }
+        }
+        return walls
+    }
+
+    /// Two axis-aligned segments touch or cross (ends included).
+    func meets(_ p: MapPoint2, _ q: MapPoint2, _ a: MapPoint2, _ b: MapPoint2) -> Bool {
+        min(p.x, q.x) <= max(a.x, b.x) && min(a.x, b.x) <= max(p.x, q.x)
+            && min(p.y, q.y) <= max(a.y, b.y) && min(a.y, b.y) <= max(p.y, q.y)
+    }
+
+    /// R28 on one route: axis-aligned segments that meet a room's walls only in its door gap, and cross no desk, no pod
+    /// title band and no furniture (but the piece an end stands on, crossed by that end's own segment). Returns how many
+    /// problems it recorded.
+    @discardableResult
+    func checkDoorsAndFurniture(_ layout: OfficeLayout, _ route: [MapPoint2], _ label: String) -> Int {
+        var problems = 0
+        func fail(_ why: String) {
+            problems += 1
+            if problems <= 3 { Issue.record("\(label): \(why)") }
+        }
+        guard let start = route.first, let end = route.last else { return 0 }
+        let rooms = layout.rooms.values.sorted { $0.id < $1.id }
+        let furniture = rooms.flatMap { layout.furniture($0.id) }
+        for (p, q) in zip(route, route.dropFirst()) {
+            if p.x != q.x && p.y != q.y { fail("diagonal \(p) → \(q)") }
+            for room in rooms {
+                for (a, b) in walls(room) where meets(p, q, a, b) { fail("\(p) → \(q) meets a wall of \(room.id) at \(a)–\(b)") }
+            }
+            for d in layout.desks.values where crossesInterior(p, q, d.rect) { fail("\(p) → \(q) crosses desk \(d.id)") }
+            for pod in layout.pods.values where crossesInterior(p, q, pod.labelRect) {
+                fail("\(p) → \(q) crosses the title band of \(pod.id)")
+            }
+            for f in furniture where crossesInterior(p, q, f) {
+                let standsOn = (p == start && contains(f, start)) || (q == end && contains(f, end))
+                if !standsOn { fail("\(p) → \(q) crosses furniture \(f)") }
+            }
+        }
+        return problems
+    }
+
+    /// R28: every route enters and leaves rooms only through their doors and walks around desks, pod titles, the review
+    /// table, the counters and the sofa: every pair of agent desks (a seeded sample at 150), and every review chair and
+    /// standing spot, mail-counter spot, sofa seat and board-door spot, and the owner's door, to and from every desk and
+    /// each other. (Open seats are left out: no one walks to or from a vacancy.)
+    @Test func routesUseDoorsAndAvoidFurniture() {
+        for n in [12, 50, 150] {
+            let layout = OfficeLayout.make(model: synthetic(n))
+            let graph = layout.routeGraph()
+            let seats = layout.desks.filter { isAgent($0.key) }.sorted { $0.key < $1.key }.map(\.value.seat)
+            var spots: [MapPoint2] = [layout.location(.owner)!]
+            spots += (0..<16).map(layout.reviewSeat)
+            spots += (0..<27).map(layout.mailCounter)
+            spots += (0..<6).map(layout.sofaSeat)
+            spots += (0..<10).map(layout.doorSpot)
+            var pairs: [(MapPoint2, MapPoint2)] = []
+            if n <= 50 {
+                for a in seats { for b in seats where a != b { pairs.append((a, b)) } }
+            } else {
+                var rng = SplitMix64(seed: 28)
+                for _ in 0..<600 {
+                    pairs.append((seats[Int.random(in: 0..<seats.count, using: &rng)],
+                                  seats[Int.random(in: 0..<seats.count, using: &rng)]))
+                }
+            }
+            for s in spots {
+                for seat in seats { pairs.append((s, seat)); pairs.append((seat, s)) }
+                for t in spots where t != s { pairs.append((s, t)) }
+            }
+            var problems = 0
+            for (a, b) in pairs {
+                let route = layout.route(from: a, to: b, graph: graph)
+                #expect(route.first == a && route.last == b)
+                problems += checkDoorsAndFurniture(layout, route, "office-\(n) \(a) → \(b)")
+                if problems > 20 { break }
+            }
+            #expect(problems == 0, "office-\(n): \(problems) problems over \(pairs.count) routes")
+        }
+    }
+
+    /// The cached-graph route is the uncached one.
+    @Test func routeGraphGivesTheSameRoutes() {
+        let layout = OfficeLayout.make(model: synthetic(50))
+        let graph = layout.routeGraph()
+        let seats = layout.desks.values.sorted { $0.id < $1.id }.map(\.seat)
+        for (a, b) in zip(seats, seats.reversed()) {
+            #expect(layout.route(from: a, to: b, graph: graph) == layout.route(from: a, to: b))
+        }
     }
 
     @Test func locationsAndSeats() throws {
