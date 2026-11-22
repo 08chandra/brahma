@@ -34,7 +34,8 @@ extension Store {
     public func relayedTaint(inbox: [(InboxItem, Message, Channel)], notices: [PendingNotice], handoff: Handoff?,
                              handles: [String: String]) -> String? {
         func who(_ id: String) -> String { "@" + (handles[id] ?? "unknown") }
-        if let m = inbox.first(where: { $0.1.taintedOrigin }) { return "relayed: message from \(who(m.1.senderId))" }
+        // C3b: a message stamped with its session's taint (`fromTaintedSession`) relays it as the write-time mark does.
+        if let m = inbox.first(where: { $0.1.taintedOrigin || $0.1.fromTaintedSession }) { return "relayed: message from \(who(m.1.senderId))" }
         if let n = notices.first(where: { $0.event.taintedOrigin }) { return "relayed: \(n.itemKey) \(n.event.kind.rawValue) by \(who(n.event.actorId))" }
         if let h = handoff, h.taintedOrigin { return "relayed: hand-off by \(who(h.authorId))" }
         return nil

@@ -45,7 +45,9 @@ extension Orchestrator {
         let digest = ReviewDigest.render(item: item, run: run, nameStatus: names, diff: diff,
                                          dependencies: try store.dependencies(itemId: item.id),
                                          worktree: git.worktreePath(key: item.key).path, timeZone: store.ownerTimeZone(),
-                                         untrusted: item.taintedOrigin || submitted?.taintedOrigin == true)
+                                         untrusted: item.taintedOrigin || submitted?.taintedOrigin == true,
+                                         // C3b: the diff holds commits a tainted session made (fail closed: unreadable is tainted).
+                                         taintedCommits: store.reviewDiffTaint(companyId: company.id, itemKey: item.key, commit: commit))
         var context = ReviewTurnContext(item: item, worktree: git.worktreePath(key: item.key), digest: digest,
                                         deep: item.tier == .l || !item.reviewFlags.isEmpty)
         context.untrusted = item.taintedOrigin || submitted?.taintedOrigin == true

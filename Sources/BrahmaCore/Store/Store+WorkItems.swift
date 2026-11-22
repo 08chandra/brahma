@@ -662,11 +662,13 @@ extension Store {
     @discardableResult
     func recordItemEvent(db: Database, item: WorkItem, actor: String, kind: WorkEventKind, text: String,
                          alsoNotify: [String] = [], alsoNotifyRole: NoticeRecipientRole = .other,
-                         assigneeRole: NoticeRecipientRole = .owner, onlyAlsoNotify: Bool = false, now: Date) throws -> WorkItemEvent {
+                         assigneeRole: NoticeRecipientRole = .owner, onlyAlsoNotify: Bool = false, sourceMessageId: String? = nil,
+                         now: Date) throws -> WorkItemEvent {
         let text = try redact(text)
         let active = try Self.activeNow(db: db, companyId: item.companyId)
         var event = WorkItemEvent(id: nil, companyId: item.companyId, itemId: item.id, actorId: actor, kind: kind, text: text,
-                                  createdAt: now, createdActive: active, taintedOrigin: try writesTainted(db: db, actorId: actor))
+                                  createdAt: now, createdActive: active, taintedOrigin: try writesTainted(db: db, actorId: actor),
+                                  sourceMessageId: sourceMessageId)
         try event.insert(db)
         guard let eventId = event.id else { throw StoreError.notFound }
         // S21: a claim or a submission by a tainted session marks the item (its worktree is the tainted session's work).

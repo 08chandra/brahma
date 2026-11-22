@@ -21,6 +21,9 @@ public enum TaintPolicy {
         "publish_artifact",
     ]).union(CompanyToolNames.memory)   // Plan ML: what a tainted session remembers is stored tainted; what it reads taints first.
         .union(CompanyToolNames.kb)     // Plan ML: a tainted session's page edit taints the page; reading a tainted revision taints first.
+        // Plan C Task C3b: a tainted session's share is stamped tainted (and can't send a private snapshot as a reply);
+        // `open_ref` taints the reader before any tainted byte is read.
+        .union(CompanyToolNames.collab)
 
     /// The company tools reviewed as high risk (`everyToolClassified` pins `CompanyToolNames.all` against both sets). A task
     /// that adds a tool adds it to one of the two in the same commit (10b: `propose_extension`, refused while tainted).

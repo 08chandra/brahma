@@ -311,6 +311,9 @@ public enum WorkEventKind: String, Codable, CaseIterable, Sendable, DatabaseValu
     case planWritten, planTurnWrote, modeEscalated, specConfirmed
     // Human tasks (Plan L Task 9): the owner did or declined the task the item was blocked on. Both wake the assignee.
     case humanTaskDone, humanTaskDeclined
+    /// Plan C Task C3b: a message named the item (an inline chip or an attachment); `sourceMessageId` is that message. An FYI,
+    /// never waking; its text names no conversation (backlinks are per reader, `Store.backlinks`).
+    case referenced
 
     /// Events that count as an agent making progress (the watchdog resets on them).
     public static let progress: Set<WorkEventKind> = [
@@ -339,6 +342,8 @@ public struct WorkItemEvent: Codable, Equatable, Sendable, FetchableRecord, Muta
     public var createdActive: Double
     /// Written by a session that had read outside content (I2).
     public var taintedOrigin: Bool = false
+    /// Plan C Task C3b: the message a `referenced` event came from.
+    public var sourceMessageId: String? = nil
 
     public mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
 }

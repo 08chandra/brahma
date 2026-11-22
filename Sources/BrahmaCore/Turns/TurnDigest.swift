@@ -38,6 +38,8 @@ public struct TurnContext: Sendable {
     public var inboxOverflow: Int = 0
     /// C3a: the roots of the thread replies in `inbox` the agent can read in full, by id (the digest's thread label).
     public var threadRoots: [String: Message] = [:]
+    /// C3b: the agent's lines for each inbox message's refs, by message id (`Store.digestAttachments`).
+    public var attachments: [String: [String]] = [:]
     public var channelCounts: [(channel: String, count: Int)]
     public var handles: [String: String]
     public var timeZone: TimeZone
@@ -115,6 +117,7 @@ public struct TurnContext: Sendable {
             recentSummaries: [], inboxItemIds: inbox.compactMap(\.0.id), quietItemIds: quiet.map(\.id), noticeIds: batch.deliveredIds)
         c.inboxOverflow = allInbox.count - inbox.count
         c.threadRoots = try store.threadRoots(agentId: agent.id, companyId: company.id, items: inbox)
+        c.attachments = try store.digestAttachments(agentId: agent.id, companyId: company.id, items: inbox)
         c.answeredTasks = try store.answeredHumanTasks(companyId: company.id, requesterId: agent.id, limit: TurnDigest.maxAnsweredTasks)
         c.recentSummaries = (try? store.recentTurnSummaries(agentId: agent.id, scope: c.scope)) ?? []
         c.summariesOmitted = (try? store.recentTurnSummariesTainted(agentId: agent.id, scope: c.scope)) ?? 0
@@ -295,7 +298,7 @@ public enum TurnDigest {
         if !(c.inbox.isEmpty && c.channelCounts.isEmpty && !c.notices.isEmpty) {
             out.append("# Inbox")
             var inbox = InboxDigest.render(agent: agent, company: company, items: c.inbox, handles: c.handles, unread: c.channelCounts,
-                                           threadRoots: c.threadRoots, timeZone: c.timeZone)
+                                           threadRoots: c.threadRoots, timeZone: c.timeZone, attachments: c.attachments)
             if c.inboxOverflow > 0 {
                 // The rest stay pending and arrive with the next turn; the unread line (if any) stays last.
                 let line = "- … and \(c.inboxOverflow) more (they arrive in your next turn)"

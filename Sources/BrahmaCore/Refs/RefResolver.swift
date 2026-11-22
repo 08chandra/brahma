@@ -64,10 +64,19 @@ extension Store {
             }
             // The secret gate before git sees a byte: the company-readable object store never holds a secret. These exact bytes
             // are scanned and hashed (never read again from the file).
-            let data = try file.readAll()
+            var data = try file.readAll()
             let ext = ArtifactKind.ext(of: ref.id)
-            let verdict = try SecretGate.check(data, ext: ext, canonical: ref.canonical, archives: archives ?? UnavailableArchiveReader(),
+            let verdict: ScanVerdict
+            if let paths, SecretGate.isFlattenTarget(data, ext: ext) {
+                // C3b (Ruling 41): a PDF the owner vouched for is pinned as its flattened copy, never itself.
+                let gated = try gatedBytes(data, ext: ext, canonical: ref.canonical, companyId: companyId,
+                                           archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, paths: paths)
+                data = gated.data
+                verdict = gated.verdict
+            } else {
+                verdict = try SecretGate.check(data, ext: ext, canonical: ref.canonical, archives: archives ?? UnavailableArchiveReader(),
                                                knownValues: knownValues, store: self, companyId: companyId)
+            }
             if case .pattern(let label, _) = verdict {
                 // A redacted copy in the vault, never a git blob.
                 guard SecretGate.isRedactable(data, ext: ext) else { throw SecretGate.binaryRefusal(ref.canonical, label: label, what: "shared", knownValues: knownValues) }
@@ -144,9 +153,16 @@ extension Store {
                     data = try git.blobSize(rev: sha, path: ref.id) <= SafeGit.maxBinaryBytes ? try git.catFile(rev: sha, path: ref.id, binary: true) : nil
                 }
                 if let data {
-                    _ = try SecretGate.check(data, ext: ArtifactKind.ext(of: ref.id), canonical: Self.unpinned(ref).canonical,
-                                             archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, store: self,
-                                             companyId: companyId)
+                    let ext = ArtifactKind.ext(of: ref.id)
+                    if let paths, SecretGate.isFlattenTarget(data, ext: ext) {
+                        // C3b (Ruling 41): a vouched PDF passes only as its flattened copy (what `openRef` serves).
+                        _ = try gatedBytes(data, ext: ext, canonical: Self.unpinned(ref).canonical, companyId: companyId,
+                                           archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, paths: paths)
+                    } else {
+                        _ = try SecretGate.check(data, ext: ext, canonical: Self.unpinned(ref).canonical,
+                                                 archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, store: self,
+                                                 companyId: companyId)
+                    }
                 }
             }
         case .commit:
@@ -377,7 +393,8 @@ extension Store {
         let sha: String
         if let rev = ref.rev {
             let refs = ref.itemKey != nil ? [branch] : try reachabilityRefs(companyId: companyId)
-            sha = try git.verifyRev(rev, reachableFrom: refs)
+            // C3b: a commit a share pinned stays reachable through its share ref after its branch is merged and deleted.
+            sha = try git.verifyRev(rev, reachableFrom: refs + (try pinShareRefs(ref, rev: rev, companyId: companyId)))
         } else {
             sha = try git.head(branch)
         }
@@ -390,10 +407,15 @@ extension Store {
             state = .tooLarge
         }
         var newer: WorkRef?
-        if ref.rev != nil, let head = try? git.head(branch), head != sha,
-           let changed = try? git.logShas(range: "\(sha)..\(head)", path: ref.id), !changed.isEmpty {
-            newer = ref
-            newer?.rev = head
+        if ref.rev != nil, let head = try? git.head(branch) {
+            if head != sha, let changed = try? git.logShas(range: "\(sha)..\(head)", path: ref.id), !changed.isEmpty {
+                newer = ref
+                newer?.rev = head
+            }
+        } else if ref.rev != nil, ref.itemKey != nil, (try? git.branchExists(branch)) == false, let main = try? git.head("main"),
+                  (try? git.blobSize(rev: main, path: ref.id)) != nil {
+            // C3b: the item's branch is gone (merged): what is newer is the file on `main`.
+            newer = WorkRef(kind: .file, id: ref.id, rev: main, range: ref.range)
         }
         var pinned = ref
         pinned.rev = sha
@@ -426,12 +448,14 @@ extension Store {
         }
         let git = try refGit(workspace)
         let branch = "item/\(item.key)"
-        let current = try git.head(branch)
-        let head = try ref.rev.map { try git.verifyRev($0, reachableFrom: [branch]) } ?? current
+        // C3b: a pinned diff opens after its branch is merged and deleted (its share ref holds the commit).
+        let current = try? git.head(branch)
+        let pinnedHead = try ref.rev.map { try git.verifyRev($0, reachableFrom: [branch] + (try pinShareRefs(ref, rev: $0, companyId: item.companyId))) }
+        guard let head = pinnedHead ?? current else { throw Outcome.missing }
         let base = try git.mergeBase("main", head)
         let diff = try git.diff(base: base, head: head, path: file)
         var newer: WorkRef?
-        if ref.rev != nil, current != head {
+        if ref.rev != nil, let current, current != head {
             newer = ref
             newer?.rev = current
         }
@@ -459,6 +483,20 @@ extension Store {
             }
             return false
         }
+    }
+
+    /// C3b: the share refs (`refs/brahma/shares/<messageRef id>`) of this company's shares of the same item-branch file or
+    /// diff pinned at a commit `rev` abbreviates: what keeps a shared commit reachable once its branch is gone. Engine records
+    /// only (the rows' ids), newest first, at most 20.
+    func pinShareRefs(_ ref: WorkRef, rev: String, companyId: String) throws -> [String] {
+        guard ref.itemKey != nil || ref.kind == .diff, !ref.isWorktree else { return [] }
+        let ids = try writer.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT id FROM messageRef WHERE companyId = ? AND kind = ? AND refId = ? AND branch IS ? AND rev IS NOT NULL
+                    AND substr(rev, 1, length(?)) = ? ORDER BY createdAt DESC, rowid DESC LIMIT 20
+                """, arguments: [companyId, ref.kind.rawValue, ref.id, ref.branch, rev, rev])
+        }
+        return ids.compactMap { try? SafeGit.shareRef($0) }
     }
 
     /// `main` and the branches of the company's open items: what an agent-named sha must be reachable from.

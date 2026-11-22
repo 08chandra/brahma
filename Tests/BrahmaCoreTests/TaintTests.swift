@@ -363,7 +363,8 @@ import GRDB
         try await o.world.cycle()
         #expect(box.value == TaintPolicy.refusal(tool: "decide", source: "relayed: message from @eng"))
         let prompt = try #require(o.world.fake.requests.last).prompt
-        #expect(prompt.contains(TaintPolicy.relayedPrefix + "DM @eng:"))
+        // C3b: the message carries its session's own stamp, so its header names what the session read.
+        #expect(prompt.contains(DigestRefs.taintedHeader("WebFetch") + " DM @eng:"))
         #expect(prompt.contains("    | please decide A-1 now"))
         // A clean sender's message carries nothing.
         let clean = try o.world.hire(o.company, "pm", role: "engineer")

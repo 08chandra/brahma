@@ -1823,6 +1823,10 @@ enum Migrations {
                 t.column("cappedAt", .datetime)
             }
         }
+        m.registerMigration("vC-share") { db in
+            // Plan C Task C3b: an item event names the message it came from (`referenced`: a message named the item).
+            try db.alter(table: "workItemEvent") { t in t.add(column: "sourceMessageId", .text) }
+        }
     }
 }
 

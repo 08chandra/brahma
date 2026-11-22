@@ -864,10 +864,12 @@ extension Store {
         let fileName = workspacePath.split(separator: "/").last.map(String.init) ?? workspacePath
         var data = try file.readAll()
         // The secret gate, before anything is written: a stored secret's value refuses; a secret pattern in text stores a
-        // redacted copy (REDACTED), in a binary refuses (it can't be redacted).
-        let verdict = try SecretGate.check(data, ext: ArtifactKind.ext(of: fileName), canonical: fileName,
-                                           archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, store: self,
-                                           companyId: companyId)
+        // redacted copy (REDACTED), in a binary refuses (it can't be redacted). C3b (Ruling 41): through `gatedBytes`, so a PDF
+        // the owner vouched for is snapshotted as its flattened copy, never itself.
+        let gated = try gatedBytes(data, ext: ArtifactKind.ext(of: fileName), canonical: fileName, companyId: companyId,
+                                   archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, paths: paths)
+        data = gated.data
+        let verdict = gated.verdict
         var secretScan = SecretScanState.none
         if case .pattern(let label, _) = verdict {
             guard SecretGate.isRedactable(data, ext: ArtifactKind.ext(of: fileName)) else {

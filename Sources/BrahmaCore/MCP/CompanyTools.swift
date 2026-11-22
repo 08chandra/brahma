@@ -71,22 +71,28 @@ public struct CompanyTools: Sendable {
     /// The secret store `brahma mcp` resolved (Plan ML: `remember` refuses a fact holding a stored value). Nil: none, which
     /// refuses `remember` whenever the company has secrets (fail closed).
     let vault: (any SecretVault)?
+    /// Plan C Task C3b: what reads archive members and PDFs at the secret gate of `share`, `open_ref` and attachments
+    /// (`brahma mcp`: `CompanyTools.liveArchives`, the sandboxed unzip reader with the PDF helper). Nil: none, so archives and
+    /// PDFs are refused (fail closed).
+    let archives: (any ArchiveReader)?
     let counter = TurnQuotaCounter()
 
     public init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
                 quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false, taintFlag: URL? = nil,
-                paths: BrahmaPaths? = nil, vault: (any SecretVault)? = nil) {
+                paths: BrahmaPaths? = nil, vault: (any SecretVault)? = nil, archives: (any ArchiveReader)? = nil) {
         self.init(store: store, companyId: companyId, agentId: agentId, reviewItemId: reviewItemId, auditTurnId: auditTurnId,
                   quotas: quotas, quotaTurnId: quotaTurnId, planTurn: planTurn, taintFlag: taintFlag, paths: paths, vault: vault,
-                  diagnostics: { line in FileHandle.standardError.write(Data((line + "\n").utf8)) })
+                  archives: archives, diagnostics: { line in FileHandle.standardError.write(Data((line + "\n").utf8)) })
     }
 
     init(store: Store, companyId: String, agentId: String, reviewItemId: String? = nil, auditTurnId: String? = nil,
          quotas: ModeQuotas? = nil, quotaTurnId: String? = nil, planTurn: Bool = false, taintFlag: URL? = nil,
-         paths: BrahmaPaths? = nil, vault: (any SecretVault)? = nil, diagnostics: @escaping @Sendable (String) -> Void) {
+         paths: BrahmaPaths? = nil, vault: (any SecretVault)? = nil, archives: (any ArchiveReader)? = nil,
+         diagnostics: @escaping @Sendable (String) -> Void) {
         self.store = store; self.companyId = companyId; self.agentId = agentId; self.diagnostics = diagnostics
         self.paths = paths
         self.vault = vault
+        self.archives = archives
         self.reviewItemId = reviewItemId
         self.auditTurnId = reviewItemId == nil ? auditTurnId : nil
         self.quotas = quotas; self.quotaTurnId = quotaTurnId; self.planTurn = planTurn
@@ -114,7 +120,7 @@ public struct CompanyTools: Sendable {
 
     func quotaKind(_ name: String, _ args: [String: JSONValue]) -> TurnQuotaCounter.Kind? {
         switch name {
-        case "post_message", "send_dm": return .posts
+        case "post_message", "send_dm", "share": return .posts
         case "create_work_item": return .items
         case "comment_work_item": return .comments
         case "update_work_item": return Set(args.keys).isSubset(of: Self.updateLowRiskFields) ? nil : .highRisk
@@ -184,7 +190,7 @@ public struct CompanyTools: Sendable {
     /// Every tool group's specs (the stable, role-independent list).
     private static func allSpecs() -> [ToolSpec] {
         baseSpecs() + workSpecs() + inboxToolSpecs() + safetyToolSpecs() + previewToolSpecs() + deployToolSpecs() + queueToolSpecs() + humanTaskToolSpecs()
-            + extensionToolSpecs() + memoryToolSpecs() + handbookToolSpecs()
+            + extensionToolSpecs() + memoryToolSpecs() + handbookToolSpecs() + collabToolSpecs()
     }
 
     private static let implemented: Set<String> = Set(allSpecs().map(\.name))
@@ -197,12 +203,14 @@ public struct CompanyTools: Sendable {
             ToolSpec(name: "post_message", description: "Post a message to a channel you are a member of. Use @handle to mention teammates.",
                      inputSchema: s.schema(["channel": s.prop("string", "Channel name, e.g. general"),
                                             "text": s.prop("string", "Message text"),
-                                            "reply_to": s.prop("string", "Reply in the thread of this channel message (msg:<id>)")],
+                                            "reply_to": s.prop("string", "Reply in the thread of this channel message (msg:<id>)"),
+                                            "attachments": s.refsProp("Refs to attach (at most 6), e.g. ENG-12:src/a.ts:40-88, F-3")],
                                            required: ["channel", "text"])),
             ToolSpec(name: "send_dm", description: "Send a direct message to a teammate or to the owner.",
                      inputSchema: s.schema(["to": s.prop("string", "Recipient handle, e.g. @cto, or owner"),
                                             "text": s.prop("string", "Message text"),
-                                            "reply_to": s.prop("string", "Reply in the thread of this DM message (msg:<id>)")],
+                                            "reply_to": s.prop("string", "Reply in the thread of this DM message (msg:<id>)"),
+                                            "attachments": s.refsProp("Refs to attach (at most 6); the recipient must be able to read each")],
                                            required: ["to", "text"])),
             ToolSpec(name: "read_channel", description: "Read the latest messages of a channel or DM you are in, oldest first.",
                      inputSchema: s.schema(["channel": s.prop("string", "Channel name"),
@@ -356,17 +364,32 @@ public struct CompanyTools: Sendable {
             switch name {
             case "post_message":
                 let channel = try string(args, "channel"), text = try string(args, "text")
-                let result = try router.postDetailed(companyId: companyId, channel: channel, from: .agent(agentId), text: text,
+                let attachments = try attachmentList(args)
+                let result: PostResult
+                if let attachments {
+                    result = try postAttachments(to: "#" + Store.normalizeChannelName(channel), text: text, attachments: attachments,
+                                                 replyTo: try optionalString(args, "reply_to"))
+                } else {
+                    result = try router.postDetailed(companyId: companyId, channel: channel, from: .agent(agentId), text: text,
                                                      replyTo: try optionalString(args, "reply_to"))
-                var reply = "Posted to #\(Store.normalizeChannelName(channel))"
+                }
+                var reply = "Posted to #\(Store.normalizeChannelName(channel))" + Self.attachedSuffix(attachments?.count)
                     + (result.message.parentId.map { " in thread msg:\($0)." } ?? ".")
                 if let refusal = result.broadcastRefusal { reply += " " + refusal }
                 return reply
             case "send_dm":
                 let to = try string(args, "to"), text = try string(args, "text")
-                let sent = try router.sendDM(companyId: companyId, from: .agent(agentId), to: to, text: text,
+                let attachments = try attachmentList(args)
+                let sent: Message
+                if let attachments {
+                    sent = try postAttachments(to: "@" + Self.handle(to), text: text, attachments: attachments,
+                                               replyTo: try optionalString(args, "reply_to")).message
+                } else {
+                    sent = try router.sendDM(companyId: companyId, from: .agent(agentId), to: to, text: text,
                                              replyTo: try optionalString(args, "reply_to"))
-                return "Sent DM to @\(Self.handle(to))" + (sent.parentId.map { " in thread msg:\($0)." } ?? ".")
+                }
+                return "Sent DM to @\(Self.handle(to))" + Self.attachedSuffix(attachments?.count)
+                    + (sent.parentId.map { " in thread msg:\($0)." } ?? ".")
             case "read_channel":
                 return try readChannel(try string(args, "channel"), limit: try limit(args), thread: try optionalString(args, "thread"))
             case "list_channels":
@@ -399,6 +422,7 @@ public struct CompanyTools: Sendable {
                 if let result = try dispatchHumanTask(name, args) { return result }
                 if let result = try dispatchMemory(name, args) { return result }
                 if let result = try dispatchHandbook(name, args) { return result }
+                if let result = try dispatchCollab(name, args) { return result }
                 throw ToolError(message: "unknown tool: \(name)")
             }
         } catch let e as ToolError {

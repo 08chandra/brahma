@@ -116,7 +116,13 @@ struct MCP: ParsableCommand {
                                                    // The hook's fail-closed mark: present, every high-risk call is refused.
                                                    taintFlag: TaintFlag.url(home: secretPaths.home, agentId: me.id),
                                                    // `remember` refuses a fact holding a stored secret's value.
-                                                   vault: vault), beforeCall: check)
+                                                   vault: vault,
+                                                   // C3b: `share`, `open_ref` and attachments read archives and PDFs only
+                                                   // through the sandboxed unzip reader and the PDF helper.
+                                                   archives: CompanyTools.liveArchives(
+                                                       store: store, paths: secretPaths, companyId: company,
+                                                       executable: Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))),
+                               beforeCall: check)
         server.serve(input: .standardInput, output: .standardOutput)
     }
 }

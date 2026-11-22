@@ -117,7 +117,7 @@ extension Store {
         let reason = r.resolved.taintReason ?? "outside content"
         if tainted, case .agent(let id) = reader { try markTainted(agentId: id, source: "ref:\(canonical)", now: now) }
         // 4. The bytes.
-        let content: Content
+        var content: Content
         do {
             content = try readContent(r, subject: subject, company: company, paths: paths, whole: copy, knownValues: knownValues)
         } catch let e as WorkError {
@@ -129,10 +129,20 @@ extension Store {
             if reader == .owner, !(error is VaultError), !(error is SafeGitError), !(error is SafeFSError) { throw error }
             throw WorkError.notFound(Self.refUnavailable)
         }
-        // The secret gate (C2b), before a byte is shown or copied: a stored secret's value refuses.
-        let verdict = try SecretGate.check(content.data, ext: content.ext, canonical: canonical,
+        // The secret gate (C2b), before a byte is shown or copied: a stored secret's value refuses. C3b (Ruling 41): bytes that
+        // may be a PDF are served only through `gatedBytes`, so one the owner vouched for is its flattened copy, never itself.
+        let verdict: ScanVerdict
+        if case .bytes(let data, let ext) = content.body, SecretGate.isFlattenTarget(data, ext: ext) {
+            let gated = try gatedBytes(data, ext: ext, canonical: canonical, companyId: companyId, archives: archives ?? UnavailableArchiveReader(),
+                                       knownValues: knownValues, paths: paths)
+            content.body = .bytes(gated.data, ext: gated.ext)
+            content.ext = gated.ext
+            verdict = gated.verdict
+        } else {
+            verdict = try SecretGate.check(content.data, ext: content.ext, canonical: canonical,
                                            archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, store: self,
                                            companyId: companyId)
+        }
         if let copier {
             // A copy with a secret pattern is the redacted copy; a binary one can't be redacted and is refused.
             var copied = content

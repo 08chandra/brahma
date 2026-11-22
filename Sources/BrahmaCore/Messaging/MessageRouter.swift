@@ -31,24 +31,31 @@ public struct MessageRouter: Sendable {
         try postDetailed(companyId: companyId, channel: name, from: from, text: text, now: now, replyTo: replyTo).message
     }
 
+    /// Plan C Task C3b: the refs the text names (`Store.inlineRefs`, not for `Sender.system`) are resolved for the sender
+    /// before the write transaction and stored with the message as `inline` `messageRef` rows; an item ref adds a non-waking
+    /// `referenced` item event naming the message.
     public func postDetailed(companyId: String, channel name: String, from: Sender, text: String, now: Date = .now,
                              replyTo: String? = nil) throws -> PostResult {
-        try store.writer.write { db in
-            try post(db: db, companyId: companyId, channel: name, from: from, text: text, now: now, replyTo: replyTo)
+        let channelId = try store.channel(companyId: companyId, name: Store.normalizeChannelName(name))?.id
+        let inline = try store.inlineRefs(companyId: companyId, sender: from, text: text, channelId: channelId)
+        return try store.writer.write { db in
+            try post(db: db, companyId: companyId, channel: name, from: from, text: text, now: now, replyTo: replyTo, inline: inline)
         }
     }
 
     /// `replyTo` as for `post`: a message of this DM.
     public func sendDM(companyId: String, from: Sender, to handle: String, text: String, now: Date = .now,
                        replyTo: String? = nil) throws -> Message {
-        try store.writer.write { db in
-            try sendDM(db: db, companyId: companyId, from: from, to: handle, text: text, now: now, replyTo: replyTo)
+        let inline = try store.inlineRefs(companyId: companyId, sender: from, text: text, channelId: nil)
+        return try store.writer.write { db in
+            try sendDM(db: db, companyId: companyId, from: from, to: handle, text: text, now: now, replyTo: replyTo, inline: inline)
         }
     }
 
-    /// In-transaction `post`, for callers that already hold a write transaction.
+    /// In-transaction `post`, for callers that already hold a write transaction. `kind` is the stored message kind (C3b's
+    /// shares); `inline` the rows `Store.inlineRefs` made for the text, stored from `firstInlinePosition`.
     func post(db: Database, companyId: String, channel name: String, from: Sender, text: String, now: Date,
-              replyTo: String? = nil) throws -> PostResult {
+              replyTo: String? = nil, kind: MessageKind = .text, inline: [MessageRef] = [], firstInlinePosition: Int = 0) throws -> PostResult {
         let normalized = Store.normalizeChannelName(name)
         try validate(from, companyId: companyId, db)
         guard let channel = try Channel.filter(Column("companyId") == companyId && Column("name") == normalized).fetchOne(db)
@@ -60,13 +67,14 @@ public struct MessageRouter: Sendable {
         let parentId = try replyTo.map {
             try Store.replyRoot(db: db, companyId: companyId, channelId: channel.id, reference: $0, sender: from, catalog: store.catalog)
         }
-        return try deliver(db, channel: channel, from: from, text: text, now: now, parentId: parentId)
+        return try deliver(db, channel: channel, from: from, text: text, now: now, parentId: parentId, kind: kind, inline: inline,
+                           firstInlinePosition: firstInlinePosition)
     }
 
     /// In-transaction `sendDM`.
     @discardableResult
     func sendDM(db: Database, companyId: String, from: Sender, to handle: String, text: String, now: Date,
-                replyTo: String? = nil) throws -> Message {
+                replyTo: String? = nil, kind: MessageKind = .text, inline: [MessageRef] = [], firstInlinePosition: Int = 0) throws -> Message {
         let target = handle.hasPrefix("@") ? String(handle.dropFirst()).lowercased() : handle.lowercased()
         try validate(from, companyId: companyId, db)
         let toMember: String
@@ -96,7 +104,8 @@ public struct MessageRouter: Sendable {
             channel = try Store.insertChannel(db, companyId: companyId, name: channelName, kind: .dm,
                                               members: [from.id, toMember], now: now)
         }
-        return try deliver(db, channel: channel, from: from, text: text, now: now, parentId: parentId).message
+        return try deliver(db, channel: channel, from: from, text: text, now: now, parentId: parentId, kind: kind, inline: inline,
+                           firstInlinePosition: firstInlinePosition).message
     }
 
     private func validate(_ sender: Sender, companyId: String, _ db: Database) throws {
@@ -119,7 +128,7 @@ public struct MessageRouter: Sendable {
     /// event, inside the caller's transaction. A reply (`parentId`, its thread's root) updates the thread's counters first and
     /// is woken by `WakePolicy.threadWakes`; the reply that caps its thread is followed by @system's one `ThreadPolicy.capNote`.
     private func deliver(_ db: Database, channel: Channel, from: Sender, text: String, now: Date, parentId: String? = nil,
-                         kind: MessageKind = .text) throws -> PostResult {
+                         kind: MessageKind = .text, inline: [MessageRef] = [], firstInlinePosition: Int = 0) throws -> PostResult {
         let text = try store.redact(text)
         // Task 10: agent text that claims to be the owner is flagged (digest prefix, activity, the app's chip); it never acts.
         let impersonates = OwnerImpersonation.flags(text: text, sender: from)
@@ -133,6 +142,20 @@ public struct MessageRouter: Sendable {
                               taintedOrigin: try store.writesTainted(db: db, actorId: from.id), kind: kind,
                               fromTaintedSession: sessionTaint != nil, taintSource: sessionTaint, parentId: parentId)
         try message.insert(db)
+
+        // C3b: the refs the text names, as the sender resolved them (never for the engine's own lines).
+        if from != .system, !inline.isEmpty {
+            var rows: [MessageRef] = []
+            for (i, var row) in inline.enumerated() {
+                row.companyId = channel.companyId
+                row.messageId = message.id
+                row.position = firstInlinePosition + i
+                row.inline = true
+                try row.insert(db)
+                rows.append(row)
+            }
+            try Store.recordReferences(db: db, store: store, rows: rows, message: message, now: now)
+        }
 
         // C3a: the thread's counters move with the reply, in this transaction, before anyone's wake is decided.
         var thread: (capped: Bool, newlyCapped: Bool, rootAuthorId: String)?

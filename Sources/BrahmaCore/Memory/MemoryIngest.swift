@@ -197,15 +197,44 @@ public enum MemoryIngest {
                 } else {
                     title = "#\(channelName) @\(try batch.handle(message.senderId)) \(time)"
                 }
-                let taint = try batch.taint(author: message.senderId, at: message.createdAt, marked: message.taintedOrigin)
+                // C3b: the session's own stamp (`fromTaintedSession`) taints it too, OR-ed with ML's `taintAt`.
+                let taint = try batch.taint(author: message.senderId, at: message.createdAt, marked: message.taintedOrigin,
+                                            session: message.fromTaintedSession ? message.taintSource ?? "outside content" : nil)
+                // C3b: the most sensitive of the refs it carries (written in its post's transaction), never below normal.
+                let carried = try refSensitivity(batch.db, companyId: companyId, messageId: message.id)
                 try batch.ingest(MemoryIngestDoc(
                     companyId: companyId, source: .message, sourceId: message.id, ref: "msg:\(message.id)", title: title,
                     body: message.text, access: dm ? .dm(message.channelId) : .channel(message.channelId),
+                    sensitivity: carried.sensitivity, restrictions: carried.restrictions,
                     provenance: batch.provenance(message.senderId), tainted: taint != nil, taintReason: taint,
                     authorId: message.senderId, createdAt: message.createdAt))
             }
             return rows.count
         }
+    }
+
+    /// Plan C Task C3b: the sensitivity a message takes from its `messageRef` rows: the maximum of theirs (never below
+    /// `normal`), and when that is `restricted`, the restrictions of every restricted row, each kept (every one must be
+    /// satisfied). A row whose sensitivity or restrictions can't be read makes the message `secret` (owner only; fail closed).
+    static func refSensitivity(_ db: Database, companyId: String, messageId: String) throws -> (sensitivity: Sensitivity, restrictions: [Restriction]) {
+        let rows = try Row.fetchAll(db, sql: "SELECT sensitivity, restrictions FROM messageRef WHERE companyId = ? AND messageId = ?",
+                                    arguments: [companyId, messageId])
+        var max = Sensitivity.normal
+        var parsed: [(Sensitivity, [Restriction])] = []
+        for row in rows {
+            guard let s = Sensitivity(rawValue: row["sensitivity"]),
+                  let r = try? JSONDecoder().decode([[String]].self, from: Data((row["restrictions"] as String).utf8)) else {
+                return (.secret, [])
+            }
+            parsed.append((s, r.map(Set.init)))
+            if s > max { max = s }
+        }
+        guard max == .restricted else { return (max, []) }
+        var restrictions: [Restriction] = []
+        for (s, r) in parsed where s == .restricted {
+            for one in r where !restrictions.contains(one) { restrictions.append(one) }
+        }
+        return (max, restrictions)
     }
 
     static func items(store: Store, companyId: String, now: Date) throws -> Int {
@@ -480,12 +509,15 @@ public enum MemoryIngest {
 
         /// The taint reason for text `author` wrote at `at`, or nil. The owner and the engine are never tainted; a text that
         /// carries a tainted-origin mark (`marked`) is, whatever its author's turns say.
-        func taint(author: String, at: Date, marked: Bool) throws -> String? {
+        /// `session` (C3b): the source the text's own stamp names (a message's `fromTaintedSession`), used when the history
+        /// has none.
+        func taint(author: String, at: Date, marked: Bool, session: String? = nil) throws -> String? {
             var source: String?
             if author != "owner", author != "system", !author.isEmpty {
                 if histories[author] == nil { histories[author] = try TaintHistory.load(db: db, agentId: author) }
                 source = histories[author]?.taint(at: at)
             }
+            if source == nil, let session { source = session }
             if source == nil, marked { source = "outside content" }
             return source.map(Self.reason)
         }

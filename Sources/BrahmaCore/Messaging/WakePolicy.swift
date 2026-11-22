@@ -61,6 +61,8 @@ public enum WakePolicy {
         case .dependencyDone: recipientRole == .waiter
         case .commented: recipientRole == .mentioned
         case .handoffWritten: recipientRole == .recipient
+        // Plan C Task C3b: a message named the item: an FYI for everyone.
+        case .referenced: false
         default: false
         }
     }
