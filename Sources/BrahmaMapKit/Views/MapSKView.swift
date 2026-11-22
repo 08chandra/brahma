@@ -75,7 +75,8 @@ public struct HoverThrottle: Sendable {
 /// at 30 Hz), double click, and the right-click menu. It knows no scene type: hits come from the scene's `MapInteractive`
 /// conformance, the menu from `controller.actions(for:)`. Everything it finds goes out through closures.
 ///
-/// Accessibility (spec §5.6): a `MapAccessible` scene's items become VoiceOver children (at most `accessibilityLimit`,
+/// Accessibility (spec §5.6): the view keeps `SKView`'s own element answer (an `AXGroup`) in every mode, so the locked
+/// org chart's inventory is unchanged (ruling R33); a `MapAccessible` scene's items become VoiceOver children (at most `accessibilityLimit`,
 /// rebuilt at most every `accessibilityInterval`); any other scene keeps the superclass's answer. The system's Reduce
 /// Motion reaches every `MapMotionReducible` scene the view presents, and follows the setting when it changes.
 @MainActor
@@ -161,9 +162,6 @@ public final class MapSKView: SKView {
     }
 
     // MARK: Accessibility
-
-    /// The map itself is a container, never an element.
-    public override func isAccessibilityElement() -> Bool { false }
 
     /// The scene's items as elements when it is `MapAccessible`; else whatever `SKView` answers (the org chart's frozen
     /// inventory).

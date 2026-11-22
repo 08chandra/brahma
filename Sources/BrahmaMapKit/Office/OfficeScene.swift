@@ -617,7 +617,8 @@ extension OfficeScene: MapAccessible, MapMotionReducible {
     /// The rooms VoiceOver reads by name besides the board room (a click on them hits nothing, so they are not pressed).
     static let spokenRooms = [("room:review", "Review room"), ("room:break", "Break room"), ("room:mail", "Mail room")]
 
-    /// The rooms first (so the cap never drops them): the board room with its open asks, then the review, break and mail
+    /// The rooms first (so the cap never drops them): the board room with its open asks ("1 open ask", else "N open
+    /// asks"; ruling R32), then the review, break and mail
     /// rooms by name; then one item per desk in tree order: `"<handle>, <role>, <state>"` and `", <item>"` when the agent
     /// has one (the hover card's cleaned fields), or `"Open seat, <role title>"`. Frames are the layout's rects (a gliding
     /// desk's final one); a desk and the board room press what a click on them hits.
@@ -625,8 +626,8 @@ extension OfficeScene: MapAccessible, MapMotionReducible {
         guard limit > 0, let model = builtModel else { return [] }
         var items: [MapAccessibilityItem] = []
         if let frame = roomRect("room:board") {
-            items.append(MapAccessibilityItem(id: "room:board", label: "Board room, owner, \(model.openAsks) open asks",
-                                              frame: frame, hit: .owner))
+            let asks = model.openAsks == 1 ? "1 open ask" : "\(model.openAsks) open asks"
+            items.append(MapAccessibilityItem(id: "room:board", label: "Board room, owner, " + asks, frame: frame, hit: .owner))
         }
         for (id, name) in Self.spokenRooms {
             guard let frame = roomRect(id) else { continue }

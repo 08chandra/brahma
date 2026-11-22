@@ -31,6 +31,15 @@ import AppKit
         (view.accessibilityChildren() ?? []).compactMap { $0 as? NSAccessibilityElement }
     }
 
+    /// The map view answers as a freshly made plain `SKView` does (ruling R33): the same element flag and role, so its
+    /// parent's accessibility children (Plan P's frozen inventory) do not change in either mode.
+    static func expectPlainSKViewElement(_ view: MapSKView, sourceLocation: SourceLocation = #_sourceLocation) {
+        let plain = SKView(frame: CGRect(origin: .zero, size: size))
+        plain.presentScene(SKScene(size: size))
+        #expect(view.isAccessibilityElement() == plain.isAccessibilityElement(), sourceLocation: sourceLocation)
+        #expect(view.accessibilityRole() == plain.accessibilityRole(), sourceLocation: sourceLocation)
+    }
+
     /// The label spec §5.6 gives a desk: the hover card's cleaned handle, role and state, then its item when it has one.
     static func deskLabel(_ card: MapHoverCard) -> String {
         "\(card.handle), \(card.role), \(card.stateLabel)" + (card.item.map { ", " + $0 } ?? "")
@@ -120,6 +129,15 @@ import AppKit
         #expect(scene.accessibilityItems(limit: 0).isEmpty)
     }
 
+    @Test func openAsksAgreeInNumber() {
+        for (asks, spoken) in [(0, "0 open asks"), (1, "1 open ask"), (3, "3 open asks")] {
+            let scene = OfficeSceneTests.scene(OfficeSceneTests.model(agents: 12, inputs: { $0.openAsks = asks }))
+            let board = scene.accessibilityItems(limit: 1).first
+            #expect(board?.id == "room:board")
+            #expect(board?.label == "Board room, owner, " + spoken)
+        }
+    }
+
     // MARK: - The view
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "no Metal device"))
@@ -129,14 +147,14 @@ import AppKit
         #expect((scene as SKScene) as? MapAccessible == nil, "the org chart joins only with an approved inventory update")
         let view = Self.view(showing: scene)
         #expect((view.accessibilityChildren() ?? []).isEmpty)
-        #expect(view.isAccessibilityElement() == false)
+        Self.expectPlainSKViewElement(view)
     }
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "no Metal device"))
     func viewExposesChildrenAndPress() throws {
         let model = OfficeSceneTests.model(agents: 12)
         let (view, scene) = Self.officeView(model)
-        #expect(view.isAccessibilityElement() == false)
+        Self.expectPlainSKViewElement(view)
         let items = scene.accessibilityItems(limit: MapSKView.accessibilityLimit)
         let elements = Self.elements(view)
         #expect(elements.count == items.count)

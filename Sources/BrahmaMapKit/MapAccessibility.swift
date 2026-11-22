@@ -37,8 +37,8 @@ public protocol MapMotionReducible: AnyObject {
 }
 
 /// The element `MapSKView` gives VoiceOver for one item. Its frame is computed when asked, from the camera as it is then,
-/// so panning and zooming never leave a stale frame; a press goes through the view's `onClick`, the mouse's path.
-@MainActor
+/// so panning and zooming never leave a stale frame; a press goes through the view's `onClick`, the mouse's path. Not
+/// main-actor isolated, like its AppKit superclass; it is made and used on the main thread only.
 final class MapAccessibilityElement: NSAccessibilityElement {
     private(set) var item: MapAccessibilityItem
     private weak var view: MapSKView?
@@ -63,13 +63,18 @@ final class MapAccessibilityElement: NSAccessibilityElement {
         setAccessibilityLabel(item.label)
     }
 
+    // AppKit's accessibility methods are nonisolated; the accessibility client calls them on the main thread, where the
+    // view is reached.
     override func accessibilityFrame() -> NSRect {
-        view?.screenRect(sceneRect: item.frame) ?? .zero
+        guard let view else { return .zero }
+        let frame = item.frame
+        return MainActor.assumeIsolated { view.screenRect(sceneRect: frame) }
     }
 
     override func accessibilityPerformPress() -> Bool {
         guard let hit = item.hit, let view else { return false }
-        view.onClick?(hit, CGPoint(x: item.frame.midX, y: item.frame.midY))
+        let centre = CGPoint(x: item.frame.midX, y: item.frame.midY)
+        MainActor.assumeIsolated { view.onClick?(hit, centre) }
         return true
     }
 }
