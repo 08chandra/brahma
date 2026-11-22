@@ -52,6 +52,7 @@ final class OfficeDeskNode: SKNode {
     private(set) var screenState = OfficeTextures.ScreenState.off
     private(set) var lampOn = false
     private(set) var badge: OfficeTextures.BadgeGlyph?
+    private var badgeRect: CGRect?
     private(set) var handleText: String?
     private(set) var roleText: String?
     private(set) var hasBox = false
@@ -103,7 +104,7 @@ final class OfficeDeskNode: SKNode {
         hasPlacard = true
         let title = OrgCardNode.fit(vacancy.roleTitle, width: Self.labelWidth, size: 8, mono: false)
         roleText = title
-        items.addChild(label(title, size: 8, mono: false, color: ThemeHex.text1, y: -11.5))
+        addLabel(title, size: 8, mono: false, color: ThemeHex.text1, y: -11.5, band: Self.roleBand, to: items)
         addChild(items)
         setZoom(zoom)
     }
@@ -129,6 +130,7 @@ final class OfficeDeskNode: SKNode {
         screenState = .off
         lampOn = false
         badge = nil
+        badgeRect = nil
         handleText = nil
         roleText = nil
         hasBox = false
@@ -141,15 +143,23 @@ final class OfficeDeskNode: SKNode {
 
     // MARK: Agent
 
-    /// Where things sit on the top, by orientation: the monitor and lamp on the far side from the sitter, the labels
-    /// on the near side.
+    /// Where things sit on the top, by orientation: the monitor, lamp and desk items on the far side from the sitter;
+    /// the handle and role bands between the monitor and the sitter, clear of the seated figure's frame (which starts
+    /// 5 pt short of the seat, 19 pt from the desk's centre), of its bubble (beside the body) and of the badge (beyond the
+    /// desk's left edge, on the monitor's side).
     private struct Plan {
-        var monitorY: CGFloat, handleY: CGFloat, roleY: CGFloat
+        var monitorY: CGFloat, handleY: CGFloat, roleY: CGFloat, badgeY: CGFloat
     }
 
     private var plan: Plan {
-        facesDown ? Plan(monitorY: -6, handleY: 10.5, roleY: 2.5) : Plan(monitorY: 11, handleY: 1.5, roleY: -6)
+        facesDown ? Plan(monitorY: -6, handleY: 9.5, roleY: 1.5, badgeY: -8)
+            : Plan(monitorY: 11.5, handleY: 3.5, roleY: -4, badgeY: 13)
     }
+
+    /// The bands behind the handle and the role: a label is drawn over a `bg1` plate (above every figure), so it stays
+    /// legible over a screen's glow, and nothing is drawn over it.
+    static let handleBand: CGFloat = 8.5
+    static let roleBand: CGFloat = 7.5
 
     private func buildAgent(_ agent: MapAgent, lod: OfficeLOD, reduceMotion: Bool) {
         let p = plan
@@ -180,8 +190,8 @@ final class OfficeDeskNode: SKNode {
 
         let monitorAt = CGPoint(x: -7, y: p.monitorY)
         if screenState == .lit {
-            // The screen's light falls on the desk in front of it, toward the sitter.
-            halo = sprite(OfficeTextures.screenGlow, at: CGPoint(x: monitorAt.x, y: monitorAt.y + (facesDown ? 3 : -3)))
+            // The screen glows around the monitor, its core kept off the label bands (on the sitter's side).
+            halo = sprite(OfficeTextures.screenGlow, at: CGPoint(x: monitorAt.x, y: monitorAt.y + (facesDown ? -1.5 : 1.5)))
             halo.size = CGSize(width: 44, height: 30)
             tint(halo, status)
             halo.name = "halo"
@@ -219,8 +229,8 @@ final class OfficeDeskNode: SKNode {
         // The handle (from textZoom), struck through for a former agent as on the org card.
         let handle = OrgCardNode.fit(agent.handle, width: Self.labelWidth, size: 9, mono: true)
         handleText = handle
-        let handleSprite = label(handle, size: 9, mono: true, color: ThemeHex.text0, y: p.handleY)
-        details.addChild(handleSprite)
+        let handleSprite = addLabel(handle, size: 9, mono: true, color: ThemeHex.text0, y: p.handleY, band: Self.handleBand,
+                                    to: details)
         if gone {
             let strike = SKSpriteNode(color: MapPalette.color(ThemeHex.text0),
                                       size: CGSize(width: handleSprite.size.width - 2, height: 1))
@@ -234,7 +244,7 @@ final class OfficeDeskNode: SKNode {
         // The role and up to two desk items (from itemZoom).
         let role = OrgCardNode.fit(agent.role, width: Self.labelWidth, size: 8, mono: false)
         roleText = role
-        items.addChild(label(role, size: 8, mono: false, color: ThemeHex.text1, y: p.roleY))
+        addLabel(role, size: 8, mono: false, color: ThemeHex.text1, y: p.roleY, band: Self.roleBand, to: items)
         var x = CGFloat(OfficeLayout.desk.w / 2) + 1
         for perk in agent.perks.prefix(2).reversed() {
             let texture = LabelTextures.shared.emoji(OrgCardNode.fit(perk, width: 16, size: 10, mono: false), size: 10)
@@ -250,7 +260,9 @@ final class OfficeDeskNode: SKNode {
 
         if reduceMotion, let glyph = Self.badge(activity) {
             badge = glyph
-            let chip = sprite(OfficeTextures.badge(glyph), at: CGPoint(x: -OfficeLayout.desk.w / 2, y: 15))
+            badgeRect = CGRect(x: -OfficeLayout.desk.w / 2 - 10, y: p.badgeY - 5, width: 10, height: 10)
+            // Just outside the desk's left edge, beside the lamp: off the label bands.
+            let chip = sprite(OfficeTextures.badge(glyph), at: CGPoint(x: -OfficeLayout.desk.w / 2 - 5, y: p.badgeY))
             tint(chip, status)
             chip.zPosition = OfficeZ.overlay
             chip.name = "badge"
@@ -258,7 +270,7 @@ final class OfficeDeskNode: SKNode {
         }
         // Desk-only LOD: the blocked and waiting bubbles become 4 pt markers.
         if lod == .deskOnly, activity == .blocked || activity == .waitingOnOwner {
-            let marker = sprite(OfficeTextures.lamp, at: CGPoint(x: OfficeLayout.desk.w / 2 - 2, y: 13))
+            let marker = sprite(OfficeTextures.lamp, at: CGPoint(x: OfficeLayout.desk.w / 2 + 3, y: p.monitorY))
             marker.size = CGSize(width: 4, height: 4)
             tint(marker, ThemeHex.blocked)
             marker.zPosition = OfficeZ.overlay
@@ -301,13 +313,33 @@ final class OfficeDeskNode: SKNode {
         s.colorBlendFactor = 1
     }
 
-    /// A text sprite centred at (0, `y`).
-    private func label(_ text: String, size: CGFloat, mono: Bool, color: UInt32, y: CGFloat) -> SKSpriteNode {
+    /// A text sprite centred at (0, `y`) over a `bg1` plate `band` points tall, added to `parent`.
+    @discardableResult
+    private func addLabel(_ text: String, size: CGFloat, mono: Bool, color: UInt32, y: CGFloat, band: CGFloat,
+                          to parent: SKNode) -> SKSpriteNode {
         let texture = LabelTextures.shared.text(text, size: size, mono: mono, color: color)
         let s = SKSpriteNode(texture: texture, size: OrgCardNode.points(texture))
         s.position = CGPoint(x: 0, y: y)
+        let plate = SKSpriteNode(color: MapPalette.color(ThemeHex.bg1), size: CGSize(width: s.size.width - 1, height: band))
+        plate.alpha = 0.8
+        plate.position = s.position
+        // Under every text of the desk, so the role's plate never clips the handle's descenders.
+        plate.zPosition = -1
+        plate.name = "plate"
+        parent.addChild(plate)
+        parent.addChild(s)
         return s
     }
+
+    /// The label plates showing now, in the parent's coordinates.
+    var labelFrames: [CGRect] {
+        [details, items].filter { !$0.isHidden && $0.parent != nil }.flatMap { layer in
+            layer.children.filter { $0.name == "plate" }.map { $0.frame.offsetBy(dx: position.x, dy: position.y) }
+        }
+    }
+
+    /// The Reduce Motion badge's frame in the parent's coordinates, nil without one.
+    var badgeFrame: CGRect? { badgeRect?.offsetBy(dx: position.x, dy: position.y) }
 }
 
 // MARK: - Figure
@@ -335,6 +367,12 @@ final class OfficeFigureNode: SKNode {
 
     private(set) var collarColor: UInt32?
     private(set) var bubble: OfficeTextures.BubbleGlyph?
+
+    /// The bubble's frame in scene coordinates, nil without one.
+    var bubbleFrame: CGRect? {
+        bubble == nil ? nil : CGRect(origin: CGPoint(x: position.x + bubbleSprite.position.x, y: position.y + bubbleSprite.position.y),
+                                     size: bubbleSprite.size)
+    }
 
     override init() {
         super.init()
@@ -723,12 +761,18 @@ final class OfficeRoomNode: SKNode {
 
 /// A team's carpet (its department colour at `officeCarpetAlpha`), the title in the band above it, and the pin board in
 /// the head row. Drawn in scene coordinates (the node stays at the origin).
+///
+/// A pod with a head desk has its manager sitting at the top centre, and that figure (and its bubble) reaches into the
+/// title band: the title then keeps to the band's left half, cut to its team part (`TEAM-1` of `TEAM-1 · ENGINEERING`;
+/// the carpet carries the department) when the whole title does not fit there.
 @MainActor
 final class OfficePodNode: SKNode {
     let pod: OfficePod
     private(set) var title = ""
+    /// The title's frame in scene coordinates.
+    private(set) var labelFrame = CGRect.zero
 
-    init(pod: OfficePod) {
+    init(pod: OfficePod, hasHead: Bool) {
         self.pod = pod
         super.init()
         let r = OfficeScene.sceneRect(pod.rect)
@@ -741,13 +785,23 @@ final class OfficePodNode: SKNode {
         addChild(carpet)
 
         let band = OfficeScene.sceneRect(pod.labelRect)
-        title = OrgCardNode.fit(pod.title, width: band.width - 4, size: 10, mono: true)
+        if hasHead {
+            // Left of the head figure: the band's half less the figure's half-width and a margin.
+            let width = band.width / 2 - OfficeTextures.figureSize.width / 2 - 4
+            title = OrgCardNode.fit(pod.title, width: width, size: 10, mono: true)
+            if title != pod.title, let team = pod.title.components(separatedBy: " · ").first, team != pod.title {
+                title = OrgCardNode.fit(team, width: width, size: 10, mono: true)
+            }
+        } else {
+            title = OrgCardNode.fit(pod.title, width: band.width - 4, size: 10, mono: true)
+        }
         let texture = LabelTextures.shared.text(title, size: 10, mono: true, color: ThemeHex.text2)
         let label = SKSpriteNode(texture: texture, size: OrgCardNode.points(texture))
         label.anchorPoint = CGPoint(x: 0, y: 0.5)
         label.position = CGPoint(x: band.minX + 1, y: band.midY)
         label.name = "podLabel"
         addChild(label)
+        labelFrame = label.frame
 
         let board = SKSpriteNode(texture: OfficeTextures.pinBoard, size: OfficeTextures.points(OfficeTextures.pinBoard))
         board.position = CGPoint(x: pod.board.x, y: -pod.board.y)

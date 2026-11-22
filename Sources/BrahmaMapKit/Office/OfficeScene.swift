@@ -423,7 +423,7 @@ public final class OfficeScene: SKScene, MapScene {
             roomLayer.addChild(floor)
         }
         for pod in layout.pods.values.sorted(by: { $0.id < $1.id }) {
-            let node = OfficePodNode(pod: pod)
+            let node = OfficePodNode(pod: pod, hasHead: hasHead(pod))
             podLayer.addChild(node)
             pods[pod.id] = node
         }
@@ -451,7 +451,7 @@ public final class OfficeScene: SKScene, MapScene {
     // MARK: Hit test
 
     /// What lies under a scene point: a figure (the frontmost), a desk (an agent or an open seat), the board room (the
-    /// owner), a pod's label (its manager's team); else nothing.
+    /// owner), the label of a pod with a head desk (its manager's team); else nothing.
     public func hit(at p: CGPoint) -> MapHit? {
         if !figureLayer.isHidden {
             let under = figures.filter { $0.value.frameRect.contains(p) }
@@ -462,10 +462,17 @@ public final class OfficeScene: SKScene, MapScene {
             return .agent(id)
         }
         if let board = roomRect("room:board"), board.contains(p) { return .owner }
-        for pod in layout.pods.values.sorted(by: { $0.id < $1.id }) {
+        for pod in layout.pods.values.sorted(by: { $0.id < $1.id }) where hasHead(pod) {
             if let manager = pod.managerId, Self.sceneRect(pod.labelRect).contains(p) { return .team(manager) }
         }
         return nil
+    }
+
+    /// The pod's manager sits at its head desk (spec §5.2): only such a pod's label hits `.team`. A pod whose owner has
+    /// an office (CEO, C-suite, director), and a department pod, has no head desk and no team hit.
+    func hasHead(_ pod: OfficePod) -> Bool {
+        guard let manager = pod.managerId else { return false }
+        return layout.desks[manager]?.podId == pod.id
     }
 
     // MARK: Test and tooling accessors
@@ -474,6 +481,8 @@ public final class OfficeScene: SKScene, MapScene {
     func figureNode(_ id: String) -> OfficeFigureNode? { figures[id] }
     func roomNode(_ id: String) -> OfficeRoomNode? { rooms[id] }
     var allFigureNodes: [OfficeFigureNode] { Array(figures.values) }
+    var allDeskNodes: [OfficeDeskNode] { Array(desks.values) }
+    func podNode(_ id: String) -> OfficePodNode? { pods[id] }
     var fameGlyphs: [String] { rooms["room:break"]?.fame ?? [] }
     var roomNodeCount: Int { rooms.count }
     var deskCount: Int { desks.count }

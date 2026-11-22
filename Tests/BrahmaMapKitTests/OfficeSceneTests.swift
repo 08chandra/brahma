@@ -99,9 +99,16 @@ import AppKit
 
         #expect(scene.hit(at: try #require(scene.roomRect("room:board")).center) == .owner)
 
-        let pod = try #require(scene.layout.pods.values.sorted { $0.id < $1.id }.first { $0.managerId != nil })
-        let label = pod.labelRect
-        #expect(scene.hit(at: CGPoint(x: label.x + 4, y: -(label.y + label.h / 2))) == .team(pod.managerId!))
+        // Only a pod whose manager sits at its head desk has a team hit (spec §5.2); a pod whose owner has an office
+        // (here the CEO's or a director's) has none, nor has a department pod.
+        func labelPoint(_ pod: OfficePod) -> CGPoint { CGPoint(x: pod.labelRect.x + 4, y: -(pod.labelRect.y + pod.labelRect.h / 2)) }
+        let pods = scene.layout.pods.values.sorted { $0.id < $1.id }
+        let headed = try #require(pods.first { p in p.managerId.map { scene.layout.desks[$0]?.podId == p.id } ?? false })
+        #expect(scene.hit(at: labelPoint(headed)) == .team(headed.managerId!))
+        let officeOwned = pods.filter { p in p.managerId.map { scene.layout.desks[$0]?.roomId != nil } ?? false }
+        #expect(!officeOwned.isEmpty)
+        for pod in officeOwned { #expect(scene.hit(at: labelPoint(pod)) == nil, "\(pod.id)") }
+        for pod in pods where pod.managerId == nil { #expect(scene.hit(at: labelPoint(pod)) == nil, "\(pod.id)") }
 
         #expect(scene.hit(at: CGPoint(x: -500, y: 500)) == nil)
         let corridor = try #require(scene.layout.corridors.first)
@@ -327,12 +334,83 @@ import AppKit
         let node = try #require(scene.deskNode(id))
         scene.rebuild(model: model)
         #expect(scene.deskNode(id) === node, "same node across rebuilds")
+        #expect(node.action(forKey: "move") == nil, "an unmoved desk does not glide")
         // Sleep the first living agent: same node, new state.
         let edited = Self.model(agents: 50, edit: { agents in
             if let i = agents.firstIndex(where: { $0.id == id }) { agents[i].state = .sleeping }
         })
         scene.rebuild(model: edited)
         #expect(scene.deskNode(id) === node && !node.lampOn)
+
+        // A leave closes the gap: the next desk of the pod takes the free slot, gliding there.
+        let move = try Self.movedDesk(scene: scene, model: model)
+        #expect(move.node.action(forKey: "move") != nil)
+        #expect(Self.near(move.node.position, move.from.center), "the desk has not jumped")
+    }
+
+    /// Kills the first member of a pod with two or more agent members and rebuilds: the second member's desk moves to the
+    /// first slot. Returns its node and its rects before and after.
+    static func movedDesk(scene: OfficeScene, model: MapModel) throws -> (node: OfficeDeskNode, from: CGRect, to: CGRect) {
+        scene.rebuild(model: model)
+        let layout = scene.layout
+        let pod = try #require(layout.pods.values.sorted { $0.id < $1.id }.first { pod in
+            model.tree.order.filter { layout.desks[$0]?.podId == pod.id && $0 != pod.managerId && model.agents[$0] != nil }.count >= 2
+        })
+        let members = model.tree.order.filter { layout.desks[$0]?.podId == pod.id && $0 != pod.managerId && model.agents[$0] != nil }
+        let (leaver, mover) = (members[0], members[1])
+        let from = try #require(scene.deskRect(mover))
+        let node = try #require(scene.deskNode(mover))
+        let after = Self.model(agents: 50, edit: { agents in
+            if let i = agents.firstIndex(where: { $0.id == leaver }) { agents[i].state = .killed }
+        })
+        scene.rebuild(model: after)
+        let to = try #require(scene.deskRect(mover))
+        #expect(to != from, "the desk moved")
+        #expect(scene.deskNode(mover) === node, "the node is reused")
+        return (node, from, to)
+    }
+
+    /// Half way through `moveDuration` the desk is about half way; after it, it is at its new rect.
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "no Metal device"))
+    func movedDeskGlidesOverMoveDuration() throws {
+        let model = Self.model(agents: 50)
+        let scene = Self.scene(model)
+        let move = try Self.movedDesk(scene: scene, model: model)
+        let a = move.from.center, b = move.to.center
+        let span = hypot(b.x - a.x, b.y - a.y)
+        // The renderer's first frame starts the action: 1 + 12 frames at 60 Hz is moveDuration / 2.
+        let half = Int((OfficeScene.moveDuration / 2 * 60).rounded())
+        _ = try #require(MapSnapshotter.render(scene: scene, size: scene.size, steps: half + 1))
+        let p = move.node.position
+        let progress = hypot(p.x - a.x, p.y - a.y) / span
+        #expect(progress > 0.35 && progress < 0.65, "progress \(progress) at moveDuration / 2")
+        _ = try #require(MapSnapshotter.render(scene: scene, size: scene.size, steps: 36))
+        #expect(Self.near(move.node.position, b, within: 0.5), "\(move.node.position) vs \(b)")
+    }
+
+    /// No figure, bubble or badge covers a desk's handle or role, and no figure or bubble covers a pod's title, at zoom
+    /// 1.5 (both text lines showing): full LOD with and without Reduce Motion, and static LOD.
+    @Test func labelsAreNeverCovered() throws {
+        for (n, reduceMotion) in [(12, false), (50, false), (50, true), (150, false)] {
+            let model = Self.model(agents: n)
+            let scene = Self.scene(model, reduceMotion: reduceMotion)
+            scene.zoom = 1.5
+            var covers: [(String, CGRect)] = []
+            for figure in scene.allFigureNodes {
+                covers.append(("figure", figure.frameRect))
+                if let bubble = figure.bubbleFrame { covers.append(("bubble", bubble)) }
+            }
+            for desk in scene.allDeskNodes { if let badge = desk.badgeFrame { covers.append(("badge", badge)) } }
+            #expect(!covers.isEmpty)
+            var labels: [CGRect] = scene.allDeskNodes.flatMap(\.labelFrames)
+            #expect(labels.count >= 2 * Self.living(model).count, "handle and role on every desk")
+            labels += scene.layout.pods.keys.compactMap { scene.podNode($0)?.labelFrame }
+            for label in labels {
+                for (kind, rect) in covers where rect.intersects(label) {
+                    Issue.record("office-\(n)\(reduceMotion ? "-rm" : ""): a \(kind) at \(rect) covers the label at \(label)")
+                }
+            }
+        }
     }
 
     // MARK: - Snapshots
