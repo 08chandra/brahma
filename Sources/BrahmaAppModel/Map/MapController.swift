@@ -203,7 +203,10 @@ public final class MapController {
                                     focus: follow ?? highlightId)
     }
 
+    /// Folds or unfolds a subtree of the org chart. Nothing in the office: it has no subtrees, and its empty `collapsed`
+    /// would write an expand override the org chart would then keep.
     public func toggleSubtree(_ id: String) {
+        guard mode != .office else { return }
         orgOverrides[id] = collapsed.contains(id)
     }
 

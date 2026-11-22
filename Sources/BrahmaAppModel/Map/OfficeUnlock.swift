@@ -1,8 +1,9 @@
 import Foundation
 
 /// The office easter egg's two routes (spec §4.1), as a pure state machine on map time: type `office` with each letter
-/// within `keyWindow` of the previous one, or click the Board `boardClicks` times within `clickWindow` of the first counted
-/// click. Each route reports true once, on the event that completes it, and then starts over.
+/// within `keyWindow` of the previous one, or click the Board so that the last `boardClicks` clicks fall within `clickWindow`
+/// (a sliding window, ruling R10: a stray earlier click never delays it). Each route reports true once, on the event that
+/// completes it, and then starts over.
 public struct OfficeUnlock: Equatable, Sendable {
     public static let word = "office"
     public static let keyWindow: TimeInterval = 2
@@ -15,9 +16,8 @@ public struct OfficeUnlock: Equatable, Sendable {
     /// How many letters of `word` have been typed, and when the last of them was.
     private var matched = 0
     private var lastKeyAt: TimeInterval?
-    /// Board clicks counted in the current window, and when the window's first click was.
-    private var clicks = 0
-    private var firstClickAt: TimeInterval?
+    /// The times of the latest Board clicks, oldest first; at most `boardClicks`.
+    private var clicks: [TimeInterval] = []
 
     public init() {}
 
@@ -38,25 +38,20 @@ public struct OfficeUnlock: Equatable, Sendable {
         return true
     }
 
-    /// True on the `boardClicks`-th click within `clickWindow` of the first counted click; a click outside the window starts
-    /// a new one.
+    /// True on the click that makes the last `boardClicks` clicks span at most `clickWindow` (the boundary counts). A clock
+    /// that went backwards starts the count over from this click.
     public mutating func boardClick(at t: TimeInterval) -> Bool {
-        if let first = firstClickAt, t - first <= Self.clickWindow, t >= first {
-            clicks += 1
-        } else {
-            firstClickAt = t
-            clicks = 1
-        }
-        guard clicks >= Self.boardClicks else { return false }
-        clicks = 0
-        firstClickAt = nil
+        if let last = clicks.last, t < last { clicks = [] }
+        clicks.append(t)
+        if clicks.count > Self.boardClicks { clicks.removeFirst(clicks.count - Self.boardClicks) }
+        guard clicks.count == Self.boardClicks, let first = clicks.first, t - first <= Self.clickWindow else { return false }
+        clicks = []
         return true
     }
 
     /// Any click that is not on the Board breaks the run of Board clicks.
     public mutating func otherClick() {
-        clicks = 0
-        firstClickAt = nil
+        clicks = []
     }
 
     public mutating func reset() {

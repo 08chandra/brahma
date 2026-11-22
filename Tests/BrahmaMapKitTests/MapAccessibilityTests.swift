@@ -45,6 +45,45 @@ import AppKit
         "\(card.handle), \(card.role), \(card.stateLabel)" + (card.item.map { ", " + $0 } ?? "")
     }
 
+    // MARK: - Keys
+
+    /// The office unlock's keyboard route (spec §4.1): the map takes first responder on a click and hands unmodified keys to
+    /// `onKey` (shift allowed; command, control and option keys are not its), and being first responder changes nothing in
+    /// its accessibility answer (ruling R33).
+    @Test func mapViewTakesKeysWithoutChangingItsElement() throws {
+        let view = Self.view(showing: OrgScene(size: Self.size))
+        var keys: [Character] = []
+        view.onKey = { keys.append($0) }
+        #expect(view.acceptsFirstResponder)
+        func key(_ s: String, _ flags: NSEvent.ModifierFlags = []) throws -> NSEvent {
+            try #require(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0,
+                                          context: nil, characters: s, charactersIgnoringModifiers: s, isARepeat: false,
+                                          keyCode: 0))
+        }
+        view.keyDown(with: try key("o"))
+        view.keyDown(with: try key("F", .shift))
+        view.keyDown(with: try key("f", .command))
+        view.keyDown(with: try key("f", .control))
+        view.keyDown(with: try key("f", .option))
+        view.keyDown(with: try key("ic"))
+        view.keyDown(with: try key("1"))
+        #expect(keys == ["o", "F", "i", "c", "1"])
+
+        let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        defer { window.contentView = nil }
+        Self.expectPlainSKViewElement(view)
+        let down = try #require(NSEvent.mouseEvent(with: .leftMouseDown, location: CGPoint(x: 10, y: 10), modifierFlags: [],
+                                                   timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                                   eventNumber: 0, clickCount: 1, pressure: 1))
+        view.mouseDown(with: down)
+        #expect(window.firstResponder === view)
+        Self.expectPlainSKViewElement(view)
+        view.presentScene(OfficeScene(size: Self.size))
+        Self.expectPlainSKViewElement(view)
+    }
+
     // MARK: - Items
 
     @Test func officeItemsOnePerDeskPlusRooms() throws {

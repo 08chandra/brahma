@@ -1,5 +1,6 @@
 #!/bin/bash
-# Usage: scripts/map-demo.sh [agents] [extra Brahma flags, e.g. --map-bench=5]
+# Usage: scripts/map-demo.sh [agents] [extra Brahma flags, e.g. --map-bench=5, --map-skin=office]
+# --map-skin=office opens the demo in the office (Plan 4c) without unlocking or persisting anything.
 # Builds the debug app and opens the read-only agent-map demo (a synthetic company of [agents] agents, default 300).
 # Always runs in a fresh temp home with the file key stores: it never touches the real data home or the Keychain.
 set -euo pipefail

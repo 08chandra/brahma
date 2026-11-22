@@ -320,11 +320,49 @@ import AppKit
         #expect(scene.hit(at: try #require(scene.roomRect("room:board")).center) == .owner)
     }
 
-    @Test func factoryMakesEitherScene() {
+    @Test func factoryPicksSceneByMode() {
         #expect(MapSceneFactory.make(.org, size: Self.size) is OrgScene)
         #expect(MapSceneFactory.make(.office, size: Self.size) is OfficeScene)
         #expect(MapSceneFactory.make(.org, size: Self.size).mode == .org)
         #expect(MapSceneFactory.make(.office, size: Self.size).mode == .office)
+    }
+
+    /// The map view shows the scene for the controller's mode (Task 10): the same mode keeps its scene; a switch stops the
+    /// old scene reading the controller, points the new one at it, fits the floor, and keeps a followed agent followed.
+    @Test func viewSwitchesSceneByMode() throws {
+        #expect(OrgView.modeFade == 0.6)
+        let c = MapController(source: .synthetic(agents: 20, rate: 0, seed: 1), defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        let view = MapSKView(frame: CGRect(origin: .zero, size: Self.size))
+        view.reduceMotionOverride = true
+        let org = OrgView.switchScene(in: view, from: nil, to: c)
+        let orgScene = try #require(org as? OrgScene)
+        #expect(view.scene === org)
+        #expect(orgScene.motion.driver === c)
+        #expect(OrgView.switchScene(in: view, from: org, to: c) === org, "the same mode keeps its scene")
+
+        let id = try #require(c.model.agents.keys.sorted().first)
+        c.follow(id)
+        let followRequest = c.cameraRequest
+        c.mode = .office
+        let office = OrgView.switchScene(in: view, from: org, to: c)
+        let officeScene = try #require(office as? OfficeScene)
+        #expect(view.scene === office, "under Reduce Motion the office shows at once")
+        #expect(orgScene.motion.driver == nil, "the old scene stops reading the controller")
+        #expect(officeScene.driver === c)
+        #expect(c.follow == id && c.camera == .agent(id), "a followed agent stays followed")
+        #expect(c.cameraRequest == followRequest)
+
+        // With motion: a cross-fade back to the org chart, which fits the whole chart when nobody is followed.
+        view.reduceMotionOverride = false
+        c.follow(nil)
+        let fitRequest = c.cameraRequest
+        c.mode = .org
+        let back = OrgView.switchScene(in: view, from: office, to: c)
+        #expect(back is OrgScene)
+        #expect(officeScene.driver == nil)
+        #expect((back as? OrgScene)?.motion.driver === c)
+        #expect(c.camera == .fit)
+        #expect(c.cameraRequest == fitRequest + 1)
     }
 
     @Test func desksAreReusedAndGlide() throws {

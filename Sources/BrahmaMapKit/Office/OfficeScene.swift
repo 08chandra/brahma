@@ -102,7 +102,7 @@ public final class OfficeScene: SKScene, MapScene {
     private var textLevel = -1
     private var lastCamera: (position: CGPoint, scale: CGFloat, size: CGSize)?
 
-    private var driver: MapController?
+    private(set) var driver: MapController?
     private var timeBase: TimeInterval?
 
     /// Bumped when what VoiceOver hears may have changed (`MapAccessible`).

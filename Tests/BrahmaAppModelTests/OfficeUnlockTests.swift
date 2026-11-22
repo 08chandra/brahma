@@ -92,13 +92,34 @@ import Foundation
 
     @Test func slowClicksReset() {
         var u = OfficeUnlock()
-        // 3.5 is 3.5 s after the first counted click: a new window starts there, and 6.2 is its fifth (2.7 s in).
+        // A sliding window (ruling R10): the last five clicks must fall within 3 s, the boundary included. At 4.5 the last
+        // five (1…4.5) span 3.5 s; at 5.0 they (2, 3.5, 4, 4.5, 5) span exactly 3.0 s and unlock. The route then starts
+        // over, so 6.2 alone does nothing.
         let r = clicks(&u, [0, 1, 2, 3.5, 4, 4.5, 5, 6.2])
-        #expect(r == [false, false, false, false, false, false, false, true])
+        #expect(r == [false, false, false, false, false, false, true, false])
+        // Just past the boundary does not.
+        var past = OfficeUnlock()
+        let p = clicks(&past, [0, 1, 2, 3, 3.01])
+        #expect(!p.contains(true))
         // Clicks a second apart never get five into one window.
         var slow = OfficeUnlock()
         let s = clicks(&slow, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
         #expect(!s.contains(true))
+    }
+
+    /// A stray earlier click never delays the unlock: the five clicks 2.5…3.3 unlock although the first click (0) is 3.3 s
+    /// before the last.
+    @Test func strayClickDoesNotDelay() {
+        var u = OfficeUnlock()
+        let r = clicks(&u, [0, 2.5, 2.7, 2.9, 3.1, 3.3])
+        #expect(r == [false, false, false, false, false, true])
+    }
+
+    /// A clock that went backwards starts the count over from that click.
+    @Test func backwardsClockRestartsClicks() {
+        var u = OfficeUnlock()
+        let r = clicks(&u, [10, 10.2, 10.4, 10.6, 1, 1.2, 1.4, 1.6, 1.8])
+        #expect(r == [false, false, false, false, false, false, false, false, true])
     }
 
     @Test func otherClickResets() {

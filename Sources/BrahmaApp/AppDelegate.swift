@@ -204,9 +204,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// `--map-demo`: the deterministic synthetic company (read-only: no write actions, clicks never change the selection)
     /// replaces the map's controller, and the map window opens as soon as the main window has registered how to open it.
+    /// `--map-skin=office` opens it in the office without unlocking anything (spec §4.3).
     private func launchMapDemo(model: AppModel, options: LaunchOptions) {
-        model.installMapController(MapController(source: .synthetic(agents: options.mapDemoAgents, rate: 50, seed: 42),
-                                                 defaults: model.mapDefaults))
+        let controller = MapController(source: .synthetic(agents: options.mapDemoAgents, rate: 50, seed: 42),
+                                       defaults: model.mapDefaults)
+        // Only a harness run takes the skin: its mode lands in the run's volatile suite, never in `.standard`.
+        if options.isHarness { controller.mode = options.mapSkin ?? .org }
+        model.installMapController(controller)
         Task { @MainActor [weak self] in
             let deadline = AwakeTime.deadline(after: .seconds(20))
             while self?.openMapWindow == nil, AwakeTime.now < deadline { try? await Task.sleep(for: .milliseconds(50)) }

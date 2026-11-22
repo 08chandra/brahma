@@ -75,6 +75,9 @@ public struct HoverThrottle: Sendable {
 /// at 30 Hz), double click, and the right-click menu. It knows no scene type: hits come from the scene's `MapInteractive`
 /// conformance, the menu from `controller.actions(for:)`. Everything it finds goes out through closures.
 ///
+/// Keys (the office unlock, spec §4.1): a click makes the view first responder, and each character of an unmodified key
+/// (shift allowed; no command, control or option) goes to `onKey`; modified keys go on to `super`.
+///
 /// Accessibility (spec §5.6): the view keeps `SKView`'s own element answer (an `AXGroup`) in every mode, so the locked
 /// org chart's inventory is unchanged (ruling R33); a `MapAccessible` scene's items become VoiceOver children (at most `accessibilityLimit`,
 /// rebuilt at most every `accessibilityInterval`); any other scene keeps the superclass's answer. The system's Reduce
@@ -100,6 +103,8 @@ public final class MapSKView: SKView {
     /// Opens the confirmation; nothing fills from here.
     public var onFill: ((String) -> Void)?
     public var onRemoveVacancy: ((String) -> Void)?
+    /// Each character of an unmodified key typed while the view is first responder.
+    public var onKey: ((Character) -> Void)?
 
     private var hoverThrottle = HoverThrottle()
     /// The latest hover the throttle held back (view point, and the event time it is due at).
@@ -269,6 +274,7 @@ public final class MapSKView: SKView {
     }
 
     public override func mouseDown(with event: NSEvent) {
+        if window?.firstResponder !== self { window?.makeFirstResponder(self) }
         let start = convert(event.locationInWindow, from: nil)
         drag = (start, scene?.camera?.position ?? .zero, false)
     }
@@ -289,6 +295,24 @@ public final class MapSKView: SKView {
         defer { drag = nil }
         guard drag?.moved == false, let found = hit(event) else { return }
         if event.clickCount >= 2 { onDoubleClick?(found.hit, found.point) } else { onClick?(found.hit, found.point) }
+    }
+
+    // MARK: Keys
+
+    /// First responder adds no accessibility element: the view keeps `SKView`'s own answer (ruling R33).
+    public override var acceptsFirstResponder: Bool { true }
+
+    /// Unmodified keys go to `onKey`, one character at a time; command, control and option keys go to `super` (menus and
+    /// shortcuts). A key that is not all letters (Tab, Escape, arrows, digits) goes to `super` as well, after `onKey`, so
+    /// the key-view loop and cancel still work while the map has focus.
+    public override func keyDown(with event: NSEvent) {
+        let modified = !event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+        guard !modified, let onKey, let characters = event.characters, !characters.isEmpty else {
+            super.keyDown(with: event)
+            return
+        }
+        for c in characters { onKey(c) }
+        if !characters.allSatisfy(\.isLetter) { super.keyDown(with: event) }
     }
 
     // MARK: Zoom

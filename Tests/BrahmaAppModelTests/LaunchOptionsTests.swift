@@ -96,6 +96,15 @@ import BrahmaCore
         #expect(LaunchOptions.parse(["/x", "--map-skin=office"]) == expected)
     }
 
+    /// `--ui-snapshot=<path>`: the form `scripts/map-demo.sh` can pass (it puts `--map-demo-agents=<n>` first, and AppKit
+    /// mis-parses a `--flag value` pair after a bare `--flag=value` as a file to open).
+    @Test func uiSnapshotEqualsForm() {
+        #expect(LaunchOptions.parse(["/x", "--map-demo-agents=50", "--ui-snapshot=.superpowers/ui/a.png"]).snapshotPath
+                == ".superpowers/ui/a.png")
+        #expect(LaunchOptions.parse(["/x", "--ui-snapshot="]).snapshotPath == nil)
+        #expect(LaunchOptions.parse(["/x", "--ui-snapshot=/tmp/b.png"]).isHarness)
+    }
+
     @Test func isHarness() {
         #expect(!LaunchOptions().isHarness)
         #expect(!LaunchOptions.parse(["/x", "-psn_0_123", "--company", "Acme", "--select", "map"]).isHarness)

@@ -162,6 +162,13 @@ public struct LaunchOptions: Equatable, Sendable {
                 i += 1
                 continue
             }
+            // `--ui-snapshot=<path>` is the form `scripts/map-demo.sh` can pass after its own `--map-demo-agents=<n>`.
+            if args[i].hasPrefix("--ui-snapshot=") {
+                let path = String(args[i].dropFirst("--ui-snapshot=".count))
+                if !path.isEmpty { o.snapshotPath = path }
+                i += 1
+                continue
+            }
             if args[i].hasPrefix("--smoke-release=") {
                 let path = String(args[i].dropFirst("--smoke-release=".count))
                 if !path.isEmpty { o.smokeRelease = path }

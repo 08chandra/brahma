@@ -103,6 +103,57 @@ import Foundation
         #expect(!c.collapsed.isEmpty)
     }
 
+    /// A collapse in the office never writes the org chart's overrides (the office has no subtrees to fold).
+    @Test func toggleSubtreeIgnoredInOffice() throws {
+        let clock = MapTestClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let c = demo(agents: 300, defaults: suite(), clock: clock)
+        let stub = try #require(c.collapsed.first)
+        c.mode = .office
+        c.toggleSubtree(stub)
+        #expect(c.orgOverrides.isEmpty)
+        c.mode = .org
+        #expect(c.collapsed.contains(stub))
+        c.toggleSubtree(stub)
+        #expect(c.orgOverrides == [stub: true], "the org chart still folds")
+    }
+
+    /// Review focus 3: switching the mode is a view change only; the followed agent, the camera target and an open replay
+    /// (and its time) stay as they were, both ways.
+    @Test func modeSwitchKeepsReplayAndFollow() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, ceo, _, _) = try seedAcme(store, paths)
+        // An hour of history: the seed's rows are dated two hours back.
+        let past = Date().addingTimeInterval(-7200)
+        try await store.writer.write { db in
+            try db.execute(sql: "UPDATE agent SET createdAt = ? WHERE companyId = ?", arguments: [past, acme.id])
+            try db.execute(sql: "UPDATE \(ActivityEvent.databaseTableName) SET createdAt = ? WHERE companyId = ?",
+                           arguments: [past, acme.id])
+        }
+        _ = try store.transition(agentId: ceo.id, to: .running)
+        let c = MapController(source: .live(store: store, companyId: acme.id), defaults: suite())
+        c.sync(snapshot: try Snapshot.load(store: store, selectedCompanyId: acme.id))
+
+        c.follow(ceo.id)
+        let request = c.cameraRequest
+        c.mode = .office
+        #expect(c.follow == ceo.id)
+        #expect(c.camera == .agent(ceo.id))
+        #expect(c.cameraRequest == request)
+
+        await c.enterReplay()
+        let r = try #require(c.replay)
+        c.scrub(to: r.timeline.start.addingTimeInterval(r.timeline.end.timeIntervalSince(r.timeline.start) / 2))
+        let time = try #require(c.replay?.time)
+        c.mode = .org
+        #expect(c.isReplaying)
+        #expect(c.replay?.time == time)
+        c.mode = .office
+        #expect(c.isReplaying)
+        #expect(c.replay?.time == time)
+        #expect(c.follow == ceo.id)
+        #expect(c.camera == .agent(ceo.id))
+    }
+
     @Test func appModelBuildsMapControllersOnMapDefaults() async throws {
         let (store, paths) = try makeHome()
         _ = try seedAcme(store, paths)
