@@ -397,6 +397,46 @@ final class RecordingMemory: MemorySearching, @unchecked Sendable {
         #expect(try s.recordedCommitAuthors(companyId: fx.d.id, shas: [itemWork]).isEmpty)
     }
 
+    /// C4b fix round 1 (I-2): a turn that rewrites its branch (its start head is no longer an ancestor of its end head) records
+    /// nothing: a new holder that amends an earlier holder's recorded commit and builds on it is never the author of either,
+    /// and the earlier holder keeps the original.
+    @Test func historyRewriteNeverReattributes() async throws {
+        let w = try SearchFixture()
+        let s = w.store, fx = w.fx, cId = w.c.id, now = w.now
+        let (itemId, eng3Id, qa2Id) = (fx.item.id, fx.eng3.id, fx.qa2.id)
+        let claimHead = try fx.git.git(["rev-parse", "item/ENG-1~1"])
+        let itemWork = try fx.git.git(["rev-parse", "item/ENG-1"])
+        s.recordTurnCommits(companyId: cId, agentId: eng3Id, turnId: "t-3", heldAtStart: [itemId: claimHead], now: now)
+        try await s.writer.write { db in
+            try WorkLease(itemId: itemId, companyId: cId, agentId: qa2Id, acquiredAt: now, expiresActive: 1_000_000_000).insert(db)
+        }
+        // qa-2's turn starts at "item work", amends it, and commits on top.
+        try fx.git.git(["checkout", "-q", "item/ENG-1"])
+        try fx.git.git(["commit", "-q", "--amend", "-m", "item work (reworded)"])
+        let amended = try fx.git.git(["rev-parse", "HEAD"])
+        try fx.git.write("src/q.ts", "q\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "qa work"])
+        let qaWork = try fx.git.git(["rev-parse", "HEAD"])
+        try fx.git.git(["checkout", "-q", "main"])
+        s.recordTurnCommits(companyId: cId, agentId: qa2Id, turnId: "t-qa", heldAtStart: [itemId: itemWork], now: now)
+        let recorded = try s.recordedCommitAuthors(companyId: cId, shas: [itemWork, amended, qaWork])
+        #expect(recorded == [itemWork: "eng-3"], "\(recorded)")
+        let g = GlobalSearch(store: s, files: FileIndexCache(), commits: CommitIndexCache(), memory: MemoryIndex(store: s))
+        let byQA = try await g.search("work", filters: SearchFilters(kinds: [.commit], actor: "qa-2"), companyId: cId, reader: .owner,
+                                      limitPerGroup: 20, knownValues: [])
+        #expect(!byQA.contains { $0.ref.kind == .commit }, "\(byQA.map(\.ref.canonical))")
+        // A turn that only adds on top still records its own commit.
+        try fx.git.git(["checkout", "-q", "item/ENG-1"])
+        try fx.git.write("src/r.ts", "r\n")
+        try fx.git.git(["add", "-A"])
+        try fx.git.git(["commit", "-q", "-m", "more qa work"])
+        let more = try fx.git.git(["rev-parse", "HEAD"])
+        try fx.git.git(["checkout", "-q", "main"])
+        s.recordTurnCommits(companyId: cId, agentId: qa2Id, turnId: "t-qa2", heldAtStart: [itemId: qaWork], now: now)
+        #expect(try s.recordedCommitAuthors(companyId: cId, shas: [more, qaWork]) == [more: "qa-2"])
+    }
+
     @Test func blockedAloneListsBlockedWork() async throws {
         let w = try SearchFixture()
         let (itemId, eng3Id) = (w.zebraItem.id, w.fx.eng3.id)

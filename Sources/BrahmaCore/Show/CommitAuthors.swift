@@ -9,9 +9,14 @@ import GRDB
 extension Store {
     /// Records the commits one turn made: for each item it held as it started (`heldAtStart`: item id → its branch head
     /// then, read by the engine) and each item it claimed during the turn (the claim log's trusted claim head), the commits of
-    /// `<start>..head(item/<KEY>)` that neither `main` nor any other item branch holds. An item whose start head is unknown is
-    /// skipped (its commits stay unverified: attribution fails closed, unlike taint). The first record of a sha wins. Never
-    /// throws (git, off the cooperative pool).
+    /// `<start>..head(item/<KEY>)` that neither `main` nor any other item branch holds. An item whose start head is unknown,
+    /// or whose start is no longer an ancestor of its head (the turn rewrote the branch), is skipped (its commits stay
+    /// unverified: attribution fails closed, unlike taint). The first record of a sha wins. Never throws (git, off the
+    /// cooperative pool).
+    ///
+    /// Trust assumption (as C2a's taint record): during a turn only that turn's agent moves its item branch — the sandbox's
+    /// ref scope keeps other agents' sessions off it. Without the sandbox a concurrent session could move another holder's
+    /// branch and have its commits recorded as that holder's.
     public func recordTurnCommits(companyId: String, agentId: String, turnId: String, heldAtStart: [String: String], now: Date) {
         var starts = heldAtStart
         do {
@@ -31,6 +36,11 @@ extension Store {
             for (itemId, start) in starts.sorted(by: { $0.key < $1.key }) {
                 guard let item = try workItem(id: itemId), item.companyId == companyId, let head = branches["item/\(item.key)"],
                       head != start else { continue }
+                // Fix round 1 (I-2): a turn that rewrote the branch (its start is no longer an ancestor of its end: a rebase,
+                // an amend, a reset onto other commits) records nothing for it. Its range could hold an earlier holder's work
+                // replayed, which must never become the rewriter's; the rewritten commits stay with their first recorder, or
+                // unverified. (`recordTurnEndHead` flags the same rewrite as a moved branch.)
+                guard try git.isAncestor(start, of: head) else { continue }
                 let others = [main] + branches.filter { $0.key != "item/\(item.key)" }.map(\.value)
                 let shas = try git.revList(start, head, excluding: others)
                 try recordCommitAuthors(companyId: companyId, itemId: itemId, agentId: agentId, turnId: turnId, shas: shas, now: now)

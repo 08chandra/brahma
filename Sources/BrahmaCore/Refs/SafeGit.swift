@@ -308,9 +308,12 @@ public struct SafeGit: Sendable {
     }
 
     /// The commits of `range` (`a..b`, or one rev) touching `path`, newest first.
-    public func logShas(range: String, path: String) throws -> [String] {
+    /// Plan C Task C4b fix round 1: `max` bounds the listing (`-n`), so a lookup of the newest commit reads one.
+    public func logShas(range: String, path: String, max: Int? = nil) throws -> [String] {
         let rangeArg = try range.components(separatedBy: "..").map(Self.sha).joined(separator: "..")
-        return Self.lines(try output(["log", "--format=%H", "--no-textconv", "--no-ext-diff", "--end-of-options", rangeArg, "--", try Self.checkPath(path)]))
+        var args = ["log", "--format=%H", "--no-textconv", "--no-ext-diff"]
+        if let max { args += ["-n", String(Swift.max(1, max))] }
+        return Self.lines(try output(args + ["--end-of-options", rangeArg, "--", try Self.checkPath(path)]))
     }
 
     /// The commits reachable from `tip` (a sha; nil: every ref and every worktree's `HEAD`, `--all`) and not from `base` (a

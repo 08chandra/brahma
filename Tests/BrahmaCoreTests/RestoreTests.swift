@@ -742,6 +742,28 @@ import GRDB
         #expect(try w.tainted(restored, "\(item.key):diff"))
     }
 
+    /// C4b fix round 1 (I-1): a restore never loses the engine's commit-author record (git is not rolled back): a commit whose
+    /// turn was recorded after the snapshot keeps its author, so `by @agent` still finds it and no later turn can claim it; one
+    /// recorded before the snapshot is unchanged.
+    @Test func restoreKeepsCommitAuthorsRecordedAfterTheSnapshot() throws {
+        let w = try TaintWorld()
+        let (item, _) = try w.item("Work")
+        let designer = try #require(try w.env.store.workItem(id: item.id)?.ownerId)
+        let start = try w.git.git(["rev-parse", "refs/heads/item/\(item.key)"])
+        let early = try w.commit(on: item, "src/early.ts", tainted: false)
+        w.env.store.recordTurnCommits(companyId: w.acme.id, agentId: designer, turnId: "t-1", heldAtStart: [item.id: start], now: Date())
+        let snapshot = try w.service.snapshot(reason: .manual)
+        let late = try w.commit(on: item, "src/late.ts", tainted: false)
+        w.env.store.recordTurnCommits(companyId: w.acme.id, agentId: designer, turnId: "t-2", heldAtStart: [item.id: early], now: Date())
+        #expect(try w.env.store.recordedCommitAuthors(companyId: w.acme.id, shas: [early, late]) == [early: "design-work", late: "design-work"])
+        let restored = try w.restore(snapshot)
+        #expect(try restored.recordedCommitAuthors(companyId: w.acme.id, shas: [early, late]) == [early: "design-work", late: "design-work"])
+        // First record wins after the restore too: another agent's turn reaching the commit doesn't take it.
+        let other = try restored.hire(companyId: w.acme.id, name: "other", role: "engineer", model: "sonnet")
+        restored.recordTurnCommits(companyId: w.acme.id, agentId: other.id, turnId: "t-3", heldAtStart: [item.id: start], now: Date())
+        #expect(try restored.recordedCommitAuthors(companyId: w.acme.id, shas: [late]) == [late: "design-work"])
+    }
+
     /// R4-4: the clearing of a carried row: a row uncleared in either database stays uncleared; a row only the live database
     /// has comes back as it is there (cleared there: cleared).
     @Test func restoreKeepsTaintedCommitClearingStricter() throws {

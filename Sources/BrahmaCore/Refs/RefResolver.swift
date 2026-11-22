@@ -201,8 +201,8 @@ extension Store {
         let gate = GlobalSearch.TextGate(knownValues: knownValues)
         guard let answer = try FactsResolver(store: self).answer(for: ref, companyId: companyId, reader: reader, now: Store.now(), gate: gate)
         else { return "No answer." }
-        let (header, lines) = FactsResolver.lines(answer, tz: ownerTimeZone(), gate: gate)
-        return ([header] + lines).joined(separator: "\n")
+        // Fix round 1 (I-3): gated as the assembled text.
+        return FactsResolver.block(answer, tz: ownerTimeZone(), gate: gate, wrap: { $0 }).joined(separator: "\n")
     }
 
     // MARK: Resolution

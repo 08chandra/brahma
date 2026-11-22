@@ -144,13 +144,17 @@ public struct FactsResolver: FactsAnswering {
     /// The text of an answer, one line each (the `search` tool's answer block and the body `open_ref` reads): the header
     /// (`<title>, as of HH:mm`), then `- <text> [<ref>] …` per line, or `- <emptyText>`. Every ref chip goes through the
     /// display pipeline with the inert mapping, and every printed line is gated as printed (one holding a value reads
-    /// `- (withheld)`, so the count of lines never depends on the vault).
+    /// `- (withheld)`, so the count of lines never depends on the vault). Fix round 1 (I-3, Ruling 55): the header is gated as
+    /// assembled; when it holds a value it falls back to `<KIND>, as of HH:mm`, then `<KIND>`.
     public static func lines(_ a: FactAnswer, tz: TimeZone, gate: GlobalSearch.TextGate) -> (header: String, lines: [String]) {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = tz
         f.dateFormat = "HH:mm"
-        let title = gate.final(a.title, max: SafeTitle.max, inert: true) ?? a.kind.rawValue.uppercased()
+        let kind = a.kind.rawValue.uppercased()
+        let asOf = ", as of \(f.string(from: a.asOf))"
+        let title = gate.final(a.title, max: SafeTitle.max, inert: true) ?? kind
+        let header = [title + asOf, kind + asOf, kind].first { !gate.holdsSecret($0) } ?? ""
         var out: [String] = []
         for line in a.lines {
             var s = "- " + (gate.final(line.text, max: 400, inert: false) ?? "(withheld)")
@@ -160,7 +164,25 @@ public struct FactsResolver: FactsAnswering {
             out.append(gate.holdsSecret(s) ? "- (withheld)" : s)
         }
         if a.lines.isEmpty, let empty = a.emptyText { out.append("- " + empty) }
-        return ("\(title), as of \(f.string(from: a.asOf))", out)
+        return (header, out)
+    }
+
+    /// Fix round 1 (I-3, Ruling 55): the answer as printed, every string gated as it finally reads: the header inside the
+    /// caller's wrapper (`wrap`, e.g. `Answer (…):`; falling back to the plainer headers, then to `Answer:`),
+    /// then the lines; and the whole block joined as printed (one value spanning two lines withholds every line, never
+    /// drops one).
+    public static func block(_ a: FactAnswer, tz: TimeZone, gate: GlobalSearch.TextGate, wrap: (String) -> String) -> [String] {
+        let (header, body) = lines(a, tz: tz, gate: gate)
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = tz
+        f.dateFormat = "HH:mm"
+        let kind = a.kind.rawValue.uppercased()
+        let candidates = [header, "\(kind), as of \(f.string(from: a.asOf))", kind].filter { !$0.isEmpty }.map(wrap)
+        let top = candidates.first { !gate.holdsSecret($0) } ?? "Answer:"
+        let block = [top] + body
+        guard gate.holdsSecret(block.joined(separator: "\n")) else { return block }
+        return [top] + body.map { _ in "- (withheld)" }
     }
 }
 
@@ -309,7 +331,9 @@ extension FactsResolver {
                 if let reset = info.fiveHourResetsAt, reset > now { s += " · resets \(stamp(reset))" }
                 s += " · 7D " + (info.sevenDayUtilization.map(percent) ?? "not reported")
                 lines.append(line(s, [factRef]))
-                let share = r.reserve.map { 1 - $0 } ?? r.share
+                // 3a's share (`Pacing.pace`: share = 1 - reserve, the reserve being the company's override, else the
+                // owner-wide `1 - weeklyShare`; `SchedulerConfig.reserve(for:)`).
+                let share = 1 - (r.reserve ?? (1 - r.share))
                 if let seven = info.sevenDayUtilization, share > 0 {
                     lines.append(line("7D \(percent(seven)) is \(percent(seven / share)) of this company's \(percent(share)) weekly share", [factRef]))
                 }
@@ -343,24 +367,22 @@ extension FactsResolver {
                 s += " · " + (i.taintedOrigin ? "(untrusted)" : agentText(i.blockedReason, empty: "no reason given"))
                 itemLines.append(line(s, [item(i.key)]))
             }
+            // Fix round 1: an agent's reason is the stall report's (`StallExplainer.agentReason`, the words of its blocker
+            // groups), with the agent or item it waits on as a ref; an owner-wait's own reason is the agent's text about the
+            // owner, added for the owner and the concierge only.
             var agentLines: [FactLine] = []
             for a in agents {
                 var refs = [agent(a.name)]
-                let why: String
+                var why = StallExplainer.agentReason(a.blocker, ownerWord: isAgent ? "the owner" : "you", handle: { names[$0] }, timeZone: tz)
                 switch a.blocker {
-                case .agent(let id)?:
-                    if let h = names[id] { why = "waiting on @\(h)"; refs.append(agent(h)) } else { why = "waiting on another agent" }
-                case .owner(let reason, _)?:
-                    // The reason is the agent's own text about the owner: the owner's (and the concierge's) to read.
-                    why = isAgent ? "waiting on the owner" : "waiting on the owner: " + agentText(reason, empty: "no reason given")
-                case .usageLimit(let until)?: why = "usage limit until \(stamp(until))"
-                case .turnBudget(let until)?: why = "turn budget until \(stamp(until))"
-                case .retry(let until, let failures)?: why = "retrying at \(stamp(until)) after \(plural(failures, "failure", "failures"))"
+                case .agent(let id)?: if let h = names[id] { refs.append(agent(h)) }
                 case .workItem(let id, _)?:
-                    if let key = keys[id] { why = "waiting on \(key)"; refs.append(item(key)) } else { why = "waiting on an item" }
-                case nil: why = "no reason recorded"
+                    // The key the blocker recorded, only when it is still this company's item (else no ref; the words stay).
+                    if let key = keys[id] { refs.append(item(key)) }
+                case .owner(let reason, _)? where !isAgent: why += ": " + agentText(reason, empty: "no reason given")
+                default: break
                 }
-                agentLines.append(line("@\(a.name) blocked · \(why)", refs))
+                agentLines.append(line("@\(a.name) \(why)", refs))
             }
             let shownItems = scoped(itemLines), shownAgents = scoped(agentLines)
             return answer(.blocked, title: "BLOCKED · \(plural(shownItems.count, "ITEM", "ITEMS")), \(plural(shownAgents.count, "AGENT", "AGENTS"))",
@@ -438,7 +460,7 @@ extension FactsResolver {
             }
             if let company = try store.company(id: companyId),
                let git = try? store.refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true)),
-               let main = try? git.head("main"), let sha = (try? git.logShas(range: main, path: path))?.first {
+               let main = try? git.head("main"), let sha = (try? git.logShas(range: main, path: path, max: 1))?.first {
                 let author = try store.recordedCommitAuthors(companyId: companyId, shas: [sha])[sha]
                 let commit = WorkRef(kind: .commit, id: sha)
                 if let author {
@@ -578,7 +600,10 @@ extension FactsResolver {
                 }
             }
             var lines: [FactLine] = []
-            for (s, items, turns, active) in rows {
+            for (s, all, turns, active) in rows {
+                // Fix round 1 (M-2, Ruling 56): counted over the items the reader can read (today every item is company-class,
+                // so an agent counts them all; the filter keeps it so if items ever gain access classes).
+                let items = all.filter { readable(item($0.key)) }
                 let done = items.filter { $0.status == .done }
                 let blocked = items.filter { $0.status == .blocked }
                 let points = items.reduce(0) { $0 + ($1.points ?? 0) }, donePoints = done.reduce(0) { $0 + ($1.points ?? 0) }

@@ -31,12 +31,9 @@ extension Store {
 
             var groups: [String: Int] = [:]
             for a in live where a.state == .blocked {
-                switch a.blocker {
-                case .agent(let id)?: groups["@" + (try Agent.fetchOne(db, key: id)?.name ?? "?"), default: 0] += 1
-                case .workItem(_, let key)?: groups[key, default: 0] += 1
-                case .owner?: groups["you", default: 0] += 1
-                case .usageLimit?: groups["usage limit", default: 0] += 1
-                default: break
+                if let target = StallExplainer.blockerTarget(a.blocker, ownerWord: "you",
+                                                              handle: { id in (try? Agent.fetchOne(db, key: id))?.name }) {
+                    groups[target, default: 0] += 1
                 }
             }
             input.blockerGroups = groups.map { StallBlockerGroup(target: $0.key, count: $0.value) }

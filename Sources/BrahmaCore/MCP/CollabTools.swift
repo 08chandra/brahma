@@ -151,11 +151,8 @@ extension CompanyTools {
         }
         var lines: [String] = []
         // C4b: a fact answer comes first (`Answer (<title>, as of HH:mm):`, then one line per fact line with its ref chips).
-        if let answer = result.answer {
-            let (header, body) = FactsResolver.lines(answer, tz: tz, gate: gate)
-            lines.append("Answer (\(header)):")
-            lines += body
-        }
+        // Fix round 1 (I-3): gated as the assembled block (`FactsResolver.block`), the wrapper included.
+        if let answer = result.answer { lines += FactsResolver.block(answer, tz: tz, gate: gate, wrap: { "Answer (\($0)):" }) }
         var printed = 0
         for hit in result.hits where !hit.inlineOnly && printed < limit {
             let kind = hit.kind?.rawValue ?? hit.ref.kind.rawValue

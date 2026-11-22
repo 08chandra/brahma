@@ -150,8 +150,9 @@ struct ShowFactsFixture {
         }
     }
 
-    func tool(_ a: Agent, _ q: String) throws -> String {
-        try CompanyTools(store: store, companyId: c.id, agentId: a.id, paths: cf.paths).call(name: "search", arguments: ["query": .string(q)])
+    func tool(_ a: Agent, _ q: String, vault: (any SecretVault)? = nil) throws -> String {
+        try CompanyTools(store: store, companyId: c.id, agentId: a.id, paths: cf.paths, vault: vault)
+            .call(name: "search", arguments: ["query": .string(q)])
     }
 }
 
@@ -212,6 +213,11 @@ struct ShowFactsFixture {
         // A window of its own: last week holds only cto's $10.
         let last = try #require(try await w.answer("how much did we spend last week"))
         #expect(last.title == "USAGE · LAST WEEK · $10.00 LE", "\(last.title)")
+        // Fix round 1: the share is 3a's (`Pacing.pace`: share = 1 - reserve; reserve = the company's override, else
+        // 1 - weeklyShare). A company reserve of 60% leaves it 40%.
+        try w.store.setOwnerReserve(companyId: w.c.id, 0.6)
+        let reserved = try #require(try await w.answer("how much usage have we spent this week"))
+        #expect(reserved.lines.contains { $0.text.contains("of this company's 40% weekly share") }, "\(reserved.lines.map(\.text))")
     }
 
     @Test func blockedIncludesReasons() async throws {
@@ -224,7 +230,11 @@ struct ShowFactsFixture {
         #expect(a.lines.first?.refs.first?.id == w.payments.key)
         #expect(a.lines.contains { $0.refs.first?.id == w.searchBox.key && $0.text.contains("blocked 1h") })
         let cto = try #require(a.lines.first { $0.refs.first == WorkRef(kind: .agent, id: "cto") })
-        #expect(cto.text.contains("@cto") && cto.text.contains("waiting on \(w.payments.key)"), "\(cto.text)")
+        // Fix round 1: the agent's reason is the stall report's (`StallExplainer`), in the report's own words.
+        #expect(cto.text == "@cto " + StallExplainer.agentReason(.workItem(id: w.payments.id, key: w.payments.key), ownerWord: "the owner",
+                                                                 handle: { _ in nil }, timeZone: w.tz), "\(cto.text)")
+        #expect(cto.text.contains("blocked on \(w.payments.key)"), "\(cto.text)")
+        #expect(try w.store.stallReport(companyId: w.c.id).reasons.contains("1 agent blocked on \(w.payments.key)"))
         #expect(cto.refs.contains(WorkRef(kind: .item, id: w.payments.key)))
     }
 
@@ -360,6 +370,15 @@ struct ShowFactsFixture {
         #expect(first.hasPrefix("Answer (BLOCKED · 2 ITEMS, 1 AGENT, as of ") && first.hasSuffix("):"), "\(out)")
         #expect(lines.count > 3 && lines[1].hasPrefix("- \(w.payments.key) ") && lines[1].hasSuffix("[\(w.payments.key)]"), "\(out)")
         #expect(lines.contains { $0.hasPrefix("- @cto ") && $0.contains("[@cto]") && $0.contains("[\(w.payments.key)]") }, "\(out)")
+        // An owner-wait reason is the agent's own text: the owner's to read, never another agent's.
+        let ctoId = w.fx.cto.id
+        try await w.store.writer.write { db in
+            var cto = try #require(try Agent.fetchOne(db, key: ctoId))
+            cto.blocker = .owner(reason: "need the prod password", askId: nil)
+            try cto.update(db)
+        }
+        #expect(!(try w.tool(w.fx.eng1, "what's blocked")).contains("prod password"))
+        #expect(try await w.answer("what's blocked")?.lines.contains { $0.text.contains("prod password") } == true)
         // An owner-only kind prints no answer for an agent.
         #expect(!(try w.tool(w.fx.eng1, "pending approvals")).hasPrefix("Answer ("))
         // An empty answer still answers.
@@ -367,6 +386,31 @@ struct ShowFactsFixture {
         try await w.store.writer.write { db in try db.execute(sql: "UPDATE agent SET state = 'ready', blocker = NULL WHERE state = 'blocked'") }
         let empty = try w.tool(w.fx.eng1, "what's blocked").split(separator: "\n").map(String.init)
         #expect(empty.count >= 2 && empty[0].hasPrefix("Answer (BLOCKED · 0 ITEMS, 0 AGENTS, as of ") && empty[1] == "- Nothing is blocked.", "\(empty)")
+    }
+
+    /// Fix round 1 (I-3, Ruling 55): the answer's header (`<title>, as of HH:mm`) and the tool's `Answer (…):` wrapper are
+    /// gated as the assembled strings: a stored value that only appears once they are composed is never printed, and the
+    /// answer keeps its lines.
+    @Test func answerHeaderGatedAsAssembled() async throws {
+        let w = try ShowFactsFixture()
+        let values = ["1 AGENT, as of", "Answer (BLOCKED"]
+        let known = values.enumerated().map { (name: "HDR_\($0.offset)", value: $0.element) }
+        let a = try #require(try await w.answer("what's blocked", knownValues: known))
+        #expect(a.title == "BLOCKED · 2 ITEMS, 1 AGENT" && a.lines.count == 3)
+        let gate = GlobalSearch.TextGate(knownValues: known)
+        let (header, body) = FactsResolver.lines(a, tz: w.tz, gate: gate)
+        #expect(!values.contains { header.contains($0) } && body.count == 3, "\(header)")
+        let block = FactsResolver.block(a, tz: w.tz, gate: gate, wrap: { "Answer (\($0)):" })
+        #expect(block.count == 4 && block[0].hasPrefix("Answer") && !values.contains { block.joined(separator: "\n").contains($0) }, "\(block)")
+        // Through the tool (the values come from the vault) and through open_ref.
+        let vault = MemoryVault()
+        for (name, value) in known { try w.store.setSecret(companyId: w.c.id, name: name, value: value, isTest: false, vault: vault) }
+        let out = try w.tool(w.fx.eng1, "what's blocked", vault: vault)
+        #expect(out.hasPrefix("Answer") && !values.contains { out.contains($0) }, "\(out)")
+        #expect(out.split(separator: "\n").filter { $0.hasPrefix("- ") }.count == 3, "\(out)")
+        let body2 = try w.store.openRef(companyId: w.c.id, reader: .owner, pinned: WorkRef(kind: .fact, id: "what's blocked"), lines: nil,
+                                        copy: false, turnId: nil, knownValues: known, paths: w.cf.paths, now: w.now).text
+        #expect(!values.contains { body2.contains($0) }, "\(body2)")
     }
 
     @Test func factRefOpensLive() async throws {

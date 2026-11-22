@@ -58,6 +58,13 @@ struct RestoreCarry {
     var itemCommitTaints: [ItemCommitTaint] = []
     /// Ruling 22's restore epochs (P2 R5-1): an earlier restore over an unreadable database; an uncleared one must not be lost.
     var restoreEpochs: [BrahmaCore.RestoreEpoch] = []
+    /// C4b fix round 1 (I-1): the engine's commit-author record (`turnCommit`). Git is not rolled back, so a commit whose turn
+    /// was recorded after the snapshot is still there; without its row it would read unverified, and a later turn reaching it
+    /// could become its first recorder.
+    var commitAuthors: [CommitAuthor] = []
+
+    /// A row of C4b's `turnCommit`.
+    struct CommitAuthor { var companyId: String, sha: String, itemId: String?, agentId: String, turnId: String?, createdAt: Date }
 
     /// What the live database says, or why it could not be read.
     enum Live {
@@ -128,6 +135,12 @@ struct RestoreCarry {
         }
         if try has("restoreEpoch") {
             c.restoreEpochs = try BrahmaCore.RestoreEpoch.fetchAll(db, sql: "SELECT * FROM restoreEpoch")
+        }
+        if try has("turnCommit") {
+            c.commitAuthors = try Row.fetchAll(db, sql: "SELECT companyId, sha, itemId, agentId, turnId, createdAt FROM turnCommit").map {
+                CommitAuthor(companyId: $0["companyId"], sha: $0["sha"], itemId: $0["itemId"], agentId: $0["agentId"], turnId: $0["turnId"],
+                             createdAt: $0["createdAt"])
+            }
         }
         return c
     }
@@ -365,6 +378,21 @@ struct RestoreCarry {
         }
         try carryRestoreEpochs(c.restoreEpochs, into: db)
         try carryItemCommitTaints(c.itemCommitTaints, into: db)
+        try carryCommitAuthors(c.commitAuthors, into: db)
+    }
+
+    /// C4b fix round 1 (I-1): the live database's commit-author rows come back (when their company is in the snapshot). The
+    /// first record of a sha wins, as at recording: a row the snapshot already has stays as it is there (`INSERT OR IGNORE`).
+    /// A row naming an agent the snapshot lacks is kept too: it attributes to nobody visible, but still holds the sha against
+    /// a later turn.
+    static func carryCommitAuthors(_ rows: [CommitAuthor], into db: Database) throws {
+        guard !rows.isEmpty, try db.tableExists("turnCommit") else { return }
+        for r in rows {
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO turnCommit (companyId, sha, itemId, agentId, turnId, createdAt)
+                SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM company WHERE id = ?)
+                """, arguments: [r.companyId, r.sha, r.itemId, r.agentId, r.turnId, r.createdAt, r.companyId])
+        }
     }
 
     /// P2 R5-1: the live database's restore epochs come back like its tainted commits (`carryItemCommitTaints`): one only it

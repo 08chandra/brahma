@@ -190,3 +190,36 @@ public enum StallExplainer {
         return StallReport(running: input.running, reasons: reasons)
     }
 }
+
+extension StallExplainer {
+    /// What one blocked agent waits on, as the stall report groups it (`StallInput.blockerGroups`): `@<handle>` (`@?` when
+    /// unknown), the item key, `ownerWord` (`you` in the owner's report) or `usage limit`; nil for a blocker the report
+    /// doesn't group (a turn budget, a retry, none).
+    public static func blockerTarget(_ blocker: Blocker?, ownerWord: String, handle: (String) -> String?) -> String? {
+        switch blocker {
+        case .agent(let id)?: "@" + (handle(id) ?? "?")
+        case .workItem(_, let key)?: key
+        case .owner?: ownerWord
+        case .usageLimit?: "usage limit"
+        default: nil
+        }
+    }
+
+    /// Plan C Task C4b: one blocked agent's reason in the stall report's words: `blocked on <target>` (`blockerTarget`), with
+    /// the time a usage limit lifts; a turn budget or a retry with its time; `blocked` when nothing is recorded. Engine text
+    /// only: an owner-wait's own reason (agent text) is the caller's to add, for the readers allowed it.
+    public static func agentReason(_ blocker: Blocker?, ownerWord: String, handle: (String) -> String?, timeZone: TimeZone) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = timeZone
+        f.dateFormat = "HH:mm"
+        switch blocker {
+        case .usageLimit(let until)?: return "blocked on usage limit until \(f.string(from: until))"
+        case .turnBudget(let until)?: return "blocked on turn budget until \(f.string(from: until))"
+        case .retry(let until, let failures)?:
+            return "blocked: retrying at \(f.string(from: until)) after \(failures) \(failures == 1 ? "failure" : "failures")"
+        default:
+            return blockerTarget(blocker, ownerWord: ownerWord, handle: handle).map { "blocked on \($0)" } ?? "blocked"
+        }
+    }
+}
