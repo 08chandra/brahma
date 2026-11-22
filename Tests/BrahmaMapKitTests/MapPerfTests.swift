@@ -14,7 +14,7 @@ private enum PerfGate {
     #endif
 }
 
-/// Offscreen frame-time checks for the org chart. Run them with
+/// Offscreen frame-time checks for the org chart and the office. Run them with
 /// `BRAHMA_PERF=1 swift test -c release -Xswiftc -enable-testing --filter MapPerfTests` (the other test files use `@testable`,
 /// which a release build only allows with `-enable-testing`). Each run drives a synthetic company through `MapBench` at a
 /// fixed 1/60 s step and prints one `MAP BENCH` line; the assertion is the 60 fps budget (16.7 ms at the 95th percentile).
@@ -57,6 +57,49 @@ private enum PerfGate {
         print(r.line)
         #expect(r.frames > 0)
         #expect(r.aggregateSeconds == 0, "aggregate mode ran, so the particle path was not what was measured: \(r.line)")
+        #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
+    }
+
+    // MARK: Office (spec §8; LOD by living agents: full ≤ 50, static ≤ 150, desk-only above)
+
+    /// Full detail (walks, typing, strolls, glow pulse) at 50 msg/s with a 200-message burst every 10 s.
+    @Test(.enabled(if: PerfGate.enabled, "needs BRAHMA_PERF=1, a release build and a Metal device"))
+    @MainActor func officeSixtyFpsAt50Bursts() {
+        let r = MapBench.run(agents: 50, mode: .office)
+        print(r.line)
+        #expect(r.mode == .office)
+        #expect(r.frames > 0)
+        #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
+    }
+
+    /// Full detail under the aggregate threshold with no bursts: every message is a note flown from the pool.
+    @Test(.enabled(if: PerfGate.enabled, "needs BRAHMA_PERF=1, a release build and a Metal device"))
+    @MainActor func officeSixtyFpsAt50Particles() {
+        let r = MapBench.run(agents: 50, mode: .office, rate: 15, burst: nil)
+        print(r.line)
+        #expect(r.mode == .office)
+        #expect(r.frames > 0)
+        #expect(r.aggregateSeconds == 0, "aggregate mode ran, so the note path was not what was measured: \(r.line)")
+        #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
+    }
+
+    /// Static LOD: figures but no walks, typing frames, strolls or pulse.
+    @Test(.enabled(if: PerfGate.enabled, "needs BRAHMA_PERF=1, a release build and a Metal device"))
+    @MainActor func officeAt150Static() {
+        let r = MapBench.run(agents: 150, mode: .office)
+        print(r.line)
+        #expect(r.mode == .office)
+        #expect(r.frames > 0)
+        #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
+    }
+
+    /// Desk-state-only LOD: no figures, desks show state by light, notes are dots.
+    @Test(.enabled(if: PerfGate.enabled, "needs BRAHMA_PERF=1, a release build and a Metal device"))
+    @MainActor func officeAt300DeskOnly() {
+        let r = MapBench.run(agents: 300, mode: .office)
+        print(r.line)
+        #expect(r.mode == .office)
+        #expect(r.frames > 0)
         #expect(r.p95Ms <= Self.budgetMs, "p95 \(r.p95Ms) ms: \(r.line)")
     }
 }

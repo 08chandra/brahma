@@ -22,7 +22,8 @@ public struct MapBenchResult: Sendable {
     public var line: String
 }
 
-/// Drives a synthetic `MapController` through an `OrgScene` offscreen, one fixed 1/60 s step per frame: the controller polls
+/// Drives a synthetic `MapController` through the scene for a `MapMode` (`MapSceneFactory`: the org chart's `OrgScene` or the
+/// office's `OfficeScene`) offscreen, one fixed 1/60 s step per frame: the controller polls
 /// on its 500 ms cadence on a virtual clock (so traffic, bursts and state churn are the same on every run), and each frame
 /// is timed from `SKRenderer.update` (which runs the controller's `frame` and the scene's update) to the finished command
 /// buffer. Needs a Metal device; without one the result has zero frames.
@@ -43,15 +44,17 @@ public enum MapBench {
         func advance(_ seconds: TimeInterval) { lock.lock(); time = time.addingTimeInterval(seconds); lock.unlock() }
     }
 
-    public static func run(agents: Int, rate: Double = 50, burst: (TimeInterval, Int)? = (10, 200), seconds: Double = 30,
-                           expandAll: Bool = false) -> MapBenchResult {
+    /// `expandAll` opens every subtree of the org chart; the office has no collapsed subtrees, so it is ignored in `.office`.
+    public static func run(agents: Int, mode: MapMode = .org, rate: Double = 50, burst: (TimeInterval, Int)? = (10, 200),
+                           seconds: Double = 30, expandAll: Bool = false) -> MapBenchResult {
         // An epoch multiple of 10 s, so a (10, n) burst lands 10 s into the run.
         let clock = VirtualClock(Date(timeIntervalSince1970: 1_800_000_000))
         let controller = MapController(source: .synthetic(agents: agents, rate: rate, seed: 42),
                                        defaults: UserDefaults(suiteName: "brahma.mapbench.\(UUID().uuidString)")!,
                                        clock: { clock.now })
         controller.syntheticBurst = burst.map { (every: $0.0, size: $0.1) }
-        let scene = OrgScene(size: size)
+        controller.mode = mode   // before `present`: the mode decides what the controller collapses (none in the office)
+        let scene = MapSceneFactory.make(mode, size: size)
         scene.present(controller: controller)
 
         func result(_ intervals: [TimeInterval], aggregate: Double) -> MapBenchResult {
@@ -94,7 +97,7 @@ public enum MapBench {
             clock.advance(step)
             sceneTime += step
             if index % framesPerPoll == 0 { controller.pollSynthetic() }
-            if expandAll, !expanded {
+            if expandAll, mode == .org, !expanded {
                 // Every manager with reports open: nothing is a stub.
                 for (id, node) in controller.model.tree.nodes where !node.childIds.isEmpty { controller.orgOverrides[id] = true }   // true = expanded
                 expanded = true
@@ -118,7 +121,7 @@ public enum MapBench {
         for _ in 0..<warmupFrames {
             _ = frame(index)
             index += 1
-            if index == 2 { scene.zoomToFit() }   // after the first rebuild: the whole chart is on screen, the costliest view
+            if index == 2 { scene.zoomToFit(margin: 40) }   // after the first rebuild: everything is on screen, the costliest view
         }
         // `zoomToFit` eases the camera; two more seconds of frames settle it before timing starts.
         for _ in 0..<120 { _ = frame(index); index += 1 }
