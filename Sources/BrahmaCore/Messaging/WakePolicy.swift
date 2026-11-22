@@ -33,6 +33,20 @@ public enum WakePolicy {
         }
     }
 
+    /// Plan C Task C3a: who a thread reply wakes (`MessageRouter` uses it instead of `wakes` for a message with a `parentId`).
+    /// A capped thread wakes nobody; otherwise a mentioned agent, a party of a DM, and the root's author when the owner replies
+    /// or mentions them. Everyone else gets a non-waking inbox item (counted as unread, seen next turn). The router's
+    /// recipients of a DM are its parties plus mentioned agents, so a DM recipient who is not mentioned is a party. The
+    /// engine's (`Sender.system`) replies in a channel never wake, as its channel posts don't.
+    public static func threadWakes(sender: Sender, recipientId: String, rootAuthorId: String, mentioned: Bool, isDM: Bool,
+                                   capped: Bool) -> Bool {
+        if capped { return false }
+        if sender == .system, !isDM { return false }
+        if mentioned { return true }
+        if isDM { return true }
+        return recipientId == rootAuthorId && sender == .owner
+    }
+
     /// Whether a work-item event must wake its recipient. Only actionable events do: a review requested
     /// (`verificationPassed` to the reviewer), returned work (`changesRequested`, `verificationFailed`, `mergeConflict` to
     /// the assignee or lease holder), a finished dependency (`dependencyDone` to the one waiting), a hand-off addressed to the recipient and a comment that

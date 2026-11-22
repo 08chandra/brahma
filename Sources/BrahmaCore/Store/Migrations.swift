@@ -1809,6 +1809,20 @@ enum Migrations {
             // (`flattened/<row id>.pdf`); the copy's own SHA-256, which every read of it must match.
             try db.alter(table: "fileVouch") { t in t.add(column: "copySha256", .text) }
         }
+        m.registerMigration("vC-threads") { db in
+            // Plan C Task C3a: threads. A reply's root (`parentId`; a reply to a reply joins the root); per root, its reply count
+            // and the thread cap's tumbling window of agent-only replies in company-active seconds, and when it capped.
+            try db.alter(table: "message") { t in t.add(column: "parentId", .text) }
+            try db.create(index: "message_parent", on: "message", columns: ["parentId", "createdAt"])
+            try db.create(table: "threadStat") { t in
+                t.primaryKey("rootId", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("replies", .integer).notNull().defaults(to: 0)
+                t.column("agentRepliesWindow", .integer).notNull().defaults(to: 0)
+                t.column("windowStartActive", .double)
+                t.column("cappedAt", .datetime)
+            }
+        }
     }
 }
 

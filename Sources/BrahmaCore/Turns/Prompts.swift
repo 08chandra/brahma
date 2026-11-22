@@ -71,10 +71,17 @@ private let blockedInline = CharacterSet.newlines.union(.controlCharacters)
 public enum InboxDigest {
     /// A longer message is cut: the digest stays bounded, and the full text is one `read_channel` away.
     public static let maxMessageChars = 4000
+    /// C3a: how much of a thread's root text the label of a reply in it shows.
+    public static let threadLabelChars = 40
 
+    /// `threadRoots` (C3a): the roots, by id, of the thread replies among `items` that the agent can read in full
+    /// (`Store.threadRoots`); a reply is labelled `- @qa-2 (#eng, thread "<root text>") 14:05: …` in `timeZone`, and without
+    /// the root's text when its root is not given, was written by a session that read outside content or is flagged
+    /// (`threadLabel`).
     public static func render(agent: Agent, company: Company,
                               items: [(InboxItem, Message, Channel)],
-                              handles: [String: String], unread: [(channel: String, count: Int)] = []) -> String {
+                              handles: [String: String], unread: [(channel: String, count: Int)] = [],
+                              threadRoots: [String: Message] = [:], timeZone: TimeZone = .current) -> String {
         var out = "New since your last turn (\(items.count) items):"
         var unreadLine = ""
         if !unread.isEmpty {
@@ -100,7 +107,16 @@ public enum InboxDigest {
             }
             // The engine's prefix, never the text's (Task 10): the sender claimed to be the owner.
             let unverified = message.flag == OwnerImpersonation.flag ? OwnerImpersonation.digestPrefix : ""
-            if message.taintedOrigin {
+            if let rootId = message.parentId {
+                let label = "@\(handle) (\(source), thread\(threadLabel(threadRoots[rootId]))) \(ReviewDigest.clock(message.createdAt, timeZone)):"
+                // Framed as the digest's other lines are (and as `Store.relayedTaint` taints the turn for): by `taintedOrigin`.
+                if message.taintedOrigin {
+                    out += "\n- \(unverified)\(TaintPolicy.relayedPrefix)\(label)\n"
+                        + UntrustedBlock.render(source: "@\(handle), a session that read outside content", text: text, maxLines: 1)
+                } else {
+                    out += "\n- \(unverified)\(label) \(text)"
+                }
+            } else if message.taintedOrigin {
                 // I2: written by a session that read outside content: framed as untrusted data, never as one of the engine's lines.
                 out += "\n- \(unverified)\(TaintPolicy.relayedPrefix)\(source) @\(handle):\n"
                     + UntrustedBlock.render(source: "@\(handle), a session that read outside content", text: text, maxLines: 1)
@@ -109,6 +125,18 @@ public enum InboxDigest {
             }
         }
         return out + unreadLine
+    }
+
+    /// ` "<root text>"`: flattened to one line, double quotes turned single (the label's own quotes stay the engine's) and cut
+    /// to `threadLabelChars`; empty for a root not given, written by a session that read outside content, or flagged as
+    /// claiming to be the owner.
+    static func threadLabel(_ root: Message?) -> String {
+        guard let root, !root.taintedOrigin, !root.fromTaintedSession, root.flag != OwnerImpersonation.flag else { return "" }
+        let flat = String(String.UnicodeScalarView(root.text.unicodeScalars.map { blockedInline.contains($0) ? " " : $0 }))
+            .replacingOccurrences(of: "\"", with: "'")
+            .split(separator: " ", omittingEmptySubsequences: true).joined(separator: " ")
+        let cut = flat.count > threadLabelChars ? String(flat.prefix(threadLabelChars - 1)) + "…" : flat
+        return " \"\(cut)\""
     }
 }
 

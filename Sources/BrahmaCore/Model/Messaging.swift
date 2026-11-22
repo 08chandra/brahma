@@ -57,6 +57,9 @@ public struct Message: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     /// (`Store.refTaint`).
     public var fromTaintedSession: Bool = false
     public var taintSource: String? = nil
+    /// Plan C Task C3a: the root of the thread this message replies in (always a root: a reply to a reply joins the root);
+    /// nil for a message that is not a reply.
+    public var parentId: String? = nil
 }
 
 /// The stored `message.kind`.
