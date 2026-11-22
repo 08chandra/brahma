@@ -80,10 +80,11 @@ enum MotionTextures {
     }
 }
 
-/// One of the 150 pooled sprites: a message dot, a hand-off square or a broadcast ring, with an optional text label child.
+/// One of the 150 pooled sprites: a message dot, a hand-off square or a broadcast ring (the org chart), or the office's
+/// paper note and folder; with an optional text label child.
 @MainActor
 final class MotionParticle {
-    enum Kind { case dot, square, ring }
+    enum Kind { case dot, square, ring, note, folder }
 
     static let dotSize = CGSize(width: 5, height: 5)
     static let squareSize = CGSize(width: 7, height: 7)
@@ -97,35 +98,61 @@ final class MotionParticle {
     var route: MotionRoute?
     var routeVersion = -1
 
-    func configure(event: VisualEvent, from: String, to: String?, route: MotionRoute, version: Int) {
+    /// `kind` nil picks the org chart's for the event (a hand-off square, a broadcast ring, else a dot); the office passes
+    /// its own (`.note`, `.folder`, or a 4b kind in aggregate mode and at desk-only LOD).
+    func configure(event: VisualEvent, from: String, to: String?, route: MotionRoute, version: Int, kind: Kind? = nil) {
         self.event = event
         self.from = from
         self.to = to
         self.route = route
         routeVersion = version
-        switch event.kind {
-        case .handoff:
-            kind = .square
-            sprite.texture = nil
-            sprite.color = MapPalette.color(ThemeHex.warning)
-            sprite.size = Self.squareSize
-        case .broadcast:
-            kind = .ring
-            sprite.texture = MotionTextures.ring
-            sprite.color = .white
-            sprite.colorBlendFactor = 0
-            sprite.size = CGSize(width: 16, height: 16)
-        default:
-            kind = .dot
-            sprite.texture = MotionTextures.dot
-            sprite.color = .white
-            sprite.colorBlendFactor = 0
-            sprite.size = Self.dotSize
+        switch kind ?? Self.orgKind(event.kind) {
+        case .square: setKind(.square)
+        case .ring: setKind(.ring)
+        case .dot: setKind(.dot)
+        case .note: setKind(.note)
+        case .folder: setKind(.folder)
         }
         sprite.alpha = 0
         sprite.position = route.start
         sprite.isHidden = false
         refreshLabel()
+    }
+
+    private static func orgKind(_ k: VisualKind) -> Kind {
+        switch k {
+        case .handoff: .square
+        case .broadcast: .ring
+        default: .dot
+        }
+    }
+
+    /// The sprite's look for `kind`: the org chart's dot, square and ring, the office's paper note and folder.
+    func setKind(_ kind: Kind) {
+        self.kind = kind
+        switch kind {
+        case .square:
+            sprite.texture = nil
+            sprite.color = MapPalette.color(ThemeHex.warning)
+            sprite.colorBlendFactor = 0
+            sprite.size = Self.squareSize
+        case .ring:
+            sprite.texture = MotionTextures.ring
+            sprite.color = .white
+            sprite.colorBlendFactor = 0
+            sprite.size = CGSize(width: 16, height: 16)
+        case .dot:
+            sprite.texture = MotionTextures.dot
+            sprite.color = .white
+            sprite.colorBlendFactor = 0
+            sprite.size = Self.dotSize
+        case .note, .folder:
+            let texture = kind == .note ? OfficeTextures.note : OfficeTextures.folder
+            sprite.texture = texture
+            sprite.color = .white
+            sprite.colorBlendFactor = 0
+            sprite.size = OfficeTextures.points(texture)
+        }
     }
 
     /// The `×n` of a coalesced message, or a hand-off's key; nothing for a lone message and for a ring. Every string goes
@@ -471,7 +498,7 @@ extension OrgScene {
             }
             p.sprite.isHidden = false
             switch p.kind {
-            case .dot, .square:
+            case .dot, .square, .note, .folder:
                 p.sprite.position = route.point(at: f)
                 p.sprite.alpha = Swift.min(1, f / 0.1, (1 - f) / 0.1)
             case .ring:

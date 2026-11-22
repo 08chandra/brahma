@@ -12,7 +12,9 @@ import BrahmaAppModel
 /// chip layer. The level of detail follows the living-agent count (`lod(living:)`), never the frame time.
 ///
 /// Rebuilding is incremental: the layout and the rooms are remade only when the structure changed; desk and figure nodes
-/// are reused by id (and pooled when they leave), and a desk whose rect moved glides there in `moveDuration`.
+/// are reused by id (and pooled when they leave), and a desk whose rect moved glides there in `moveDuration`. The motion
+/// (walks, notes, event visuals, strolls, the highlight ring and follow) is driven on map time by
+/// `update(controller:events:now:)` (OfficeMotion.swift); a rebuild alone puts every figure where it belongs at once.
 @MainActor
 public final class OfficeScene: SKScene, MapScene {
     public static let zoomRange = 0.15...3.0
@@ -30,6 +32,8 @@ public final class OfficeScene: SKScene, MapScene {
     public static let walkDuration = 0.8
     public static let typingHz = 4.0
     public static let pulseHz = 1.0
+    /// An idle figure strolls to the break room this long after it sat down (or came back), seeded by its agent id.
+    public static let strollRange = 20.0...40.0
     /// Folders on the board table before it shows `9+`.
     public static let askFolders = 9
     /// Perk glyphs on the break room's wall of fame.
@@ -58,6 +62,8 @@ public final class OfficeScene: SKScene, MapScene {
     private let figureLayer = SKNode()
     let highlightLayer = SKNode()
     let chipLayer = SKNode()
+    /// Walks, notes, event visuals and the highlight ring (OfficeMotion.swift).
+    let motion = OfficeMotionState()
 
     // MARK: State
 
@@ -66,19 +72,29 @@ public final class OfficeScene: SKScene, MapScene {
     public private(set) var contentBounds = CGRect.zero
     /// No typing frames or pulses, and a state badge on every desk (spec §5.6). Starts at the system setting.
     public var reduceMotion = false {
-        didSet { if reduceMotion != oldValue, let builtModel { rebuild(model: builtModel) } }
+        didSet {
+            guard reduceMotion != oldValue, let builtModel else { return }
+            rebuild(model: builtModel, replaying: builtReplaying)
+            advanceFigures(now: nil)
+        }
     }
 
-    private var builtModel: MapModel?
+    private(set) var builtModel: MapModel?
+    /// The agents as the floor shows them: the model's, or during a replay its states without the item facets.
+    private(set) var shownAgents: [String: MapAgent] = [:]
+    /// The last rebuild was of a replay (its item facets hidden).
+    private var builtReplaying = false
     private var builtTree: OrgTree?
     private var builtRevision = -1
+    /// The structure revision the desks and figures were last refreshed for (the layout may be held at an older one).
+    private(set) var contentRevision = -1
     private var hasLayout = false
-    private var desks: [String: OfficeDeskNode] = [:]
+    private(set) var desks: [String: OfficeDeskNode] = [:]
     private var deskTargets: [String: CGPoint] = [:]
     private var deskPool: [OfficeDeskNode] = []
-    private var figures: [String: OfficeFigureNode] = [:]
+    private(set) var figures: [String: OfficeFigureNode] = [:]
     private var figurePool: [OfficeFigureNode] = []
-    private var rooms: [String: OfficeRoomNode] = [:]
+    private(set) var rooms: [String: OfficeRoomNode] = [:]
     private var pods: [String: OfficePodNode] = [:]
     private var floorSize: CGSize?
     private var textLevel = -1
@@ -86,7 +102,6 @@ public final class OfficeScene: SKScene, MapScene {
 
     private var driver: MapController?
     private var timeBase: TimeInterval?
-    private var lastRebuild = -Double.infinity
 
     // MARK: Init
 
@@ -105,7 +120,9 @@ public final class OfficeScene: SKScene, MapScene {
         scaleMode = .resizeFill
         anchorPoint = .zero
         reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        // Notes fly above every figure (whose depth is a few thousand at most) and under the desks' labels.
         let layers: [(SKNode, CGFloat)] = [(floorLayer, -10), (roomLayer, 1), (podLayer, 2), (deskLayer, 3), (figureLayer, 4),
+                                           (motion.particleLayer, OfficeZ.labels / 2),
                                            (highlightLayer, 2 * OfficeZ.overlay), (chipLayer, 2 * OfficeZ.overlay + 1)]
         for (layer, z) in layers {
             layer.zPosition = z
@@ -120,13 +137,11 @@ public final class OfficeScene: SKScene, MapScene {
     // MARK: Driving
 
     /// Makes `controller` drive this scene from `SKScene.update(_:)` (or stops driving with nil). Map time continues from
-    /// the controller's.
+    /// the controller's; the walks, notes and effects of a previous controller are dropped.
     public func present(controller: MapController?) {
         driver = controller
         timeBase = nil
-        lastRebuild = -.infinity
-        builtRevision = -1
-        cameraDriver.reset()
+        resetMotion(for: controller)
     }
 
     public override func update(_ currentTime: TimeInterval) {
@@ -135,18 +150,16 @@ public final class OfficeScene: SKScene, MapScene {
             let base = timeBase ?? (currentTime - controller.mapNow())
             timeBase = base
             let now = currentTime - base
-            // The events are the office's to play from Task 7; at rest the frame only advances the controller.
-            _ = controller.frame(now: now)
-            let model = controller.model
-            if builtRevision != model.structureRevision || now - lastRebuild >= Self.refreshInterval || now < lastRebuild {
-                rebuild(model: model)
-                lastRebuild = now
-            }
-            cameraDriver.update(controller: controller, now: now, targetRect: deskRect, contentBounds: contentBounds)
-            cameraDriver.syncZoom(controller: controller)
+            update(controller: controller, events: controller.frame(now: now), now: now)
         }
         // A gesture or the camera driver may have moved the camera.
         cameraMovedIfNeeded()
+    }
+
+    /// The next `update(controller:…)` rebuilds the floor whatever changed.
+    func forceRebuild() {
+        builtRevision = -1
+        contentRevision = -1
     }
 
     // MARK: Camera
@@ -176,7 +189,7 @@ public final class OfficeScene: SKScene, MapScene {
         if cameraNode.parent != nil { cameraMoved() }
     }
 
-    private func cameraMovedIfNeeded() {
+    func cameraMovedIfNeeded() {
         if let last = lastCamera, last.position == cameraNode.position, last.scale == cameraNode.xScale, last.size == size { return }
         cameraMoved()
     }
@@ -189,6 +202,7 @@ public final class OfficeScene: SKScene, MapScene {
         if level != textLevel {
             textLevel = level
             for node in desks.values { node.setZoom(z) }
+            rooms["room:mail"]?.showKeys(level == 2)
         }
         figureLayer.isHidden = z < Self.figureZoom
     }
@@ -196,27 +210,52 @@ public final class OfficeScene: SKScene, MapScene {
     // MARK: Rebuild
 
     /// Brings the floor in line with `model`: the layout and rooms when the structure changed, then every desk, figure and
-    /// room state.
+    /// room state; every figure is put where it belongs at once (no walks: those are `update(controller:…)`'s).
     public func rebuild(model: MapModel) {
+        rebuild(model: model, replaying: false)
+        advanceFigures(now: nil)
+    }
+
+    /// The rebuild behind `rebuild(model:)` and the driven frame. While a leave plays the layout is held (the leaver's desk
+    /// stays where it was until its animation ends; spec §5.4), but states, activities and rooms are refreshed. During a
+    /// replay the item facets are not shown (spec §5.7): no reviewing, meetings or parcels.
+    func rebuild(model: MapModel, replaying: Bool) {
         builtModel = model
+        builtReplaying = replaying
         let tree = model.tree
-        if !hasLayout || builtTree != tree || builtRevision != model.structureRevision {
+        let hold = !motion.leaving.isEmpty && hasLayout
+        if !hold && (!hasLayout || builtTree != tree || builtRevision != model.structureRevision) {
             let next = OfficeLayout.make(model: model)
             builtTree = tree
             builtRevision = model.structureRevision
             if !hasLayout || next != layout {
                 layout = next
                 hasLayout = true
+                motion.layoutChanged()
                 rebuildFloor()
                 rebuildRooms()
             }
         }
+        contentRevision = model.structureRevision
+        shownAgents = replaying ? model.agents.mapValues(Self.replayed) : model.agents
         let living = model.agents.values.filter { $0.state != .killed }
         lod = Self.lod(living: living.count)
         rebuildDesks(model)
         let counts = rebuildFigures(model)
-        updateRooms(model, waiting: counts.waiting, inReview: counts.inReview)
+        updateRooms(model, waiting: counts.waiting, inReview: counts.inReview, replaying: replaying)
         contentBounds = CGRect(x: 0, y: -layout.size.h, width: layout.size.w, height: layout.size.h)
+    }
+
+    /// An agent as a replay shows it: its state only (item phases are not in the timeline), so no review room, meeting
+    /// or parcel.
+    static func replayed(_ a: MapAgent) -> MapAgent {
+        var a = a
+        switch a.activity {
+        case .reviewing, .meeting: a.activity = a.state == .running ? .typing : .idle
+        default: break
+        }
+        a.shipping = nil
+        return a
     }
 
     private func rebuildDesks(_ model: MapModel) {
@@ -224,10 +263,17 @@ public final class OfficeScene: SKScene, MapScene {
         let z = zoom
         var kept = Set<String>()
         for (id, desk) in layout.desks {
+            if motion.leaving[id] != nil, desks[id] != nil {
+                // Playing its leave: left as it is until the animation ends.
+                kept.insert(id)
+                continue
+            }
             if let seat = vacancies[id] {
                 place(id, desk).configure(vacancy: seat, zoom: z)
-            } else if let agent = model.agents[id] {
-                place(id, desk).configure(agent: agent, zoom: z, lod: lod, reduceMotion: reduceMotion)
+            } else if let agent = shownAgents[id] {
+                let node = place(id, desk)
+                node.isHead = desk.podId.flatMap { layout.pods[$0]?.managerId } == id
+                node.configure(agent: agent, zoom: z, lod: lod, reduceMotion: reduceMotion)
             } else {
                 continue
             }
@@ -265,35 +311,47 @@ public final class OfficeScene: SKScene, MapScene {
         return node
     }
 
-    /// Figures at rest (spec §5.4), in tree order: at the seat typing, idle or blocked (raised hand, `!`); standing at the
-    /// board room door waiting on the owner (`…`); at a review-room chair reviewing or in a meeting; none away or gone.
-    /// None at all at desk-only LOD. Returns how many wait at the board room and sit in the review room.
+    /// Where each figure belongs at rest (spec §5.4), in tree order: at the seat typing, idle or blocked (raised hand,
+    /// `!`); standing at the board room door waiting on the owner (`…`); at a review-room chair reviewing or in a meeting;
+    /// none away or gone, and none at all at desk-only LOD. A figure keeps its review chair or door spot while it stays
+    /// there; a newcomer takes the lowest free one. A leaving figure is kept as it is (it fades out). The figures get there
+    /// in `advanceFigures`. Returns how many wait at the board room and sit in the review room.
     private func rebuildFigures(_ model: MapModel) -> (waiting: Int, inReview: Int) {
-        var kept = Set<String>()
-        var waiting = 0, inReview = 0
+        var review: [String] = [], door: [String] = []
         for id in model.tree.order {
-            guard let agent = model.agents[id], let desk = layout.desks[id] else { continue }
-            let spot: MapPoint2
-            var pose = OfficeTextures.FigurePose.sit
-            var bubble: OfficeTextures.BubbleGlyph?
+            guard let agent = shownAgents[id], layout.desks[id] != nil, motion.leaving[id] == nil else { continue }
+            switch agent.activity {
+            case .reviewing, .meeting: review.append(id)
+            case .waitingOnOwner: door.append(id)
+            default: break
+            }
+        }
+        motion.reviewSeats = Self.assign(review, keeping: motion.reviewSeats)
+        motion.doorSpots = Self.assign(door, keeping: motion.doorSpots)
+
+        var kept = Set<String>()
+        for id in model.tree.order {
+            guard let agent = shownAgents[id], let desk = layout.desks[id] else { continue }
+            if motion.leaving[id] != nil {
+                if figures[id] != nil { kept.insert(id) }
+                continue
+            }
+            var rest = OfficeMotionState.Rest(spot: Self.point(desk.seat), pose: .sit, bubble: nil, typing: false, idle: false)
             switch agent.activity {
             case .typing:
-                spot = desk.seat
-                pose = .typeA
+                rest.pose = .typeA
+                rest.typing = lod == .full && !reduceMotion
             case .idle:
-                spot = desk.seat
+                rest.idle = true
             case .blocked:
-                spot = desk.seat
-                pose = .raisedHand
-                bubble = .exclaim
+                rest.pose = .raisedHand
+                rest.bubble = .exclaim
             case .waitingOnOwner:
-                spot = layout.doorSpot(waiting)
-                waiting += 1
-                pose = .stand
-                bubble = .ellipsis
+                rest.spot = Self.point(layout.doorSpot(motion.doorSpots[id] ?? 0))
+                rest.pose = .stand
+                rest.bubble = .ellipsis
             case .reviewing, .meeting:
-                spot = layout.reviewSeat(inReview)
-                inReview += 1
+                rest.spot = Self.point(layout.reviewSeat(motion.reviewSeats[id] ?? 0))
             case .away, .gone:
                 continue
             }
@@ -301,48 +359,80 @@ public final class OfficeScene: SKScene, MapScene {
             kept.insert(id)
             let node = figures[id] ?? {
                 let node = figurePool.popLast() ?? OfficeFigureNode()
+                // A figure that appears is where it belongs (it walks only from one place to another).
+                node.position = rest.spot
+                node.zPosition = -node.position.y
+                motion.targets[id] = rest.spot
                 figureLayer.addChild(node)
                 figures[id] = node
                 return node
             }()
             node.tint(agent.department)
             node.collar = agent.trust?.tier
-            node.pose = pose
-            node.setTyping(agent.activity == .typing && lod == .full && !reduceMotion)
-            node.setBubble(bubble)
-            node.position = CGPoint(x: spot.x, y: -spot.y)
-            node.zPosition = -node.position.y
+            motion.rests[id] = rest
         }
+        // A leaver is out of the tree already; its figure stays until its fade ends.
+        for id in motion.leaving.keys where figures[id] != nil { kept.insert(id) }
         for id in figures.keys where !kept.contains(id) {
             guard let node = figures.removeValue(forKey: id) else { continue }
             node.removeFromParent()
             node.reset()
             figurePool.append(node)
+            motion.forgetFigure(id)
         }
-        return (waiting, inReview)
+        return (door.count, review.count)
+    }
+
+    /// Spot indices for `ids`: each keeps the one it had, the others take the lowest free ones in order.
+    static func assign(_ ids: [String], keeping old: [String: Int]) -> [String: Int] {
+        var result: [String: Int] = [:]
+        var used = Set<Int>()
+        for id in ids {
+            if let k = old[id], used.insert(k).inserted { result[id] = k }
+        }
+        var next = 0
+        for id in ids where result[id] == nil {
+            while used.contains(next) { next += 1 }
+            result[id] = next
+            used.insert(next)
+        }
+        return result
     }
 
     /// The asks on the board table, the door counters (desk-only LOD), the meeting's door light, the wall of fame (the
-    /// first `fameLimit` perks in tree order) and the mail-room parcels (never a former agent's).
-    private func updateRooms(_ model: MapModel, waiting: Int, inReview: Int) {
+    /// first `fameLimit` perks in tree order) and the mail-room parcels.
+    private func updateRooms(_ model: MapModel, waiting: Int, inReview: Int, replaying: Bool) {
         let board = rooms["room:board"], review = rooms["room:review"]
         board?.setAsks(model.openAsks)
         board?.count = lod == .deskOnly ? waiting : 0
         review?.count = lod == .deskOnly ? inReview : 0
-        let meeting = model.meetings.first { m in
-            m.participantIds.contains { model.agents[$0]?.activity == .meeting(m.id) }
+        let meeting = replaying ? nil : model.meetings.first { m in
+            m.participantIds.contains { shownAgents[$0]?.activity == .meeting(m.id) }
         }
         review?.setMeeting(meeting?.title)
 
         var fame: [String] = []
-        var parcels: [MapItemPhase] = []
         for id in model.tree.order {
             guard let agent = model.agents[id], agent.activity != .gone else { continue }
             if fame.count < Self.fameLimit { fame.append(contentsOf: agent.perks.prefix(Self.fameLimit - fame.count)) }
-            if let phase = agent.shipping { parcels.append(phase) }
         }
         rooms["room:break"]?.setFame(fame)
-        rooms["room:mail"]?.setParcels(parcels, spots: parcels.indices.map { Self.point(layout.mailCounter($0)) })
+        updateParcels()
+    }
+
+    /// One parcel per shipping item, in tree order, never a former agent's (Task 2 M1) nor one whose passed parcel has
+    /// already left; `✓` on a parcel being stamped. None during a replay (`shownAgents` has no shipping then).
+    func updateParcels() {
+        guard let model = builtModel, let mail = rooms["room:mail"] else { return }
+        motion.departed = motion.departed.filter { shownAgents[$0]?.shipping == .passed }
+        var list: [OfficeRoomNode.Parcel] = []
+        for id in model.tree.order {
+            guard let agent = shownAgents[id], agent.activity != .gone, let phase = agent.shipping,
+                  !motion.departed.contains(id) else { continue }
+            let key = agent.item.flatMap { $0.split(separator: " ", maxSplits: 1).first.map(String.init) }
+            list.append(OfficeRoomNode.Parcel(id: id, phase: phase, key: key, stamped: motion.stamps[id] != nil))
+        }
+        mail.setParcels(list, spots: list.indices.map { Self.point(layout.mailCounter($0)) })
     }
 
     // MARK: Floor and rooms
@@ -427,6 +517,7 @@ public final class OfficeScene: SKScene, MapScene {
             podLayer.addChild(node)
             pods[pod.id] = node
         }
+        rooms["room:mail"]?.showKeys(textLevel == 2)
     }
 
     // MARK: Geometry
@@ -473,6 +564,15 @@ public final class OfficeScene: SKScene, MapScene {
     func hasHead(_ pod: OfficePod) -> Bool {
         guard let manager = pod.managerId else { return false }
         return layout.desks[manager]?.podId == pod.id
+    }
+
+    /// Where the camera looks for `id` (spec §5.7): its figure as it is drawn now at full and static LOD, else its desk.
+    func figureOrDeskRect(_ id: String) -> CGRect? {
+        if lod != .deskOnly, let node = figures[id] {
+            let s = OfficeTextures.figureSize
+            return CGRect(x: node.position.x - s.width / 2, y: node.position.y - s.height / 2, width: s.width, height: s.height)
+        }
+        return deskRect(id)
     }
 
     // MARK: Test and tooling accessors

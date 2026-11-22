@@ -5,7 +5,7 @@ import BrahmaAppModel
 
 /// The office's level of detail, by living-agent count (spec §5.5).
 public enum OfficeLOD: Equatable, Sendable {
-    /// Everything moves: typing frames, glow pulses (and in Task 7 walks and strolls).
+    /// Everything moves: typing frames, glow pulses, walks and idle strolls.
     case full
     /// Figures appear where they belong but do not animate.
     case staticFigures
@@ -46,6 +46,12 @@ final class OfficeDeskNode: SKNode {
         didSet { if facesDown != oldValue { content = nil } }
     }
 
+    /// A pod's head desk (its manager's, alone at the top of the pod): the Reduce Motion badge goes to its right, clear of
+    /// the first row's seated figures below-left. Set before `configure`.
+    var isHead = false {
+        didSet { if isHead != oldValue { content = nil } }
+    }
+
     private var content: Content?
     /// The monitor's tint: the status colour while lit or dim, `bg1` while off.
     private(set) var screenColor = ThemeHex.bg1
@@ -66,6 +72,11 @@ final class OfficeDeskNode: SKNode {
     /// Shown from `OfficeScene.itemZoom`: the role and the desk items.
     private let items = SKNode()
     private var itemSprites = 0
+    /// Where each desk item rests (a leave slides them into the box from here).
+    private var perkHomes: [CGPoint] = []
+    private var leaveBox: SKSpriteNode?
+    /// A Reduce Motion event flash is playing on the badge (or the monitor of a desk without one).
+    private(set) var isFlashing = false
 
     /// Desk items showing now (0 below `itemZoom`).
     var itemCount: Int { items.isHidden ? 0 : itemSprites }
@@ -109,12 +120,20 @@ final class OfficeDeskNode: SKNode {
         setZoom(zoom)
     }
 
-    /// Back to a blank node for the pool; also drops the glide.
+    /// Back to a blank node for the pool; also drops the glide (and a hire's fade-in).
     func reset() {
         removeAllActions()
         clear()
         facesDown = false
+        isHead = false
+        alpha = 1
     }
+
+    /// The next `configure` rebuilds the desk even if its content did not change (after a leave or flash was cut short).
+    func invalidate() { content = nil }
+
+    /// The far corner of the top where the desk items sit: a promotion's trophy pops here.
+    var cornerPoint: CGPoint { CGPoint(x: OfficeLayout.desk.w / 2 - 5, y: plan.perkY) }
 
     func setZoom(_ zoom: Double) {
         details.isHidden = zoom < OfficeScene.textZoom
@@ -138,6 +157,9 @@ final class OfficeDeskNode: SKNode {
         isStruck = false
         isVacancy = false
         itemSprites = 0
+        perkHomes = []
+        leaveBox = nil
+        isFlashing = false
         halo = SKSpriteNode()
     }
 
@@ -146,14 +168,24 @@ final class OfficeDeskNode: SKNode {
     /// Where things sit on the top, by orientation: the monitor, lamp and desk items on the far side from the sitter;
     /// the handle and role bands between the monitor and the sitter, clear of the seated figure's frame (which starts
     /// 5 pt short of the seat, 19 pt from the desk's centre), of its bubble (beside the body) and of the badge (beyond the
-    /// desk's left edge, on the monitor's side).
+    /// desk's left edge, on the monitor's side). The desk items keep to the far corner strip beside the monitor, between
+    /// the handle (or role) band and the desk's edge, `perkHeight` tall.
     private struct Plan {
-        var monitorY: CGFloat, handleY: CGFloat, roleY: CGFloat, badgeY: CGFloat
+        var monitorY: CGFloat, handleY: CGFloat, roleY: CGFloat, badgeY: CGFloat, perkY: CGFloat
     }
 
     private var plan: Plan {
-        facesDown ? Plan(monitorY: -6, handleY: 9.5, roleY: 1.5, badgeY: -8)
-            : Plan(monitorY: 11.5, handleY: 3.5, roleY: -4, badgeY: 13)
+        facesDown ? Plan(monitorY: -6, handleY: 9.5, roleY: 1.5, badgeY: -8, perkY: -6)
+            : Plan(monitorY: 11.5, handleY: 3.5, roleY: -4, badgeY: 13, perkY: 11.75)
+    }
+
+    /// A desk item's glyph height: the strip between a label band and the desk's far edge.
+    static let perkHeight: CGFloat = 7
+
+    /// The badge's centre: beyond the desk's left edge on the monitor's side; a head desk's beside its right edge, level
+    /// with the desk's middle, where nothing sits (the first row's figures are below it, the pin board left of it).
+    private var badgeCenter: CGPoint {
+        isHead ? CGPoint(x: OfficeLayout.desk.w / 2 + 12, y: -2) : CGPoint(x: -OfficeLayout.desk.w / 2 - 5, y: plan.badgeY)
     }
 
     /// The bands behind the handle and the role: a label is drawn over a `bg1` plate (above every figure), so it stays
@@ -205,6 +237,7 @@ final class OfficeDeskNode: SKNode {
         }
         let monitor = sprite(OfficeTextures.monitor(screenState), at: monitorAt)
         if screenState != .off { tint(monitor, status) }
+        monitor.name = "monitor"
         addChild(monitor)
 
         let lampAt = CGPoint(x: -15, y: p.monitorY + 0.5)
@@ -245,24 +278,29 @@ final class OfficeDeskNode: SKNode {
         let role = OrgCardNode.fit(agent.role, width: Self.labelWidth, size: 8, mono: false)
         roleText = role
         addLabel(role, size: 8, mono: false, color: ThemeHex.text1, y: p.roleY, band: Self.roleBand, to: items)
-        var x = CGFloat(OfficeLayout.desk.w / 2) + 1
+        // The desk items: 10 pt glyphs drawn `perkHeight` tall in the far corner, right to left from the desk's edge.
+        var x = CGFloat(OfficeLayout.desk.w / 2) - 1
         for perk in agent.perks.prefix(2).reversed() {
             let texture = LabelTextures.shared.emoji(OrgCardNode.fit(perk, width: 16, size: 10, mono: false), size: 10)
-            let glyph = SKSpriteNode(texture: texture, size: OrgCardNode.points(texture))
+            let natural = OrgCardNode.points(texture)
+            let scale = natural.height > 0 ? Self.perkHeight / natural.height : 1
+            let glyph = SKSpriteNode(texture: texture, size: CGSize(width: natural.width * scale, height: Self.perkHeight))
             glyph.anchorPoint = CGPoint(x: 1, y: 0.5)
-            glyph.position = CGPoint(x: x, y: p.monitorY)
+            glyph.position = CGPoint(x: x, y: p.perkY)
             glyph.name = "perk"
             items.addChild(glyph)
-            x -= glyph.size.width - 1
+            perkHomes.append(glyph.position)
+            x -= glyph.size.width
             itemSprites += 1
         }
         addChild(items)
 
         if reduceMotion, let glyph = Self.badge(activity) {
             badge = glyph
-            badgeRect = CGRect(x: -OfficeLayout.desk.w / 2 - 10, y: p.badgeY - 5, width: 10, height: 10)
-            // Just outside the desk's left edge, beside the lamp: off the label bands.
-            let chip = sprite(OfficeTextures.badge(glyph), at: CGPoint(x: -OfficeLayout.desk.w / 2 - 5, y: p.badgeY))
+            let at = badgeCenter
+            badgeRect = CGRect(x: at.x - 5, y: at.y - 5, width: 10, height: 10)
+            // Just outside the desk's edge, beside the lamp (a head desk's beside its right edge): off the label bands.
+            let chip = sprite(OfficeTextures.badge(glyph), at: at)
             tint(chip, status)
             chip.zPosition = OfficeZ.overlay
             chip.name = "badge"
@@ -340,6 +378,56 @@ final class OfficeDeskNode: SKNode {
 
     /// The Reduce Motion badge's frame in the parent's coordinates, nil without one.
     var badgeFrame: CGRect? { badgeRect?.offsetBy(dx: position.x, dy: position.y) }
+
+    /// The desk items showing now, in the parent's coordinates.
+    var perkFrames: [CGRect] {
+        guard !items.isHidden, items.parent != nil else { return [] }
+        return items.children.filter { $0.name == "perk" }.map { $0.frame.offsetBy(dx: position.x, dy: position.y) }
+    }
+
+    // MARK: Effects (driven by the scene on map time, OfficeMotion.swift)
+
+    /// The leave (spec §5.4) at fraction `t` of its 1.5 s: the desk items slide into a box that fades in where a former
+    /// agent's box sits, the screen glow and the lamp go out.
+    func setLeaving(_ t: CGFloat) {
+        let t = Swift.min(1, Swift.max(0, t))
+        let boxAt = CGPoint(x: 7, y: plan.monitorY)
+        if leaveBox == nil {
+            let box = sprite(OfficeTextures.box, at: boxAt)
+            box.alpha = 0
+            box.name = "leaveBox"
+            addChild(box)
+            leaveBox = box
+            halo.removeAction(forKey: Self.pulseKey)
+        }
+        leaveBox?.alpha = t
+        for (glyph, home) in zip(items.children.filter { $0.name == "perk" }, perkHomes) {
+            glyph.position = CGPoint(x: home.x + (boxAt.x + 4 - home.x) * t, y: home.y + (boxAt.y - home.y) * t)
+            glyph.alpha = 1 - t
+        }
+        halo.alpha = 1 - t
+        childNode(withName: "lampGlow")?.alpha = 0.7 * (1 - t)
+        if t >= 0.5, let lamp = childNode(withName: "lamp") as? SKSpriteNode {
+            lamp.color = MapPalette.color(ThemeHex.lineStrong)
+            lampOn = false
+        }
+    }
+
+    /// A Reduce Motion event (spec §5.6): the badge (or, on a desk without one, the monitor) dims and comes back over
+    /// 0.2 s; `t` is the fraction played, nil when it is over.
+    func setFlash(_ t: CGFloat?) {
+        let target = childNode(withName: "badge") ?? childNode(withName: "monitor")
+        isFlashing = t != nil
+        target?.alpha = t.map { 0.3 + 0.7 * Swift.min(1, Swift.max(0, $0)) } ?? 1
+    }
+
+    /// A state change (spec §5.4): the screen cross-fades in to its new colour in `duration`.
+    func crossFadeScreen(duration: TimeInterval) {
+        guard let monitor = childNode(withName: "monitor") else { return }
+        monitor.removeAction(forKey: "crossFade")
+        monitor.alpha = 0.3
+        monitor.run(.fadeAlpha(to: 1, duration: duration), withKey: "crossFade")
+    }
 }
 
 // MARK: - Figure
@@ -484,6 +572,11 @@ final class OfficeRoomNode: SKNode {
     private(set) var askLabel: String?
     private(set) var fame: [String] = []
     private(set) var parcels = 0
+    private var parcelList: [Parcel] = []
+    private var parcelSpots: [CGPoint] = []
+    private var parcelNodes: [String: SKSpriteNode] = [:]
+    private var parcelKeys: [String: String] = [:]
+    private var showsKeys = false
 
     private let furniture = SKNode()
     private let asks = SKNode()
@@ -702,11 +795,14 @@ final class OfficeRoomNode: SKNode {
         countLabel = backing
     }
 
+    /// The sofa's centre in a break room of rect `r` (scene coordinates): idle figures stroll here (OfficeMotion.swift).
+    static func sofaCenter(_ r: CGRect) -> CGPoint { CGPoint(x: r.maxX - 36, y: r.midY + 6) }
+
     /// A counter, the sofa, and the wall of fame on its shelf.
     private func buildBreak(_ r: CGRect, _ layout: OfficeLayout) {
         let counter = OfficeTextures.counter
         put(counter, at: CGPoint(x: r.minX + 12 + OfficeTextures.points(counter).width / 2, y: r.maxY - 32))
-        put(OfficeTextures.sofa, at: CGPoint(x: r.maxX - 36, y: r.midY + 6))
+        put(OfficeTextures.sofa, at: Self.sofaCenter(r))
         let spot = layout.fameShelf()
         let board = SKSpriteNode(texture: OfficeTextures.shelf, size: OfficeTextures.points(OfficeTextures.shelf))
         board.position = CGPoint(x: spot.x, y: -spot.y)
@@ -741,20 +837,84 @@ final class OfficeRoomNode: SKNode {
         addChild(mail)
     }
 
-    /// One parcel per shipping item at `spots`, its strap `blocked` once the checks failed.
-    func setParcels(_ phases: [MapItemPhase], spots: [CGPoint]) {
-        mail.removeAllChildren()
-        parcels = phases.count
-        for (phase, p) in zip(phases, spots) {
-            let size = OfficeTextures.points(OfficeTextures.parcel)
-            let parcel = SKSpriteNode(texture: OfficeTextures.parcel, size: size)
-            parcel.position = p
-            parcel.name = "parcel"
-            let strap = SKSpriteNode(texture: OfficeTextures.parcelStrap(failed: phase == .failed), size: size)
-            parcel.addChild(strap)
-            mail.addChild(parcel)
-        }
+    /// One mail-room parcel: whose item it is, its phase (a failed check gives it a `blocked` strap), the item key it is
+    /// labelled with (cleaned model text), and whether it is being stamped (the `✓` bubble of a passed check).
+    struct Parcel: Equatable {
+        var id: String
+        var phase: MapItemPhase
+        var key: String?
+        var stamped: Bool
     }
+
+    /// One parcel per shipping item at `spots`, reusing each item's node. A no-op when nothing changed: the scene calls it
+    /// on every refresh. Keys alternate above and below the parcels so neighbours' keys do not run into each other.
+    func setParcels(_ list: [Parcel], spots: [CGPoint]) {
+        guard list != parcelList || spots != parcelSpots else { return }
+        parcelList = list
+        parcelSpots = spots
+        parcels = list.count
+        var next: [String: SKSpriteNode] = [:]
+        let size = OfficeTextures.points(OfficeTextures.parcel)
+        for (k, (item, p)) in zip(list, spots).enumerated() {
+            let parcel: SKSpriteNode
+            if let old = parcelNodes[item.id] {
+                parcel = old
+            } else {
+                parcel = SKSpriteNode(texture: OfficeTextures.parcel, size: size)
+                parcel.name = "parcel"
+                let strap = SKSpriteNode(texture: OfficeTextures.parcelStrap(failed: false), size: size)
+                strap.name = "strap"
+                parcel.addChild(strap)
+                let check = SKSpriteNode(texture: OfficeTextures.bubble(.check), size: OfficeTextures.points(OfficeTextures.bubble(.check)))
+                check.anchorPoint = CGPoint(x: 0, y: 0)
+                check.position = CGPoint(x: 1, y: size.height / 2)
+                check.zPosition = 2
+                check.name = "check"
+                parcel.addChild(check)
+                mail.addChild(parcel)
+            }
+            parcel.position = p
+            (parcel.childNode(withName: "strap") as? SKSpriteNode)?.texture = OfficeTextures.parcelStrap(failed: item.phase == .failed)
+            parcel.childNode(withName: "check")?.isHidden = !item.stamped
+            parcel.childNode(withName: "key")?.removeFromParent()
+            if let key = item.key {
+                let text = OrgCardNode.fit(key, width: 28, size: 6, mono: true)
+                let texture = LabelTextures.shared.text(text, size: 6, mono: true, color: ThemeHex.text1)
+                let label = SKSpriteNode(texture: texture, size: OrgCardNode.points(texture))
+                label.position = CGPoint(x: 0, y: k % 2 == 0 ? size.height / 2 + 3 : -size.height / 2 - 3)
+                label.isHidden = !showsKeys
+                label.name = "key"
+                parcel.addChild(label)
+                parcelKeys[item.id] = text
+            } else {
+                parcelKeys[item.id] = nil
+            }
+            next[item.id] = parcel
+        }
+        for (id, node) in parcelNodes where next[id] == nil {
+            node.removeFromParent()
+            parcelKeys[id] = nil
+        }
+        parcelNodes = next
+    }
+
+    /// The parcels' item keys show from `OfficeScene.itemZoom`, as the desks' roles do.
+    func showKeys(_ on: Bool) {
+        guard on != showsKeys else { return }
+        showsKeys = on
+        for node in parcelNodes.values { node.childNode(withName: "key")?.isHidden = !on }
+    }
+
+    /// The parcels in counter order (agent ids).
+    var parcelIds: [String] { parcelList.map(\.id) }
+    /// The parcels showing a `✓` bubble.
+    var stampedParcels: Set<String> { Set(parcelList.filter(\.stamped).map(\.id)) }
+    /// The strap colour of an item's parcel: `blocked` after a failed check, else `warning`; nil without a parcel.
+    func strapColor(_ id: String) -> UInt32? {
+        parcelList.first { $0.id == id }.map { $0.phase == .failed ? ThemeHex.blocked : ThemeHex.warning }
+    }
+    /// The key drawn on an item's parcel.
+    func parcelKey(_ id: String) -> String? { parcelKeys[id] }
 }
 
 // MARK: - Pod

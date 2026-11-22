@@ -559,27 +559,50 @@ public struct OfficeLayout: Equatable, Sendable {
         return (best!.corridor, best!.point)
     }
 
-    /// Manhattan: start → the nearest corridor point → along corridor centrelines (shortest) → the nearest corridor point
-    /// to the end → end. Every segment but the first and last lies inside the corridors.
-    public func route(from a: MapPoint2, to b: MapPoint2) -> [MapPoint2] {
-        guard a != b else { return [a] }
-        guard !corridors.isEmpty else { return a.x == b.x || a.y == b.y ? [a, b] : [a, MapPoint2(x: b.x, y: a.y), b] }
-        let lines = corridors.map(Line.init)
-        let ea = entry(a), eb = entry(b)
+    /// The corridor network a route walks: each corridor's centreline and the junctions where a vertical corridor meets a
+    /// horizontal one, with each junction's place along both lines. It depends on the corridors only, so a caller that
+    /// routes many times over one layout builds it once (`routeGraph()`) and passes it to `route(from:to:graph:)`.
+    public struct RouteGraph: Sendable {
+        let lines: [Line]
+        let junctions: [MapPoint2]
+        let onLine: [[(t: Double, node: Int)]]
+    }
 
-        // Nodes: the junctions where a vertical corridor meets a horizontal one, then the two snapped ends.
-        var nodes: [MapPoint2] = []
+    public func routeGraph() -> RouteGraph {
+        let lines = corridors.map(Line.init)
+        var junctions: [MapPoint2] = []
         var onLine: [[(t: Double, node: Int)]] = Array(repeating: [], count: lines.count)
         for (h, hl) in lines.enumerated() where hl.horizontal {
             let hc = corridors[h]
             for (v, vl) in lines.enumerated() where !vl.horizontal {
                 let vc = corridors[v]
                 guard vc.x >= hc.x, vc.x + vc.w <= hc.x + hc.w, vc.y <= hc.y + hc.h, vc.y + vc.h >= hc.y else { continue }
-                nodes.append(MapPoint2(x: vl.at, y: hl.at))
-                onLine[h].append((vl.at, nodes.count - 1))
-                onLine[v].append((hl.at, nodes.count - 1))
+                junctions.append(MapPoint2(x: vl.at, y: hl.at))
+                onLine[h].append((vl.at, junctions.count - 1))
+                onLine[v].append((hl.at, junctions.count - 1))
             }
         }
+        return RouteGraph(lines: lines, junctions: junctions, onLine: onLine)
+    }
+
+    /// Manhattan: start → the nearest corridor point → along corridor centrelines (shortest) → the nearest corridor point
+    /// to the end → end. Every segment but the first and last lies inside the corridors.
+    public func route(from a: MapPoint2, to b: MapPoint2) -> [MapPoint2] {
+        route(from: a, to: b, graph: corridors.isEmpty ? nil : routeGraph())
+    }
+
+    /// `route(from:to:)` over a graph built by `routeGraph()` from this layout's corridors.
+    public func route(from a: MapPoint2, to b: MapPoint2, graph: RouteGraph?) -> [MapPoint2] {
+        guard a != b else { return [a] }
+        guard !corridors.isEmpty, let graph, graph.lines.count == corridors.count else {
+            return a.x == b.x || a.y == b.y ? [a, b] : [a, MapPoint2(x: b.x, y: a.y), b]
+        }
+        let lines = graph.lines
+        let ea = entry(a), eb = entry(b)
+
+        // Nodes: the junctions, then the two snapped ends.
+        var nodes = graph.junctions
+        var onLine = graph.onLine
         let sa = lines[ea.corridor].snap(ea.point), sb = lines[eb.corridor].snap(eb.point)
         nodes.append(sa)
         let start = nodes.count - 1
