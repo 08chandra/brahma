@@ -114,7 +114,9 @@ extension Store {
         // Fix round 1 (review M1): the record is written in the transaction that renames the file into place; no record, no
         // file (a copy no purge could list).
         return try writeExport(data, folder: folder, name: name) { db, path in
-            try Self.recordRefRead(db: db, companyId: companyId, reader: .owner, canonical: canonical, rev: rev, bytes: data.count,
+            // Re-review N1: by the canonical form without its pin (`@<rev>`), as purge looks it up; the pin is in `rev`.
+            try Self.recordRefRead(db: db, companyId: companyId, reader: .owner, canonical: Self.unpinned(ref).canonical,
+                                   rev: rev ?? ref.rev, bytes: data.count,
                                    tainted: r.resolved.tainted, via: "export", turnId: nil, now: now, exportPath: path)
             try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .export, text: try redact("ownerExport \(shown)"),
                               createdAt: now).insert(db)
@@ -212,11 +214,17 @@ extension Store {
 
     /// Fix round 1 (controller): what other tools execute as config. A folder component `.claude` or `.git`, or `.github`
     /// followed by `workflows`; a file named `CLAUDE.md` or `.mcp.json` (or `.claude`, `.git`). Case-insensitive (NFC, then
-    /// lowercased).
+    /// folded: `folded`).
     static let toolConfigRefusal = "Brahma doesn't save exports where other tools read their configuration (.claude, .git, .github/workflows, CLAUDE.md, .mcp.json); choose another place"
 
+    /// Re-review N2: NFKC, then a Unicode case fold (`ſ` → `s`), width and diacritics folded too.
+    static func folded(_ s: String) -> String {
+        s.precomposedStringWithCompatibilityMapping.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+            .precomposedStringWithCompatibilityMapping
+    }
+
     static func refuseToolConfigFolder(_ path: String) throws {
-        let parts = path.precomposedStringWithCanonicalMapping.lowercased().split(separator: "/").map(String.init)
+        let parts = folded(path).split(separator: "/").map(String.init)
         for (i, part) in parts.enumerated() {
             if part == ".claude" || part == ".git" { throw WorkError.forbidden(toolConfigRefusal) }
             if part == ".github", i + 1 < parts.count, parts[i + 1] == "workflows" { throw WorkError.forbidden(toolConfigRefusal) }
@@ -224,7 +232,7 @@ extension Store {
     }
 
     static func refuseToolConfigName(_ name: String) throws {
-        let n = name.precomposedStringWithCanonicalMapping.lowercased()
+        let n = folded(name)
         if ["claude.md", ".mcp.json", ".claude", ".git"].contains(n) { throw WorkError.forbidden(toolConfigRefusal) }
     }
 

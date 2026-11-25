@@ -275,6 +275,47 @@ import Glibc
         let github = base.appending(path: ".github", directoryHint: .isDirectory)
         _ = try export(cf, ref, to: github.appending(path: "notes.md"))
     }
+
+    // MARK: Fix round 2
+
+    /// Re-review N1: exports of a pinned file and a pinned diff (canonical with `@<rev>`) are listed by their purge.
+    @Test func purgeOfPinsListsTheirExports() throws {
+        let cf = try CollabFixture()
+        let out = try tempDir()
+        var written: [WorkRef: URL] = [:]
+        for (raw, id) in [("ENG-1:src/a.ts", "mr-f"), ("ENG-1:diff", "mr-d")] {
+            let pinned = try cf.store.pinRef(try cf.fx.ref(raw), for: .owner, companyId: cf.c.id, messageRefId: id, knownValues: [],
+                                             paths: cf.paths)
+            #expect(pinned.rev != nil && pinned.canonical.contains("@"), "\(pinned.canonical)")
+            // A message carries it as purge finds it (its canonical form without the pin).
+            var carried = pinned
+            carried.rev = nil
+            try PurgeTests.record(cf, carried, id: id, at: cf.now)
+            written[pinned] = try export(cf, pinned, to: out.appending(path: id))
+        }
+        for (pinned, url) in written {
+            let report = try cf.store.purge(companyId: cf.c.id, ref: pinned, contentVault: ContentVault(paths: cf.paths), paths: cf.paths,
+                                            now: cf.now)
+            #expect(report.exportedCopies == [url.path], "\(pinned.canonical)")
+        }
+    }
+
+    /// Re-review N2: config names are matched with a Unicode case fold (long s, fullwidth, other cases), not `lowercased()`.
+    @Test func toolConfigNamesFoldCase() throws {
+        let cf = try CollabFixture()
+        try cf.addResource(21, name: "notes.md", ext: "md", bytes: Data("# Notes\n".utf8))
+        let ref = WorkRef(kind: .resource, id: "21")
+        let base = try tempDir()
+        var targets = [".mcp.j\u{17F}on", "\u{FF23}LAUDE.md", "CLAUDE.M\u{FF24}", "\u{FF0E}mcp.json"].map { base.appending(path: $0) }
+        for dir in [".\u{FF23}laude", ".gi\u{FF54}", ".github/\u{FF37}ork\u{FB02}ows"] {
+            let url = base.appending(path: dir, directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            targets.append(url.appending(path: "out.md"))
+        }
+        for url in targets {
+            #expect(refusal { try export(cf, ref, to: url) } == Store.toolConfigRefusal, "\(url.path)")
+        }
+    }
 }
 
 /// A PDF reader that verifies nothing but its own flattened copies (as `FlaggedPDFReader` in the app's tests).

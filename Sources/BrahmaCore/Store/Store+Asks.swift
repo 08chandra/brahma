@@ -184,7 +184,11 @@ extension Store {
     /// characters dropped, quotes and brackets inert, at most `FileRequestCard.titleMax`) gated against `knownValues` after
     /// that (Rulings 53-56: a title holding a value is `FileRequestCard.withheld`; secret patterns are gated even without
     /// values), with `OwnerImpersonation.digestPrefix` when an agent's title claims to be the owner — as `fileRequestCard`.
-    func enterPendingOwner(_ db: Database, ask: inout Ask, company: Company, knownValues: [(name: String, value: String)] = [],
+    ///
+    /// Fix round 2 (Ruling C5-5): `knownValues` is required. Callers pass the stored values they read (the tools, from the
+    /// injected vault) or the engine's loaded copy (`engineKnownValues`); nil (they could not be read in full) holds the title
+    /// back (`titleHeldText`), never showing it raw.
+    func enterPendingOwner(_ db: Database, ask: inout Ask, company: Company, knownValues: [(name: String, value: String)]?,
                            now: Date) throws {
         ask.status = .pendingOwner
         ask.statusSinceActive = try Store.activeNow(db: db, companyId: company.id)
@@ -199,13 +203,31 @@ extension Store {
 
     /// An ask's title as the owner's lines show it (`enterPendingOwner`): gated final display string, flagged when an agent's
     /// title claims to be the owner.
-    static func ownerShownTitle(_ ask: Ask, knownValues: [(name: String, value: String)]) -> String {
+    static func ownerShownTitle(_ ask: Ask, knownValues: [(name: String, value: String)]?) -> String {
+        guard let knownValues else { return titleHeldText }
         // Flagged only on the text the owner sees (Ruling 56): a withheld title is never checked.
         guard let shown = GlobalSearch.TextGate(knownValues: knownValues).final(ask.title, max: FileRequestCard.titleMax, inert: true) else {
             return FileRequestCard.withheld
         }
         guard ask.requesterId != "system", OwnerImpersonation.flags(text: shown, sender: .agent(ask.requesterId)) else { return shown }
         return OwnerImpersonation.digestPrefix + shown
+    }
+
+    /// Fix round 2 (Ruling C5-5): the owner's line when the stored values could not be read to check a title.
+    public static let titleHeldText = "[title held back: the stored secrets aren't loaded, so it couldn't be checked]"
+
+    /// The company's stored values as the engine has them loaded (the redactor's copy, which the engine reloads from the
+    /// vault): every secret of the company with its current `updatedAt`, else nil (not loaded in full: fail closed). The
+    /// Store holds no vault; this is its read of the same values inside a transaction.
+    func engineKnownValues(db: Database, companyId: String) -> [(name: String, value: String)]? {
+        guard let metas = try? SecretMeta.filter(Column("companyId") == companyId).order(Column("name")).fetchAll(db) else { return nil }
+        let cache = redactor.cachedValues()
+        var out: [(name: String, value: String)] = []
+        for meta in metas {
+            guard let loaded = cache["\(companyId):\(meta.name)"], loaded.updatedAt == meta.updatedAt else { return nil }
+            out.append((meta.name, loaded.value))
+        }
+        return out
     }
 
     /// DMs the requester when the ask reaches a final status (unless the engine filed it).
@@ -285,7 +307,7 @@ extension Store {
     func propose(db: Database, companyId: String, by sender: Sender, kind: AskKind, risk: AskRisk?, category: String?, title: String,
                  summary: String, payload: AskPayload?, document: PreparedDocument?, itemId: String?, subjectId: String?,
                  supersedes: String?, requestId: String?, decisionClass: DecisionClass, viaOwner: Bool,
-                 quotaExempt: AskQuota.Exemption? = nil, announce: Bool = true, knownValues: [(name: String, value: String)] = [],
+                 quotaExempt: AskQuota.Exemption? = nil, announce: Bool = true, knownValues: [(name: String, value: String)]? = nil,
                  now: Date) throws -> Ask {
         let company = try requireCompany(db, companyId)
         let requester = try askRequester(db, sender, companyId: companyId)
@@ -345,7 +367,9 @@ extension Store {
             let text = "\(ask.ref) needs your decision: \(try Store.displayTitle(db, ask)): \(ask.title) (decide with the decide tool)"
             try MessageRouter(store: self).sendDM(db: db, companyId: companyId, from: .system, to: approver.name, text: text, now: now)
         } else if announce {
-            try enterPendingOwner(db, ask: &ask, company: company, knownValues: knownValues, now: now)
+            // The caller's values (read from its vault), else the engine's loaded copy (fix round 2).
+            try enterPendingOwner(db, ask: &ask, company: company,
+                                  knownValues: knownValues ?? engineKnownValues(db: db, companyId: company.id), now: now)
             try ask.insert(db)
         } else {
             // Decided in the same transaction (an access preset): no "approval needed" line or DM for the owner.
@@ -440,7 +464,7 @@ extension Store {
                           requesterId: requester.id, title: cleanTitle, summary: q, payload: body, status: .pendingOwner,
                           createdActive: active, statusSinceActive: active, createdAt: now, updatedAt: now, requestId: rid)
             ask.expiresActive = expiresInHours.map { active + $0 * 3600 }
-            try enterPendingOwner(db, ask: &ask, company: company, now: now)
+            try enterPendingOwner(db, ask: &ask, company: company, knownValues: engineKnownValues(db: db, companyId: company.id), now: now)
             try ask.insert(db)
             return ask
         }
@@ -507,7 +531,7 @@ extension Store {
             switch role {
             case .approve:
                 ask.updatedAt = now
-                try enterPendingOwner(db, ask: &ask, company: company, now: now)
+                try enterPendingOwner(db, ask: &ask, company: company, knownValues: engineKnownValues(db: db, companyId: company.id), now: now)
                 try ask.update(db)
             case .fyi:
                 ask.fyi = true

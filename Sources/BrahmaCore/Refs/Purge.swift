@@ -248,9 +248,9 @@ extension Store {
         // C5 fix round 1: every copy the owner exported, by the path it was saved at (a resource's: by `purgeResource`).
         if resource == nil { report.exportedCopies = try writer.read { db in
             try String.fetchAll(db, sql: """
-                SELECT exportPath FROM refRead WHERE companyId = ? AND canonical = ? AND via = 'export' AND exportPath IS NOT NULL
+                SELECT exportPath FROM refRead WHERE companyId = ? AND canonical IN (?, ?) AND via = 'export' AND exportPath IS NOT NULL
                 GROUP BY exportPath ORDER BY MIN(createdAt), exportPath
-                """, arguments: [companyId, canonical])
+                """, arguments: [companyId, canonical, ref.canonical])
         } }
         let dates = Dictionary(backups.map { ($0.name, $0.takenAt) }, uniquingKeysWith: { a, _ in a })
         let day = DateFormatter()

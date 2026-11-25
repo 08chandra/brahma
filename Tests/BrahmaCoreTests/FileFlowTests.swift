@@ -380,4 +380,75 @@ import Glibc
         }
         #expect(approvals.contains(try ownerLine(claim)) && !approvals.joined().contains("tok-zebra"))
     }
+
+    // MARK: Fix round 2 (Ruling C5-5)
+
+    /// A stored value in a form the engine's redactor doesn't rewrite (its hex), in an ask title.
+    static let secret = "tok-zebra-quokka-991"
+    static var hexSecret: String { Array(secret.utf8).map { String(format: "%02x", $0) }.joined() }
+
+    /// The company with `secret` stored and the engine's values loaded (`reloadRedactorIfNeeded`), unless `loaded` is false.
+    func secretWorld(loaded: Bool = true) throws -> W {
+        let w = try W()
+        try w.store.setSecret(companyId: w.c.id, name: "DEPLOY_TOKEN", value: Self.secret, isTest: false, vault: w.secrets)
+        if loaded { _ = try w.store.reloadRedactorIfNeeded(vault: w.secrets, logFailures: false, force: true) }
+        return w
+    }
+
+    func ownerLine(_ w: W, _ ask: Ask) throws -> String {
+        let line = try w.messages().last { $0.senderId == "system" && $0.text.hasPrefix("Owner approval needed: \(ask.ref) ") }
+        return try #require(line).text
+    }
+
+    func expectGated(_ w: W, _ ask: Ask, _ path: String) throws {
+        let text = try ownerLine(w, ask)
+        #expect(!text.contains(Self.hexSecret) && text.contains(FileRequestCard.withheld), "\(path): \(text)")
+        let cId = w.c.id
+        let approvals = try w.store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT text FROM activityEvent WHERE companyId = ? AND kind = 'approval'", arguments: [cId])
+        }
+        #expect(!approvals.joined().contains(Self.hexSecret), "\(path): the activity line")
+    }
+
+    @Test func requestFromOwnerTitleGated() throws {
+        let w = try secretWorld()
+        let ask = try w.store.requestFromOwner(companyId: w.c.id, by: .agent(w.fx.eng1.id), title: "Key \(Self.hexSecret)", question: "ok?")
+        try expectGated(w, ask, "requestFromOwner")
+        // The engine's values not (fully) loaded: the title is held back, never shown raw.
+        let cold = try secretWorld(loaded: false)
+        let held = try cold.store.requestFromOwner(companyId: cold.c.id, by: .agent(cold.fx.eng1.id), title: "Key \(Self.hexSecret)", question: "ok?")
+        let text = try ownerLine(cold, held)
+        #expect(!text.contains(Self.hexSecret) && text.contains(Store.titleHeldText), "\(text)")
+    }
+
+    /// eng-1's decision, routed to the cto (its manager), who approves it on to the owner.
+    @Test func internalDecideTitleGated() throws {
+        let w = try secretWorld()
+        let ask = try w.store.propose(companyId: w.c.id, by: .agent(w.fx.eng1.id), kind: .architecture, title: "Use \(Self.hexSecret)",
+                                      summary: "s")
+        #expect(ask.status == .pendingInternal && ask.internalApproverId == w.fx.cto.id)
+        let decided = try w.store.internalDecide(askId: ask.id, by: .agent(w.fx.cto.id), approve: true, note: "ok")
+        #expect(decided.status == .pendingOwner)
+        try expectGated(w, decided, "internalDecide")
+    }
+
+    /// The approver leaves the company: the ask is rerouted to the owner.
+    @Test func rerouteTitleGated() throws {
+        let w = try secretWorld()
+        let ask = try w.store.propose(companyId: w.c.id, by: .agent(w.fx.eng1.id), kind: .architecture, title: "Use \(Self.hexSecret)",
+                                      summary: "s")
+        #expect(ask.internalApproverId == w.fx.cto.id)
+        try w.store.transition(agentId: w.fx.cto.id, to: .killed)
+        #expect(try w.store.ask(id: ask.id)?.status == .pendingOwner)
+        try expectGated(w, ask, "reroute")
+    }
+
+    @Test func escalateTitleGated() throws {
+        let w = try secretWorld()
+        let ask = try w.store.propose(companyId: w.c.id, by: .agent(w.fx.eng1.id), kind: .architecture, title: "Use \(Self.hexSecret)",
+                                      summary: "s")
+        let escalated = try w.store.escalate(askId: ask.id, by: .agent(w.fx.cto.id), reason: "above me")
+        #expect(escalated.status == .pendingOwner)
+        try expectGated(w, escalated, "escalate")
+    }
 }

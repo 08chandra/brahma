@@ -108,7 +108,7 @@ extension Store {
     func reroute(_ db: Database, ask: inout Ask, company: Company, to approver: Agent?, now: Date) throws {
         guard let approver else {
             ask.updatedAt = now
-            try enterPendingOwner(db, ask: &ask, company: company, now: now)
+            try enterPendingOwner(db, ask: &ask, company: company, knownValues: engineKnownValues(db: db, companyId: company.id), now: now)
             try ask.update(db)
             return
         }
@@ -179,7 +179,7 @@ extension Store {
                 let text = "\(ask.ref) (\(try Store.displayTitle(db, ask)): \(ask.title)) was escalated to you by @\(agent.name): \(flatWhy) (decide with the decide tool)"
                 try MessageRouter(store: self).sendDM(db: db, companyId: company.id, from: .system, to: target.name, text: text, now: now)
             } else {
-                try enterPendingOwner(db, ask: &ask, company: company, now: now)
+                try enterPendingOwner(db, ask: &ask, company: company, knownValues: engineKnownValues(db: db, companyId: company.id), now: now)
                 try ask.update(db)
             }
             return ask
