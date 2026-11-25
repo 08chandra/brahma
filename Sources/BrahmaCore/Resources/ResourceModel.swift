@@ -214,7 +214,7 @@ public struct Resource: Equatable, Sendable, FetchableRecord, PersistableRecord 
     public var quarantined: Bool
     public var secretScan: SecretScanState
     public var vouchedAt: Date?
-    /// The drop context: `library`, `dm`, `channel`, `inbox`, `item` or `cli`.
+    /// The drop context: `library`, `dm`, `channel`, `inbox`, `item`, `cli` or (Plan C) `thread`.
     public var addedVia: String
     public var channelId: String?
     public var messageId: String?
@@ -315,6 +315,10 @@ public enum DropContext: Equatable, Sendable {
     case inbox(askId: String)
     case item(id: String)
     case cli
+    /// Plan C Task C5: a reply in the thread of `rootId` (`msg:<id>` or the bare id; a reply's id joins its root), in a channel
+    /// or in the owner's DM with an agent. Its default scope is that conversation's agent members at drop time, like
+    /// `.channel` (a DM: `.dm(handle:)`'s), and its announcement is posted as a reply in that thread.
+    case thread(rootId: String)
 
     /// The stored `resource.addedVia`.
     public var via: String {
@@ -325,6 +329,7 @@ public enum DropContext: Equatable, Sendable {
         case .inbox: "inbox"
         case .item: "item"
         case .cli: "cli"
+        case .thread: "thread"
         }
     }
 }

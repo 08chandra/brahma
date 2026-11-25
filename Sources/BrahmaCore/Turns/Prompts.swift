@@ -123,6 +123,15 @@ public enum InboxDigest {
             let framing: String? = message.fromTaintedSession
                 ? DigestRefs.taintedHeader(message.taintSource ?? "outside content") + " "
                 : message.taintedOrigin ? TaintPolicy.relayedPrefix : nil
+            // Plan C Task C5: the owner's file ask in the agent's own DM is one engine-shaped line naming the reply to make.
+            if message.kind == .fileAsk, message.senderId == "owner", source == "DM", message.parentId == nil {
+                out += "\n- " + fileAskLine(message, text: text, timeZone: timeZone)
+                if let lines = attachments[message.id], !lines.isEmpty {
+                    for line in lines { out += "\n" + (line.hasPrefix("    ") ? line : "    " + line) }
+                    if lines.contains(where: DigestRefs.isChip) { out += "\n" + DigestRefs.footer }
+                }
+                continue
+            }
             let lead: String
             if let rootId = message.parentId {
                 lead = "@\(handle) (\(source), thread\(threadLabel(threadRoots[rootId]))) \(ReviewDigest.clock(message.createdAt, timeZone)):"
@@ -141,6 +150,14 @@ public enum InboxDigest {
             }
         }
         return out + unreadLine
+    }
+
+    /// Plan C Task C5: `@owner (DM) 14:20 FILE ASK: "<description>" — reply with share(..., reply_to: "msg:<id>")`. The
+    /// description is the owner's text, already one line (`text`); its double quotes become single ones so the engine's quotes
+    /// stay the engine's.
+    static func fileAskLine(_ message: Message, text: String, timeZone: TimeZone) -> String {
+        let description = text.replacingOccurrences(of: "\"", with: "'")
+        return "@owner (DM) \(ReviewDigest.clock(message.createdAt, timeZone)) FILE ASK: \"\(description)\" — reply with share(..., reply_to: \"msg:\(message.id)\")"
     }
 
     /// ` "<root text>"`: flattened to one line, double quotes turned single (the label's own quotes stay the engine's) and cut

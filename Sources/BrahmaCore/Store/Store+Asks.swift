@@ -184,7 +184,7 @@ extension Store {
         ask.statusSinceActive = try Store.activeNow(db: db, companyId: company.id)
         ask.remindCount = 0
         ask.notifiedAt = nil
-        let verb = ask.kind == .info ? "answer" : ask.kind == .humanTask ? "task show" : "approve"
+        let verb = ask.kind == .info || FileRequests.isFileRequest(ask) ? "answer" : ask.kind == .humanTask ? "task show" : "approve"
         let text = "Owner approval needed: \(ask.ref) \(try Store.displayTitle(db, ask)): \(ask.title) (brahma \(verb) \(company.slug) \(ask.ref))"
         try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .approval, text: text, createdAt: now).insert(db)
         try MessageRouter(store: self).sendDM(db: db, companyId: company.id, from: .system, to: "owner", text: text, now: now)
@@ -552,6 +552,10 @@ extension Store {
             let slug = try Company.fetchOne(db, key: ask.companyId)?.slug ?? "<co>"
             throw WorkError.invalid("provide the secret instead: brahma secret provide \(slug) \(ask.ref) [--test] (or in the app)")
         }
+        // Plan C Task C5: a file request is answered with a file (`answerFileRequest`) or declined (`declineFileRequest`).
+        if approve, FileRequests.isFileRequest(ask) {
+            throw WorkError.invalid("\(ask.ref) asks for a file: drop one on it in the Inbox, or decline it")
+        }
         guard ask.kind.isDecision else {
             throw WorkError.invalid(ask.kind == .info ? "\(ask.ref) is a question; answer it" : "\(ask.ref) is an engine alert; acknowledge it")
         }
@@ -597,22 +601,31 @@ extension Store {
         }
     }
 
-    /// The owner answers a question (`info` ask); the requester gets the answer as a DM from the owner.
+    /// The owner answers a question (`info` ask), or (Plan C Task C5) an agent's file request (`FileRequests.isFileRequest`:
+    /// `Store.answerFileRequest`, `declineFileRequest`); the requester gets the answer as a DM from the owner.
     @discardableResult
     public func ownerAnswer(askId: String, text: String, now: Date = Store.now()) throws -> Ask {
-        try writer.write { db in
-            var ask = try requireAsk(db, askId)
-            guard ask.kind == .info else { throw WorkError.invalid("\(ask.ref) is not a question") }
-            guard ask.status == .pendingOwner else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
-            guard let answer = try Store.limitedText(text, Store.maxAskText, "the answer") else { throw WorkError.invalid("the answer is empty") }
-            ask.ownerAnswer = answer
-            ask.ownerDecidedAt = now
-            try settle(db, ask: &ask, status: .answered, decidedBy: "owner", tellRequesterToo: false, now: now)
-            if ask.requesterId != "system", let requester = try Agent.fetchOne(db, key: ask.requesterId), requester.state != .killed {
-                try MessageRouter(store: self).sendDM(db: db, companyId: ask.companyId, from: .owner, to: requester.name, text: answer, now: now)
-            }
-            return ask
+        try writer.write { db in try ownerAnswer(db: db, askId: askId, text: text, now: now).ask }
+    }
+
+    /// `ownerAnswer` inside the caller's write transaction, with the answer DM's stored `kind` and chips (Plan C Task C5: a file
+    /// request's answer is the drop's `kind = share` message). Returns the ask and the DM (nil when the requester is the engine
+    /// or killed).
+    func ownerAnswer(db: Database, askId: String, text: String, kind: MessageKind = .text, inline: [MessageRef] = [],
+                     firstInlinePosition: Int = 0, now: Date) throws -> (ask: Ask, message: Message?) {
+        var ask = try requireAsk(db, askId)
+        guard ask.kind == .info || FileRequests.isFileRequest(ask) else { throw WorkError.invalid("\(ask.ref) is not a question") }
+        guard ask.status == .pendingOwner else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
+        guard let answer = try Store.limitedText(text, Store.maxAskText, "the answer") else { throw WorkError.invalid("the answer is empty") }
+        ask.ownerAnswer = answer
+        ask.ownerDecidedAt = now
+        try settle(db, ask: &ask, status: .answered, decidedBy: "owner", tellRequesterToo: false, now: now)
+        var message: Message?
+        if ask.requesterId != "system", let requester = try Agent.fetchOne(db, key: ask.requesterId), requester.state != .killed {
+            message = try MessageRouter(store: self).sendDM(db: db, companyId: ask.companyId, from: .owner, to: requester.name, text: answer,
+                                                            now: now, kind: kind, inline: inline, firstInlinePosition: firstInlinePosition)
         }
+        return (ask, message)
     }
 
     /// The owner acknowledges an FYI (a policy-approved ask) or an engine alert (which then counts as answered).

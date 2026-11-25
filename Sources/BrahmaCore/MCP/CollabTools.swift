@@ -1,12 +1,13 @@
 import Foundation
 
 /// Plan C Task C4c (design §7): what Collab adds to every turn's tool list, in tokens (characters ÷ 4): the schema JSON of
-/// `share`, `open_ref`, `show` and `search`, plus the three new parameters of existing tools (`attachments`, `reply_to`,
-/// `thread`). `brahma doctor`'s `collab-tools` item passes while it is at most `maxTokens`.
+/// `share`, `open_ref`, `show` and `search`, plus the new parameters of existing tools (`attachments`, `reply_to`,
+/// `thread`, and C5's `wants_file`). `brahma doctor`'s `collab-tools` item passes while it is at most `maxTokens`.
 public enum CollabToolBudget {
     public static let maxTokens = 900
     static let tools = ["share", "open_ref", "show", "search"]
-    static let parameters = [("post_message", "attachments"), ("post_message", "reply_to"), ("read_channel", "thread")]
+    static let parameters = [("post_message", "attachments"), ("post_message", "reply_to"), ("read_channel", "thread"),
+                             ("request_from_owner", "wants_file")]
 
     public static func addedTokens() -> Int {
         let encoder = JSONEncoder()

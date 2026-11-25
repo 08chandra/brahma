@@ -37,6 +37,11 @@ extension Store {
             return (.agent(requester.id), [requester.id])
         case .library, .cli:
             return (.company, nil)
+        case .thread(let rootId):
+            // Plan C Task C5: the conversation's agent members at drop time (a DM: its agent, as `.dm(handle:)`).
+            let (_, channel, dmAgent) = try threadDrop(db, companyId: companyId, rootId: rootId)
+            if let dmAgent { return (.agent(dmAgent.id), [dmAgent.id]) }
+            return (.channel(channel.id), try channelAgentIds(db, channelId: channel.id, companyId: companyId))
         }
     }
 
@@ -278,7 +283,8 @@ extension Store {
 
         // 8. Announcement, after commit.
         let text = Self.announcement(rows: rows, folder: folder, message: drop.message, refsOnly: refsOnly)
-        let posted = announce(text, drop: drop, resolved: resolved, companyId: companyId, refs: rows.map(\.ref), now: now)
+        let posted = announce(text, drop: drop, resolved: resolved, companyId: companyId, refs: rows.map(\.ref),
+                              top: rows.filter { $0.parentId == nil }.map(\.number), now: now)
         if let posted { for i in rows.indices { rows[i].messageId = posted.id; rows[i].channelId = posted.channelId } }
         recordAfterCommit(companyId: companyId, rows: rows, mirrored: mirrored, posted: posted, now: now)
         do {
@@ -335,7 +341,7 @@ extension Store {
                               text: try redact("You added \(Self.linkTag(link.ref)) (\(label))"), createdAt: now).insert(db)
         }
         let text = Self.announcement(rows: [link], folder: nil, message: drop.message, refsOnly: refsOnly)
-        let posted = announce(text, drop: drop, resolved: resolved, companyId: companyId, refs: [link.ref], now: now)
+        let posted = announce(text, drop: drop, resolved: resolved, companyId: companyId, refs: [link.ref], top: [link.number], now: now)
         if let posted { link.messageId = posted.id; link.channelId = posted.channelId }
         recordAfterCommit(companyId: companyId, rows: [link], mirrored: [:], posted: posted, now: now)
         do { return try resource(companyId: companyId, number: link.number) ?? link } catch {
@@ -461,6 +467,57 @@ extension Store {
     // MARK: Helpers
 
     static let inboxRefusal = "drop files on a question from an agent"
+    /// Plan C Task C5: a `.thread` drop whose root is missing, another company's, or in a conversation the owner can't post in.
+    static let threadRefusal = "drop files in a thread of a channel or of your DM with an agent"
+
+    /// Plan C Task C5: a `.thread` drop's root (a reply's id joins its root), its channel, and the agent of the owner's DM when
+    /// the thread is in one. Only a channel or the owner's own DM with an agent of this company (`ThreadError` → the refusal).
+    static func threadDrop(_ db: Database, companyId: String, rootId: String) throws -> (root: Message, channel: Channel, dmAgent: Agent?) {
+        guard let id = threadMessageId(rootId),
+              let target = try Message.fetchOne(db, sql: "SELECT * FROM message WHERE companyId = ? AND id = ?", arguments: [companyId, id])
+        else { throw ResourceError.invalid(threadRefusal) }
+        let root = try target.parentId.map {
+            try Message.fetchOne(db, sql: "SELECT * FROM message WHERE companyId = ? AND id = ?", arguments: [companyId, $0])
+        } ?? target
+        guard let root, let channel = try Channel.fetchOne(db, sql: "SELECT * FROM channel WHERE companyId = ? AND id = ?",
+                                                           arguments: [companyId, root.channelId]) else {
+            throw ResourceError.invalid(threadRefusal)
+        }
+        guard channel.kind == .dm else { return (root, channel, nil) }
+        let members = try String.fetchAll(db, sql: "SELECT member FROM channelMember WHERE channelId = ?", arguments: [channel.id])
+        let agents = members.filter { $0 != "owner" }
+        guard members.contains("owner"), members.count == 2, agents.count == 1,
+              let agent = try Agent.fetchOne(db, key: agents[0]), agent.companyId == companyId else {
+            throw ResourceError.invalid(threadRefusal)
+        }
+        return (root, channel, agent)
+    }
+
+    /// Plan C Task C5: posts an owner drop's announcement (`post`, in its transaction) as the drop's `kind = share` message, with
+    /// one `messageRef` row (`inline = 0`, resolved for the owner) per top-level ref, then the text's other chips. The rows are
+    /// built before the write; a ref that no longer resolves in full for the owner fails the post (nothing is half-written).
+    private func postShare(_ text: String, companyId: String, top: [Int], channelId: String?, now: Date,
+                           post: (Database, [MessageRef], Int) throws -> Message) throws -> Message {
+        var rows: [MessageRef] = []
+        for n in top {
+            let id = UUID().uuidString
+            let r = try resolveDetailed(WorkRef(kind: .resource, id: String(n)), reader: .owner, companyId: companyId, messageRefId: id)
+            guard r.resolved.visibility == .full, let subject = r.subject else { throw ResourceError.notFound("no resource F-\(n)") }
+            rows.append(try Self.refRow(id: id, companyId: companyId, pinned: r.pinned, subject: subject, resolved: r.resolved,
+                                        inline: false, now: now))
+        }
+        let shared = Set(rows.map(\.canonical))
+        let inline = try inlineRefs(companyId: companyId, sender: .owner, text: text, channelId: channelId).filter { !shared.contains($0.canonical) }
+        return try writer.write { db in
+            let message = try post(db, inline, rows.count)
+            for (i, var row) in rows.enumerated() {
+                row.messageId = message.id
+                row.position = i
+                try row.insert(db)
+            }
+            return message
+        }
+    }
 
     /// A drop's scope, reader set and context, checked against the company.
     struct ResolvedDrop {
@@ -470,6 +527,8 @@ extension Store {
         var channelId: String?
         var askId: String?
         var itemId: String?
+        /// Plan C Task C5: a `.thread` drop's root message.
+        var threadRootId: String? = nil
     }
 
     /// The drop's scope, reader set and context, checked against the company (who the announcement reaches is checked
@@ -506,6 +565,10 @@ extension Store {
             resolved.itemId = try Self.resourceItem(db, companyId: companyId, id: id).id
         case .inbox(let askId):
             resolved.askId = try Self.dropAsk(db, companyId: companyId, askId: askId).ask.id
+        case .thread(let rootId):
+            let (root, channel, _) = try Self.threadDrop(db, companyId: companyId, rootId: rootId)
+            resolved.channelId = channel.id
+            resolved.threadRootId = root.id
         }
         return resolved
     }
@@ -536,6 +599,10 @@ extension Store {
         case .inbox(let askId):
             recipients.insert(try Self.dropAsk(db, companyId: companyId, askId: askId).requester.id)
             refusal = ""
+        case .thread(let rootId):
+            let (_, channel, dmAgent) = try Self.threadDrop(db, companyId: companyId, rootId: rootId)
+            recipients.formUnion(try Self.channelAgentIds(db, channelId: channel.id, companyId: companyId))
+            refusal = dmAgent.map { "@\($0.name)" } ?? "#\(channel.name)"
         }
         for handle in MessageRouter.mentions(in: announcement) where handle != "owner" {
             if let id = try String.fetchOne(db, sql: "SELECT id FROM agent WHERE companyId = ? AND name = ?", arguments: [companyId, handle]) {
@@ -553,9 +620,10 @@ extension Store {
         }
     }
 
-    /// A pending `info` question from an agent of this company (the only thing an Inbox drop may answer), and its requester.
+    /// A pending `info` question from an agent of this company, or (Plan C Task C5) its pending file request
+    /// (`FileRequests.isFileRequest`): the only things an Inbox drop may answer; and its requester.
     private static func dropAsk(_ db: Database, companyId: String, askId: String) throws -> (ask: Ask, requester: Agent) {
-        guard let ask = try Ask.fetchOne(db, key: askId), ask.companyId == companyId, ask.kind == .info,
+        guard let ask = try Ask.fetchOne(db, key: askId), ask.companyId == companyId, ask.kind == .info || FileRequests.isFileRequest(ask),
               ask.status == .pendingOwner, let requester = try Agent.fetchOne(db, key: ask.requesterId),
               requester.companyId == companyId
         else { throw ResourceError.invalid(inboxRefusal) }
@@ -623,9 +691,15 @@ extension Store {
     }
 
     /// Delivers the announcement by context, each through its own transaction (after the rows committed). Returns the posted
-    /// message for a DM or a channel. A failure is traced, never thrown: the resources are already added.
+    /// message for a DM, a channel, a thread or a file request. A failure is traced, never thrown: the resources are already
+    /// added.
+    ///
+    /// Plan C Task C5: in a DM, a channel or a thread (a reply to its root), and as the answer to an agent's file request
+    /// (`ownerAnswer`, its text led by `provided F-<n>…`), the announcement is the drop's one `kind = share` message: posted
+    /// with a `messageRef` row (`inline = 0`) for each top-level ref (`top`, resolved for the owner) in the same transaction,
+    /// and the text's other chips after them. No second message is ever posted.
     private func announce(_ text: String, drop: ResourceDrop, resolved: ResolvedDrop, companyId: String, refs: [String],
-                          now: Date) -> Message? {
+                          top: [Int] = [], now: Date) -> Message? {
         let router = MessageRouter(store: self)
         do {
             // The recipients again, on exactly the text delivered (its sizes and mirror paths are final only now).
@@ -634,10 +708,39 @@ extension Store {
             }
             switch drop.context {
             case .dm(let handle):
-                return try router.sendDM(companyId: companyId, from: .owner, to: handle, text: text, now: now)
+                return try postShare(text, companyId: companyId, top: top, channelId: nil, now: now) { db, inline, first in
+                    try router.sendDM(db: db, companyId: companyId, from: .owner, to: handle, text: text, now: now, kind: .share,
+                                      inline: inline, firstInlinePosition: first)
+                }
             case .channel(let name):
-                return try router.post(companyId: companyId, channel: name, from: .owner, text: text, now: now)
+                return try postShare(text, companyId: companyId, top: top, channelId: resolved.channelId, now: now) { db, inline, first in
+                    try router.post(db: db, companyId: companyId, channel: name, from: .owner, text: text, now: now, kind: .share,
+                                    inline: inline, firstInlinePosition: first).message
+                }
+            case .thread:
+                guard let rootId = resolved.threadRootId, let channelId = resolved.channelId else { throw ResourceError.invalid(Self.threadRefusal) }
+                return try postShare(text, companyId: companyId, top: top, channelId: channelId, now: now) { db, inline, first in
+                    let (_, channel, dmAgent) = try Self.threadDrop(db, companyId: companyId, rootId: rootId)
+                    guard channel.id == channelId else { throw ResourceError.invalid(Self.threadRefusal) }
+                    if let dmAgent {
+                        return try router.sendDM(db: db, companyId: companyId, from: .owner, to: dmAgent.name, text: text, now: now,
+                                                 replyTo: rootId, kind: .share, inline: inline, firstInlinePosition: first)
+                    }
+                    return try router.post(db: db, companyId: companyId, channel: channel.name, from: .owner, text: text, now: now,
+                                           replyTo: rootId, kind: .share, inline: inline, firstInlinePosition: first).message
+                }
             case .inbox(let askId):
+                if let ask = try writer.read({ db in try Ask.fetchOne(db, key: askId) }), ask.companyId == companyId,
+                   FileRequests.isFileRequest(ask) {
+                    let answer = FileRequests.providedText(refs: top.map { "F-\($0)" }) + "\n" + text
+                    return try postShare(answer, companyId: companyId, top: top, channelId: nil, now: now) { db, inline, first in
+                        guard let message = try ownerAnswer(db: db, askId: askId, text: answer, kind: .share, inline: inline,
+                                                            firstInlinePosition: first, now: now).message else {
+                            throw ResourceError.invalid(Self.inboxRefusal)
+                        }
+                        return message
+                    }
+                }
                 _ = try ownerAnswer(askId: askId, text: text, now: now)
             case .item(let id):
                 _ = try commentWorkItem(id: id, by: .owner, text: text, now: now)

@@ -66,7 +66,8 @@ extension CompanyTools {
                      inputSchema: schema(["title": prop("string", "One line"), "question": prop("string", "The question"),
                                           "details": prop("string", "Background the owner needs"),
                                           "expires_in_hours": prop("number", "Stop waiting after this many active hours"),
-                                          "request_id": prop("string", "Your own id; repeating it returns the same ask")],
+                                          "request_id": prop("string", "Your own id; repeating it returns the same ask"),
+                                          "wants_file": prop("boolean", "true to ask for a file; it arrives as F-<n>")],
                                          required: ["title", "question"])),
             ToolSpec(name: "escalate_decision", description: """
                 Send an ask to the CEO (or the owner when no one else can take it), once per ask. The internal approver can escalate \
@@ -188,6 +189,21 @@ extension CompanyTools {
             hours = n
         }
         let deduped = try isRepeat(requestId: try optionalText(args, "request_id"))
+        // Plan C Task C5: a file request is a `request` ask straight to the owner, answered with a drop (or declined).
+        switch args["wants_file"] {
+        case nil, .null?, .bool(false)?:
+            break
+        case .bool(true)?:
+            let ask = try store.requestFileFromOwner(companyId: companyId, by: agentId, title: try text(args, "title"),
+                                                     question: try text(args, "question"), details: try optionalText(args, "details"),
+                                                     expiresInHours: hours, requestId: try optionalText(args, "request_id"))
+            if deduped || !FileRequests.isFileRequest(ask) || ask.status != .pendingOwner {
+                return try describe(ask, expecting: .request, deduped: deduped)
+            }
+            return "Asked the owner for a file (\(ask.ref)). It arrives as a DM from the owner naming F-<n>; read it with open_ref."
+        default:
+            throw ToolError(message: "argument wants_file must be true or false")
+        }
         let ask = try store.requestFromOwner(companyId: companyId, by: .agent(agentId), title: try text(args, "title"),
                                              question: try text(args, "question"), details: try optionalText(args, "details"),
                                              expiresInHours: hours, requestId: try optionalText(args, "request_id"))

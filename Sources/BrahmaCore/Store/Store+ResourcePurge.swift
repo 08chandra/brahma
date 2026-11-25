@@ -54,6 +54,10 @@ extension Store {
             try reindexResources(db: db, rows, now: now)
             try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .resource,
                               text: try redact("You vouched for \(Self.named(rows))"), createdAt: now).insert(db)
+            // Plan C Task C5: a vouch changes what agents may read as the owner's (untainted), so it is an access event too.
+            try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .access,
+                              text: "You vouched for \(rows[0].ref)\(rows.count > 1 ? " and its \(rows.count - 1) files" : ""): agents read it as yours, untainted",
+                              createdAt: now).insert(db)
             return rows.map(\.id)
         }
         syncResourceMirror(companyId: companyId, contentVault: contentVault, now: now)

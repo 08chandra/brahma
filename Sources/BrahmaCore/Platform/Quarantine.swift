@@ -31,6 +31,20 @@ public enum Quarantine {
         #endif
     }
 
+    /// Plan C Task C5: marks a file the owner exported (`Store.exportRef`) as downloaded, so Gatekeeper and the apps that
+    /// honour the mark treat it as coming from outside: `0081;<unix time, hex>;Brahma;` on the file itself (never a link it
+    /// may be). Throws when the mark can't be set (the caller then keeps no unmarked copy). Off Darwin there is no such mark:
+    /// a no-op.
+    public static func mark(_ url: URL) throws {
+        #if canImport(Darwin)
+        let value = "0081;\(String(UInt64(max(0, Date().timeIntervalSince1970)), radix: 16));Brahma;"
+        let rc = value.withCString { setxattr(url.path, attribute, $0, strlen($0), 0, XATTR_NOFOLLOW) }
+        guard rc == 0 else {
+            throw QuarantineMarkError(errno: errno)
+        }
+        #endif
+    }
+
     #if canImport(Darwin)
     /// What a `getxattr` result means: present (rc ≥ 0), absent (`ENOATTR`, `ENOTSUP`), or unknown, which is quarantined.
     static func interpret(rc: Int, errno err: Int32) -> Bool {
@@ -38,4 +52,10 @@ public enum Quarantine {
         return err != ENOATTR && err != ENOTSUP
     }
     #endif
+}
+
+/// `Quarantine.mark` could not set the mark (the `setxattr` errno).
+public struct QuarantineMarkError: Error, Equatable, Sendable, CustomStringConvertible {
+    public let errno: Int32
+    public var description: String { "the download mark could not be set (errno \(errno))" }
 }
