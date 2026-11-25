@@ -58,7 +58,10 @@ extension Store {
             ask.notifiedAt = nil
             ask.updatedAt = now
             try ask.update(db)
-            let text = "Reminder: \(ask.ref) has waited \(Store.ageText(age)): \(ask.title)"
+            // C5 fix round 3: the title as `enterPendingOwner` shows it (gated final string; held back while the engine's
+            // values aren't loaded in full), never raw a day later.
+            let text = "Reminder: \(ask.ref) has waited \(Store.ageText(age)): "
+                + Self.ownerShownTitle(ask, knownValues: engineKnownValues(db: db, companyId: company.id))
             try MessageRouter(store: self).sendDM(db: db, companyId: company.id, from: .system, to: "owner", text: text, now: now)
             try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .approval, text: text, createdAt: now).insert(db)
             return true

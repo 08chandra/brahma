@@ -451,4 +451,30 @@ import Glibc
         #expect(escalated.status == .pendingOwner)
         try expectGated(w, escalated, "escalate")
     }
+
+    // MARK: Fix round 3
+
+    /// The owner's 1-day and 3-day reminders show the title through the same gate (never raw a day later), and hold it back
+    /// while the engine's values aren't loaded.
+    @Test func reminderTitlesGated() throws {
+        for loaded in [true, false] {
+            let w = try secretWorld(loaded: loaded)
+            let ask = try w.store.requestFromOwner(companyId: w.c.id, by: .agent(w.fx.eng1.id), title: "Key \(Self.hexSecret)", question: "ok?")
+            for days in [1.0, 2.0] {
+                try w.store.advanceActive(companyId: w.c.id, by: days * AskLifecycle.day)
+                #expect(try w.store.sweepAsks(now: w.cf.now) >= 1)
+            }
+            let reminders = try w.messages().filter { $0.senderId == "system" && $0.text.hasPrefix("Reminder: \(ask.ref) has waited") }
+            #expect(reminders.count == 2)
+            for r in reminders {
+                #expect(!r.text.contains(Self.hexSecret), "\(r.text)")
+                #expect(r.text.hasSuffix(loaded ? FileRequestCard.withheld : Store.titleHeldText), "\(r.text)")
+            }
+            let cId = w.c.id
+            let lines = try w.store.writer.read { db in
+                try String.fetchAll(db, sql: "SELECT text FROM activityEvent WHERE companyId = ? AND text LIKE 'Reminder:%'", arguments: [cId])
+            }
+            #expect(lines.count == 2 && !lines.joined().contains(Self.hexSecret))
+        }
+    }
 }
