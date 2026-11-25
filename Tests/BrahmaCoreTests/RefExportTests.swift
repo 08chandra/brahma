@@ -147,4 +147,148 @@ import Glibc
             == "folder export needs macOS")
         #endif
     }
+
+    // MARK: Fix round 1
+
+    /// Ruling (1): a purge lists every copy the owner exported, by path, as copies outside Brahma to delete.
+    @Test func purgeListsExportedCopies() throws {
+        let cf = try CollabFixture()
+        try cf.addResource(21, name: "notes.md", ext: "md", bytes: Data("# Notes\n".utf8))
+        let ref = WorkRef(kind: .resource, id: "21")
+        let first = try export(cf, ref, to: try tempDir().appending(path: "notes.md"))
+        let second = try export(cf, ref, to: try tempDir().appending(path: "copy.md"))
+        #expect(try cf.reads("F-21").compactMap(\.exportPath).sorted() == [first.path, second.path].sorted())
+        let report = try cf.store.purge(companyId: cf.c.id, ref: ref, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: cf.now)
+        #expect(report.exportedCopies.sorted() == [first.path, second.path].sorted())
+        let notices = try cf.store.undeliveredNotices().filter { $0.title == Store.exportedCopiesTitle }
+        #expect(notices.count == 2, "\(notices.map(\.body))")
+        #expect(notices.map(\.body).sorted() == [first.path, second.path].map { "you exported F-21 to \($0) · Brahma can't delete it; delete it if you no longer need it" }.sorted())
+    }
+
+    /// Ruling (3): the folder is opened once (no link anywhere on the way) and written through that descriptor; a folder moved
+    /// or replaced before the write fails closed, and a link planted at the name is replaced, never followed.
+    @Test func exportSurvivesFolderAndNameSwaps() throws {
+        let cf = try CollabFixture()
+        try cf.addResource(21, name: "notes.md", ext: "md", bytes: Data("# Notes\n".utf8))
+        let ref = WorkRef(kind: .resource, id: "21")
+        let fm = FileManager.default
+        // A link planted at the target name: replaced by the file; what it pointed at is untouched.
+        let out = try tempDir()
+        let victim = try tempDir().appending(path: "victim.md")
+        try Data("keep".utf8).write(to: victim)
+        try fm.createSymbolicLink(at: out.appending(path: "notes.md"), withDestinationURL: victim)
+        let written = try export(cf, ref, to: out.appending(path: "notes.md"))
+        #expect(try Data(contentsOf: victim) == Data("keep".utf8))
+        #expect(try fm.attributesOfItem(atPath: written.path)[.type] as? FileAttributeType == .typeRegular)
+        // A link anywhere on the way to the folder: refused when it is opened (the real path is walked without following).
+        // The folder swapped for a link after it was opened: nothing is saved, in either place.
+        let base = try tempDir()
+        let chosen = base.appending(path: "chosen", directoryHint: .isDirectory)
+        let moved = base.appending(path: "moved", directoryHint: .isDirectory)
+        let elsewhere = try tempDir()
+        try fm.createDirectory(at: chosen, withIntermediateDirectories: true)
+        let (chosenPath, movedPath, elsewherePath) = (chosen.path, moved.path, elsewhere.path)
+        cf.store.refHooks.setAfterExportFolderOpened {
+            try FileManager.default.moveItem(atPath: chosenPath, toPath: movedPath)
+            try FileManager.default.createSymbolicLink(atPath: chosenPath, withDestinationPath: elsewherePath)
+        }
+        let refused = refusal { try export(cf, ref, to: chosen.appending(path: "notes.md")) }
+        cf.store.refHooks.setAfterExportFolderOpened(nil)
+        #expect(refused == "the folder to save in was moved or replaced while saving; nothing was saved")
+        #expect(try fm.contentsOfDirectory(atPath: elsewherePath).isEmpty)
+        #expect(try fm.contentsOfDirectory(atPath: movedPath).isEmpty)
+        #expect(try activity(cf, .export).count == 1, "only the first export is recorded")
+    }
+
+    /// Review I2 (both purge entry points): ML's own `purgeResource` (what the app and the CLI call) lists the exports too.
+    @Test func resourcePurgeListsExportedCopies() throws {
+        let cf = try CollabFixture()
+        try cf.addResource(21, name: "notes.md", ext: "md", bytes: Data("# Notes\n".utf8))
+        let written = try export(cf, WorkRef(kind: .resource, id: "21"), to: try tempDir().appending(path: "notes.md"))
+        let report = try cf.store.purgeResource(companyId: cf.c.id, number: 21, backups: [], contentVault: ContentVault(paths: cf.paths),
+                                                paths: cf.paths, now: cf.now)
+        #expect(report.exports == [written.path])
+        #expect(try cf.store.undeliveredNotices().filter { $0.title == Store.exportedCopiesTitle }.map(\.body)
+            == ["you exported F-21 to \(written.path) · Brahma can't delete it; delete it if you no longer need it"])
+        // An old tombstone's report (no `exports` key) still reads.
+        let old = try JSONDecoder().decode(PurgeReport.self, from: Data(#"{"backups":["b"],"transcripts":[]}"#.utf8))
+        #expect(old == PurgeReport(backups: ["b"], transcripts: []))
+    }
+
+    /// Review M1: an export whose record can't be written leaves no file (it would be a copy no purge could list).
+    @Test func exportWithoutRecordLeavesNoFile() throws {
+        let cf = try CollabFixture()
+        try cf.addResource(21, name: "notes.md", ext: "md", bytes: Data("# Notes\n".utf8))
+        try cf.store.writer.write { db in try db.execute(sql: "DROP TABLE refRead") }
+        let out = try tempDir()
+        #expect(refusal { try export(cf, WorkRef(kind: .resource, id: "21"), to: out.appending(path: "notes.md")) } != nil)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: out.path).isEmpty)
+        #expect(try activity(cf, .export).isEmpty)
+    }
+
+    /// Review I4 (Ruling 42): a PDF the owner vouched for exports its flattened copy, never the original.
+    @Test func vouchedPDFExportsFlattenedCopy() throws {
+        let cf = try CollabFixture()
+        let pdf = Data("%PDF-1.7 vouched for export".utf8)
+        try cf.addResource(23, name: "deck.pdf", ext: "pdf", bytes: pdf)
+        let ref = WorkRef(kind: .resource, id: "23")
+        let out = try tempDir()
+        func save() throws -> URL {
+            try cf.store.exportRef(companyId: cf.c.id, ref: ref, to: out.appending(path: "deck"), knownValues: [], paths: cf.paths,
+                                   archives: FlattenOnlyReader(), now: cf.now)
+        }
+        #expect(refusal { try save() } != nil, "its structure can't be verified: refused until vouched")
+        _ = try cf.store.vouchFile(companyId: cf.c.id, canonical: ref.canonical, sha256: SHA256.hex(pdf), now: cf.now)
+        let written = try save()
+        let bytes = try Data(contentsOf: written)
+        #expect(written.lastPathComponent == "deck.pdf")
+        #expect(bytes.starts(with: FlattenOnlyReader.copyMark) && bytes != pdf && !bytes.contains(pdf))
+        #expect(try cf.reads("F-23").first?.via == "export")
+    }
+
+    /// Fix round 1 (controller): never into config other tools execute, inside a workspace or not, whatever the case, and
+    /// not through a link to such a folder.
+    @Test func exportRefusesToolConfigPlaces() throws {
+        let cf = try CollabFixture()
+        try cf.addResource(21, name: "notes.md", ext: "md", bytes: Data("# Notes\n".utf8))
+        let ref = WorkRef(kind: .resource, id: "21")
+        let fm = FileManager.default
+        let base = try tempDir()
+        var targets: [URL] = []
+        for dir in [".claude", ".Git", ".github/Workflows", "x/.CLAUDE/commands"] {
+            let url = base.appending(path: dir, directoryHint: .isDirectory)
+            try fm.createDirectory(at: url, withIntermediateDirectories: true)
+            targets.append(url.appending(path: "out.md"))
+        }
+        let link = base.appending(path: "innocent")
+        try fm.createSymbolicLink(at: link, withDestinationURL: base.appending(path: ".claude"))
+        targets.append(link.appending(path: "out.md"))
+        let plain = base.appending(path: "plain", directoryHint: .isDirectory)
+        try fm.createDirectory(at: plain, withIntermediateDirectories: true)
+        targets += [plain.appending(path: "CLAUDE.md"), plain.appending(path: "claude"), plain.appending(path: ".MCP.json")]
+        for url in targets {
+            #expect(refusal { try export(cf, ref, to: url) } == Store.toolConfigRefusal, "\(url.path)")
+        }
+        #expect(try fm.contentsOfDirectory(atPath: plain.path).isEmpty)
+        #expect(try activity(cf, .export).isEmpty)
+        // `.github` alone is fine.
+        let github = base.appending(path: ".github", directoryHint: .isDirectory)
+        _ = try export(cf, ref, to: github.appending(path: "notes.md"))
+    }
+}
+
+/// A PDF reader that verifies nothing but its own flattened copies (as `FlaggedPDFReader` in the app's tests).
+struct FlattenOnlyReader: ArchiveReader {
+    static let copyMark = Data("%PDF-1.3 flattened for export ".utf8)
+
+    func members(of data: Data, wanted: @Sendable (String) -> Bool, limits: ArchiveLimits) throws -> [(name: String, data: Data)] {
+        throw ArchiveReadError.refused("no archives here")
+    }
+
+    func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] {
+        if data.starts(with: Self.copyMark) { return [PDFPart(kind: .pageText, data: Data("hello".utf8))] }
+        throw UnverifiedPDF(parts: [])
+    }
+
+    func flattenPDF(of data: Data, maxBytes: Int, timeout: Duration) throws -> Data { Self.copyMark + Data(SHA256.hex(data).utf8) }
 }

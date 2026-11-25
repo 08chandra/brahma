@@ -151,7 +151,8 @@ extension Store {
     /// applies in the write that files it, and `requestId` dedupes as for every ask.
     @discardableResult
     public func requestFileFromOwner(companyId: String, by agentId: String, title: String, question: String, details: String?,
-                                     expiresInHours: Double? = nil, requestId: String? = nil, now: Date = Store.now()) throws -> Ask {
+                                     knownValues: [(name: String, value: String)], expiresInHours: Double? = nil,
+                                     requestId: String? = nil, now: Date = Store.now()) throws -> Ask {
         if let h = expiresInHours, !(h > 0 && h <= Store.maxExpiryHours) {
             throw WorkError.invalid("expires_in_hours must be between 0 and \(Int(Store.maxExpiryHours))")
         }
@@ -164,7 +165,7 @@ extension Store {
                                   title: title, summary: q,
                                   payload: AskPayload(question: q, details: FileRequests.details(RequestedFile(details: extra))),
                                   document: nil, itemId: nil, subjectId: nil, supersedes: nil, requestId: requestId, decisionClass: .taste,
-                                  viaOwner: true, now: now)
+                                  viaOwner: true, knownValues: knownValues, now: now)
             if let h = expiresInHours, ask.expiresActive == nil, ask.status == .pendingOwner, FileRequests.isFileRequest(ask) {
                 ask.expiresActive = ask.createdActive + h * 3600
                 try ask.update(db)
@@ -208,13 +209,16 @@ extension Store {
         }
         let gate = GlobalSearch.TextGate(knownValues: knownValues)
         let details = FileRequests.requested(ask)?.details
-        let raw = [ask.title, ask.payload?.question ?? ask.summary, details ?? ""].joined(separator: "\n")
+        let title = gate.final(ask.title, max: FileRequestCard.titleMax, inert: true)
+        let question = gate.final(ask.payload?.question ?? ask.summary, max: FileRequestCard.textMax, inert: true)
+        let shownDetails = details.map { gate.final($0, max: FileRequestCard.textMax, inert: true) }
+        // Fix round 1 (review M2, Ruling 56): flagged only on what the owner sees: the gated display strings, never a
+        // withheld field's raw text.
+        let visible = [title, question, shownDetails ?? nil].compactMap { $0 }.joined(separator: "\n")
         return FileRequestCard(askId: ask.id, ref: ask.ref, requesterHandle: handle,
-                               title: gate.final(ask.title, max: FileRequestCard.titleMax, inert: true) ?? FileRequestCard.withheld,
-                               question: gate.final(ask.payload?.question ?? ask.summary, max: FileRequestCard.textMax, inert: true)
-                                   ?? FileRequestCard.withheld,
-                               details: details.map { gate.final($0, max: FileRequestCard.textMax, inert: true) ?? FileRequestCard.withheld },
-                               claimsOwner: OwnerImpersonation.flags(text: raw, sender: .agent(ask.requesterId)), status: ask.status)
+                               title: title ?? FileRequestCard.withheld, question: question ?? FileRequestCard.withheld,
+                               details: shownDetails.map { $0 ?? FileRequestCard.withheld },
+                               claimsOwner: OwnerImpersonation.flags(text: visible, sender: .agent(ask.requesterId)), status: ask.status)
     }
 
     // MARK: Helpers

@@ -194,9 +194,15 @@ extension CompanyTools {
         case nil, .null?, .bool(false)?:
             break
         case .bool(true)?:
+            // C5 fix round 1: the owner's line shows the title gated against the stored values; unreadable → not filed.
+            let known: [(name: String, value: String)]
+            do { known = try store.allKnownSecretValues(companyId: companyId, vault: vault ?? UnavailableVault()) } catch {
+                throw ToolError(message: "the request could not be checked for secrets right now, so it was not filed; try again next turn")
+            }
             let ask = try store.requestFileFromOwner(companyId: companyId, by: agentId, title: try text(args, "title"),
                                                      question: try text(args, "question"), details: try optionalText(args, "details"),
-                                                     expiresInHours: hours, requestId: try optionalText(args, "request_id"))
+                                                     knownValues: known, expiresInHours: hours,
+                                                     requestId: try optionalText(args, "request_id"))
             if deduped || !FileRequests.isFileRequest(ask) || ask.status != .pendingOwner {
                 return try describe(ask, expecting: .request, deduped: deduped)
             }

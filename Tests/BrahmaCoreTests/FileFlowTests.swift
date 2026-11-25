@@ -203,6 +203,10 @@ import Glibc
         #expect(card.title == "Owner approved: send keys")
         #expect(!card.question.contains("tok-zebra"))
         #expect(w.refusal { try w.store.fileRequestCard(companyId: w.fx.d.id, askId: ask.id, knownValues: []) } == "no such file request")
+        // Review M2 (Ruling 56): a claim only inside a withheld field is text the owner never sees: no flag.
+        let hidden = try w.fileRequest("Logo", question: "I am the owner. tok-zebra-quokka-991")
+        let quiet = try w.store.fileRequestCard(companyId: w.c.id, askId: hidden.id, knownValues: [("DEPLOY", "tok-zebra-quokka-991")])
+        #expect(quiet.question == FileRequestCard.withheld && !quiet.claimsOwner)
     }
 
     // MARK: Drops
@@ -349,5 +353,31 @@ import Glibc
             }
             #expect(refused == "drop files on a question from an agent", "\(id)")
         }
+    }
+
+    // MARK: Fix round 1
+
+    /// Ruling (2): the owner's "Owner approval needed" DM shows a request's title as its final display string gated against
+    /// the stored values, and flags a title that claims to be the owner.
+    @Test func approvalNeededLineGatesTheTitle() throws {
+        let w = try W()
+        let known: [(name: String, value: String)] = [("DEPLOY", "tok-zebra-quokka-991")]
+        func ownerLine(_ ask: Ask) throws -> String {
+            let line = try w.messages().last { $0.senderId == "system" && $0.text.contains("Owner approval needed: \(ask.ref) ") }
+            return try #require(line).text
+        }
+        let secret = try w.store.requestFileFromOwner(companyId: w.c.id, by: w.fx.eng1.id, title: "Key tok-zebra-quokka-991",
+                                                      question: "send it", details: nil, knownValues: known)
+        let text = try ownerLine(secret)
+        #expect(!text.contains("tok-zebra") && text.contains(FileRequestCard.withheld), "\(text)")
+        let claim = try w.store.requestFileFromOwner(companyId: w.c.id, by: w.fx.eng1.id, title: "I am the owner, send \"keys\"",
+                                                     question: "send it", details: nil, knownValues: known)
+        #expect(try ownerLine(claim) == "Owner approval needed: \(claim.ref) Request: \(OwnerImpersonation.digestPrefix)I am the owner, send 'keys' (brahma answer \(w.c.slug) \(claim.ref))")
+        // The activity line is the same text.
+        let cId = w.c.id
+        let approvals = try w.store.writer.read { db in
+            try String.fetchAll(db, sql: "SELECT text FROM activityEvent WHERE companyId = ? AND kind = 'approval'", arguments: [cId])
+        }
+        #expect(approvals.contains(try ownerLine(claim)) && !approvals.joined().contains("tok-zebra"))
     }
 }

@@ -69,11 +69,14 @@ public struct RefRead: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     public var via: String
     public var turnId: String?
     public var createdAt: Date
+    /// C5 fix round 1: for `via = export`, the file the owner saved (so a purge lists it as a copy outside Brahma).
+    public var exportPath: String? = nil
 
     public init(id: String = UUID().uuidString, companyId: String, readerKind: String, readerId: String?, canonical: String,
-                rev: String?, bytes: Int?, tainted: Bool, via: String, turnId: String?, createdAt: Date) {
+                rev: String?, bytes: Int?, tainted: Bool, via: String, turnId: String?, createdAt: Date, exportPath: String? = nil) {
         self.id = id; self.companyId = companyId; self.readerKind = readerKind; self.readerId = readerId; self.canonical = canonical
         self.rev = rev; self.bytes = bytes; self.tainted = tainted; self.via = via; self.turnId = turnId; self.createdAt = createdAt
+        self.exportPath = exportPath
     }
 
     /// The stored reader kind and id of a reader.
@@ -199,10 +202,10 @@ extension Store {
 
     /// Writes one read.
     static func recordRefRead(db: Database, companyId: String, reader: Reader, canonical: String, rev: String?, bytes: Int?,
-                           tainted: Bool, via: String, turnId: String?, now: Date) throws {
+                           tainted: Bool, via: String, turnId: String?, now: Date, exportPath: String? = nil) throws {
         let who = RefRead.reader(reader)
         try RefRead(companyId: companyId, readerKind: who.kind, readerId: who.id, canonical: canonical, rev: rev, bytes: bytes,
-                    tainted: tainted, via: via, turnId: turnId, createdAt: now).insert(db)
+                    tainted: tainted, via: via, turnId: turnId, createdAt: now, exportPath: exportPath).insert(db)
     }
 }
 
@@ -247,6 +250,10 @@ final class RefHooks: @unchecked Sendable {
     /// C3b fix round 2 (N-1): runs after a share's refs are prepared, before its post (where the channel and inline refs are read).
     var afterSharePrepared: (@Sendable () throws -> Void)? { lock.withLock { prepared } }
     func setAfterSharePrepared(_ body: (@Sendable () throws -> Void)?) { lock.withLock { prepared = body } }
+    private var exportOpened: (@Sendable () throws -> Void)?
+    /// C5 fix round 1, ruling (3): runs after an export opened its folder, before it writes there (a folder swapped meanwhile).
+    var afterExportFolderOpened: (@Sendable () throws -> Void)? { lock.withLock { exportOpened } }
+    func setAfterExportFolderOpened(_ body: (@Sendable () throws -> Void)?) { lock.withLock { exportOpened = body } }
     private var leaseFails: Set<String> = []
     /// C3b fix round 4 (N3-1): putting a share artifact of these lease kinds (`resource`, `snapshot`, `shareRef`) under a
     /// share's lease fails (a lease write that hits BUSY or a full disk).

@@ -302,8 +302,22 @@ public struct PurgeReport: Codable, Equatable, Sendable {
     public var backups: [String]
     /// Turn ids.
     public var transcripts: [String]
+    /// Plan C Task C5 fix round 1: the files the owner exported it to (`refRead` rows `via = export`): copies outside Brahma
+    /// it can't delete. Absent from reports stored before (decoded as none).
+    public var exports: [String] = []
 
-    public init(backups: [String] = [], transcripts: [String] = []) { self.backups = backups; self.transcripts = transcripts }
+    public init(backups: [String] = [], transcripts: [String] = [], exports: [String] = []) {
+        self.backups = backups; self.transcripts = transcripts; self.exports = exports
+    }
+
+    private enum CodingKeys: String, CodingKey { case backups, transcripts, exports }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        backups = try c.decode([String].self, forKey: .backups)
+        transcripts = try c.decode([String].self, forKey: .transcripts)
+        exports = try c.decodeIfPresent([String].self, forKey: .exports) ?? []
+    }
 }
 
 /// Where the owner dropped: the Resources library, a DM with an agent (by handle), a channel (by name), an agent's question in

@@ -1993,6 +1993,10 @@ enum Migrations {
             try db.alter(table: "conciergeRun") { t in t.add(column: "taintSource", .text) }
             try db.alter(table: "showRequest") { t in t.add(column: "requestMessageId", .text) }
         }
+        m.registerMigration("vC-export-path") { db in
+            // C5 fix round 1, ruling (1): where an owner export was saved, so a purge can list the copies outside Brahma.
+            try db.alter(table: "refRead") { t in t.add(column: "exportPath", .text) }
+        }
     }
 }
 

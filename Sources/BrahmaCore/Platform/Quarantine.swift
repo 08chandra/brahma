@@ -45,6 +45,16 @@ public enum Quarantine {
         #endif
     }
 
+    /// `mark`, on an open file's descriptor (C5 fix round 1: an export marks the file it wrote, never a path that may since
+    /// name another).
+    public static func mark(fd: Int32) throws {
+        #if canImport(Darwin)
+        let value = "0081;\(String(UInt64(max(0, Date().timeIntervalSince1970)), radix: 16));Brahma;"
+        let rc = value.withCString { fsetxattr(fd, attribute, $0, strlen($0), 0, 0) }
+        guard rc == 0 else { throw QuarantineMarkError(errno: errno) }
+        #endif
+    }
+
     #if canImport(Darwin)
     /// What a `getxattr` result means: present (rc ≥ 0), absent (`ENOATTR`, `ENOTSUP`), or unknown, which is quarantined.
     static func interpret(rc: Int, errno err: Int32) -> Bool {

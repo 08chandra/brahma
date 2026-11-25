@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 #if canImport(Darwin)
 import Darwin
 #else
@@ -55,10 +56,11 @@ extension Store {
     /// 3. **The secret gate, again** (`Store.gatedBytes` with `knownValues` and `archives`): a stored value refuses the export;
     ///    a pattern in text exports its redacted copy (`SecretGate.redactedCopy`); a vouched PDF exports its flattened copy,
     ///    never the original; a pattern in bytes that can't be redacted refuses.
-    /// 4. **Write.** A temporary file in the destination folder (created exclusively, no link followed), marked downloaded
-    ///    (`Quarantine.mark`: a mark that can't be set removes the file and refuses), then renamed over the name.
+    /// 4. **Write.** Through the folder's descriptor only (`exportFolder`, `writeExport`; fix round 1): a temporary file
+    ///    created exclusively, marked downloaded (`Quarantine.mark(fd:)`: a mark that can't be set removes the file and
+    ///    refuses), then renamed over the name while the folder is still the one at its path (else nothing is saved).
     /// 5. **Record.** An `.export` activity line `ownerExport <canonical>` (the name gated as messages show it) and a
-    ///    `refRead(via: export)` row.
+    ///    `refRead(via: export)` row with the saved path (`exportPath`, which a purge lists as a copy outside Brahma).
     /// Returns the file written.
     @discardableResult
     public func exportRef(companyId: String, ref: WorkRef, to destination: URL, knownValues: [(name: String, value: String)],
@@ -109,56 +111,59 @@ extension Store {
         }
 
         let name = ExportName.sanitize(destination.lastPathComponent, realExt: ext)
-        let written = try writeExport(data, folder: folder, name: name)
-        do {
-            try writer.write { db in
-                try Self.recordRefRead(db: db, companyId: companyId, reader: .owner, canonical: canonical, rev: rev, bytes: data.count,
-                                       tainted: r.resolved.tainted, via: "export", turnId: nil, now: now)
-                try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .export, text: try redact("ownerExport \(shown)"),
-                                  createdAt: now).insert(db)
-            }
-        } catch {
-            // The file is written and marked; the record is what failed: traced, and the export stands.
-            refTrace(companyId: companyId, "exported \(shown) but could not record it (\(Store.flat("\(error)", max: 200)))", now: now)
+        // Fix round 1 (review M1): the record is written in the transaction that renames the file into place; no record, no
+        // file (a copy no purge could list).
+        return try writeExport(data, folder: folder, name: name) { db, path in
+            try Self.recordRefRead(db: db, companyId: companyId, reader: .owner, canonical: canonical, rev: rev, bytes: data.count,
+                                   tainted: r.resolved.tainted, via: "export", turnId: nil, now: now, exportPath: path)
+            try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .export, text: try redact("ownerExport \(shown)"),
+                              createdAt: now).insert(db)
         }
-        return written
     }
 
     // MARK: Where
 
-    /// The real folder `destination` is in, refused (`WorkError.forbidden`) when it is (inside) the data home, the vault, the
-    /// workspaces root, a company's workspace or a `.brahma` folder, or when it does not exist.
-    func exportFolder(_ destination: URL, paths: BrahmaPaths) throws -> String {
+    /// The folder `destination` is in, opened once (fix round 1, ruling (3)): its real path walked from `/` one directory at a
+    /// time with `O_DIRECTORY | O_NOFOLLOW` (a link anywhere on the way, or a part swapped while it is walked, refuses), then
+    /// refused (`WorkError.forbidden`) when the kernel's path for the open descriptor is (inside) the data home, the vault, the
+    /// workspaces root, a company's workspace or a `.brahma` folder. Every later step writes through this descriptor.
+    func exportFolder(_ destination: URL, paths: BrahmaPaths) throws -> ExportFolder {
         let name = destination.lastPathComponent
         guard destination.isFileURL, !name.isEmpty, name != "/", name != ".", name != ".." else {
             throw WorkError.invalid("choose a file name to save as")
         }
-        guard let folder = Store.realPath(destination.deletingLastPathComponent().path) else {
+        guard let real = Store.realPath(destination.deletingLastPathComponent().path) else {
             throw WorkError.invalid("the folder to save in doesn't exist")
         }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: folder, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw WorkError.invalid("the folder to save in doesn't exist")
-        }
+        try Self.refuseToolConfigName(name)
+        let folder = try ExportFolder(walking: real)
         let refusal = WorkError.forbidden("Brahma doesn't save exports inside its own data folder or a company workspace; choose another folder")
-        let lower = folder.lowercased()
+        let lower = folder.path.lowercased()
         if lower.split(separator: "/").contains(where: { $0 == ".brahma" }) { throw refusal }
+        // Fix round 1 (controller): never where other tools read config they execute, inside a workspace or not. Checked on the
+        // kernel's path for the descriptor the walk opened (no link on the way), so a link can't hide one.
+        try Self.refuseToolConfigFolder(folder.path)
         var roots = [paths.home, paths.workspaces, paths.vaultDir].map(\.path) + (dataHome.map { [$0.path] } ?? [])
         roots += try companies().map(\.workspacePath)
         for root in roots {
-            let real = (Store.realPath(root) ?? URL(fileURLWithPath: root).standardizedFileURL.path).lowercased()
-            guard !real.isEmpty, real != "/" else { continue }
-            if lower == real || lower.hasPrefix(real + "/") { throw refusal }
+            let resolved = (Store.realPath(root) ?? URL(fileURLWithPath: root).standardizedFileURL.path).lowercased()
+            guard !resolved.isEmpty, resolved != "/" else { continue }
+            if lower == resolved || lower.hasPrefix(resolved + "/") { throw refusal }
         }
         return folder
     }
 
-    /// Writes `data` as `name` in `folder` (a real directory): a temporary file created exclusively (never through a link),
-    /// marked downloaded, then renamed over `name`. A directory at `name` refuses; any failure leaves no temporary file.
-    func writeExport(_ data: Data, folder: String, name: String) throws -> URL {
-        let dfd = open(folder, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard dfd >= 0 else { throw WorkError.invalid("the folder to save in can't be opened") }
-        defer { closeFD(dfd) }
+    /// Writes `data` as `name` in `folder`, only through its descriptor: a temporary file created exclusively (`openat`,
+    /// `O_EXCL | O_NOFOLLOW`), written and synced, marked downloaded on its descriptor, then — only while the folder is still
+    /// the one at its path (else the temporary file is removed and nothing is saved) — renamed over `name` (`renameat`: a
+    /// link at the name is replaced, never followed). A directory at `name` refuses.
+    ///
+    /// Fix round 1 (review M1): `record` runs in a write transaction with the final path, and the rename is that
+    /// transaction's last step: a record that fails leaves no file, and a commit that fails after the rename removes it.
+    func writeExport(_ data: Data, folder: ExportFolder, name: String, record: (Database, String) throws -> Void) throws -> URL {
+        try Self.refuseToolConfigName(name)          // the final name, after sanitizing (which may add an extension)
+        try refHooks.afterExportFolderOpened?()
+        let dfd = folder.fd
         var st = stat()
         if fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0, st.st_mode & S_IFMT == S_IFDIR {
             throw WorkError.invalid("a folder named \(Store.flat(name, max: 120)) is already there; choose another name")
@@ -182,16 +187,45 @@ extension Store {
                 }
             }
             guard fsync(fd) == 0 else { throw WorkError.invalid("the file couldn't be written (\(String(cString: strerror(errno))))") }
+            do { try Quarantine.mark(fd: fd) } catch {
+                throw WorkError.invalid("the exported file couldn't be marked as downloaded (\(error)); nothing was saved")
+            }
         }
-        let tempURL = URL(fileURLWithPath: folder).appending(path: temp)
-        do { try Quarantine.mark(tempURL) } catch {
-            throw WorkError.invalid("the exported file couldn't be marked as downloaded (\(error)); nothing was saved")
-        }
-        guard renameat(dfd, temp, dfd, name) == 0 else {
-            throw WorkError.invalid("the file couldn't be saved as \(Store.flat(name, max: 120)) (\(String(cString: strerror(errno))))")
+        let final = URL(fileURLWithPath: folder.path).appending(path: name)
+        var renamed = false
+        do {
+            try writer.write { db in
+                try record(db, final.path)
+                guard folder.isInPlace else { throw WorkError.invalid(ExportFolder.movedRefusal) }
+                guard renameat(dfd, temp, dfd, name) == 0 else {
+                    throw WorkError.invalid("the file couldn't be saved as \(Store.flat(name, max: 120)) (\(String(cString: strerror(errno))))")
+                }
+                renamed = true
+            }
+        } catch {
+            if renamed { unlinkat(dfd, name, 0) }
+            throw error
         }
         ok = true
-        return URL(fileURLWithPath: folder).appending(path: name)
+        return final
+    }
+
+    /// Fix round 1 (controller): what other tools execute as config. A folder component `.claude` or `.git`, or `.github`
+    /// followed by `workflows`; a file named `CLAUDE.md` or `.mcp.json` (or `.claude`, `.git`). Case-insensitive (NFC, then
+    /// lowercased).
+    static let toolConfigRefusal = "Brahma doesn't save exports where other tools read their configuration (.claude, .git, .github/workflows, CLAUDE.md, .mcp.json); choose another place"
+
+    static func refuseToolConfigFolder(_ path: String) throws {
+        let parts = path.precomposedStringWithCanonicalMapping.lowercased().split(separator: "/").map(String.init)
+        for (i, part) in parts.enumerated() {
+            if part == ".claude" || part == ".git" { throw WorkError.forbidden(toolConfigRefusal) }
+            if part == ".github", i + 1 < parts.count, parts[i + 1] == "workflows" { throw WorkError.forbidden(toolConfigRefusal) }
+        }
+    }
+
+    static func refuseToolConfigName(_ name: String) throws {
+        let n = name.precomposedStringWithCanonicalMapping.lowercased()
+        if ["claude.md", ".mcp.json", ".claude", ".git"].contains(n) { throw WorkError.forbidden(toolConfigRefusal) }
     }
 
     // MARK: Artifact folders
@@ -240,7 +274,7 @@ extension Store {
     }
 
     /// `files` gated one by one (`gatedBytes`, canonical `AR-<n>/<path>`: a stored value refuses, a pattern in text is
-    /// redacted, a vouched PDF is its flattened copy), staged under a private temporary folder with sanitized names, and
+    /// redacted, a vouched PDF is its flattened copy), staged under `<data home>/tmp` (0700) with sanitized names, and
     /// zipped with `ditto -c -k` (no resource forks, extended attributes or ACLs). Darwin only.
     func zipArtifact(_ a: Artifact, files: [(path: String, data: Data)], companyId: String, archives: any ArchiveReader,
                      knownValues: [(name: String, value: String)], paths: BrahmaPaths) throws -> Data {
@@ -258,8 +292,12 @@ extension Store {
             gated.append((f.path.split(separator: "/").map { ExportName.component(String($0)) }, data))
         }
         let fm = FileManager.default
-        let stage = fm.temporaryDirectory.appending(path: "brahma-export-\(UUID().uuidString.lowercased())", directoryHint: .isDirectory)
-        try fm.createDirectory(at: stage, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        // Fix round 1 (review M3): staged under the engine's own data home (`<home>/tmp`, 0700), never the per-user TMPDIR
+        // agents share; no fallback.
+        let tmp = paths.home.appending(path: "tmp", directoryHint: .isDirectory)
+        try BrahmaPaths.ensurePrivateDirectory(tmp)
+        let stage = tmp.appending(path: "export-\(UUID().uuidString.lowercased())", directoryHint: .isDirectory)
+        try BrahmaPaths.ensurePrivateDirectory(stage)
         defer { try? fm.removeItem(at: stage) }
         let root = stage.appending(path: ExportName.component((a.storedPath as NSString).lastPathComponent), directoryHint: .isDirectory)
         try fm.createDirectory(at: root, withIntermediateDirectories: false)
@@ -310,3 +348,53 @@ extension Store {
 
 /// `close(2)` (a `Store` method shadows the name inside its extensions).
 private func closeFD(_ fd: Int32) { _ = close(fd) }
+
+/// C5 fix round 1, ruling (3): the folder an export is saved in, held open. Opened by walking its real path from `/` with
+/// `O_DIRECTORY | O_NOFOLLOW` at every step, so no link is followed on the way; `path` is the kernel's path for the
+/// descriptor.
+final class ExportFolder {
+    static let movedRefusal = "the folder to save in was moved or replaced while saving; nothing was saved"
+    static let changedRefusal = "the folder to save in changed while it was opened; choose it again"
+
+    let fd: Int32
+    let path: String
+
+    init(walking real: String) throws {
+        guard real.hasPrefix("/") else { throw WorkError.invalid("the folder to save in doesn't exist") }
+        var current = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard current >= 0 else { throw WorkError.invalid(Self.changedRefusal) }
+        for part in real.split(separator: "/", omittingEmptySubsequences: true).map(String.init) {
+            let next = openat(current, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            closeFD(current)
+            guard next >= 0 else { throw WorkError.invalid(Self.changedRefusal) }
+            current = next
+        }
+        guard let kernel = Self.kernelPath(current) else {
+            closeFD(current)
+            throw WorkError.invalid(Self.changedRefusal)
+        }
+        fd = current
+        path = kernel
+    }
+
+    deinit { closeFD(fd) }
+
+    /// Still the directory at `path`: the kernel's path for the descriptor is unchanged, and `path` (its last part not
+    /// followed) names this same directory by (device, inode).
+    var isInPlace: Bool {
+        guard Self.kernelPath(fd) == path else { return false }
+        var held = stat(), named = stat()
+        guard fstat(fd, &held) == 0, lstat(path, &named) == 0 else { return false }
+        return held.st_dev == named.st_dev && held.st_ino == named.st_ino && named.st_mode & S_IFMT == S_IFDIR
+    }
+
+    static func kernelPath(_ fd: Int32) -> String? {
+        #if canImport(Darwin)
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fcntl(fd, F_GETPATH, &buffer) != -1 else { return nil }
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        #else
+        return Store.realPath("/proc/self/fd/\(fd)")
+        #endif
+    }
+}

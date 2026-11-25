@@ -19,11 +19,14 @@ public struct RefPurgeReport: Codable, Equatable, Sendable {
     public var transcripts: [String]
     /// The content is committed: its share refs are gone, but the company's git history still holds it.
     public var stillInHistory: Bool
+    /// C5 fix round 1: the files the owner exported it to (`refRead` rows `via = export`): copies outside Brahma, which it
+    /// can't delete; each gets an owner notice.
+    public var exportedCopies: [String] = []
 
     public init(vaultPaths: [String] = [], gitRefs: [String] = [], backupsFlagged: [String] = [], transcripts: [String] = [],
-                stillInHistory: Bool = false) {
+                stillInHistory: Bool = false, exportedCopies: [String] = []) {
         self.vaultPaths = vaultPaths; self.gitRefs = gitRefs; self.backupsFlagged = backupsFlagged; self.transcripts = transcripts
-        self.stillInHistory = stillInHistory
+        self.stillInHistory = stillInHistory; self.exportedCopies = exportedCopies
     }
 }
 
@@ -165,6 +168,7 @@ extension Store {
                                            paths: paths, now: now)
                 report.backupsFlagged = ml.backups
                 report.transcripts = ml.transcripts
+                report.exportedCopies = ml.exports      // listed, with their notices, by ML's purge
             }
             if let memoryNumber { try ownerDeleteMemory(companyId: companyId, number: memoryNumber, now: now) }
             for snapshot in snapshots where snapshot.purgedAt == nil {
@@ -241,6 +245,13 @@ extension Store {
                 """, arguments: [companyId, canonical])
         }
         for t in read where !report.transcripts.contains(t) { report.transcripts.append(t) }
+        // C5 fix round 1: every copy the owner exported, by the path it was saved at (a resource's: by `purgeResource`).
+        if resource == nil { report.exportedCopies = try writer.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT exportPath FROM refRead WHERE companyId = ? AND canonical = ? AND via = 'export' AND exportPath IS NOT NULL
+                GROUP BY exportPath ORDER BY MIN(createdAt), exportPath
+                """, arguments: [companyId, canonical])
+        } }
         let dates = Dictionary(backups.map { ($0.name, $0.takenAt) }, uniquingKeysWith: { a, _ in a })
         let day = DateFormatter()
         day.locale = Locale(identifier: "en_US_POSIX")
@@ -261,6 +272,7 @@ extension Store {
             try PurgeLog(companyId: companyId, canonical: shown, vaultPaths: try json(report.vaultPaths), gitRefs: try json(report.gitRefs),
                          backupsFlagged: try json(report.backupsFlagged), createdAt: now).insert(db)
             let holders = "\(report.backupsFlagged.count) backups and \(report.transcripts.count) transcripts may still contain it"
+                + (report.exportedCopies.isEmpty ? "" : "; \(report.exportedCopies.count) copies you exported are outside Brahma")
                 + (stillInHistory ? "; it is still in the company's git history" : "")
             try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .access,
                               text: try redact("Purged \(shown) (\(holders))"), createdAt: now).insert(db)
@@ -272,6 +284,10 @@ extension Store {
             for turn in report.transcripts {
                 try notifyOwner(db: db, companyId: companyId, kind: .system, urgency: .normal, title: "Purged content in a transcript",
                                 body: "the transcript of turn \(turn) may contain purged content · delete it", now: now)
+            }
+            for path in report.exportedCopies where resource == nil {
+                try notifyOwner(db: db, companyId: companyId, kind: .system, urgency: .normal, title: Self.exportedCopiesTitle,
+                                body: Self.exportedCopyBody(shown, path: path), now: now)
             }
             if stillInHistory {
                 try notifyOwner(db: db, companyId: companyId, kind: .system, urgency: .normal, title: "Purged content is still in git",
@@ -295,6 +311,14 @@ extension Store {
 }
 
 extension Store {
+    /// C5 fix round 1: the title of the owner notice for each exported copy of purged content.
+    public static let exportedCopiesTitle = "Copies outside Brahma you may want to delete"
+
+    /// The body of that notice: the ref as messages show it and the path the owner saved it at.
+    static func exportedCopyBody(_ shown: String, path: String) -> String {
+        "you exported \(shown) to \(Store.flat(path, max: 1000)) · Brahma can't delete it; delete it if you no longer need it"
+    }
+
     /// The message of an item check or extension trial refused while the owner's purge holds the fence (R4-6).
     static let purgingRefusal = "the owner is purging content in this company"
 

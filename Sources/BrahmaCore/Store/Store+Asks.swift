@@ -179,15 +179,33 @@ extension Store {
     }
 
     /// Moves the ask to `pendingOwner`, logs the activity line and DMs the owner.
-    func enterPendingOwner(_ db: Database, ask: inout Ask, company: Company, now: Date) throws {
+    ///
+    /// C5 fix round 1, ruling (2): the agent's title is shown as its final display string (one line, NFKC, invisible and bidi
+    /// characters dropped, quotes and brackets inert, at most `FileRequestCard.titleMax`) gated against `knownValues` after
+    /// that (Rulings 53-56: a title holding a value is `FileRequestCard.withheld`; secret patterns are gated even without
+    /// values), with `OwnerImpersonation.digestPrefix` when an agent's title claims to be the owner — as `fileRequestCard`.
+    func enterPendingOwner(_ db: Database, ask: inout Ask, company: Company, knownValues: [(name: String, value: String)] = [],
+                           now: Date) throws {
         ask.status = .pendingOwner
         ask.statusSinceActive = try Store.activeNow(db: db, companyId: company.id)
         ask.remindCount = 0
         ask.notifiedAt = nil
         let verb = ask.kind == .info || FileRequests.isFileRequest(ask) ? "answer" : ask.kind == .humanTask ? "task show" : "approve"
-        let text = "Owner approval needed: \(ask.ref) \(try Store.displayTitle(db, ask)): \(ask.title) (brahma \(verb) \(company.slug) \(ask.ref))"
+        let text = "Owner approval needed: \(ask.ref) \(try Store.displayTitle(db, ask)): \(Self.ownerShownTitle(ask, knownValues: knownValues)) "
+            + "(brahma \(verb) \(company.slug) \(ask.ref))"
         try ActivityEvent(companyId: company.id, agentId: nil, turnId: nil, kind: .approval, text: text, createdAt: now).insert(db)
         try MessageRouter(store: self).sendDM(db: db, companyId: company.id, from: .system, to: "owner", text: text, now: now)
+    }
+
+    /// An ask's title as the owner's lines show it (`enterPendingOwner`): gated final display string, flagged when an agent's
+    /// title claims to be the owner.
+    static func ownerShownTitle(_ ask: Ask, knownValues: [(name: String, value: String)]) -> String {
+        // Flagged only on the text the owner sees (Ruling 56): a withheld title is never checked.
+        guard let shown = GlobalSearch.TextGate(knownValues: knownValues).final(ask.title, max: FileRequestCard.titleMax, inert: true) else {
+            return FileRequestCard.withheld
+        }
+        guard ask.requesterId != "system", OwnerImpersonation.flags(text: shown, sender: .agent(ask.requesterId)) else { return shown }
+        return OwnerImpersonation.digestPrefix + shown
     }
 
     /// DMs the requester when the ask reaches a final status (unless the engine filed it).
@@ -267,7 +285,8 @@ extension Store {
     func propose(db: Database, companyId: String, by sender: Sender, kind: AskKind, risk: AskRisk?, category: String?, title: String,
                  summary: String, payload: AskPayload?, document: PreparedDocument?, itemId: String?, subjectId: String?,
                  supersedes: String?, requestId: String?, decisionClass: DecisionClass, viaOwner: Bool,
-                 quotaExempt: AskQuota.Exemption? = nil, announce: Bool = true, now: Date) throws -> Ask {
+                 quotaExempt: AskQuota.Exemption? = nil, announce: Bool = true, knownValues: [(name: String, value: String)] = [],
+                 now: Date) throws -> Ask {
         let company = try requireCompany(db, companyId)
         let requester = try askRequester(db, sender, companyId: companyId)
         let rid = Store.cleanRequestId(requestId)
@@ -326,7 +345,7 @@ extension Store {
             let text = "\(ask.ref) needs your decision: \(try Store.displayTitle(db, ask)): \(ask.title) (decide with the decide tool)"
             try MessageRouter(store: self).sendDM(db: db, companyId: companyId, from: .system, to: approver.name, text: text, now: now)
         } else if announce {
-            try enterPendingOwner(db, ask: &ask, company: company, now: now)
+            try enterPendingOwner(db, ask: &ask, company: company, knownValues: knownValues, now: now)
             try ask.insert(db)
         } else {
             // Decided in the same transaction (an access preset): no "approval needed" line or DM for the owner.

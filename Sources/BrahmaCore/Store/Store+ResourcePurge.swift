@@ -215,7 +215,16 @@ extension Store {
         let flagged = backups.filter { $0.takenAt >= top.createdAt && $0.takenAt <= now }
             .sorted { ($0.takenAt, $0.name) < ($1.takenAt, $1.name) }
             .compactMap { seen.insert($0.name).inserted ? $0.name : nil }
-        let report = PurgeReport(backups: flagged, transcripts: transcripts)
+        // C5 fix round 1: every copy the owner exported of it (or of a file of the folder), by the path it was saved at.
+        let refs = rows.map(\.ref)
+        let exported = try writer.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT canonical, exportPath FROM refRead WHERE companyId = ? AND via = 'export' AND exportPath IS NOT NULL
+                  AND canonical IN (\(refs.map { _ in "?" }.joined(separator: ", ")))
+                GROUP BY canonical, exportPath ORDER BY MIN(createdAt), exportPath
+                """, arguments: StatementArguments([companyId]) + StatementArguments(refs))
+        }.map { (ref: $0["canonical"] as String, path: $0["exportPath"] as String) }
+        let report = PurgeReport(backups: flagged, transcripts: transcripts, exports: exported.map(\.path))
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
         let reportText = String(decoding: try encoder.encode(report), as: UTF8.self)
@@ -248,6 +257,10 @@ extension Store {
             try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .resource,
                               text: "Purged \(top.ref) (\(Self.purgeHolders(report)))",
                               createdAt: now).insert(db)
+            for e in exported {
+                try notifyOwner(db: db, companyId: companyId, kind: .system, urgency: .normal, title: Self.exportedCopiesTitle,
+                                body: Self.exportedCopyBody(e.ref, path: e.path), now: now)
+            }
         }
 
         // 2. The mirror files and the vault bytes.
