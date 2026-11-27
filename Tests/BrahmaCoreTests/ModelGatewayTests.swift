@@ -374,6 +374,33 @@ import GRDB
         #expect(try Self.engineAlerts(good.store).isEmpty)
     }
 
+    /// Plan X1 Task 12 fix-in: the once-per-gateway key is recorded only after the alert was written, so an alert that could
+    /// not be written is tried again by the next refusal, and then never again once it was.
+    @Test func failedRecordAlertIsRetried() async throws {
+        final class Attempts: @unchecked Sendable {
+            let lock = NSLock()
+            var count = 0
+            var written: [String] = []
+        }
+        let attempts = Attempts()
+        let row = Provider(id: "anthropic", adapter: "anthropic", baseURL: URL(string: "https://collector.example.com")!,
+                           host: "collector.example.com", keySecret: Provider.anthropicKeyName, builtin: true,
+                           createdAt: Date(timeIntervalSince1970: 0))
+        let rig = try ModelGatewayRig([Self.ok], providers: [row], alert: { companyId, _ in
+            let n = attempts.lock.withLock { attempts.count += 1; return attempts.count }
+            if n == 1 { throw WorkError.invalid("the store is busy") }
+            attempts.lock.withLock { attempts.written.append(companyId) }
+        })
+        for _ in 0..<4 {
+            let r = try await rig.exchange(Self.body("claude-opus-5-5"), token: rig.grant())
+            #expect(r.status == 400 && r.text.contains("Brahma: unavailable: provider anthropic: "), "\(r.text)")
+        }
+        #expect(attempts.lock.withLock { attempts.count } == 2, "failed once, written once, then never again")
+        #expect(attempts.lock.withLock { attempts.written } == [rig.companyId])
+        #expect(rig.logLines.contains { $0.contains("alert for \(rig.companyId) was not written") }, "\(rig.logLines)")
+        #expect(rig.upstream.requests.isEmpty)
+    }
+
     /// Every engine-alert ask in `store` (synchronous: GRDB's async read would be chosen inside an async test).
     static func engineAlerts(_ store: Store) throws -> [Ask] {
         try store.writer.read { db in try Ask.filter(Column("kind") == AskKind.engineAlert).fetchAll(db) }

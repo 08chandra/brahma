@@ -22,9 +22,12 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     public let registry: TurnTokenRegistry
     private let providers: @Sendable (String) throws -> Provider?
     private let isTestSecret: @Sendable (_ companyId: String, _ name: String) throws -> Bool
-    private let alert: @Sendable (_ companyId: String, _ text: String) -> Void
+    private let alert: @Sendable (_ companyId: String, _ text: String) throws -> Void
     /// `companyId|provider|reason` of every provider-record alert raised: each is raised once per gateway, not per request.
+    /// A key joins only once its alert was written, so one that failed is raised again by the next refused request.
     private var alerted: Set<String> = []
+    /// The keys whose alert is being written now: a concurrent refusal does not write a second one.
+    private var alerting: Set<String> = []
     private let adapters: [AdapterId: any ProviderAdapter]
     private let upstream: any UpstreamTransport
     private let vault: any SecretVault
@@ -42,7 +45,7 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     /// line per refused, failed or served request (never a key); `meter` reserves and settles every request sent upstream.
     public convenience init(registry: TurnTokenRegistry, providers: @escaping @Sendable (String) throws -> Provider?,
                             isTestSecret: @escaping @Sendable (String, String) throws -> Bool,
-                            alert: @escaping @Sendable (_ companyId: String, _ text: String) -> Void,
+                            alert: @escaping @Sendable (_ companyId: String, _ text: String) throws -> Void,
                             adapters: [any ProviderAdapter] = [AnthropicAdapter(), OpenAICompatibleAdapter()], upstream: any UpstreamTransport,
                             vault: any SecretVault,
                             meter: GatewayMeter, log: @escaping @Sendable (String) -> Void = { _ in }) {
@@ -52,7 +55,7 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
 
     init(registry: TurnTokenRegistry, providers: @escaping @Sendable (String) throws -> Provider?,
          isTestSecret: @escaping @Sendable (String, String) throws -> Bool,
-         alert: @escaping @Sendable (_ companyId: String, _ text: String) -> Void, adapters: [any ProviderAdapter],
+         alert: @escaping @Sendable (_ companyId: String, _ text: String) throws -> Void, adapters: [any ProviderAdapter],
          upstream: any UpstreamTransport, vault: any SecretVault, meter: GatewayMeter, maxUpstream: Int,
          log: @escaping @Sendable (String) -> Void) {
         self.registry = registry; self.providers = providers; self.isTestSecret = isTestSecret; self.alert = alert
@@ -267,18 +270,33 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     }
 
     /// Ruling X1-38: a provider record the rules refuse is an engine alert for the turn's company, raised once per
-    /// (company, provider, reason) for this gateway's life — `claude` retries a refusal, and the owner needs one alert.
+    /// (company, provider, reason) for this gateway's life — `claude` retries a refusal, and the owner needs one alert. The
+    /// key is recorded only after the alert was written (Plan X1 Task 12 fix-in), so an alert that failed is tried again by
+    /// the next refused request; the refusal stands either way.
     private func raiseRecordAlert(companyId: String, provider: String, reason: String) {
-        let first = lock.withLock { alerted.insert("\(companyId)|\(provider)|\(reason)").inserted }
-        guard first else { return }
-        alert(companyId, "The gateway refused provider \(provider): \(reason). Its record breaks the provider rules "
-              + "`brahma providers add` enforces, so it was changed outside Brahma (a restore, a direct write or an older version). "
-              + "No request was sent and its key was not read. Check `brahma providers` and fix or remove it.")
+        let key = "\(companyId)|\(provider)|\(reason)"
+        let start = lock.withLock { !alerted.contains(key) && alerting.insert(key).inserted }
+        guard start else { return }
+        let written: Bool
+        do {
+            try alert(companyId, "The gateway refused provider \(provider): \(reason). Its record breaks the provider rules "
+                      + "`brahma providers add` enforces, so it was changed outside Brahma (a restore, a direct write or an older version). "
+                      + "No request was sent and its key was not read. Check `brahma providers` and fix or remove it.")
+            written = true
+        } catch {
+            log("gateway: the provider-record alert for \(companyId) was not written (\(error)); the next refusal tries again")
+            written = false
+        }
+        lock.withLock {
+            alerting.remove(key)
+            if written { alerted.insert(key) }
+        }
     }
 
     /// The production `alert`: `EngineAlerts.raise` for the company (an owner DM, an activity error and one `engineAlert` ask,
-    /// reason `EngineAlerts.providerRecordReason`). An alert that cannot be written is logged; the refusal stands either way.
-    public static func engineAlerts(store: Store, log: @escaping @Sendable (String) -> Void) -> @Sendable (String, String) -> Void {
+    /// reason `EngineAlerts.providerRecordReason`). An alert that cannot be written is logged and thrown, so the gateway tries
+    /// it again; the refusal stands either way.
+    public static func engineAlerts(store: Store, log: @escaping @Sendable (String) -> Void) -> @Sendable (String, String) throws -> Void {
         { companyId, text in
             do {
                 try EngineAlerts.raise(store: store, text: text, now: Store.now(), reason: EngineAlerts.providerRecordReason,
@@ -286,6 +304,7 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
                 log("gateway: engine alert raised for \(companyId): \(text)")
             } catch {
                 log("gateway: the engine alert for \(companyId) could not be raised (\(error)): \(text)")
+                throw error
             }
         }
     }

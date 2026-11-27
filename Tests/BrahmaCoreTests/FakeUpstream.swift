@@ -163,7 +163,8 @@ final class ModelGatewayRig: @unchecked Sendable {
     init(_ script: [FakeUpstream.Reply], providers: [Provider] = [AnthropicFixture.provider()], storeKey: Bool = true,
          caps: ProviderCaps? = ProviderCaps(monthlyUSD: 1000), capped: [String] = ["anthropic"],
          maxUpstream: Int = GatewayLimits.maxUpstreamRequests, adapters: [any ProviderAdapter] = [AnthropicAdapter()],
-         prices: [PriceRow] = [], isTestSecret: (@Sendable (String, String) throws -> Bool)? = nil) throws {
+         prices: [PriceRow] = [], isTestSecret: (@Sendable (String, String) throws -> Bool)? = nil,
+         alert: (@Sendable (String, String) throws -> Void)? = nil) throws {
         upstream = FakeUpstream(script)
         vaultReads = ScriptedVault(inner: vault)
         store = try Store.inMemory()
@@ -179,7 +180,7 @@ final class ModelGatewayRig: @unchecked Sendable {
             hook?()
             return byId[id]
         }, isTestSecret: isTestSecret ?? { [store] companyId, name in try store.isTestSecret(companyId: companyId, name: name) },
-           alert: ModelGateway.engineAlerts(store: store, log: log),
+           alert: alert ?? ModelGateway.engineAlerts(store: store, log: log),
            adapters: adapters, upstream: upstream, vault: vaultReads, meter: meter, maxUpstream: maxUpstream, log: log)
         // Connection deadlines on a clock that stands still: no load can time a connection out (Ruling 44).
         server = GatewayServer(registry: registry, handler: gateway, timing: .pinned, clock: ManualAwakeClock(), beforeDispatch: nil)

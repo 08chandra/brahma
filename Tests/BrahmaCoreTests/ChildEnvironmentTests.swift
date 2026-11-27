@@ -201,10 +201,13 @@ private let turnToken = String(repeating: "0123456789abcdef", count: 4)
     @Test func extraNeverPassesAProviderKeyName() {
         let providerKey = ["sk", "ant", "provider"].joined(separator: "-")
         let extra = ["BRAHMA_AGENT_ID": "a1", "BRAHMA_KEY_OPENROUTER": providerKey, "BRAHMA_KEY_" + String(repeating: "B", count: 40): providerKey,
-                     "BRAHMA_KEYS": "plain"]
+                     "BRAHMA_KEYS": "plain",
+                     // Task 12 fix-in: the whole prefix, names `Provider.isKeyName` would not call a key name included.
+                     "BRAHMA_KEY_": providerKey, "BRAHMA_KEY_lower": providerKey, "BRAHMA_KEY_" + String(repeating: "C", count: 90): providerKey]
         for purpose in [ChildEnvironment.Purpose.claude, .general, .check] {
             let env = ChildEnvironment.make(base: ["PATH": "/bin"], extra: extra, purpose: purpose)
             #expect(!env.keys.contains { Provider.isKeyName($0) }, "\(purpose): \(env.keys.sorted())")
+            #expect(!env.keys.contains { $0.hasPrefix(Provider.keyNamePrefix) }, "\(purpose): \(env.keys.sorted())")
             #expect(!env.values.contains(providerKey))
             #expect(env["BRAHMA_AGENT_ID"] == "a1" && env["BRAHMA_KEYS"] == "plain", "\(purpose)")
         }

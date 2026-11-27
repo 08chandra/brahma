@@ -36,8 +36,10 @@ public enum ProviderHost {
     public static let keyDomains: [String: String] = [
         "BRAHMA_KEY_OPENAI": "openai.com", "BRAHMA_KEY_OPENROUTER": "openrouter.ai", "BRAHMA_KEY_GROQ": "groq.com",
     ]
-    /// Names that only resolve on a private network or this machine (RFC 6761/6762/8375 and common private zones).
-    static let privateSuffixes = ["localhost", "local", "internal", "home.arpa", "lan", "intranet", "corp", "localdomain"]
+    /// Names that only resolve on a private network or this machine, or never resolve publicly (RFC 2606/6761/6762/8375, the
+    /// infrastructure `.arpa` zone and common private zones).
+    static let privateSuffixes = ["localhost", "local", "internal", "home.arpa", "lan", "intranet", "corp", "localdomain",
+                                  "home", "test", "example", "invalid", "mail", "arpa"]
 
     /// The host `baseURL` pins for `adapter`, or why the record is refused; `keySecret` must be bound to that host. Makes no
     /// network call.

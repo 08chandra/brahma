@@ -71,9 +71,10 @@ public enum ChildEnvironment {
             env[name] = value
         }
         // Never the MCP server's per-turn token: it lives only in that server's env block (fix round 1, I2(d)). Never a
-        // provider key name either (Plan X1 Ruling 61 m4): `BRAHMA_KEY_*` is the gateway's, whatever the caller put in `extra`.
+        // provider key name either (Plan X1 Ruling 61 m4): the whole `BRAHMA_KEY_` prefix is the gateway's, whatever the caller
+        // put in `extra`, well-formed key name or not (Task 12 fix-in).
         for (name, value) in extra where name.hasPrefix("BRAHMA_") && name != "BRAHMA_DEV" && name != MCPConfig.tokenVariable
-            && !Provider.isKeyName(name) {
+            && !name.hasPrefix(Provider.keyNamePrefix) && !Provider.isKeyName(name) {
             env[name] = value
         }
         if purpose == .claude {

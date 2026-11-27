@@ -64,9 +64,14 @@ import Foundation
         let notAName = "a provider's base URL must name its host, never an IP address or localhost"
         for url in ["https://localhost/v1", "https://a.localhost/v1", "https://printer.local/v1", "https://llm.internal/v1",
                     "https://nas.home.arpa/v1", "https://box.lan/v1", "https://wiki.intranet/v1", "https://ai.corp/v1",
-                    "https://LLM.Internal/v1", "https://gpu.localdomain/v1", "https://llm/v1"] {
+                    "https://LLM.Internal/v1", "https://gpu.localdomain/v1", "https://llm/v1",
+                    // Plan X1 Task 12 fix-in: names that never resolve publicly.
+                    "https://nas.home/v1", "https://llm.test/v1", "https://api.example/v1", "https://llm.invalid/v1",
+                    "https://llm.mail/v1", "https://1.0.0.127.in-addr.arpa/v1", "https://x.ip6.arpa/v1"] {
             #expect(Self.refusal(url) == notAName, "\(url)")
         }
+        #expect(Self.validate("https://home.example.com/v1") == .success("home.example.com"), "only the suffix counts")
+        #expect(Self.validate("https://api.testing.com/v1") == .success("api.testing.com"))
         #expect(Self.validate("https://local.example.com/v1") == .success("local.example.com"), "only the suffix counts")
         #expect(Self.validate("https://api.corporate.com/v1") == .success("api.corporate.com"))
         for url in ["https://api.example.com:00443/v1", "https://api.example.com:/v1", "https://api.example.com:0443"] {
