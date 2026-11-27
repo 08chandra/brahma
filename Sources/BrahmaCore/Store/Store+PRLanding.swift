@@ -10,13 +10,23 @@ extension Store {
     static let prAbandonOwnerOnly = "only the owner can abandon a PR landing"
 
     /// Starts (or restarts) the item's landing for `sha` at `pushing`. The same commit again is idempotent: an open landing is
-    /// left as it is (true: carry on), a closed one stays closed (false). A new commit — the item was resubmitted — restarts at
+    /// left as it is (true: carry on), a closed one stays closed (false) — except one GitHub sent back (`checksFailed`,
+    /// `changesRequested`, Task 4 fix round 1): the item was resubmitted unchanged (a check re-run, a review answered), so the
+    /// landing is `open` again and its checks and reviews are read anew. A new commit — the item was resubmitted — restarts at
     /// `pushing` on the landing's branch, keeping its PR while that is open (the PR follows the branch), and voids every owner
     /// card for an older commit.
     func beginPRLanding(item: WorkItem, sha: String, branch: String, now: Date) throws -> Bool {
         try writer.write { db in
             let existing = try PRLanding.fetchOne(db, key: item.id)
-            if let existing, existing.pushedSHA == sha { return existing.state.isOpen }
+            if var existing, existing.pushedSHA == sha {
+                if existing.state == .checksFailed || existing.state == .changesRequested {
+                    existing.state = .open
+                    existing.lastError = nil
+                    existing.updatedAt = now
+                    try existing.save(db)
+                }
+                return existing.state.isOpen
+            }
             var landing = existing ?? PRLanding(itemId: item.id, companyId: item.companyId, branch: branch, pushedSHA: sha, state: .pushing,
                                                 updatedAt: now)
             if let existing, !existing.state.isOpen {
@@ -108,7 +118,8 @@ extension Store {
     }
 
     /// Owner only (Ruling 21). Ends the item's open landing (`abandoned`, with the owner's reason) and voids its owner cards;
-    /// nothing is closed or deleted on GitHub.
+    /// nothing is closed or deleted on GitHub. Task 4 fix round 1: the item's merge request handed to the PR is bounced and the
+    /// item goes back to its holder (it did not land; nothing stays locked in review), and the landing's hold alert resolves.
     public func abandonPRLanding(itemId: String, reason: String, by sender: Sender, now: Date = Store.now()) throws {
         guard sender == .owner else { throw WorkError.forbidden(Self.prAbandonOwnerOnly) }
         try writer.write { db in
@@ -120,6 +131,11 @@ extension Store {
             landing.updatedAt = now
             try landing.save(db)
             try voidPRActionCards(db, itemId: itemId, keepingSHA: nil, now: now)
+            if let item = try WorkItem.fetchOne(db, key: itemId) {
+                _ = try releaseHandedToPR(db, item: item, sha: nil, failure: nil,
+                                          detail: "the owner abandoned the item's pull request landing; it did not land", now: now)
+            }
+            try resolveEngineAlerts(db, reasons: try Self.openPRHoldAlertReasons(db, itemId: itemId), now: now)
         }
     }
 }

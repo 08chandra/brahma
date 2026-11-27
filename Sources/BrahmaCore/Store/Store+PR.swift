@@ -79,6 +79,8 @@ extension Store {
     /// already listed, in any case, keeps the first record.
     public func addTrustedLogin(_ login: String, companyId: String, by sender: Sender, now: Date = Store.now()) throws {
         guard sender == .owner else { throw WorkError.forbidden(Self.prOwnerOnly) }
+        // Fix round 1: a non-ASCII login could fold onto an ASCII one (U+212A KELVIN SIGN lowercases to `k`); checked as typed.
+        guard TrustList.isASCII(login) else { throw WorkError.invalid("a login is ASCII letters, digits and punctuation") }
         let login = TrustList.normalize(login)
         guard !login.isEmpty, login.unicodeScalars.allSatisfy({ !CharacterSet.whitespacesAndNewlines.contains($0) }) else {
             throw WorkError.invalid("a login has no spaces")

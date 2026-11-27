@@ -8,14 +8,18 @@ public struct TrustList: Equatable, Sendable {
     private let logins: Set<String>
 
     public init(logins: [String]) {
-        self.logins = Set(logins.map(Self.normalize).filter { !$0.isEmpty })
+        self.logins = Set(logins.filter(Self.isASCII).map(Self.normalize).filter { !$0.isEmpty })
     }
 
-    /// Whether `login` is on the list. An empty login never is.
+    /// Whether `login` is on the list. An empty login never is, nor one with a non-ASCII character (fix round 1: Unicode case
+    /// folding maps look-alikes such as U+212A KELVIN SIGN onto ASCII letters; GitHub logins are ASCII).
     public func isTrusted(login: String) -> Bool {
         let key = Self.normalize(login)
-        return !key.isEmpty && logins.contains(key)
+        return !key.isEmpty && Self.isASCII(login) && logins.contains(key)
     }
+
+    /// Every scalar is ASCII.
+    public static func isASCII(_ login: String) -> Bool { login.unicodeScalars.allSatisfy(\.isASCII) }
 
     /// The form logins are stored and compared in: trimmed and lowercased.
     public static func normalize(_ login: String) -> String {

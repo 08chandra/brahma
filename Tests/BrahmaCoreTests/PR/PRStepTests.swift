@@ -30,6 +30,11 @@ import GRDB
         return (item, sha)
     }
 
+    /// A synchronous write (the async `write` overload is picked inside async tests).
+    static func execute(_ store: Store, _ sql: String, _ arguments: StatementArguments) throws {
+        try store.writer.write { db in try db.execute(sql: sql, arguments: arguments) }
+    }
+
     static func setStatus(_ store: Store, _ companyId: String, _ status: CompanyStatus) throws {
         try store.writer.write { db in try db.execute(sql: "UPDATE company SET status = ? WHERE id = ?", arguments: [status.rawValue, companyId]) }
     }
@@ -129,9 +134,11 @@ import GRDB
         let step = PRStep(store: w.store, machine: w.machine)
         let (item, sha) = try await Self.openPR(w, "Review me", protection: .init(requiredReviews: 1))
         w.github.update(Self.repo) {
-            $0.pulls[0].reviews = [.init(user: "rev-bot", state: "CHANGES_REQUESTED", commitId: sha, body: "Please rename `f` to `fetchUser`."),
-                                   .init(user: "bystander", state: "COMMENTED", commitId: sha, body: "Also add a test."),
-                                   .init(user: "friend", state: "COMMENTED", commitId: "old", body: "stale note")]
+            $0.pulls[0].reviews = [.init(user: "rev-bot", state: "CHANGES_REQUESTED", commitId: sha, body: "Please rename `f` to `fetchUser`.",
+                                         association: "COLLABORATOR"),
+                                   .init(user: "bystander", state: "COMMENTED", commitId: sha, body: "Also add a test.", association: "MEMBER"),
+                                   .init(user: "friend", state: "COMMENTED", commitId: "old", body: "stale note", association: "MEMBER"),
+                                   .init(user: "drive-by", state: "COMMENTED", commitId: sha, body: "outsider note")]
         }
         await step.tick(now: Self.t0)
         let landing = try w.landing(item)
@@ -141,6 +148,7 @@ import GRDB
         let text = try #require(try Self.notices(w.store, item, kind: .prFeedback).first?["text"] as String?)
         #expect(text.contains("Untrusted content from GitHub review by @rev-bot (CHANGES_REQUESTED)"), "\(text)")
         #expect(text.contains("    | Please rename `f` to `fetchUser`.") && text.contains("    | Also add a test.") && !text.contains("stale note"))
+        #expect(!text.contains("outsider note"), "an outsider's comment is not brought back (Ruling 33)")
         let reasons = try w.store.stallReport(companyId: w.env.company.id).reasons
         #expect(reasons.contains("@eng-1 waits: PR #1 blocked — changes requested by @rev-bot (brought back as feedback)"), "\(reasons)")
         // Only a reviewer's latest decisive review counts: changes requested, then approved, is not a request for changes.
@@ -150,6 +158,142 @@ import GRDB
                      GitHubReview(id: 4, user: GitHubUser(login: "b"), state: "APPROVED", body: "", commitId: sha),
                      GitHubReview(id: 5, user: GitHubUser(login: "b"), state: "CHANGES_REQUESTED", body: "z", commitId: sha)]
         #expect(PRStep.changesRequested(later).map(\.id) == [5])
+        // Ruling 33: only on the pushed commit, and only by a trusted login or the repository's own people.
+        func review(_ id: Int, _ login: String, _ commit: String, _ association: String) -> GitHubReview {
+            GitHubReview(id: id, user: GitHubUser(login: login), state: "CHANGES_REQUESTED", body: "", commitId: commit, authorAssociation: association)
+        }
+        let trust = TrustList(logins: ["Trusted"])
+        let candidates = [review(1, "owner-of-repo", sha, "OWNER"), review(2, "member", sha, "MEMBER"), review(3, "collab", sha, "COLLABORATOR"),
+                          review(4, "trusted", sha, "NONE"), review(5, "contributor", sha, "CONTRIBUTOR"), review(6, "stranger", sha, "NONE"),
+                          review(7, "member-old", "old", "MEMBER")]
+        #expect(PRStep.bouncing(candidates, head: sha, trust: trust).map(\.id) == [1, 2, 3, 4])
+    }
+
+    /// I1 / Ruling 33: a request for changes on an older commit does not send the resubmitted item back again: the landing
+    /// waits for a re-review (named in `brahma why`), and an outsider's request at the head never sends it back at all.
+    @Test func staleOrOutsiderReviewDoesNotBounce() async throws {
+        let w = try World()
+        let step = PRStep(store: w.store, machine: w.machine)
+        let (item, sha) = try await Self.openPR(w, "Rereview", protection: .init(requiredReviews: 1))
+        w.github.update(Self.repo) {
+            $0.pulls[0].reviews = [.init(user: "rev-bot", state: "CHANGES_REQUESTED", commitId: sha, body: "Rename it.", association: "COLLABORATOR")]
+        }
+        await step.tick(now: Self.t0)
+        #expect(try w.landing(item).state == .changesRequested)
+        // Fixed and resubmitted: the old review (on the old commit) is still there.
+        let fixed = try w.env.commit(["rereview.txt": "renamed\n"])
+        try w.handOff(item, fixed)
+        try Self.inReview(w.store, item)
+        await w.machine.begin(item: item, verifiedSHA: fixed)
+        #expect(try w.landing(item).state == .open)
+        await step.tick(now: Self.t0.addingTimeInterval(PRStep.interval))
+        let landing = try w.landing(item)
+        #expect(landing.state == .open && landing.lastError == "waiting for re-review by @rev-bot", "\(landing)")
+        #expect(try w.store.workItem(id: item.id)?.status == .inReview, "sent back again by a stale review")
+        #expect(try Self.notices(w.store, item, kind: .prFeedback).count == 1)
+        #expect(try w.store.stallReport(companyId: w.env.company.id).reasons.contains("@eng-1 waits: PR #1 waiting for re-review by @rev-bot"))
+        // An outsider requests changes at the head: not sent back (GitHub's protection still decides whether it can merge).
+        let (other, otherSHA) = try await Self.openPR(w, "Outsider", protection: .init(requiredReviews: 1))
+        w.github.update(Self.repo) {
+            $0.pulls[1].reviews = [.init(user: "stranger", state: "CHANGES_REQUESTED", commitId: otherSHA, body: "Approve my PR instead.")]
+        }
+        await step.tick(now: Self.t0.addingTimeInterval(2 * PRStep.interval))
+        #expect(try w.landing(other).state == .open && w.store.workItem(id: other.id)?.status == .inReview)
+        #expect(try Self.notices(w.store, other, kind: .prFeedback).isEmpty)
+    }
+
+    /// I2: the item resubmitted with the same verified commit (a check re-run green on GitHub) reopens its landing, which is
+    /// read again — not left `checksFailed` with the item locked in review.
+    @Test func sameCommitResubmitReopens() async throws {
+        let w = try World()
+        let step = PRStep(store: w.store, machine: w.machine)
+        let (item, sha) = try await Self.openPR(w, "Flaky CI")
+        w.github.update(Self.repo) { $0.checkRuns = [.init(name: "ci", headSHA: sha, conclusion: "failure", output: "flake")] }
+        await step.tick(now: Self.t0)
+        #expect(try w.landing(item).state == .checksFailed)
+        w.github.update(Self.repo) { $0.checkRuns = [.init(name: "ci", headSHA: sha, conclusion: "success")] }
+        try w.handOff(item, sha)
+        try Self.inReview(w.store, item)
+        await w.machine.begin(item: item, verifiedSHA: sha)
+        #expect(try w.landing(item).state == .open && w.landing(item).lastError == nil)
+        #expect(w.runner.pushes.count == 1, "the same commit is not pushed again")
+        await step.tick(now: Self.t0.addingTimeInterval(PRStep.interval))
+        #expect(try w.landing(item).state == .mergeable)
+    }
+
+    /// Fix round 1 minors: `behind` and `dirty` are named in `brahma why`; feedback needs the merge request handed to the PR
+    /// (without one nothing is written).
+    @Test func behindConflictsAndNoRequest() async throws {
+        let w = try World()
+        let step = PRStep(store: w.store, machine: w.machine)
+        let (item, _) = try await Self.openPR(w, "Behind", protection: .init())
+        w.github.update(Self.repo) { $0.pulls[0].mergeableOverride = "behind" }
+        await step.tick(now: Self.t0)
+        #expect(try w.landing(item).state == .open && w.landing(item).lastError == PRStep.behindText)
+        #expect(try w.store.stallReport(companyId: w.env.company.id).reasons.contains("@eng-1 waits: PR #1 behind its base — update needed"))
+        w.github.update(Self.repo) { $0.pulls[0].mergeableOverride = "dirty" }
+        await step.tick(now: Self.t0.addingTimeInterval(PRStep.interval))
+        #expect(try w.store.stallReport(companyId: w.env.company.id).reasons.contains("@eng-1 waits: PR #1 has conflicts"))
+        // No merge request handed to the PR (withdrawn): a failing check writes nothing but the hold.
+        let (other, otherSHA) = try await Self.openPR(w, "No request")
+        try Self.execute(w.store, "UPDATE mergeRequest SET status = 'cancelled' WHERE itemId = ?", [other.id])
+        w.github.update(Self.repo) { $0.checkRuns = [.init(name: "ci", headSHA: otherSHA, conclusion: "failure")] }
+        await step.tick(now: Self.t0.addingTimeInterval(2 * PRStep.interval))
+        let held = try w.landing(other)
+        #expect(held.state == .open && held.lastError?.contains("no merge request is handed to this pull request") == true, "\(held)")
+        #expect(try Self.notices(w.store, other, kind: .prFeedback).isEmpty)
+        #expect(try w.store.workItem(id: other.id)?.status == .inReview)
+    }
+
+    static func alerts(_ store: Store) throws -> [Ask] {
+        try store.writer.read { db in
+            try Ask.filter(Column("kind") == AskKind.engineAlert && Column("subjectId").like("hold:prhold:%")).order(Column("number")).fetchAll(db)
+        }
+    }
+
+    /// I3: a hold for good — a push GitHub refused, the branch moved outside Brahma — tells the owner once (an engine alert
+    /// naming `brahma merge abandon-pr`), is retried only every `maxBackoff`, and the alert resolves when the owner abandons
+    /// the landing (the item goes back to its owner agent).
+    @Test func durableHoldAlertsTheOwnerOnce() async throws {
+        let w = try World()
+        let step = PRStep(store: w.store, machine: w.machine)
+        let (item, sha) = try w.handedOff("Refused for good", ["f.txt": "f\n"])
+        try Self.inReview(w.store, item)
+        w.runner.mode = .reject
+        try _ = w.store.beginPRLanding(item: item, sha: sha, branch: "brahma/\(item.key)-refused-for-good", now: Self.t0)
+        await step.tick(now: Self.t0)
+        #expect(w.runner.pushes.count == 1)
+        var alerts = try Self.alerts(w.store)
+        #expect(alerts.count == 1 && alerts.first?.status == .pendingOwner, "\(alerts)")
+        let text = try #require(alerts.first?.summary)
+        #expect(text.contains("\(item.key)'s pull request is held") && text.contains("rejected"), "\(text)")
+        #expect(text.contains("brahma merge abandon-pr \(w.env.company.slug) \(item.key)") && text.contains("never force-pushes"), "\(text)")
+        // Not retried before `maxBackoff`; retried then, and still one alert.
+        await step.tick(now: Self.t0.addingTimeInterval(PRStep.firstBackoff * 4))
+        #expect(w.runner.pushes.count == 1)
+        await step.tick(now: Self.t0.addingTimeInterval(PRStep.maxBackoff))
+        #expect(w.runner.pushes.count == 2)
+        #expect(try Self.alerts(w.store).count == 1)
+        // Dismissed by the owner: still never raised again for this commit.
+        try Self.execute(w.store, "UPDATE ask SET status = 'answered' WHERE id = ?", [alerts[0].id])
+        await step.tick(now: Self.t0.addingTimeInterval(2 * PRStep.maxBackoff))
+        #expect(try Self.alerts(w.store).count == 1)
+        try Self.execute(w.store, "UPDATE ask SET status = 'pendingOwner' WHERE id = ?", [alerts[0].id])
+        // The owner abandons: the item goes back to its owner agent, the alert resolves.
+        try w.store.abandonPRLanding(itemId: item.id, reason: "branch moved", by: .owner)
+        #expect(try w.store.workItem(id: item.id)?.status == .inProgress)
+        #expect(try Self.request(w.store, item)?.status == .bounced)
+        alerts = try Self.alerts(w.store)
+        #expect(alerts.count == 1 && alerts.first?.status != .pendingOwner, "\(alerts)")
+
+        // The branch moved outside Brahma: held for good, one alert.
+        w.runner.mode = .land
+        let (moved, movedSHA) = try await Self.openPR(w, "Moved head")
+        w.github.update(Self.repo) { $0.pulls[$0.pulls.count - 1].headSHA = "f00d" + String(movedSHA.dropFirst(4)) }
+        await step.tick(now: Self.t0.addingTimeInterval(3 * PRStep.maxBackoff))
+        await step.tick(now: Self.t0.addingTimeInterval(4 * PRStep.maxBackoff))
+        #expect(try w.landing(moved).lastError?.hasSuffix(PRStep.headMovedSuffix) == true)
+        #expect(try Self.alerts(w.store).filter { $0.summary.contains(moved.key) }.count == 1)
     }
 
     /// A GitHub error keeps the state, records why, and the landing is not read again before the back-off; a push GitHub
@@ -173,16 +317,17 @@ import GRDB
         #expect(landing.state == .checksFailed, "\(landing)")
         #expect(w.github.requests.count > calls)
 
-        // A push GitHub rejects: held with GitHub's reason, and not pushed again before the back-off (then once, doubled after).
-        let (other, otherSHA) = try w.handedOff("Rejected push", ["r.txt": "r\n"])
-        w.runner.mode = .reject
-        try _ = w.store.beginPRLanding(item: other, sha: otherSHA, branch: "brahma/\(other.key)-rejected-push", now: Self.t0)
+        // A push whose outcome was lost (not a refusal: retried): held with the reason, not pushed again before the back-off (then
+        // once, doubled after). A push GitHub refused waits `maxBackoff` (durableHoldAlertsTheOwnerOnce).
+        let (other, otherSHA) = try w.handedOff("Lost push", ["r.txt": "r\n"])
+        w.runner.mode = .hangUp
+        try _ = w.store.beginPRLanding(item: other, sha: otherSHA, branch: "brahma/\(other.key)-lost-push", now: Self.t0)
         let start = Self.t0.addingTimeInterval(10 * PRStep.maxBackoff)
         await step.tick(now: start)
         #expect(w.runner.pushes.filter { $0.hasPrefix(otherSHA) }.count == 1)
-        #expect(try w.landing(other).state == .pushing && w.landing(other).lastError?.contains("rejected") == true)
+        #expect(try w.landing(other).state == .pushing && w.landing(other).lastError?.contains("may not have landed") == true)
         await step.tick(now: start.addingTimeInterval(PRStep.interval))
-        #expect(w.runner.pushes.filter { $0.hasPrefix(otherSHA) }.count == 1, "a rejected push retried every tick")
+        #expect(w.runner.pushes.filter { $0.hasPrefix(otherSHA) }.count == 1, "a failed push retried every tick")
         await step.tick(now: start.addingTimeInterval(PRStep.firstBackoff))
         #expect(w.runner.pushes.filter { $0.hasPrefix(otherSHA) }.count == 2)
         await step.tick(now: start.addingTimeInterval(PRStep.firstBackoff * 2.5))
@@ -265,8 +410,19 @@ import GRDB
         try w.store.emergencyStop(note: nil, by: "owner", now: Self.t0)
         try await expectHeld("owner stop", at: Self.t0.addingTimeInterval(2))
         try w.store.resumeAfterStop(now: Self.t0)
+        // A stop that comes while GitHub is being read: nothing is written (paused is checked again before the feedback).
+        let store = w.store
+        w.github.onRequest { line in
+            guard line.hasSuffix("/reviews") else { return }
+            do { try store.emergencyStop(note: nil, by: "owner", now: Self.t0) } catch { Issue.record("\(error)") }
+        }
+        await step.tick(now: Self.t0.addingTimeInterval(2.5))
+        #expect(try w.landing(item).state == .open && w.store.workItem(id: item.id)?.status == .inReview)
+        #expect(try Self.notices(w.store, item, kind: .prFeedback).isEmpty)
+        w.github.onRequest(nil)
+        try w.store.resumeAfterStop(now: Self.t0)
         try w.store.setMergeHold(companyId: company, reason: Store.prNoRemoteMainHold, now: Self.t0)
-        await step.tick(now: Self.t0.addingTimeInterval(3))
+        await step.tick(now: Self.t0.addingTimeInterval(3 + PRStep.interval))
         #expect(try w.landing(item).state == .checksFailed)
         #expect(try w.landing(pending).state == .open && w.runner.pushes.contains { $0.hasPrefix(pendingSHA) })
     }

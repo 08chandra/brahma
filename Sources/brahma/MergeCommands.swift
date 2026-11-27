@@ -9,7 +9,7 @@ import BrahmaCore
 struct MergeGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "merge", abstract: "A company's merge queue: list it, change its settings, retry a failed merge, resume a held queue.",
-        subcommands: [List.self, Settings.self, Retry.self, Resume.self, AdoptMain.self], defaultSubcommand: List.self)
+        subcommands: [List.self, Settings.self, Retry.self, Resume.self, AdoptMain.self, AbandonPR.self], defaultSubcommand: List.self)
 
     /// `main <sha7> · batch <n> · <strategy title> · main check: <cmd|none> · landing <local|pr>[ · HELD: <reason>]`.
     static func header(_ c: Company) -> String {
@@ -108,6 +108,25 @@ struct MergeGroup: ParsableCommand {
             print(safe("\(r.ref) is back in the queue as \(fresh?.ref ?? "a new request"); the engine merges it next."))
             // `M-2 queued` for scripts: the new request's ref and status on one line.
             if let fresh { print(safe("\(fresh.ref) \(fresh.status.rawValue)")) }
+        }
+    }
+
+    /// `brahma merge abandon-pr <co> <KEY> [--reason]` (Plan X8 Task 4 fix round 1): the owner gives up on an item's PR landing
+    /// (Ruling 21, `Store.abandonPRLanding`); the item goes back to its owner agent. Nothing is closed or deleted on GitHub.
+    struct AbandonPR: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "abandon-pr", abstract: "Give up on an item's pull request landing (owner only); the item goes back to its owner agent.")
+        @Argument(help: "Company name or slug.") var company: String
+        @Argument(help: "The item's key (ACME-12).") var item: String
+        @Option(help: "Why, for the record.") var reason: String = ""
+
+        func run() throws {
+            try requireOwnerShell()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            guard let i = try store.workItem(companyId: c.id, key: item.uppercased()) else { throw fail("no item \(item)") }
+            do { try store.abandonPRLanding(itemId: i.id, reason: reason, by: .owner) } catch let e as WorkError { throw fail(e.message) }
+            print(safe("\(i.key): PR landing abandoned; nothing was closed on GitHub."))
         }
     }
 

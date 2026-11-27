@@ -16,7 +16,7 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
         /// `output.text`.
         var output = ""
     }
-    struct Review: Equatable { var user: String; var state: String; var commitId: String; var body = "" }
+    struct Review: Equatable { var user: String; var state: String; var commitId: String; var body = ""; var association = "NONE" }
     struct Comment: Equatable { var user: String; var body: String }
     struct IssueRecord: Equatable { var number: Int; var title: String; var body: String; var user: String; var labels: [String]; var state = "open" }
     struct Commit: Equatable { var sha: String; var authorLogin: String?; var verified: Bool }
@@ -33,6 +33,8 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
         var title = ""
         var body = ""
         var maintainerCanModify = false
+        /// A `mergeable_state` GitHub reports whatever the protection says (`dirty`, `unknown`, ...).
+        var mergeableOverride: String? = nil
     }
     struct Repo {
         var visibility: String
@@ -106,6 +108,7 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
     }
 
     private static func mergeableState(_ r: Repo, _ pr: PullRequest) -> String {
+        if let forced = pr.mergeableOverride { return forced }
         if let tip = r.branches[pr.base], tip != pr.baseSHA { return "behind" }
         let approvals = Set(pr.reviews.filter { $0.state == "APPROVED" && $0.commitId == pr.headSHA }.map(\.user)).count
         var latest: [String: String] = [:]
@@ -196,7 +199,8 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
             guard let r = repos[repo] else { throw Failure.notFound("/repos/\(repo.owner)/\(repo.name)") }
             guard let pr = r.pulls.first(where: { $0.number == number }) else { throw Failure.notFound("/pulls/\(number)") }
             return pr.reviews.enumerated().map { i, review in
-                GitHubReview(id: i + 1, user: GitHubUser(login: review.user), state: review.state, body: review.body, commitId: review.commitId)
+                GitHubReview(id: i + 1, user: GitHubUser(login: review.user), state: review.state, body: review.body, commitId: review.commitId,
+                             authorAssociation: review.association)
             }
         }
     }

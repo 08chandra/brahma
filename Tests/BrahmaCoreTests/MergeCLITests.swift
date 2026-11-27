@@ -131,6 +131,32 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(try brahma(["merge", "settings", "Acme"], home: rig.home, env: env).status == 0)
     }
 
+    /// Plan X8 Task 4 fix round 1: `brahma merge abandon-pr` is the owner's way out of a PR landing held for good. An agent's
+    /// shell is refused; the owner's abandons it and the item goes back to its owner agent.
+    @Test func mergeAbandonPR() throws {
+        let rig = try Rig()
+        let (item, request) = try rig.request(1, status: .handedToPR) { $0.candidateCommit = String(repeating: "1", count: 40) }
+        try rig.store.writer.write { db in
+            try db.execute(sql: "UPDATE workItem SET status = 'inReview', mergeState = 'verifying' WHERE id = ?", arguments: [item.id])
+        }
+        try rig.store.upsertPRLanding(PRLanding(itemId: item.id, companyId: rig.company.id, branch: "brahma/\(item.key)",
+                                                pushedSHA: request.headCommit, prNumber: 4, state: .pushing, lastError: "[rejected] (non-fast-forward)",
+                                                updatedAt: Date()))
+        let refused = try brahma(["merge", "abandon-pr", "Acme", item.key], home: rig.home, env: ["BRAHMA_AGENT_ID": rig.agent.id])
+        #expect(refused.status == 1 && refused.stderr.contains("owner commands can't run inside an agent turn"), "\(refused.stderr)")
+        #expect(try rig.store.prLanding(itemId: item.id)?.state == .pushing)
+        let missing = try brahma(["merge", "abandon-pr", "Acme", "ACME-99"], home: rig.home)
+        #expect(missing.status == 1 && missing.stderr.contains("no item ACME-99"), "\(missing.stderr)")
+        let done = try brahma(["merge", "abandon-pr", "Acme", item.key, "--reason", "branch moved"], home: rig.home)
+        #expect(done.status == 0 && done.stdout.contains("\(item.key): PR landing abandoned"), "\(done.stderr)")
+        let landing = try #require(try rig.store.prLanding(itemId: item.id))
+        #expect(landing.state == .abandoned && landing.lastError == "abandoned by the owner: branch moved")
+        #expect(try rig.store.workItem(id: item.id)?.status == .inProgress)
+        #expect(try rig.store.mergeRequest(id: request.id)?.status == .bounced)
+        let again = try brahma(["merge", "abandon-pr", "Acme", item.key], home: rig.home)
+        #expect(again.status == 1 && again.stderr.contains("already abandoned"), "\(again.stderr)")
+    }
+
     @Test func mergeRetryRequeues() throws {
         let rig = try Rig()
         let (item, failed) = try rig.request(1, status: .failed) { $0.failure = .engineError; $0.detail = "git failed 3 times" }

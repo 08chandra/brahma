@@ -47,8 +47,15 @@ public struct GitHubReview: Equatable, Sendable {
     public var body: String
     /// `commit_id`: the head the review was made on.
     public var commitId: String
+    /// `author_association`: `OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`,
+    /// `MANNEQUIN`. Only the first three (or a login on the owner's trust list) can send an item back (Ruling 33).
+    public var authorAssociation: String
 
-    public init(id: Int, user: GitHubUser, state: String, body: String, commitId: String) {
+    public init(id: Int, user: GitHubUser, state: String, body: String, commitId: String, authorAssociation: String = "NONE") {
         self.id = id; self.user = user; self.state = state; self.body = body; self.commitId = commitId
+        self.authorAssociation = authorAssociation
     }
+
+    /// The repository's own people: `OWNER`, `MEMBER`, `COLLABORATOR`.
+    public static let repositoryAssociations: Set<String> = ["OWNER", "MEMBER", "COLLABORATOR"]
 }
