@@ -38,8 +38,8 @@ public enum ContentScan {
     private static func scan(isText: Bool, knownValues: [(name: String, value: String)], chunk: Int,
                              source: (off_t, Int) throws -> [UInt8]) throws -> [ScanFinding] {
         let known = knownValues.filter { $0.value.count >= Redactor.minLength }
-        let needles: [(name: String, forms: [[UInt8]])] = known.map { kv in
-            (kv.name, Redactor.forms(of: kv.value).map { Array($0.utf8) }.filter { !$0.isEmpty })
+        let needles: [(name: String, forms: [[UInt8]])] = try known.map { kv in
+            (kv.name, try Redactor.forms(of: kv.value).map { Array($0.utf8) }.filter { !$0.isEmpty })
         }
         if !isText && needles.isEmpty { return [] }
         let longest = needles.flatMap(\.forms).map(\.count).max() ?? 0
@@ -104,7 +104,7 @@ public enum ContentScan {
             for m in p.regex.matches(in: text, range: whole) where m.range.length > 0 { spans.append((m.range, p.label)) }
         }
         for (name, value) in knownValues where value.count >= Redactor.minLength {
-            for form in Redactor.forms(of: value) where !form.isEmpty {
+            for form in Redactor.scanForms(of: value) where !form.isEmpty {
                 var search = whole
                 while search.length > 0 {
                     let r = ns.range(of: form, options: .literal, range: search)

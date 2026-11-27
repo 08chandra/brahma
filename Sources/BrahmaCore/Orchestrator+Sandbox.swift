@@ -100,7 +100,7 @@ extension Orchestrator {
         if own.isEmpty {
             extensionPlaces.append(reviewDir)
         } else {
-            for name in try SandboxPath.entries(reviewDir.resolvedForSandbox.path) where !own.contains("\(ExtensionLibrary.reviewDir)/\(name)") {
+            for name in try SandboxScope.listedEntries(reviewDir.resolvedForSandbox.path) where !own.contains("\(ExtensionLibrary.reviewDir)/\(name)") {
                 extensionPlaces.append(reviewDir.appending(path: name))
             }
         }

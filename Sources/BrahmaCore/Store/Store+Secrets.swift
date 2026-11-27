@@ -153,15 +153,17 @@ extension Store {
     /// The item is read again inside the write (never the turn context's snapshot, which an engine rebase recorded since
     /// may have overtaken), and an item that is already flagged returns at once: one alert per move, not one per turn.
     func checkBranchContinuity(item: WorkItem, agent: Agent, head: String?, now: Date) throws -> Bool {
-        try writer.write { db in
-            guard let current = try WorkItem.fetchOne(db, key: item.id) else { return false }
-            if current.branchMoved { return false }
-            guard let recorded = current.leaseHeadCommit else { return true }
-            if head == recorded { return true }
-            try flagBranchMoved(db: db, item: current, agent: agent, holderId: agent.id,
-                                why: "its head is \(head?.prefix(7) ?? "gone"), not the recorded \(recorded.prefix(7))", now: now)
-            return false
+        let (held, moved) = try writer.write { db -> (Bool, BranchMoved?) in
+            guard let current = try WorkItem.fetchOne(db, key: item.id) else { return (false, nil) }
+            if current.branchMoved { return (false, nil) }
+            guard let recorded = current.leaseHeadCommit else { return (true, nil) }
+            if head == recorded { return (true, nil) }
+            let moved = try markBranchMoved(db: db, item: current, agent: agent, holderId: agent.id,
+                                            why: "its head is \(head?.prefix(7) ?? "gone"), not the recorded \(recorded.prefix(7))", now: now)
+            return (false, moved)
         }
+        if let moved { try tellBranchMoved(moved, now: now) }
+        return held
     }
 
     /// Removes an item's worktree unless it is leased again (`GitWorkspace.removeWorktree`), and records the engine's own
@@ -257,8 +259,8 @@ extension Store {
     /// head the branch no longer is — a move while nobody held the lease. That is flagged (with no flagged holder, so only an
     /// executive or the owner can re-adopt it), not adopted. An item already flagged keeps its flag and its flagged holder.
     func recordClaimHead(itemId: String, head: String, now: Date) throws {
-        try writer.write { db in
-            guard let item = try WorkItem.fetchOne(db, key: itemId) else { return }
+        let moved = try writer.write { db -> BranchMoved? in
+            guard let item = try WorkItem.fetchOne(db, key: itemId) else { return nil }
             // Plan C2a: where a tainted turn that claimed it starts recording. Only a head the engine recorded and the branch still
             // is (an agent may have moved an unheld branch) is trusted, once per lease and claim; else the record starts at the
             // merge base with `main`.
@@ -271,23 +273,37 @@ extension Store {
             }
             if !item.branchMoved, let recorded = item.leaseHeadCommit, recorded != head,
                let claimantId = try Self.leaseHolderId(db: db, itemId: itemId), let claimant = try Agent.fetchOne(db, key: claimantId) {
-                try flagBranchMoved(db: db, item: item, agent: claimant, holderId: nil,
-                                    why: "it moved while nobody held it: its head is \(head.prefix(7)), not the recorded \(recorded.prefix(7))",
-                                    now: now)
-                return
+                return try markBranchMoved(db: db, item: item, agent: claimant, holderId: nil,
+                                           why: "it moved while nobody held it: its head is \(head.prefix(7)), not the recorded \(recorded.prefix(7))",
+                                           now: now)
             }
             try Self.recordLeaseHead(db: db, itemId: itemId, commit: head)
+            return nil
         }
+        if let moved { try tellBranchMoved(moved, now: now) }
     }
 
     /// Marks the branch moved (see `checkBranchContinuity`) and tells the company.
     func flagBranchMoved(item: WorkItem, agent: Agent, why: String, now: Date) throws {
-        try writer.write { db in try flagBranchMoved(db: db, item: item, agent: agent, holderId: agent.id, why: why, now: now) }
+        let moved = try writer.write { db in try markBranchMoved(db: db, item: item, agent: agent, holderId: agent.id, why: why, now: now) }
+        try tellBranchMoved(moved, now: now)
     }
 
+    /// A branch move just flagged, for `tellBranchMoved`.
+    struct BranchMoved {
+        var item: WorkItem
+        var agent: Agent
+        var flaggedHolder: String?
+        var why: String
+        var text: String
+    }
+
+    /// The flag itself, in the caller's transaction (S4 fix round 1, M9): `branchMoved = 1` (it refuses the submits) and the
+    /// company's activity line, which needs no redaction. Nothing here can fail on the alert: the caller commits this first,
+    /// then `tellBranchMoved` raises in a transaction of its own, so an alert that throws never rolls the flag back.
     /// `holderId` is who held the lease when the move was found (the flagged holder, `branchMovedHolderId`): the agent whose
     /// turn found it; nil for a move while nobody held the item. A flag already set is never overwritten.
-    func flagBranchMoved(db: Database, item: WorkItem, agent: Agent, holderId: String?, why: String, now: Date) throws {
+    func markBranchMoved(db: Database, item: WorkItem, agent: Agent, holderId: String?, why: String, now: Date) throws -> BranchMoved {
         let flagged = holderId
         try db.execute(sql: "UPDATE workItem SET branchMoved = 1, branchMovedHolderId = ? WHERE id = ? AND branchMoved = 0",
                        arguments: [flagged, item.id])
@@ -295,12 +311,22 @@ extension Store {
             ? "item/\(item.key) moved while nobody held it (\(why)); submits are refused until an executive or the owner re-adopts the branch (readopt_branch)"
             : "item/\(item.key) moved outside @\(agent.name)'s turn (\(why)); submits are refused until a manager re-adopts the branch (readopt_branch)"
         try ActivityEvent(companyId: item.companyId, agentId: agent.id, turnId: nil, kind: .error, text: text, createdAt: now).insert(db)
-        if let current = try WorkItem.fetchOne(db, key: item.id) {
-            try recordItemEvent(db: db, item: current, actor: "system", kind: .edited, text: "branch moved outside the holder's turn (\(why))",
-                                alsoNotify: flagged == nil ? [] : [agent.managerId].compactMap { $0 }, now: now)
+        return BranchMoved(item: item, agent: agent, flaggedHolder: flagged, why: why, text: text)
+    }
+
+    /// After the flag is committed: the item's event (notifying the flagged holder's manager) and the engine alert, in a
+    /// transaction of their own. A failure here (the secrets not loaded, the company gone) throws to the caller with the flag
+    /// already in place.
+    func tellBranchMoved(_ moved: BranchMoved, now: Date) throws {
+        try writer.write { db in
+            if let current = try WorkItem.fetchOne(db, key: moved.item.id) {
+                try recordItemEvent(db: db, item: current, actor: "system", kind: .edited,
+                                    text: "branch moved outside the holder's turn (\(moved.why))",
+                                    alsoNotify: moved.flaggedHolder == nil ? [] : [moved.agent.managerId].compactMap { $0 }, now: now)
+            }
+            try EngineAlerts.raise(store: self, db: db, text: "\(moved.item.key): \(moved.text)", now: now,
+                                   reason: Self.branchMovedAlertReason(moved.item.id), scope: .company(moved.item.companyId))
         }
-        try EngineAlerts.raise(store: self, db: db, text: "\(item.key): \(text)", now: now,
-                               reason: Self.branchMovedAlertReason(item.id), scope: .company(item.companyId))
     }
 
     static func branchMovedAlertReason(_ itemId: String) -> String { "branch-moved:\(itemId)" }
@@ -616,7 +642,7 @@ extension Store {
             let details = failures.map { Redactor.Failure(name: $0.meta.name, reason: Store.flat($0.reason, max: 200),
                                                           needsPermission: $0.permission) }.sorted { $0.name < $1.name }
             // A result read before the installed one never replaces it (defence in depth behind the lock).
-            guard redactor.install(loaded: loaded, failed: failures.map(\.meta.name).sorted(),
+            guard try redactor.install(loaded: loaded, failed: failures.map(\.meta.name).sorted(),
                                    version: failures.isEmpty ? version : nil, ticket: ticket, failures: details) else { return nil }
             redactor.recordAttempt(version: version, failed: !failures.isEmpty)
             if failures.isEmpty { _ = redactor.holdEpisode(held: false) }

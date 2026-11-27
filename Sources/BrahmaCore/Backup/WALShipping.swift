@@ -285,6 +285,9 @@ public final class WALShipper: @unchecked Sendable {
         case foreign(pid: Int32)
         /// Two spawns in a row whose start time could not be read; both children were stopped.
         case startUnreadable
+        /// The process table could not be read, so a foreign litestream for this database cannot be ruled out (S4 fix round 1,
+        /// I2): nothing was started.
+        case tableUnreadable
     }
     /// Awake seconds, for how long one run lasted (`ShipperBackoff.healthyRun`); a test seam.
     private let awakeUptime: @Sendable () -> TimeInterval
@@ -332,9 +335,9 @@ public final class WALShipper: @unchecked Sendable {
             let outcome = Self.reapStale(paths: paths, grace: grace)
             if let text = outcome.text { note(text) }
             if case .unprovenLive(let pid, _) = outcome { return .foreign(pid: pid) }
-            if let pid = Self.foreignLitestream(paths: paths, excluding: nil) {
-                note("litestream pid \(pid) is replicating this database and this engine did not start it; WAL shipping is paused until it is stopped")
-                return .foreign(pid: pid)
+            if let blocked = Self.foreignLitestream(paths: paths, excluding: nil) {
+                note(Self.blockedNote(blocked))
+                return blocked
             }
             task = Task.detached { [self] in await supervise() }
             return nil
@@ -342,15 +345,31 @@ public final class WALShipper: @unchecked Sendable {
         if let paused { onPaused?(paused) }
     }
 
-    /// A live `litestream replicate -config <this config>` of this user other than `excluding` (this shipper's own child), or
-    /// nil. Read-only: the table is read and argvs looked at; nothing is signalled. Zombies and this process are skipped.
-    static func foreignLitestream(paths: BrahmaPaths, excluding own: Int32?) -> Int32? {
+    /// What blocks a launch: a live `litestream replicate -config <this config>` of this user other than `excluding` (this
+    /// shipper's own child, `.foreign`), or a process table that cannot be read (`.tableUnreadable`: a foreign one cannot be
+    /// ruled out, so it blocks too, S4 fix round 1, I2); nil when nothing does. Read-only: the table is read and argvs looked
+    /// at; nothing is signalled. Zombies and this process are skipped. `table` is injectable for tests.
+    static func foreignLitestream(paths: BrahmaPaths, excluding own: Int32?,
+                                  table: () -> [ProcessEntry]? = ProcessTable.snapshot) -> PauseReason? {
         let config = WALShipping.configURL(paths: paths).path
         let me = getpid(), uid = getuid()
-        for entry in ProcessTable.snapshot() where entry.uid == uid && !entry.isZombie && entry.pid != me && entry.pid != own && entry.pid > 1 {
-            if let argv = ProcessArguments.of(entry.pid), isLitestream(argv, config: config) { return entry.pid }
+        guard let entries = table() else { return .tableUnreadable }
+        for entry in entries where entry.uid == uid && !entry.isZombie && entry.pid != me && entry.pid != own && entry.pid > 1 {
+            if let argv = ProcessArguments.of(entry.pid), isLitestream(argv, config: config) { return .foreign(pid: entry.pid) }
         }
         return nil
+    }
+
+    /// The log line for a launch `foreignLitestream` blocked.
+    static func blockedNote(_ reason: PauseReason) -> String {
+        switch reason {
+        case .foreign(let pid):
+            "litestream pid \(pid) is replicating this database and this engine did not start it; WAL shipping is paused until it is stopped"
+        case .tableUnreadable:
+            "the process table could not be read, so another litestream for this database cannot be ruled out; WAL shipping is paused"
+        case .startUnreadable:
+            "litestream's start time could not be read twice in a row; WAL shipping is paused"
+        }
     }
 
     /// Whether `start` is supervising a litestream (false before `start`, after `stop`, or while paused on an unproven one).
@@ -395,11 +414,11 @@ public final class WALShipper: @unchecked Sendable {
                     return
                 }
                 // Before every launch (a restart too): a litestream for this database that is not ours pauses shipping.
-                if let pid = Self.foreignLitestream(paths: paths, excluding: nil) {
+                if let blocked = Self.foreignLitestream(paths: paths, excluding: nil) {
                     task = nil
                     lock.unlock()
-                    note("litestream pid \(pid) is replicating this database and this engine did not start it; WAL shipping is paused until it is stopped")
-                    onPaused?(.foreign(pid: pid))
+                    note(Self.blockedNote(blocked))
+                    onPaused?(blocked)
                     continuation.resume(returning: -3)
                     return
                 }
@@ -552,6 +571,10 @@ public final class WALShipper: @unchecked Sendable {
             ("WAL shipping paused",
              "Brahma could not read its own litestream's start time twice in a row and stopped both, so WAL shipping is off. "
              + "Relaunch Brahma to try again.")
+        case .tableUnreadable:
+            ("WAL shipping paused",
+             "Brahma could not read the process table, so it could not rule out another litestream for this database and started "
+             + "none. Relaunch Brahma to try again.")
         }
     }
 

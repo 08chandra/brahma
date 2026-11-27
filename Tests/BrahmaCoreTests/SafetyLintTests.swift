@@ -10,11 +10,15 @@ import Foundation
 /// happens. Same scan style as `EngineGitGuardTests` (comments blanked with its `code`).
 enum SafetyLint {
     enum Rule: String, CaseIterable {
-        case spawn, sandboxPolicy, descriptor, fileAPI, dirWalk, loopbackHTTP, failOpen, alertScope, turnScope
+        case spawn, sandboxPolicy, descriptor, fileAPI, dirWalk, loopbackHTTP, failOpen, alertScope, turnScope, publicBool
 
         /// The code-only pattern (spec §6.8.2). `alertScope` is matched by `alertScopeHits` instead, which reads the argument
         /// list up to the matching `)`. `failOpen` also holds spec §6.7's two other bans (S4): a `catch` with an empty body
-        /// (a comment-only body is empty once comments are blanked) and a `catch` body that ends in `return true`.
+        /// (a comment-only body is empty once comments are blanked; `{ () }` is empty too) and a `catch` body that ends in
+        /// `return true` (also `return (true);`, after nested blocks); the part before a `catch`'s `{` may span lines, and
+        /// `?? (true)` counts as `?? true` (a tuple default such as `?? (false, nil)` does not). `publicBool` is spec §6.7's
+        /// ban on new `public func … -> Bool` in the policy and principal code (Ruling S4-B), a decision there being a
+        /// `Decision`.
         var pattern: String {
             switch self {
             case .spawn: return #"\bProcess\(\)|\bposix_spawn\(|"/usr/bin/env"|\[\s*"git""#
@@ -24,11 +28,28 @@ enum SafetyLint {
             case .dirWalk: return #"enumerator\(at:|contentsOfDirectory\(|\bopendir\(|\bfdopendir\(|\breaddir\("#
             case .loopbackHTTP: return #"URLSessionHTTPProbe|URLSession|HTTPProbing"#
             case .failOpen:
-                return #"\?\?\s*true\b|\?\?\s*false\b|\btry\?|\bcatch\b[^{}\n]*\{\s*\}|\bcatch\b[^{}\n]*\{[^{}]*\breturn\s+true\s*\}"#
+                return #"\?\?\s*(?:true|false)\b|\?\?\s*\(\s*(?:true|false)\s*\)|\btry\?|\bcatch\b[^{}]*\{\s*(?:\(\s*\)\s*)?\}|"#
+                    + #"\bcatch\b[^{}]*\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\breturn\s+\(?\s*true\s*\)?\s*;?\s*\}"#
             case .alertScope: return #"\bEngineAlerts\.raise\("#
             case .turnScope: return #"\bSandboxScope\.forTurn\("#
+            case .publicBool:
+                return #"\bpublic\s+(?:(?:static|class|final|nonisolated|override|mutating|@\w+)\s+)*func\b[^{]*?->\s*Bool\b"#
             }
         }
+
+        /// The only directories a rule scans, when it is scoped (nil: every scanned root). A scoped rule is a zero rule there
+        /// and has no baseline entries.
+        var only: [String]? {
+            switch self {
+            case .publicBool: return Self.policyAndPrincipal
+            case .spawn, .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope:
+                return nil
+            }
+        }
+
+        /// Spec §6.7's policy and principal code: the brief's `Policy/` and `BrahmaCore/Principal/`, and the spec's
+        /// `BrahmaSafety/Principal/` (not created yet; S6 may put the principal model there).
+        static let policyAndPrincipal = ["Sources/BrahmaSafety/Policy/", "Sources/BrahmaSafety/Principal/", "Sources/BrahmaCore/Principal/"]
 
         /// Repo-relative directory prefixes where the rule must have no hit at all; each lies under a `scanned` root. S3 emptied
         /// `Verify/` and `Sandbox/` of spawns (the process primitives and the Seatbelt runtime moved to `BrahmaSafety`); S4
@@ -39,6 +60,7 @@ enum SafetyLint {
             case .spawn: return ["Sources/BrahmaCore/Verify/", "Sources/BrahmaCore/Sandbox/"]
             case .failOpen: return ["Sources/BrahmaSafety/", "Sources/BrahmaCore/Principal/"]
             case .alertScope: return SafetyLint.scanned.map { $0 + "/" }
+            case .publicBool: return Self.policyAndPrincipal
             case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .turnScope:
                 return []
             }
@@ -51,7 +73,7 @@ enum SafetyLint {
             case .spawn:
                 return ["Sources/BrahmaCore/Sandbox/ClaudeSettings.swift":
                             "`ShellPrefix.tools`: the absolute tool paths the agent's shell prefix script runs, as script text; the engine spawns nothing here"]
-            case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope:
+            case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope, .publicBool:
                 return [:]
             }
         }
@@ -75,6 +97,7 @@ enum SafetyLint {
             for (path, text) in try sources(under: dir, root: root) {
                 let code = EngineGitGuardTests.code(text)
                 for rule in Rule.allCases {
+                    if let only = rule.only, !only.contains(where: { path.hasPrefix($0) }) { continue }
                     let found = rule == .alertScope ? alertScopeHits(in: code) : regexHits(in: code, pattern: rule.pattern)
                     out[rule, default: []] += found.map { Hit(path: path, line: $0.line, text: $0.text) }
                 }
@@ -335,6 +358,9 @@ enum SafetyLint {
         for rule in SafetyLint.Rule.allCases {
             #expect(SafetyLint.unscanned(rule.zero).isEmpty, "\(rule.rawValue): \(SafetyLint.unscanned(rule.zero)) is not scanned")
             #expect(SafetyLint.unscanned(Array(rule.zeroExempt.keys)).isEmpty, "\(rule.rawValue): an exemption outside the scan")
+            #expect(SafetyLint.unscanned(rule.only ?? []).isEmpty, "\(rule.rawValue): a scope outside the scan")
+            // A scoped rule is a zero rule wherever it looks.
+            if let only = rule.only { #expect(Set(only) == Set(rule.zero), "\(rule.rawValue): its scope is its zero scope") }
         }
         #expect(SafetyLint.Rule.failOpen.zero.contains("Sources/BrahmaSafety/"), "the kernel is a failOpen zero scope")
         // Whole path components only, with or without the trailing `/`.
@@ -367,6 +393,29 @@ enum SafetyLint {
         #expect(failOpen("do { try f() } catch { log(error) }") == 0)
         #expect(failOpen("do { try f() } catch { return trueish }") == 0)
         #expect(failOpen("let entry? = x; let y = a ?? trueValue") == 0)
+        // S4 fix round 1 (M3): the shapes the first matcher missed, one each, and their near misses.
+        #expect(failOpen("do { try f() } catch { return true; }") == 1, "a trailing semicolon")
+        #expect(failOpen("do { try f() }\ncatch\n{\n    log(error)\n    return true\n}") == 1, "the `{` on the next line")
+        #expect(failOpen("do { try f() } catch let e as Boom\n{\n}") == 1, "an empty body opened on the next line")
+        #expect(failOpen("do { try f() } catch {\n    if bad { log(error) }\n    for x in y { if x { z() } }\n    return true\n}") == 1,
+                "nested blocks before the `return true`")
+        #expect(failOpen("do { try f() } catch { return (true) }") == 1, "a parenthesized `true`")
+        #expect(failOpen("do { try f() } catch { () }") == 1, "an empty tuple is an empty body")
+        #expect(failOpen("let ok = flag ?? (true)\nlet no = flag ?? ( false )") == 2, "a parenthesized default")
+        #expect(failOpen("return row.map { (true, $0) } ?? (false, nil)") == 0, "a tuple default is not a `Bool` default")
+        #expect(failOpen("do { try f() } catch {\n    if bad { return true }\n    log(error)\n}") == 0, "`return true` not last")
+        #expect(failOpen("do { try f() } catch { return (trueish) }") == 0)
+        #expect(failOpen("do { try f() } catch { (log(error)) }") == 0)
+
+        // `publicBool` (Ruling S4-B): a public function returning `Bool`, on one line or several; never an internal one or one
+        // returning a `Decision`.
+        func publicBool(_ code: String) -> Int { SafetyLint.regexHits(in: code, pattern: SafetyLint.Rule.publicBool.pattern).count }
+        #expect(publicBool("public static func isAllowed(_ x: Int) -> Bool { true }") == 1)
+        #expect(publicBool("public func check(\n    _ x: Int\n) throws -> Bool {\n    true\n}") == 1)
+        #expect(publicBool("public nonisolated func ok() -> Bool? { nil }") == 1)
+        #expect(publicBool("func internalCheck() -> Bool { true }") == 0)
+        #expect(publicBool("public func decide() -> Decision<Int> { .deny(\"no\") }\nfunc other() -> Bool { true }") == 0)
+        #expect(publicBool("public var isOK: Bool { true }") == 0)
 
         // The matcher: no `scope:` → a hit; `scope:` anywhere in the argument list, across lines and nested calls → none;
         // parentheses in string literals and interpolations do not end the list early.

@@ -13,8 +13,8 @@ public struct ScanFinding: Equatable, Sendable {
 }
 
 extension SecretScan {
-    static let textCompiled: [(label: String, regex: NSRegularExpression)] = patterns.compactMap { p in
-        (try? NSRegularExpression(pattern: p.ere)).map { (p.label, $0) }
+    static let textCompiled: [(label: String, regex: NSRegularExpression)] = patterns.map { p in
+        (p.label, try! NSRegularExpression(pattern: p.ere))
     }
 
     /// What plain text (a fact to `remember`, a chunk of a dropped file in 6a's `ContentScan`) holds that looks like a secret:
@@ -48,7 +48,7 @@ extension SecretScan {
             for m in p.regex.matches(in: text, range: whole) { add(p.label, m.range.location, known: false) }
         }
         for (name, value) in knownValues where value.count >= Redactor.minLength {
-            for form in Redactor.forms(of: value) where !form.isEmpty {
+            for form in Redactor.scanForms(of: value) where !form.isEmpty {
                 var search = whole
                 while search.length > 0 {
                     let r = ns.range(of: form, options: .literal, range: search)

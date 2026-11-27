@@ -25,26 +25,28 @@ public struct ProcessEntry: Equatable, Sendable {
 
 /// The machine's process table, read without privileges (the owner's own processes are all the engine ever signals).
 public enum ProcessTable {
-    public static func snapshot() -> [ProcessEntry] {
+    /// Every process, or nil when the table could not be read (a failed `sysctl`, a table that kept outgrowing its buffer, an
+    /// unlistable `/proc`). Nil is never "nothing runs": each reader handles it explicitly and fails closed (S4 fix round 1,
+    /// I2): the stop signals every recorded group whose leader still leads it, a turn's sweep is inconclusive, WAL shipping
+    /// does not launch, and `SandboxSweep` reports `tableUnreadable`.
+    public static func snapshot() -> [ProcessEntry]? {
         #if canImport(Darwin)
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
         let stride = MemoryLayout<kinfo_proc>.stride
         for _ in 0..<5 {
             var size = 0
-            guard sysctl(&mib, 3, nil, &size, nil, 0) == 0 else { return [] }
+            guard sysctl(&mib, 3, nil, &size, nil, 0) == 0 else { return nil }
             size += size / 4 + stride * 32
             var buffer = [kinfo_proc](repeating: kinfo_proc(), count: size / stride)
             var got = buffer.count * stride
             if sysctl(&mib, 3, &buffer, &got, nil, 0) == 0 { return buffer.prefix(got / stride).map(entry) }
-            if errno != ENOMEM { return [] }
+            if errno != ENOMEM { return nil }
         }
-        return []
+        return nil
         #else
         let names: [String]
         do { names = try FileManager.default.contentsOfDirectory(atPath: "/proc") } catch {
-            // Not read: the empty table, which every reader takes for "unreadable", never for "nothing runs"
-            // (`SandboxSweep.run`: fail closed, N1), as the Darwin branch's failed `sysctl` does.
-            return []
+            return nil
         }
         return names.compactMap { pid_t($0) }.compactMap(linuxEntry)
         #endif
@@ -198,7 +200,8 @@ public struct SweepResult: Sendable, Equatable {
     /// This run's processes that would not die, and sandboxed same-uid processes newer than the run whose sandbox the kernel
     /// could not read (fail closed).
     public var survivors: [pid_t] = []
-    /// The process table could not be read (empty, or without this process in it): nothing can be ruled out (fail closed, N1).
+    /// The process table could not be read (nil, empty, or without this process in it): nothing can be ruled out (fail closed,
+    /// N1).
     public var tableUnreadable = false
     /// The run must be recorded inconclusive: something could not be killed or classified, or the table could not be read.
     public var inconclusive: Bool { !survivors.isEmpty || tableUnreadable }
@@ -209,7 +212,7 @@ public struct SweepResult: Sendable, Equatable {
 /// started no earlier than the run (`since`), so one that did `POSIX::setsid()` or double-forked out of its process group
 /// cannot outlive the run (B-I4). Shared with Task 1b's turn cleanup (`SandboxProbe`). Each kill re-reads the process and
 /// checks its start time first, so a pid reused meanwhile is never signalled. Fails closed (N1): an unreadable process table
-/// (empty, or missing this process) or an unclassifiable live process is a survivor, and a process whose row cannot be read
+/// (nil, empty, or missing this process) or an unclassifiable live process is a survivor, and a process whose row cannot be read
 /// counts as live (`isAlive`). `snapshot`, `classify` and `alive` are injectable for tests.
 public enum SandboxSweep {
     /// Whether `p` is still the same live process: the same pid with the same start time, not a zombie. A row that could not
@@ -222,7 +225,7 @@ public enum SandboxSweep {
         }
     }
     public static func run(probe: SandboxProbe, since: Double, rounds: Int = 50,
-                    snapshot: () -> [ProcessEntry] = ProcessTable.snapshot,
+                    snapshot: () -> [ProcessEntry]? = ProcessTable.snapshot,
                     classify: ((pid_t) -> SandboxProbe.Match)? = nil,
                     alive: (ProcessEntry) -> Bool = { p in SandboxSweep.isAlive(p) })
         -> SweepResult {
@@ -230,9 +233,8 @@ public enum SandboxSweep {
         let classify = classify ?? probe.classify
         var unreadable = false
         func candidates() -> [ProcessEntry] {
-            let table = snapshot()
-            // A table without this very process was not really read (sysctl failed or truncated): nothing is ruled out.
-            if table.isEmpty || !table.contains(where: { $0.pid == me }) { unreadable = true; return [] }
+            // No table, or one without this very process (sysctl truncated it), was not really read: nothing is ruled out.
+            guard let table = snapshot(), table.contains(where: { $0.pid == me }) else { unreadable = true; return [] }
             return table.filter { $0.uid == uid && $0.pid != me && !$0.isZombie && $0.start >= since }
         }
         var killed = Set<pid_t>()

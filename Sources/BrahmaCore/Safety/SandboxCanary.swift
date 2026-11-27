@@ -151,7 +151,7 @@ public struct CanaryLeakMatcher: Sendable {
     let base64: [String]
 
     public init(token: String) {
-        forms = Redactor.forms(of: token)
+        forms = Redactor.scanForms(of: token)
         uuid = String(token.split(separator: "-", maxSplits: 2).last ?? Substring(token)).lowercased()
         let data = Data(token.utf8)
         var fragments: [String] = []

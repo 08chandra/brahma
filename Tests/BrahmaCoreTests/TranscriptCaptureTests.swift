@@ -196,7 +196,7 @@ import GRDB
         let rig = try Rig()
         let sid = UUID().uuidString
         try rig.write(sid, Self.line(1))
-        rig.store.redactor.install(loaded: [:], failed: ["STRIPE_KEY"], version: nil)
+        try rig.store.redactor.install(loaded: [:], failed: ["STRIPE_KEY"], version: nil)
         #expect(rig.store.secretsHeld)
         let t1 = try rig.turn()
         #expect(rig.capture.capture(turn: t1, sessionId: sid, store: rig.store) == .held)

@@ -209,12 +209,8 @@
     "Sources/BrahmaCore/Release/ReleaseExecutor.swift" : 24,
     "Sources/BrahmaCore/Resources/ResourceIntake.swift" : 2,
     "Sources/BrahmaCore/Resources/ResourceModel.swift" : 1,
-    "Sources/BrahmaCore/Safety/EmergencyStop.swift" : 2,
     "Sources/BrahmaCore/Safety/SandboxCanary.swift" : 19,
-    "Sources/BrahmaCore/Safety/SecretScan+Text.swift" : 1,
-    "Sources/BrahmaCore/Safety/Secrets.swift" : 4,
     "Sources/BrahmaCore/Safety/SleepGuard.swift" : 3,
-    "Sources/BrahmaCore/Safety/Taint.swift" : 6,
     "Sources/BrahmaCore/Sandbox/ClaudeSettings.swift" : 4,
     "Sources/BrahmaCore/Sandbox/SandboxedCheckRunner.swift" : 6,
     "Sources/BrahmaCore/Scheduler/Pacing.swift" : 3,
@@ -381,6 +377,9 @@
     "Sources/BrahmaCore/Release/DeploySmoke.swift" : 2,
     "Sources/BrahmaCore/Release/DevReleaseScenario.swift" : 1,
     "Sources/BrahmaCore/Release/ReleaseExecutor.swift" : 6
+  },
+  "publicBool" : {
+
   },
   "sandboxPolicy" : {
     "Sources/BrahmaCore/Engine/Doctor+Extensions.swift" : 1,

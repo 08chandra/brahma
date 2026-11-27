@@ -90,6 +90,10 @@ public enum RepoImport {
     public static let sizeMessage = "this repo is larger than 2 GB; Brahma v1 imports smaller repos"
     public static let lfsMessage = "this repo uses Git LFS, which Brahma v1 does not support"
     public static func filesMessage(_ cap: Int) -> String { "this repo has more than \(cap) files; Brahma v1 imports smaller repos" }
+    /// A directory of the import's own fresh repository that could not be listed, so its size is unknown (S4 fix round 1, M2).
+    public static func unmeasuredMessage(_ dir: String) -> String {
+        "the import's repository could not be measured (\(Store.flat(dir, max: 400)))"
+    }
     /// A tracked path under one of the engine's own top-level names or a `.git` (fix round 1, C1/S3).
     public static func reservedMessage(_ name: String) -> String {
         "this repo tracks \(Store.flat(name, max: 120)), a name Brahma reserves for its own files; remove it from the repo first"

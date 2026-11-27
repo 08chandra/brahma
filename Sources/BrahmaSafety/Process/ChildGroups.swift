@@ -57,46 +57,59 @@ public struct ChildGroups: Sendable {
     /// The leaders recorded in `dir` that are still the process that was recorded (same pid and start time): a reused pid
     /// never counts. Read without following links; a damaged record is skipped.
     public static func liveLeaders(in dir: URL) -> Set<Int32> {
+        liveLeadersReporting(in: dir).leaders
+    }
+
+    /// `liveLeaders`, with what could not be read (the directory not listed, a damaged record), for the stop's result
+    /// (`EmergencyStop.Signalled.problems`, S4 fix round 1, M8): the stop cannot vouch for those groups.
+    public static func liveLeadersReporting(in dir: URL) -> (leaders: Set<Int32>, problems: [String]) {
         var out = Set<Int32>()
-        for record in records(in: dir) {
+        let (found, problems) = records(in: dir)
+        for record in found {
             if let entry = ProcessTable.entry(record.value.leader), entry.start == record.value.leaderStart, !entry.isZombie {
                 out.insert(record.value.leader)
             }
         }
-        return out
+        return (out, problems)
     }
 
     /// Start-up: records whose leader is gone (or is another process now) are removed.
     public static func removeStale(in dir: URL) {
-        for record in records(in: dir) {
+        for record in records(in: dir).found {
             let entry = ProcessTable.entry(record.value.leader)
             if entry == nil || entry?.start != record.value.leaderStart { unlink(record.url.path) }
         }
     }
 
-    /// No directory yet: no records. One that cannot be listed, or a record that cannot be decoded, is reported on stderr
-    /// (`brahma stop` shows it): the stop then cannot vouch for the checks and merges it would have named.
-    private static func records(in dir: URL) -> [(url: URL, value: ChildGroupRecord)] {
+    /// No directory yet: no records. One that cannot be listed, or a record that cannot be decoded, is reported on stderr and
+    /// returned in `problems` (`brahma stop` and STOP EVERYTHING show it): the stop then cannot vouch for the checks and merges
+    /// it would have named.
+    private static func records(in dir: URL) -> (found: [(url: URL, value: ChildGroupRecord)], problems: [String]) {
         let names: [String]
         do { names = try FileManager.default.contentsOfDirectory(atPath: dir.path) } catch {
             var st = stat()
-            if lstat(dir.path, &st) != 0 && errno == ENOENT { return [] }
-            report("could not list the child-group records in \(dir.path): \(error)")
-            return []
+            if lstat(dir.path, &st) != 0 && errno == ENOENT { return ([], []) }
+            let problem = "could not list the child-group records in \(dir.path): \(error)"
+            report(problem)
+            return ([], [problem])
         }
-        return names.filter { $0.hasSuffix(".group") && !$0.hasPrefix(".") }.compactMap { name in
+        var problems: [String] = []
+        let found: [(url: URL, value: ChildGroupRecord)] = names.filter { $0.hasSuffix(".group") && !$0.hasPrefix(".") }.compactMap { name in
             let url = dir.appending(path: name)
             var st = stat()
             guard lstat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_uid == getuid(), st.st_size < 4096,
                   let data = FileManager.default.contents(atPath: url.path) else { return nil }
             let value: ChildGroupRecord
             do { value = try JSONDecoder().decode(ChildGroupRecord.self, from: data) } catch {
-                report("skipped the damaged child-group record \(url.path): \(error)")
+                let problem = "skipped the damaged child-group record \(url.path): \(error)"
+                report(problem)
+                problems.append(problem)
                 return nil
             }
             guard value.leader > 1 else { return nil }
             return (url, value)
         }
+        return (found, problems)
     }
 
     private static func report(_ problem: String) {

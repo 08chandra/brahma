@@ -210,10 +210,11 @@ public struct FileVault: SecretVault {
             throw SecretError.vaultFailed("the vault is not a regular file owned by this user")
         }
         let data = try handle.readToEnd() ?? Data()
-        guard let contents = try? JSONDecoder().decode(Contents.self, from: data) else {
+        do {
+            return try JSONDecoder().decode(Contents.self, from: data)
+        } catch {
             throw SecretError.vaultFailed("the vault file is corrupt")
         }
-        return contents
     }
 
     /// The secrets directory, if it exists, must be a real directory (not a link).
@@ -312,9 +313,10 @@ public final class Redactor: @unchecked Sendable {
         return failed
     }
 
-    /// Replaces the whole set of values: a complete load of `version`.
+    /// Replaces the whole set of values: a complete load of `version` (an empty one at open, a pinned value of a release or
+    /// probe step). Its forms come from `scanForms(of:)`: never fewer than every form.
     public func update(_ values: [(name: String, value: String)], version: String) {
-        let built = Self.build(values)
+        let built = Self.build(values, forms: Self.scanForms(of:))
         lock.lock(); defer { lock.unlock() }
         tickets += 1
         installedTicket = tickets
@@ -352,10 +354,11 @@ public final class Redactor: @unchecked Sendable {
     /// Installs a load: `loaded` are the values to redact (keyed `<companyId>:<name>`), `failed` the names that did not
     /// load. `version` is set (and the load counts as complete) only when nothing failed. Returns false, changing nothing,
     /// when `ticket` is older than the installed load's: a slow, stale result never replaces a newer one.
+    /// Throws, changing nothing, when a value's forms cannot be built (the load refuses; S4 fix round 1).
     @discardableResult
     public func install(loaded: [String: Loaded], failed failedNames: [String], version: String?, ticket: Int? = nil,
-                        failures details: [Failure] = []) -> Bool {
-        let built = Self.build(loaded.values.sorted { $0.name < $1.name }.map { ($0.name, $0.value) })
+                        failures details: [Failure] = []) throws -> Bool {
+        let built = try Self.build(loaded.values.sorted { $0.name < $1.name }.map { ($0.name, $0.value) }, forms: Self.forms(of:))
         lock.lock(); defer { lock.unlock() }
         if let ticket {
             guard ticket >= installedTicket else { return false }
@@ -444,11 +447,13 @@ public final class Redactor: @unchecked Sendable {
         return fresh
     }
 
-    private static func build(_ values: [(name: String, value: String)]) -> [(needle: String, replacement: String)] {
+    /// The needles of `values`, each value in every form `forms` gives.
+    private static func build(_ values: [(name: String, value: String)],
+                              forms: (String) throws -> [String]) rethrows -> [(needle: String, replacement: String)] {
         var built: [(needle: String, replacement: String)] = []
         var seen = Set<String>()
         for (name, value) in values where value.count >= Self.minLength {
-            for form in Self.forms(of: value) where seen.insert(form).inserted {
+            for form in try forms(value) where seen.insert(form).inserted {
                 built.append((form, "[redacted \(name)]"))
             }
         }
@@ -506,26 +511,34 @@ public final class Redactor: @unchecked Sendable {
         }
         guard data != original else { return }
         let handle = try FileHandle(forWritingTo: url)
-        defer { try? handle.close() }
+        defer { bestEffort("closing a redacted file") { try handle.close() } }
         try handle.truncate(atOffset: 0)
         try handle.write(contentsOf: data)
     }
 
-    /// The raw value, its percent-encoded form (RFC 3986 unreserved characters stay), and its JSON-string forms.
-    static func forms(of value: String) -> [String] {
+    /// The raw value, its percent-encoded form (RFC 3986 unreserved characters stay), and its JSON-string forms. Throws when
+    /// a JSON form cannot be made, so a load that cannot build every form of a value refuses instead of redacting fewer
+    /// (S4 fix round 1): the vault's load (`install`). Callers that cannot throw use `scanForms(of:)`.
+    static func forms(of value: String) throws -> [String] {
         var out = [value]
         let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
         if let p = value.addingPercentEncoding(withAllowedCharacters: unreserved) { out.append(p) }
         for options in [JSONEncoder.OutputFormatting(), .withoutEscapingSlashes] {
             let encoder = JSONEncoder()
             encoder.outputFormatting = options
-            if let data = try? encoder.encode(value) {
-                let text = String(decoding: data, as: UTF8.self)
-                if text.count >= 2 { out.append(String(text.dropFirst().dropLast())) }
-            }
+            let text = String(decoding: try encoder.encode(value), as: UTF8.self)
+            if text.count >= 2 { out.append(String(text.dropFirst().dropLast())) }
         }
         var seen = Set<String>()
         return out.filter { seen.insert($0).inserted }
+    }
+
+    /// `forms(of:)` for the scanners that cannot throw (leak scans, display redaction, the canary matcher). A `String` always
+    /// encodes as a JSON string fragment (every supported Foundation allows top-level fragments), so this never traps in
+    /// practice; if it ever did, it traps rather than scan or redact with fewer forms (never fail open). The vault's load
+    /// (`install`) uses the throwing `forms(of:)` and refuses.
+    static func scanForms(of value: String) -> [String] {
+        try! forms(of: value)
     }
 }
 
@@ -543,8 +556,10 @@ public enum SecretScan {
         ("google-api", "AIza[0-9A-Za-z_-]{35}"),
     ]
 
-    private static let compiled: [(label: String, regex: NSRegularExpression)] = patterns.compactMap { p in
-        (try? NSRegularExpression(pattern: p.ere)).map { (p.label, $0) }
+    /// Every pattern, compiled (static patterns: one that does not compile is a programming error, never a pattern silently
+    /// left out of the scan).
+    static let compiled: [(label: String, regex: NSRegularExpression)] = patterns.map { p in
+        (p.label, try! NSRegularExpression(pattern: p.ere))
     }
 
     private static let hunkHeader = try! NSRegularExpression(pattern: #"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"#)
@@ -582,7 +597,7 @@ public enum SecretScan {
     typealias KnownForms = [(name: String, forms: [[UInt8]])]
 
     static func knownForms(_ knownValues: [(String, String)]) -> KnownForms {
-        knownValues.filter { $0.1.count >= Redactor.minLength }.map { ($0.0, Redactor.forms(of: $0.1).map { Array($0.utf8) }) }
+        knownValues.filter { $0.1.count >= Redactor.minLength }.map { ($0.0, Redactor.scanForms(of: $0.1).map { Array($0.utf8) }) }
     }
 
     static func scan(diff: String, known: KnownForms) -> [Finding] {

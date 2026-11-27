@@ -290,6 +290,8 @@ private final class HTTPSFixture {
         let small = RepoImport.Limits(maxBytes: 1024, maxFiles: RepoImport.maxFiles)
         #expect(refusal { _ = try RepoImport.stage(try RepoSource.parse(big.root.path), paths: paths, limits: small) } == RepoImport.sizeMessage)
         #expect(RepoImport.sizeMessage == "this repo is larger than 2 GB; Brahma v1 imports smaller repos")
+        // S4 fix round 1 (M2): a repository whose size cannot be read is refused as that, never as "larger than 2 GB".
+        #expect(RepoImport.unmeasuredMessage("/data/import/.git/objects") == "the import's repository could not be measured (/data/import/.git/objects)")
         let many = try SourceRepo(files: ["a": "1\n", "b": "2\n", "c": "3\n"])
         let few = RepoImport.Limits(maxBytes: RepoImport.maxBytes, maxFiles: 2)
         #expect(refusal { _ = try RepoImport.stage(try RepoSource.parse(many.root.path), paths: paths, limits: few) }

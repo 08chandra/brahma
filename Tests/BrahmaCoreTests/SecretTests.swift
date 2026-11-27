@@ -302,6 +302,42 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         }
     }
 
+    /// S4 fix round 1 (I1): every leak pattern compiles; none is silently dropped from the scan.
+    @Test func everyLeakPatternCompiles() {
+        #expect(SecretScan.compiled.count == SecretScan.patterns.count)
+        #expect(SecretScan.compiled.map(\.label) == SecretScan.patterns.map(\.label))
+        #expect(SecretScan.textCompiled.map(\.label) == SecretScan.patterns.map(\.label))
+    }
+
+    /// S4 fix round 1 (M9): the `branchMoved` flag is committed before the alert is raised, in a transaction of its own, so an
+    /// alert that throws (here: the secrets of this process are not loaded yet) never rolls the flag back.
+    @Test func branchMovedFlagSurvivesAFailedAlert() throws {
+        let f = try FreshProcess()
+        let owner = try Store(path: f.path)
+        _ = try owner.reloadRedactorIfNeeded(vault: f.inner, force: true)
+        var items: [WorkItem] = []
+        for title in ["Turn start", "Turn end"] {
+            let item = try owner.createWorkItem(companyId: f.company.id, by: .owner, draft: WorkItemDraft(type: .task, title: title, status: .ready))
+            try owner.writer.write { try $0.execute(sql: "UPDATE workItem SET leaseHeadCommit = ? WHERE id = ?",
+                                                    arguments: [String(repeating: "a", count: 40), item.id]) }
+            items.append(try #require(try owner.workItem(id: item.id)))
+        }
+        let fresh = try Store(path: f.path)
+        #expect(!fresh.redactor.hasLoaded)
+        // The turn-start check (in a transaction of the caller's) and the turn-end flag (a transaction of its own).
+        #expect(throws: SecretError.secretsNotLoaded) {
+            _ = try fresh.checkBranchContinuity(item: items[0], agent: f.ceo, head: String(repeating: "b", count: 40), now: Date())
+        }
+        #expect(throws: SecretError.secretsNotLoaded) {
+            try fresh.flagBranchMoved(item: items[1], agent: f.ceo, why: "rewritten", now: Date())
+        }
+        for item in items {
+            #expect(try owner.workItem(id: item.id)?.branchMoved == true, "the flag holds although its alert failed: \(item.title)")
+        }
+        #expect(try owner.events(afterId: 0, companyId: f.company.id).filter { $0.text.contains("moved outside") }.count == 2,
+                "the company's activity line lands with the flag")
+    }
+
     @Test func failClosedUntilFirstLoad() async throws {
         let f = try FreshProcess()
         let vault = ScriptedVault(inner: f.inner)
@@ -530,14 +566,14 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
                 == "[redacted A_KEY] [redacted B_KEY] [redacted C_KEY]")
     }
 
-    @Test func installRejectsALoadStartedBeforeTheInstalledOne() {
+    @Test func installRejectsALoadStartedBeforeTheInstalledOne() throws {
         let r = Redactor()
         let older = r.beginLoad(), newer = r.beginLoad()
-        r.install(loaded: ["c:A_KEY": .init(name: "A_KEY", updatedAt: .now, value: "a-value-1234567")], failed: [], version: "1:2",
+        try r.install(loaded: ["c:A_KEY": .init(name: "A_KEY", updatedAt: .now, value: "a-value-1234567")], failed: [], version: "1:2",
                   ticket: newer)
         #expect(r.hasLoaded); #expect(r.version == "1:2")
         // The older, failed result arrives late: ignored.
-        #expect(r.install(loaded: [:], failed: ["A_KEY"], version: nil, ticket: older) == false)
+        #expect(try r.install(loaded: [:], failed: ["A_KEY"], version: nil, ticket: older) == false)
         #expect(r.failedNames.isEmpty); #expect(r.version == "1:2")
         #expect(r.apply("a-value-1234567") == "[redacted A_KEY]")
     }

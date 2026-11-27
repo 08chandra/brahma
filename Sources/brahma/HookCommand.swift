@@ -32,7 +32,8 @@ struct HookGroup: ParsableCommand {
         }
     }
 
-    /// PostToolUse (Task 10): records the taint a tool call carries. Always exits 0; any error fails closed (the flag file).
+    /// PostToolUse (Task 10): records the taint a tool call carries. Any error fails closed (the flag file, the database mark)
+    /// and exits 0; when neither could be written it says so on stderr and exits 1 (S4 fix round 1).
     struct PostTool: ParsableCommand {
         static let configuration = CommandConfiguration(commandName: "post-tool", abstract: "Brahma's PostToolUse taint hook (Task 10).")
 
@@ -49,6 +50,9 @@ struct HookGroup: ParsableCommand {
             case .clean, .tainted: break
             case .refused(let why): FileHandle.standardError.write(Data("brahma hook post-tool: \(why)\n".utf8))
             case .failedClosed(let why): FileHandle.standardError.write(Data("brahma hook post-tool: \(why); the session is marked tainted\n".utf8))
+            case .unrecorded(let why):
+                FileHandle.standardError.write(Data("brahma hook post-tool: \(why); the taint was NOT recorded\n".utf8))
+                throw ExitCode(1)
             }
         }
     }

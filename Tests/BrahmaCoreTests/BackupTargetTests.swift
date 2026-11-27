@@ -804,8 +804,12 @@ import GRDB
         defer { foreign.end() }
         try await waitUntil { ProcessArguments.of(foreign.pid).map { WALShipper.isLitestream($0, config: config) } ?? false }
         #expect(!FileManager.default.fileExists(atPath: WALShipper.pidFile(paths: env.paths).path), "no pid file names it")
-        #expect(WALShipper.foreignLitestream(paths: env.paths, excluding: nil) == foreign.pid)
+        #expect(WALShipper.foreignLitestream(paths: env.paths, excluding: nil) == .foreign(pid: foreign.pid))
         #expect(WALShipper.foreignLitestream(paths: env.paths, excluding: foreign.pid) == nil, "a shipper's own child is not foreign")
+        // S4 fix round 1 (I2): a process table that cannot be read rules no foreign litestream out: launching is refused.
+        #expect(WALShipper.foreignLitestream(paths: env.paths, excluding: foreign.pid, table: { nil }) == .tableUnreadable)
+        let blind = WALShipper.pausedNotice(.tableUnreadable)
+        #expect(blind.title == "WAL shipping paused" && blind.body.contains("process table"), "\(blind.body)")
 
         let paused = Paused()
         let first = WALShipper(executable: litestream, paths: env.paths, tools: tools, grace: 0.5, onPaused: { paused.set($0) })

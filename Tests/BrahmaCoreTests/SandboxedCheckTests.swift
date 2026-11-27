@@ -193,6 +193,9 @@ import GRDB
         let probe = SandboxProbe(machMarker: "dev.brahma.run.test")
         let empty = SandboxSweep.run(probe: probe, since: 0, rounds: 1, snapshot: { [] }, classify: { _ in .notMine })
         #expect(empty.tableUnreadable && empty.inconclusive)
+        // S4 fix round 1 (I2): a table that could not be read at all.
+        let unread = SandboxSweep.run(probe: probe, since: 0, rounds: 1, snapshot: { nil }, classify: { _ in .notMine })
+        #expect(unread.tableUnreadable && unread.inconclusive)
         let withoutMe = SandboxSweep.run(probe: probe, since: 0, rounds: 1, snapshot: { [Self.entry(99_999)] }, classify: { _ in .notMine })
         #expect(withoutMe.tableUnreadable && withoutMe.inconclusive)
         let table = [Self.entry(getpid(), start: 0), Self.entry(99_998)]

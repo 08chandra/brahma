@@ -274,6 +274,18 @@ private let perl = "/usr/bin/perl"
         let left = try TurnRecords.reap(agentId: "a1", in: records, snapshot: { [] })
         #expect(left.survivors == [-1])
         #expect(try TurnRecords.load(agentId: "a1", in: records) == [record])
+        // S4 fix round 1 (I2): a table that could not be read at all (nil, not empty) is the same.
+        let unread = try TurnRecords.reap(agentId: "a1", in: records, snapshot: { nil })
+        #expect(unread.survivors == [-1])
+        #expect(try TurnRecords.load(agentId: "a1", in: records) == [record])
+    }
+
+    /// S4 fix round 1 (I2): a finished turn's sweep that cannot read the process table is inconclusive (`-1`), never "nothing
+    /// left".
+    @Test func sweepWithUnreadableTableIsInconclusive() {
+        let containment = TurnContainment(leader: 4242, markerValue: "m", since: 0)
+        #expect(containment.sweep(rounds: 2, snapshot: { nil }) == [-1])
+        #expect(containment.sweep(rounds: 1, snapshot: { ProcessTable.snapshot() }).isEmpty, "a readable table with nothing of the turn")
     }
 
     /// Fix round 2 (B-N5): a record that cannot be read is moved aside (never left to block the agent forever); the caller is
@@ -444,7 +456,7 @@ private let perl = "/usr/bin/perl"
     @Test func processTableSeesThisProcess() throws {
         let me = try #require(ProcessTable.entry(getpid()))
         #expect(me.pid == getpid()); #expect(me.ppid == getppid()); #expect(me.uid == getuid())
-        #expect(ProcessTable.snapshot().contains { $0.pid == getpid() })
+        #expect(ProcessTable.snapshot()?.contains { $0.pid == getpid() } == true)
         #expect(ProcessTable.entry(-5) == nil)
     }
 }

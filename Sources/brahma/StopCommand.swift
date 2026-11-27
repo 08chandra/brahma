@@ -21,6 +21,11 @@ struct StopCommand: ParsableCommand {
             let killed = signalled.killed.isEmpty ? "" : " (\(signalled.killed.count) needed SIGKILL)"
             print("signalled \(signalled.terminated.count) turn process group(s)\(killed)")
         }
+        // What the stop could not read (S4 fix round 1): the processes it names could not be vouched for. Engine-composed text
+        // (paths and errors), flattened for the terminal.
+        for problem in signalled.problems {
+            FileHandle.standardError.write(Data("brahma stop: not checked: \(safe(problem))\n".utf8))
+        }
         print("Nothing runs until you run 'brahma resume'.")
     }
 }

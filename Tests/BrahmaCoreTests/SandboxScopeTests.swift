@@ -91,6 +91,26 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         try s.validate()
     }
 
+    /// S4 fix round 1 (M1): a directory the scope must list but cannot (the workspace's top level, a sibling-deny directory)
+    /// refuses the turn as an `UnsafeEngineFile` naming it ("cannot be listed"), so `sandboxRefusal` alerts the owner once
+    /// with the path, never with a raw Cocoa error.
+    @Test func unlistableDirectoryRefusesTheTurnByName() throws {
+        let w = try SandboxWorld()
+        try FileManager.default.createDirectory(atPath: w.p(".brahma/progress"), withIntermediateDirectories: true)
+        for dir in [w.p(".brahma/progress"), w.ws.path] {
+            try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: dir)
+            defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir) }   // exec-bit fixture: a directory mode
+            do {
+                _ = try w.scope(.work)
+                Issue.record("an unlistable \(dir) must refuse the turn")
+            } catch let refused as UnsafeEngineFile {
+                #expect(refused == UnsafeEngineFile(path: dir, problem: "cannot be listed"))
+            } catch {
+                Issue.record("expected UnsafeEngineFile for \(dir), got \(error)")
+            }
+        }
+    }
+
     @Test func noticeTurnWithItemUsesItemScope() throws {
         let w = try SandboxWorld()
         #expect(try w.scope(.notice) == (try w.scope(.work)))

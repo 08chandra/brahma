@@ -135,7 +135,7 @@ public struct GlobalSearch: Sendable {
             fingerprint = StableHash.fnv1a64(expanded.map { "\($0.name)\u{0}\($0.value)" }.joined(separator: "\u{1}"))
             if SecretScan.patterns.map(\.ere) == Self.patternTriggers.patterns {
                 needles = Self.patternTriggers.triggers
-                    + expanded.filter { $0.value.count >= Redactor.minLength }.flatMap { Redactor.forms(of: $0.value) }.filter { !$0.isEmpty }
+                    + expanded.filter { $0.value.count >= Redactor.minLength }.flatMap { Redactor.scanForms(of: $0.value) }.filter { !$0.isEmpty }
             } else {
                 needles = nil
             }

@@ -251,6 +251,8 @@ struct GitCommand: Sendable {
         var oversize = false
         /// `sizeWatch` killed git: its captured output outgrew `maxWatchedStderr`.
         var flooded = false
+        /// `sizeWatch` killed git: this directory of the watched tree could not be listed, so its size is unknown.
+        var unmeasurable: String? = nil
         var text: String { String(decoding: stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }
     }
 
@@ -503,6 +505,7 @@ struct GitCommand: Sendable {
         DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: timer)
         // The size watch polls on a thread of its own: a busy shared dispatch pool must never let git outgrow the cap.
         let oversize = TimeoutFlag(), flooded = TimeoutFlag(), watchDone = TimeoutFlag()
+        let unmeasurable = PathFlag()
         if let sizeWatch {
             let stop = GitStopper(process: process, grouped: grouped)
             let outputCap = Int64(maxOutput) + Self.maxWatchedStderr
@@ -512,12 +515,18 @@ struct GitCommand: Sendable {
             }
             Thread {
                 while !watchDone.cut {
-                    if EngineFiles.treeBytes(sizeWatch.directory, stopAbove: sizeWatch.limit) > sizeWatch.limit {
-                        oversize.mark()
-                    } else if bytes(errURL) > Self.maxWatchedStderr || bytes(outURL) > outputCap {
-                        flooded.mark()
+                    do {
+                        if try EngineFiles.treeBytes(sizeWatch.directory, stopAbove: sizeWatch.limit) > sizeWatch.limit {
+                            oversize.mark()
+                        } else if bytes(errURL) > Self.maxWatchedStderr || bytes(outURL) > outputCap {
+                            flooded.mark()
+                        }
+                    } catch let unmeasured as EngineFiles.Unmeasurable {
+                        unmeasurable.set(unmeasured.path)
+                    } catch {
+                        unmeasurable.set(sizeWatch.directory.path)
                     }
-                    if oversize.cut || flooded.cut {
+                    if oversize.cut || flooded.cut || unmeasurable.path != nil {
                         if !watchDone.cut { stop.stop() }
                         return
                     }
@@ -551,15 +560,16 @@ struct GitCommand: Sendable {
         if timedOut.cut { stderr = "timed out after \(Int(timeoutSeconds)) s" + (stderr.isEmpty ? "" : ": \(stderr)") }
         if oversize.cut, let sizeWatch { stderr = "stopped: the repository grew past \(sizeWatch.limit) bytes" + (stderr.isEmpty ? "" : ": \(stderr)") }
         if flooded.cut { stderr = "stopped: git's output passed \(Self.maxWatchedStderr) bytes" + (stderr.isEmpty ? "" : ": \(stderr)") }
+        if let dir = unmeasurable.path { stderr = "stopped: \(dir) could not be measured" + (stderr.isEmpty ? "" : ": \(stderr)") }
         var status = grouped == nil ? process.terminationStatus : groupedStatus
         if let error = feed?.result.error {
             // The input ended early: whatever git made of the part it got does not count as success.
             if status == 0 { status = -1 }
             stderr = "\(error)" + (stderr.isEmpty ? "" : ": \(stderr)")
         }
-        if oversize.cut || flooded.cut, status == 0 { status = -1 }
+        if oversize.cut || flooded.cut || unmeasurable.path != nil, status == 0 { status = -1 }
         return Output(status: status, stdout: stdout, stderr: stderr, cut: cut, timedOut: timedOut.cut, oversize: oversize.cut,
-                      flooded: flooded.cut)
+                      flooded: flooded.cut, unmeasurable: unmeasurable.path)
     }
 }
 
@@ -700,6 +710,14 @@ private final class TimeoutFlag: @unchecked Sendable {
     private var over = false
     func mark() { lock.lock(); over = true; lock.unlock() }
     var cut: Bool { lock.lock(); defer { lock.unlock() }; return over }
+}
+
+/// The first path set, shared with the size-watch thread.
+private final class PathFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+    func set(_ path: String) { lock.lock(); if value == nil { value = path }; lock.unlock() }
+    var path: String? { lock.lock(); defer { lock.unlock() }; return value }
 }
 
 /// The git repository of one company workspace. The workspace itself is the repo (branch `main`); each leased item gets a
@@ -3642,10 +3660,12 @@ extension GitWorkspace {
             if let caFile { transportFlags += ["-c", "http.sslCAInfo=\(caFile.path)"] }
         }
 
-        /// A watched network step: past the size cap it is the size refusal; flooded output or any other failure is git's.
+        /// A watched network step: past the size cap it is the size refusal; a repository that could not be measured is its own
+        /// refusal (naming the directory); flooded output or any other failure is git's.
         func network(_ args: [String], maxOutput: Int = GitCommand.maxCapture) throws -> GitCommand.Output {
             let out = try remote.run(args, allowFailure: true, maxOutput: maxOutput)
             if out.oversize { throw RepoImportError(message: RepoImport.sizeMessage) }
+            if let dir = out.unmeasurable { throw RepoImportError(message: RepoImport.unmeasuredMessage(dir)) }
             guard out.status == 0, !out.flooded else {
                 throw GitError.failed(command: args.first(where: { !$0.hasPrefix("-") && !$0.contains("=") }) ?? "fetch",
                                       status: out.status, stderr: String(out.stderr.prefix(2000)))
@@ -3737,7 +3757,12 @@ extension GitWorkspace {
             if path == ".gitattributes" || path.hasSuffix("/.gitattributes") { attributes.append((String(fields[2]), size)) }
         }
         if files > caps.maxFiles { throw RepoImportError(message: RepoImport.filesMessage(caps.maxFiles)) }
-        let gitBytes = EngineFiles.treeBytes(dir.appending(path: ".git", directoryHint: .isDirectory), stopAbove: caps.maxBytes)
+        let gitBytes: Int64
+        do {
+            gitBytes = try EngineFiles.treeBytes(dir.appending(path: ".git", directoryHint: .isDirectory), stopAbove: caps.maxBytes)
+        } catch let unmeasured as EngineFiles.Unmeasurable {
+            throw RepoImportError(message: RepoImport.unmeasuredMessage(unmeasured.path))
+        }
         if bytes > caps.maxBytes || gitBytes > caps.maxBytes - bytes { throw RepoImportError(message: RepoImport.sizeMessage) }
         // Symbolic links (S3, S4): the rules for agents' commits, on the tree and with names folded as the volume folds them
         // (no absolute target, no `..`, no `.`, nothing through a link or under one, nothing into `.git` or the engine's

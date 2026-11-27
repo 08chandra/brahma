@@ -30,6 +30,22 @@ import Foundation
         #expect(denied == .deny("not on the allowlist"))
     }
 
+    /// S4 fix round 1 (M5): the rule above, held by a source scan (the `#if false` block alone proves nothing once someone adds
+    /// a conversion): in code, `Decision.swift` names no `Bool` at all (no `Bool` member, property or return) and no
+    /// `ExpressibleByBooleanLiteral`, and no other kernel file extends `Decision`.
+    @Test func decisionSourceDeclaresNoBool() throws {
+        let sources = try KernelBoundaryTests.sources(under: "Sources/BrahmaSafety")
+        let decision = try #require(sources.first { $0.path == "Sources/BrahmaSafety/Policy/Decision.swift" })
+        let code = KernelBoundaryTests.code(decision.text)
+        #expect(code.contains("enum Decision"), "the scan reads the real file")
+        for banned in [#"\bBool\b"#, #"\bExpressibleByBooleanLiteral\b"#] {
+            #expect(code.range(of: banned, options: .regularExpression) == nil, "Decision.swift: \(banned)")
+        }
+        let extensions = sources.filter { $0.path != decision.path }
+            .filter { KernelBoundaryTests.code($0.text).range(of: #"\bextension\s+Decision\b"#, options: .regularExpression) != nil }
+        #expect(extensions.isEmpty, "Decision is extended outside its file: \(extensions.map(\.path))")
+    }
+
     /// `bestEffort` runs its body; a thrown error is swallowed (and logged to stderr), never rethrown.
     @Test func bestEffortSwallowsAndRuns() {
         struct Boom: Error {}

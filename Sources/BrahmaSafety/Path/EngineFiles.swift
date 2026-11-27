@@ -37,11 +37,18 @@ public enum EngineFiles {
 
     // MARK: Sizes
 
+    /// A tree `treeBytes` could not measure: `path` is a directory still there that could not be listed.
+    public struct Unmeasurable: Error, Equatable, Sendable {
+        public let path: String
+        public init(path: String) { self.path = path }
+    }
+
     /// The bytes of every entry under `root` (`lstat` sizes; a link counts as itself and is never followed, nothing is opened
     /// or read), summed until the total passes `stopAbove`. A directory that vanishes counts as what was seen of it; one that
-    /// is still there but cannot be listed makes the total `Int64.max` (over every cap: fail closed, spec §6.7). For the
-    /// import's size cap (Plan L Task 14): the engine's own fresh repository, while git fills it.
-    public static func treeBytes(_ root: URL, stopAbove: Int64 = .max) -> Int64 {
+    /// is still there but cannot be listed throws `Unmeasurable` naming it (fail closed, spec §6.7; S4 fix round 1, M2: its own
+    /// refusal, never "over the size cap"). For the import's size cap (Plan L Task 14): the engine's own fresh repository,
+    /// while git fills it.
+    public static func treeBytes(_ root: URL, stopAbove: Int64 = .max) throws -> Int64 {
         var total: Int64 = 0
         var pending = [root.path]
         while let dir = pending.popLast() {
@@ -53,7 +60,7 @@ public enum EngineFiles {
             do { names = try FileManager.default.contentsOfDirectory(atPath: dir) } catch {
                 // Gone meanwhile (git renames its temporary directories): what was seen. Still a directory: unmeasurable.
                 guard lstat(dir, &st) == 0, st.st_mode & S_IFMT == S_IFDIR else { continue }
-                return .max
+                throw Unmeasurable(path: dir)
             }
             for name in names {
                 let path = dir + "/" + name

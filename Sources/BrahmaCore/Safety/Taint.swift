@@ -84,10 +84,16 @@ public enum TaintPolicy {
     /// The digest's prefix for an item a tainted session wrote (I2).
     public static let relayedPrefix = "[from a session that read outside content] "
 
+    /// What one tool call read from outside the company, or nil, with no extension installed (every namespaced skill or agent
+    /// taints).
+    public static func source(toolName: String, toolInput: [String: JSONValue]) -> String? {
+        source(toolName: toolName, toolInput: toolInput, publisher: { _ in nil })
+    }
+
     /// What one tool call read from outside the company, or nil. `publisher` names the installed publisher of an extension id
-    /// (nil: not installed, which taints).
+    /// (nil: not installed, which taints); a lookup that throws is rethrown, never read as "not installed".
     public static func source(toolName: String, toolInput: [String: JSONValue],
-                              publisher: (String) -> String? = { _ in nil }) -> String? {
+                              publisher: (String) throws -> String?) rethrows -> String? {
         if externalTools.contains(toolName) { return toolName }
         if toolName.hasPrefix("mcp__") {
             let rest = toolName.dropFirst(5)
@@ -99,10 +105,10 @@ public enum TaintPolicy {
             guard let command = toolInput["command"]?.stringValue, reachesNetwork(command) else { return nil }
             return "bash: " + String(flat(command).prefix(60))
         case "Skill":
-            guard let id = namespace(toolInput["skill"]?.stringValue), extensionTaints(id: id, publisher: publisher) else { return nil }
+            guard let id = namespace(toolInput["skill"]?.stringValue), try extensionTaints(id: id, publisher: publisher) else { return nil }
             return "skill:\(id)"
         case "Task", "Agent":
-            guard let id = namespace(toolInput["subagent_type"]?.stringValue), extensionTaints(id: id, publisher: publisher) else { return nil }
+            guard let id = namespace(toolInput["subagent_type"]?.stringValue), try extensionTaints(id: id, publisher: publisher) else { return nil }
             return "agent:\(id)"
         default:
             return nil
@@ -133,9 +139,9 @@ public enum TaintPolicy {
     /// `brahma` and `company:` extensions never taint; `third-party:*`, `local` and anything not installed do. A `company:`
     /// extension whose lab history is tainted (10b) is reported by `Store.extensionPublisher` as `third-party:lab-tainted`, so it
     /// taints like a third-party one.
-    static func extensionTaints(id: String, publisher: (String) -> String?) -> Bool {
+    static func extensionTaints(id: String, publisher: (String) throws -> String?) rethrows -> Bool {
         if id == ExtensionPublisher.brahma { return false }
-        guard let p = publisher(id) else { return true }
+        guard let p = try publisher(id) else { return true }
         return !(p == ExtensionPublisher.brahma || p.hasPrefix("company:"))
     }
 
@@ -143,7 +149,8 @@ public enum TaintPolicy {
     /// `postToolGate`, unless it has no network at all and no web tools. `network` nil: unrestricted (no sandbox scope).
     public static func preTaint(tools: Set<String>, network: NetworkScope?, hookVerified: Bool) -> Bool {
         guard !tools.isDisjoint(with: ["Task", "Agent", "Workflow"]), !hookVerified else { return false }
-        let offline = network.map { $0.allowedDomains.isEmpty && $0.webDomains.isEmpty } ?? false
+        var offline = false
+        if let network { offline = network.allowedDomains.isEmpty && network.webDomains.isEmpty }
         return !(offline && tools.isDisjoint(with: externalTools))
     }
 
@@ -493,12 +500,18 @@ public enum TaintFlag {
         return text.isEmpty ? nil : text
     }
 
-    /// Creates the flag (and its 0700 directory), never following a link. Returns whether it exists afterwards.
+    /// Creates the flag (and its 0700 directory), never following a link. Returns whether it exists afterwards (`exists`: a
+    /// flag not provably absent counts); a directory that could not be made is reported on stderr, and what decides is still
+    /// whether the flag exists.
     @discardableResult
     public static func write(home: URL, agentId: String, source: String) -> Bool {
         guard let url = url(home: home, agentId: agentId) else { return false }
         let dir = url.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        } catch {
+            FileHandle.standardError.write(Data("brahma: the taint flag directory \(dir.path) could not be made: \(error)\n".utf8))
+        }
         let fd = open(url.path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0o600)
         if fd >= 0 {
             let bytes = Array(source.utf8.prefix(200))
@@ -515,16 +528,19 @@ public enum TaintFlag {
 }
 
 /// `brahma hook post-tool` (Task 10): the PostToolUse hook. It reads the hook input on stdin and records the taint its tool
-/// call carries (`TaintPolicy.source`). It refuses a foreign `--agent`. Any error (unreadable input, the database not reachable)
-/// fails closed: the flag file is written, then `markTainted(source: "hook-error")` is tried. The command always exits 0.
+/// call carries (`TaintPolicy.source`). It refuses a foreign `--agent`. Any error (unreadable input, the database not reachable,
+/// an extension lookup that throws) fails closed: the flag file is written, then `markTainted(source: "hook-error")` is tried.
+/// When neither landed the outcome is `unrecorded` and the command exits non-zero (S4 fix round 1); otherwise it exits 0.
 public enum PostToolHook {
     public enum Outcome: Equatable, Sendable {
         case clean
         case tainted(String)
         /// Nothing recorded: the agent is not this turn's, or its id is not one.
         case refused(String)
-        /// The flag file was written (and the database mark tried).
+        /// The flag file was written, or the database mark landed (the other one tried).
         case failedClosed(String)
+        /// Failing closed did not land: neither the flag file nor the database mark (S4 fix round 1, I1).
+        case unrecorded(String)
     }
 
     /// Attempts at the database before failing closed (a busy or locked database is retried, M3), and the backoff between them.
@@ -546,14 +562,22 @@ public enum PostToolHook {
         }
         let home = URL(fileURLWithPath: database).deletingLastPathComponent()
         func failClosed(_ why: String, _ store: Store?) -> Outcome {
-            TaintFlag.write(home: home, agentId: agentId, source: TaintPolicy.hookErrorSource)
-            if let s = store ?? (try? open(database)) {
-                try? s.markTainted(agentId: agentId, source: TaintPolicy.hookErrorSource, now: now)
-            }
-            return .failedClosed(why)
+            let flagged = TaintFlag.write(home: home, agentId: agentId, source: TaintPolicy.hookErrorSource)
+            var marked = false
+            var markError: (any Error)?
+            do {
+                let s = try store ?? open(database)
+                try s.markTainted(agentId: agentId, source: TaintPolicy.hookErrorSource, now: now)
+                marked = true
+            } catch { markError = error }
+            if flagged || marked { return .failedClosed(why) }
+            return .unrecorded("\(why); neither the taint flag nor the database mark could be written (\(markError.map { "\($0)" } ?? "unknown"))")
         }
-        guard let value = try? JSONDecoder().decode(JSONValue.self, from: stdin), let input = value.objectValue,
-              let tool = input["tool_name"]?.stringValue else {
+        let value: JSONValue
+        do { value = try JSONDecoder().decode(JSONValue.self, from: stdin) } catch {
+            return failClosed("the hook input could not be read", nil)
+        }
+        guard let input = value.objectValue, let tool = input["tool_name"]?.stringValue else {
             return failClosed("the hook input could not be read", nil)
         }
         let toolInput = input["tool_input"]?.objectValue ?? [:]
@@ -567,8 +591,9 @@ public enum PostToolHook {
             do {
                 let store = try open(database)
                 guard let companyId = try store.agent(id: agentId)?.companyId else { return failClosed("no such agent", store) }
-                let source = TaintPolicy.source(toolName: tool, toolInput: toolInput) { id in
-                    (try? store.extensionPublisher(companyId: companyId, extId: id)) ?? nil
+                // A lookup that throws is retried with the rest, then fails closed: never "not installed" (I1).
+                let source = try TaintPolicy.source(toolName: tool, toolInput: toolInput) { id in
+                    try store.extensionPublisher(companyId: companyId, extId: id)
                 }
                 guard let source else { return .clean }
                 try store.markTainted(agentId: agentId, source: source, now: now)

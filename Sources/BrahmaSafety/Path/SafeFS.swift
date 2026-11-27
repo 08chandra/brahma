@@ -305,7 +305,6 @@ public final class SafeFS: @unchecked Sendable {
         return parts
     }
 
-    /// Refuses `..`, `.`, an empty component, NUL, C0 and C1 controls, DEL, bidi and zero-width characters.
     /// Whether `name` passes `checkComponent`. A handle that does not gets no own lab (its lab is never held: not allowed).
     static func isComponent(_ name: String) -> Bool {
         do {
@@ -316,6 +315,7 @@ public final class SafeFS: @unchecked Sendable {
         }
     }
 
+    /// Refuses `..`, `.`, an empty component, NUL, C0 and C1 controls, DEL, bidi and zero-width characters.
     static func checkComponent(_ name: String) throws {
         guard !name.isEmpty, name != ".", name != ".." else { throw SafeFSError.badPath }
         for scalar in name.unicodeScalars {

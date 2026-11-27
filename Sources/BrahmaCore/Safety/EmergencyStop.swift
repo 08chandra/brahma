@@ -120,16 +120,25 @@ public enum EmergencyStop {
         "stopped by the owner since \(clock(since, timeZone: timeZone))"
     }
 
-    /// What signalling came to: the groups sent SIGTERM, and those still alive after the grace that were sent SIGKILL.
+    /// What signalling came to: the groups sent SIGTERM, those still alive after the grace that were sent SIGKILL, and what
+    /// the stop could not read (`problems`: a source of recorded groups, the process table), so the owner learns which
+    /// processes it could not vouch for (`brahma stop`, STOP EVERYTHING; S4 fix round 1, I1/I2/M8). Everything else was still
+    /// signalled.
     public struct Signalled: Equatable, Sendable {
         public var terminated: [Int32] = []
         public var killed: [Int32] = []
+        public var problems: [String] = []
 
-        public init(terminated: [Int32] = [], killed: [Int32] = []) {
+        public init(terminated: [Int32] = [], killed: [Int32] = [], problems: [String] = []) {
             self.terminated = terminated
             self.killed = killed
+            self.problems = problems
         }
     }
+
+    /// The problem a stop reports when the process table could not be read.
+    static let tableUnreadableProblem = "the process table could not be read: every recorded group whose leader still leads it "
+        + "was signalled, and SIGKILLed after the grace"
 
     /// The live (non-zombie) processes of the owner's own user in group `pgid`, never this process's own group.
     static func liveMembers(of pgid: Int32, in table: [ProcessEntry]) -> [ProcessEntry] {
@@ -138,27 +147,50 @@ public enum EmergencyStop {
         return table.filter { $0.pgid == pgid && $0.uid == uid && !$0.isZombie && $0.pid != me }
     }
 
+    /// Whether `pgid` is a group of this user's that its leader still leads (read on its own, `ProcessTable.entry`): how the
+    /// stop decides without a process table. Never this process's own group.
+    static func leaderStillLeads(_ pgid: Int32) -> Bool {
+        guard pgid > 1, pgid != getpgrp(), let leader = ProcessTable.entry(pgid) else { return false }
+        return leader.pgid == pgid && leader.uid == getuid() && !leader.isZombie && leader.pid != getpid()
+    }
+
     /// Sends SIGTERM to every group that still has a live process of this user, waits up to `grace` awake seconds for them to
     /// go, then SIGKILLs what is left. A group with nobody alive in it (a stale pid) is never signalled. Blocking.
+    /// A process table that cannot be read is never "nothing runs" (S4 fix round 1, I2): every group whose leader still leads
+    /// it (`leaderStillLeads`) is signalled, the wait cannot tell when it is gone (so it runs to the grace and SIGKILLs), and
+    /// `problems` says so. `table` is injectable for tests.
     public static func signalGroups(_ groups: Set<Int32>, grace: TimeInterval = grace,
                                     uptime: () -> TimeInterval = { AwakeTime.uptime() },
-                                    pause: () -> Void = { usleep(20_000) }) -> Signalled {
+                                    pause: () -> Void = { usleep(20_000) },
+                                    table: () -> [ProcessEntry]? = ProcessTable.snapshot) -> Signalled {
         var out = Signalled()
         guard !groups.isEmpty else { return out }
-        let table = ProcessTable.snapshot()
-        for g in groups.sorted() where !liveMembers(of: g, in: table).isEmpty {
+        var blind = false
+        /// Whether group `g` still has a live process of ours; without a table, whether its leader still leads it.
+        func live(_ g: Int32, in entries: [ProcessEntry]?) -> Bool {
+            guard let entries else { blind = true; return leaderStillLeads(g) }
+            return !liveMembers(of: g, in: entries).isEmpty
+        }
+        let first = table()
+        for g in groups.sorted() where live(g, in: first) {
             if killpg(g, SIGTERM) == 0 { out.terminated.append(g) }
         }
-        guard !out.terminated.isEmpty else { return out }
-        let deadline = uptime() + grace
-        var alive = out.terminated
-        while true {
-            let now = ProcessTable.snapshot()
-            alive = alive.filter { !liveMembers(of: $0, in: now).isEmpty }
-            if alive.isEmpty || uptime() >= deadline { break }
-            pause()
+        if !out.terminated.isEmpty {
+            let deadline = uptime() + grace
+            var alive = out.terminated
+            while true {
+                // Without a table a group whose leader went may still have members: it counts as alive until the grace ends.
+                if let now = table() {
+                    alive = alive.filter { !liveMembers(of: $0, in: now).isEmpty }
+                } else {
+                    blind = true
+                }
+                if alive.isEmpty || uptime() >= deadline { break }
+                pause()
+            }
+            for g in alive where killpg(g, SIGKILL) == 0 { out.killed.append(g) }
         }
-        for g in alive where killpg(g, SIGKILL) == 0 { out.killed.append(g) }
+        if blind { out.problems.append(tableUnreadableProblem) }
         return out
     }
 
@@ -168,12 +200,22 @@ public enum EmergencyStop {
     /// carries no start time, so a pid reused after its turn started would pass any one-sided check; the turns' leaders come
     /// from the runner's records instead (`Store.recordedTurnLeaders`, in `engineGroups`), which hold the exact start.
     public static func recordedGroups(store: Store) -> Set<Int32> {
+        gatherRecorded(store: store).groups
+    }
+
+    /// `recordedGroups`, with what could not be read (the child-group records, the preview states; S4 fix round 1, I1/M8).
+    static func gatherRecorded(store: Store) -> (groups: Set<Int32>, problems: [String]) {
         var groups = Set<Int32>()
+        var problems: [String] = []
         if let home = store.dataHome {
-            groups.formUnion(ChildGroups.liveLeaders(in: ChildGroups.directory(runDir: home.appending(path: "run", directoryHint: .isDirectory))))
+            let children = ChildGroups.liveLeadersReporting(in: ChildGroups.directory(runDir: home.appending(path: "run", directoryHint: .isDirectory)))
+            groups.formUnion(children.leaders)
+            problems += children.problems
         }
-        groups.formUnion(previewGroups(store: store))
-        return groups
+        let previews = gatherPreviewGroups(store: store)
+        groups.formUnion(previews.groups)
+        problems += previews.problems
+        return (groups, problems)
     }
 
     /// Every process group the engine recorded, for the stop paths (Task 9c fix round 1, controller ruling 1): `recordedGroups`
@@ -181,14 +223,24 @@ public enum EmergencyStop {
     /// turn is recorded there with its exact start, and a record still names a `claude` whose turn the engine already recorded
     /// `interrupted` but which is winding down). Every source matches a recorded start time exactly.
     public static func engineGroups(store: Store, paths: BrahmaPaths) -> Set<Int32> {
-        recordedGroups(store: store).union(Store.recordedTurnLeaders(paths: paths))
+        gatherEngine(store: store, paths: paths).groups
+    }
+
+    /// `engineGroups`, with what could not be read.
+    static func gatherEngine(store: Store, paths: BrahmaPaths) -> (groups: Set<Int32>, problems: [String]) {
+        let recorded = gatherRecorded(store: store)
+        return (recorded.groups.union(Store.recordedTurnLeaders(paths: paths)), recorded.problems)
     }
 
     /// The one stop every path uses: STOP EVERYTHING, `brahma stop`, a quit whose bound passed, and the second quit signal
     /// (`EngineShutdown.force`) all signal exactly `engineGroups` (SIGTERM, `grace`, SIGKILL; `grace` 0 is SIGKILL right behind
-    /// SIGTERM). Nothing the engine did not record is ever signalled. Blocking.
+    /// SIGTERM). Nothing the engine did not record is ever signalled. Blocking. What could not be read (a source of recorded
+    /// groups, the process table) is in `problems`; everything else is still signalled.
     public static func signalEngineGroups(store: Store, paths: BrahmaPaths, grace: TimeInterval = grace) -> Signalled {
-        signalGroups(engineGroups(store: store, paths: paths), grace: grace)
+        let gathered = gatherEngine(store: store, paths: paths)
+        var out = signalGroups(gathered.groups, grace: grace)
+        out.problems = gathered.problems + out.problems
+        return out
     }
 
     /// The groups of the preview servers recorded `building`, `starting` or `running`, each only while its pid still leads
@@ -196,15 +248,30 @@ public enum EmergencyStop {
     /// I2): a recycled pid, or a record without a start (an older engine's), is never signalled. What reaches previews when
     /// the engine itself cannot (`brahma stop`, the app's STOP EVERYTHING).
     static func previewGroups(store: Store) -> Set<Int32> {
+        gatherPreviewGroups(store: store).groups
+    }
+
+    /// `previewGroups`, with what could not be read: the company list, or one company's preview states (I1). The other
+    /// companies' previews are still found.
+    static func gatherPreviewGroups(store: Store) -> (groups: Set<Int32>, problems: [String]) {
         var groups = Set<Int32>()
-        for company in (try? store.companies()) ?? [] {
-            for state in ((try? store.previewStates(companyId: company.id)) ?? [:]).values
-            where [.building, .starting, .running].contains(state.status) {
+        let companies: [Company]
+        do { companies = try store.companies() } catch {
+            return ([], ["the companies could not be read, so no preview server was found to stop: \(error)"])
+        }
+        var problems: [String] = []
+        for company in companies {
+            let states: [String: PreviewState]
+            do { states = try store.previewStates(companyId: company.id) } catch {
+                problems.append("the preview servers of \(Store.flat(company.name, max: 80)) could not be read: \(error)")
+                continue
+            }
+            for state in states.values where [.building, .starting, .running].contains(state.status) {
                 if let pid = state.pid, PreviewRunner.orphanGroup(pid: pid, pidStart: state.pidStart) {
                     groups.insert(pid)
                 }
             }
         }
-        return groups
+        return (groups, problems)
     }
 }

@@ -235,10 +235,11 @@ extension Orchestrator {
         }
         if !f.unexpectedModels.isEmpty {
             let models = f.unexpectedModels.joined(separator: ", ")
+            // The hold first, on its own (S4 fix round 1, M9): an alert that throws never skips it.
+            attempt { try store.holdForDoctor(agentId: agent.id, reason: "unexpected model \(models)", now: now) }
             attempt {
                 try EngineAlerts.raise(store: store, text: "A turn of @\(agent.name) billed an unexpected model (\(models)). Its next turn "
                                        + "waits until `brahma doctor` passes again.", now: now, reason: "model", scope: .allCompanies(.cli))
-                try store.holdForDoctor(agentId: agent.id, reason: "unexpected model \(models)", now: now)
             }
         }
         if !f.safetyFallbacks.isEmpty {

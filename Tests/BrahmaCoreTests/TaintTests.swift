@@ -248,6 +248,57 @@ import GRDB
         #expect(why == TaintPolicy.refusal(tool: "request_from_owner", source: TaintPolicy.hookErrorSource))
     }
 
+    /// S4 fix round 1 (I1): when neither the flag file nor the database mark landed, the hook says so (`unrecorded`): it is
+    /// not reported as "failed closed" (the CLI writes it to stderr and exits non-zero).
+    @Test func hookUnrecordedWhenNothingLands() throws {
+        let h = try Home()
+        let run = h.dir.appending(path: "run", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: run.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: run.path) }   // exec-bit fixture: a directory mode
+        let out = PostToolHook.handle(stdin: Data("garbage".utf8), database: h.db, agentId: h.eng.id, environment: [:],
+                                      open: { _ in throw FakeError(description: "db locked") }, pause: { _ in })
+        guard case .unrecorded(let why) = out else { Issue.record("expected unrecorded, got \(out)"); return }
+        #expect(why.contains("the hook input could not be read"), Comment(rawValue: why))
+        #expect(!TaintFlag.exists(h.flag(h.eng)))
+        #expect(!(try h.fresh(h.eng).sessionTainted))
+        // The flag alone landing is enough to fail closed (the gate reads it).
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: run.path)
+        let flagged = PostToolHook.handle(stdin: Data("garbage".utf8), database: h.db, agentId: h.eng.id, environment: [:],
+                                          open: { _ in throw FakeError(description: "db locked") }, pause: { _ in })
+        guard case .failedClosed = flagged else { Issue.record("expected failedClosed, got \(flagged)"); return }
+        #expect(TaintFlag.exists(h.flag(h.eng)))
+    }
+
+    /// S4 fix round 1 (I1): an extension lookup that throws is retried and then fails closed; it never reads as "not installed".
+    @Test func extensionLookupErrorFailsClosed() throws {
+        let h = try Home()
+        try h.store.writer.write { try $0.execute(sql: "ALTER TABLE companyExtension RENAME TO companyExtensionGone") }
+        var pauses = 0
+        let out = PostToolHook.handle(stdin: Self.hookInput("Skill", ["skill": .string("vendor:x")]), database: h.db, agentId: h.eng.id,
+                                      environment: [:], pause: { _ in pauses += 1 })
+        guard case .failedClosed(let why) = out else { Issue.record("expected failedClosed, got \(out)"); return }
+        #expect(why.contains("the taint could not be recorded"), Comment(rawValue: why))
+        #expect(pauses == PostToolHook.attempts - 1, "the lookup error is retried")
+        #expect(TaintFlag.exists(h.flag(h.eng)))
+    }
+
+    /// S4 fix round 1 (M6): a directory that cannot be listed could hide a repository, so the lab-mark clear refuses (named).
+    @Test func labLikeReposRefusesAnUnlistableDirectory() throws {
+        let h = try Home()
+        let ws = URL(fileURLWithPath: h.company.workspacePath)
+        let hidden = ws.appending(path: "src/hidden", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: hidden, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: hidden.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hidden.path) }   // exec-bit fixture: a directory mode
+        do {
+            _ = try LabProvenance.labLikeRepos(workspace: ws)
+            Issue.record("an unlistable directory must refuse the clear")
+        } catch let refused as LabProvenance.ClearRefused {
+            #expect(refused.message == "src/hidden cannot be listed; move it aside, then clear the mark", Comment(rawValue: refused.message))
+        }
+    }
+
     @Test func hookRefusesForeignAgent() throws {
         let h = try Home()
         let out = PostToolHook.handle(stdin: Self.hookInput("WebFetch", [:]), database: h.db, agentId: h.eng.id,

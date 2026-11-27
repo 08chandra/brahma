@@ -256,11 +256,17 @@ extension AppModel {
     /// the engine recorded is signalled from here as well (`EmergencyStop.signalEngineGroups`, the one stop every path shares:
     /// turns in progress and turns still winding down, checks, merges, previews), so an engine that is wedged (or runs in a
     /// terminal) cannot keep agents running. The engine cancels its turns and checks at its next tick.
+    /// What the stop could not read (the child-group records, the preview states, the process table) is shown in
+    /// `errorMessage` (S4 fix round 1): the processes it names could not be vouched for; everything else was signalled.
     public func stopEverything() async {
         let paths = self.paths
-        await ownerWrite("stop everything") { store in
+        let signalled = await ownerWrite("stop everything") { store in
             try store.emergencyStop(note: nil, by: "app", now: Date())
-            _ = EmergencyStop.signalEngineGroups(store: store, paths: paths)
+            return EmergencyStop.signalEngineGroups(store: store, paths: paths)
+        }
+        if let problems = signalled?.problems, !problems.isEmpty {
+            errorMessage = "Everything is stopped, but Brahma could not check everything it would have stopped: "
+                + problems.joined(separator: "; ")
         }
     }
 

@@ -451,6 +451,48 @@ private final class GroupEvents: @unchecked Sendable {
         #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.hasSuffix(".group") }.isEmpty)
     }
 
+    // MARK: What the stop could not read (S4 fix round 1: I1, I2, M8)
+
+    /// An unreadable process table is not "nothing runs": every recorded group whose leader still leads it is signalled all
+    /// the same (SIGKILL after the grace, since no one can tell it went), and the stop says what it could not read.
+    @Test func unreadableTableStillSignalsRecordedLeaders() throws {
+        let child = try ProcessGroupChild.spawn(executable: "/bin/sleep", arguments: ["sleep", "300"], environment: [:],
+                                                workingDirectory: try tempDir(), output: -1)
+        defer { _ = child.signalGroup(SIGKILL); child.finish() }
+        let signalled = EmergencyStop.signalGroups([child.pid], grace: 0.2, table: { nil })
+        #expect(signalled.terminated == [child.pid])
+        #expect(signalled.problems.contains { $0.contains("process table") }, "\(signalled.problems)")
+        #expect(child.hasExited(), "the recorded group was signalled although the table could not be read")
+        // A group whose leader is gone is never signalled, even blind.
+        let gone = EmergencyStop.signalGroups([child.pid], grace: 0, table: { nil })
+        #expect(gone.terminated.isEmpty && gone.killed.isEmpty)
+    }
+
+    /// The stop's sources that cannot be read (the child-group records, the preview states) are carried into the result and
+    /// shown by `brahma stop`; everything else is still signalled.
+    @Test func stopReportsSourcesItCouldNotRead() throws {
+        let owner = try OwnerTestHome()
+        let paths = ownerPaths(owner.url)
+        let store = try Store(path: paths.database.path)
+        _ = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: paths.workspaces)
+        let children = ChildGroups.directory(runDir: paths.runDir)
+        try FileManager.default.createDirectory(at: children, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: children.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: children.path) }   // exec-bit fixture: a directory mode
+        try store.writer.write { try $0.execute(sql: "ALTER TABLE previewState RENAME TO previewStateGone") }
+        defer { try? store.writer.write { try $0.execute(sql: "ALTER TABLE previewStateGone RENAME TO previewState") } }
+
+        let signalled = EmergencyStop.signalEngineGroups(store: store, paths: paths, grace: 0)
+        #expect(signalled.problems.contains { $0.contains(children.path) }, "\(signalled.problems)")
+        #expect(signalled.problems.contains { $0.contains("preview") }, "\(signalled.problems)")
+
+        let stop = try cli(["stop"], home: owner.url)
+        #expect(stop.status == 0, "\(stop.stderr)")
+        #expect(stop.stdout.hasPrefix("STOPPED by the owner since "), "\(stop.stdout)")
+        #expect(stop.stderr.contains(children.path), "\(stop.stderr)")
+        #expect(stop.stderr.contains("preview"), "\(stop.stderr)")
+    }
+
     // MARK: Stop notice (M1 ruling)
 
     @Test func stopNoticeIsPushedOncePerStop() async throws {

@@ -46,7 +46,8 @@ final class TurnContainment: @unchecked Sendable {
         lock.withLock { watching = true }
         Thread.detachNewThread { [self] in
             while !lock.withLock({ stopFlag }) {
-                observe(ProcessTable.snapshot())
+                // A poll whose table could not be read observes nothing; the sweep decides on its own reads.
+                if let table = ProcessTable.snapshot() { observe(table) }
                 Thread.sleep(forTimeInterval: Self.pollInterval)
             }
             watcherDone.signal()
@@ -94,18 +95,20 @@ final class TurnContainment: @unchecked Sendable {
 
     /// Stops watching and kills (SIGKILL) every process of the turn, round after round, until none is left or `rounds` pass.
     /// Each kill re-reads the process first, so a pid that was reused meanwhile is left alone. Returns what is still alive.
-    func sweep(rounds: Int = 50) -> [pid_t] {
+    /// A process table that cannot be read rules nothing out: `[-1]`, inconclusive (S4 fix round 1, I2), as `finish` and
+    /// `TurnRecords.reap` read it. `snapshot` is injectable for tests.
+    func sweep(rounds: Int = 50, snapshot: () -> [ProcessEntry]? = ProcessTable.snapshot) -> [pid_t] {
         stopWatching()
         var left: [ProcessEntry] = []
         for _ in 0..<rounds {
-            let table = ProcessTable.snapshot()
+            guard let table = snapshot() else { return [-1] }
             observe(table)
             left = members(table)
             if left.isEmpty { return [] }
             for p in left where ProcessTable.entry(p.pid)?.start == p.start { kill(p.pid, SIGKILL) }
             Thread.sleep(forTimeInterval: 0.02)
         }
-        let table = ProcessTable.snapshot()
+        guard let table = snapshot() else { return [-1] }
         return members(table).map(\.pid)
     }
 }
@@ -187,9 +190,9 @@ enum TurnRecords {
     /// process in its session or group started no earlier than it (a pid in use cannot become a group or session id), and, for a
     /// sandboxed turn, every process whose sandbox carries its marker (`SandboxSweep`, fail closed). A record is forgotten only
     /// once nothing of it is left. Blocking.
-    /// `snapshot` is injectable for tests. Fails closed (fix round 2, B-N2): a table that cannot be read (empty, or without
-    /// this very process) rules nothing out: a survivor (`-1`), and the record is kept.
-    static func reap(agentId: String, in dir: URL, snapshot: @escaping () -> [ProcessEntry] = ProcessTable.snapshot) throws -> TurnLeftovers {
+    /// `snapshot` is injectable for tests. Fails closed (fix round 2, B-N2): a table that cannot be read (nil, empty, or
+    /// without this very process) rules nothing out: a survivor (`-1`), and the record is kept.
+    static func reap(agentId: String, in dir: URL, snapshot: @escaping () -> [ProcessEntry]? = ProcessTable.snapshot) throws -> TurnLeftovers {
         var out = TurnLeftovers()
         var kept: [TurnRecord] = []
         let me = getpid(), uid = getuid()
@@ -200,8 +203,7 @@ enum TurnRecords {
             // different start time), every group or session match is that process's, never the old turn's (fix round 2, B-N1).
             let reused = ProcessTable.entry(record.leader).map { $0.start != record.leaderStart } ?? false
             func members() -> [ProcessEntry] {
-                let table = snapshot()
-                guard !table.isEmpty, table.contains(where: { $0.pid == me }) else { unreadable = true; return [] }
+                guard let table = snapshot(), table.contains(where: { $0.pid == me }) else { unreadable = true; return [] }
                 return table.filter { p in
                     guard p.uid == uid, p.pid != me, !p.isZombie else { return false }
                     if p.pid == record.leader { return p.start == record.leaderStart }
@@ -405,8 +407,21 @@ final class TurnChild: @unchecked Sendable {
             if swept.tableUnreadable { left.insert(-1) }
         }
         group.finish()
-        let table = ProcessTable.snapshot()
-        let unaccounted = left.contains(-1) ? [ProcessEntry(pid: -1, ppid: 0, pgid: 0, uid: getuid(), start: 0, isZombie: false)] : []
-        return table.filter { left.contains($0.pid) } + unaccounted
+        let unaccounted = [ProcessEntry(pid: -1, ppid: 0, pgid: 0, uid: getuid(), start: 0, isZombie: false)]
+        guard let table = ProcessTable.snapshot() else {
+            // The table cannot be read now (S4 fix round 1, I2): each pid left is read on its own; one that cannot be read
+            // is unaccounted for, one the kernel says is gone is not.
+            var rows: [ProcessEntry] = []
+            var unread = left.contains(-1)
+            for pid in left.filter({ $0 > 0 }).sorted() {
+                switch ProcessTable.lookup(pid) {
+                case .found(let row): rows.append(row)
+                case .absent: break
+                case .unreadable: unread = true
+                }
+            }
+            return rows + (unread ? unaccounted : [])
+        }
+        return table.filter { left.contains($0.pid) } + (left.contains(-1) ? unaccounted : [])
     }
 }

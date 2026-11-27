@@ -297,6 +297,13 @@ public struct SandboxScope: Equatable, Sendable {
         case item(String), itemless, review(String?), audit, plan(String)
     }
 
+    /// `SandboxPath.entries` for a directory a turn's scope must list (to deny, protect or mount each entry): one that is still
+    /// there but cannot be listed refuses the turn as an `UnsafeEngineFile` naming it ("cannot be listed"), so
+    /// `sandboxRefusal` tells the owner once which path it was (S4 fix round 1, M1), never a raw Cocoa error.
+    static func listedEntries(_ dir: String) throws -> [String] {
+        do { return try SandboxPath.entries(dir) } catch { throw UnsafeEngineFile(path: dir, problem: "cannot be listed") }
+    }
+
     /// The scope of one turn of the agent `layout` describes. `otherWorkspaces` is every other company's workspace;
     /// `backupTargets` the owner's backup folders and WAL replica (`BackupTargets.protectedFolders`); `darwinUserTemp` the xcrun temp dir.
     /// `userHome` is the owner's home (the process's by default; tests pass a temp dir). `reviewPages` are the extension review
@@ -430,7 +437,7 @@ public struct SandboxScope: Equatable, Sendable {
         // target keeps its own rules); a name no profile may carry is left out and reported, never fatal.
         var readable: [URL] = []
         var skipped: [String] = []
-        for name in try SandboxPath.entries(ws.path) where name != ".brahma" {
+        for name in try listedEntries(ws.path) where name != ".brahma" {
             let entry = l(name)
             if SandboxPath.isUnsafe(name) { skipped.append(entry.path); continue }
             guard SandboxPath.kind(entry.path) != .link else { continue }
@@ -488,7 +495,7 @@ public struct SandboxScope: Equatable, Sendable {
         // name no profile may carry denies the whole directory instead; where the turn's own carve-out shares it, only this
         // turn is refused.
         func denyEntries(of dir: URL, keeping keep: Set<String>, carveOut: Bool) throws {
-            let names = try SandboxPath.entries(dir.path).filter { !keep.contains($0) }
+            let names = try listedEntries(dir.path).filter { !keep.contains($0) }
             if !carveOut { denyWrite += both(dir) }
             if let bad = names.first(where: SandboxPath.isUnsafe) {
                 if carveOut { throw SandboxError.unsafePathCharacter(dir.appending(path: bad).path) }
