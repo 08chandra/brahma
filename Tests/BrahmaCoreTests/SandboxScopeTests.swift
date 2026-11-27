@@ -98,7 +98,7 @@ private func expectAnySandboxError(_ body: () throws -> Void, _ match: (SandboxE
         let w = try SandboxWorld()
         try FileManager.default.createDirectory(atPath: w.p(".brahma/progress"), withIntermediateDirectories: true)
         for dir in [w.p(".brahma/progress"), w.ws.path] {
-            try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: dir)
+            try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: dir)   // exec-bit fixture: a directory mode
             defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir) }   // exec-bit fixture: a directory mode
             do {
                 _ = try w.scope(.work)

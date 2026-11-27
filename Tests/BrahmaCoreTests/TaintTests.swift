@@ -254,7 +254,7 @@ import GRDB
         let h = try Home()
         let run = h.dir.appending(path: "run", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: run.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: run.path)   // exec-bit fixture: a directory mode
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: run.path) }   // exec-bit fixture: a directory mode
         let out = PostToolHook.handle(stdin: Data("garbage".utf8), database: h.db, agentId: h.eng.id, environment: [:],
                                       open: { _ in throw FakeError(description: "db locked") }, pause: { _ in })
@@ -263,7 +263,7 @@ import GRDB
         #expect(!TaintFlag.exists(h.flag(h.eng)))
         #expect(!(try h.fresh(h.eng).sessionTainted))
         // The flag alone landing is enough to fail closed (the gate reads it).
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: run.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: run.path)   // exec-bit fixture: a directory mode
         let flagged = PostToolHook.handle(stdin: Data("garbage".utf8), database: h.db, agentId: h.eng.id, environment: [:],
                                           open: { _ in throw FakeError(description: "db locked") }, pause: { _ in })
         guard case .failedClosed = flagged else { Issue.record("expected failedClosed, got \(flagged)"); return }
