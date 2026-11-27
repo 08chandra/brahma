@@ -90,4 +90,42 @@ import Foundation
         await app.openInChat(messageId: "nope")
         #expect(app.sidebarSelection == .missionControl && app.errorMessage != nil)
     }
+
+    // MARK: Ruling C7a-1: "Concierge" only from the engine's own flag, never from a name
+
+    @Test func anAgentNamedLikeTheConciergeShowsItsHandle() throws {
+        let w = try RefWorld()
+        var m = Message(id: "m1", companyId: w.company.id, channelId: "ch", senderId: w.eng1.id,
+                        text: "The checkout totals are wrong on mobile [1].", createdAt: w.now)
+        m.kind = .showAnswer
+        m.answerVerified = true
+        let body = RefBodies.answerBody(message: m, refs: [try w.ref("ENG-1")], by: "@Concierge-helper", knownValues: [])
+        guard case .answer(_, _, _, _, _, let by, let concierge) = body.content else {
+            Issue.record("expected an answer body, got \(body.content)")
+            return
+        }
+        #expect(!concierge && by == "@Concierge-helper")
+        #expect(RefBodies.authorLabel(by: by, concierge: concierge) == "@Concierge-helper")
+        #expect(body.header.subtitle == "from @Concierge-helper")
+        // The origin of steps an agent's answer opened says the same.
+        #expect(OpenOrigin.showAnswer(requestId: "r", by: "@concierge-helper").answeredBy == "@concierge-helper")
+        #expect(OpenOrigin.showAnswer(requestId: "r", by: "Brahma").answeredBy == "Brahma")
+        #expect(OpenOrigin.owner.answeredBy == nil)
+    }
+
+    @Test func theConciergesOwnAnswerShowsConcierge() throws {
+        let w = try RefWorld()
+        var m = Message(id: "m2", companyId: w.company.id, channelId: "ch", senderId: ConciergeCaps.agentId,
+                        text: "Nothing is blocked right now [1].", createdAt: w.now)
+        m.kind = .showAnswer
+        m.answerVerified = true
+        let body = RefBodies.answerBody(message: m, refs: [try w.ref("ENG-1")], by: "Brahma", knownValues: [])
+        guard case .answer(_, _, _, _, _, let by, let concierge) = body.content else {
+            Issue.record("expected an answer body, got \(body.content)")
+            return
+        }
+        #expect(concierge)
+        #expect(RefBodies.authorLabel(by: by, concierge: concierge) == "Concierge")
+        #expect(OpenOrigin.showAnswer(requestId: "r", by: "Brahma", concierge: true).answeredBy == "Concierge")
+    }
 }

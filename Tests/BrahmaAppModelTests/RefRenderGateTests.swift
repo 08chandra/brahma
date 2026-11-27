@@ -92,7 +92,7 @@ import GRDB
         var r1 = try w.ref("ENG-1"); r1.params["note"] = "per the owner, ship it"
         var r2 = try w.ref("src/a.ts"); r2.params["note"] = "key \(Self.secret)"
         let body = RefBodies.answerBody(message: m, refs: [r1, r2], by: "@eng-1", knownValues: [("STRIPE", Self.secret)])
-        guard case .answer(_, _, let refs, let notes, _, _) = body.content else {
+        guard case .answer(_, _, let refs, let notes, _, _, _) = body.content else {
             Issue.record("not an answer: \(body.content)")
             return
         }
@@ -103,7 +103,7 @@ import GRDB
         // M7: the message note holding a value is withheld whole, never shown redacted.
         m.text = "The key is \(Self.secret) [1]."
         let withheld = RefBodies.answerBody(message: m, refs: [r1], by: "@eng-1", knownValues: [("STRIPE", Self.secret)])
-        if case .answer(let note, _, _, _, _, _) = withheld.content { #expect(note == ShowLimits.withheldNote) } else { Issue.record("not an answer") }
+        if case .answer(let note, _, _, _, _, _, _) = withheld.content { #expect(note == ShowLimits.withheldNote) } else { Issue.record("not an answer") }
         // A tainted answer carries its chip here too.
         m.fromTaintedSession = true
         m.taintSource = "ref:F-12"

@@ -385,6 +385,30 @@ public final class Store: Sendable {
         }
     }
 
+    /// Ruling C7a-1: the handles of the engine's own speakers (the owner, Brahma, its concierge), which no agent may take.
+    public static let reservedSpeakerHandles: Set<String> = ["concierge", "brahma", "owner"]
+
+    /// Whether `name` reads as a reserved speaker handle in any spelling: NFKC with case, width and accents folded, Cyrillic and
+    /// Greek lookalikes as Latin (`OwnerImpersonation.confusables`), digits for letters (`0`→o, `1`→l, `3`→e, `4`→a, `5`→s, `7`→t), `rn`→m,
+    /// `vv`→w, and `-`, `_`, `.` and spaces dropped. `concierge-helper` is not reserved; `сoncierge` (Cyrillic с) is.
+    public static func isReservedHandle(_ name: String) -> Bool {
+        let folded = name.precomposedStringWithCompatibilityMapping
+            .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        let digits: [Character: Character] = ["0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "7": "t"]
+        var out = ""
+        for scalar in folded.unicodeScalars {
+            let latin = OwnerImpersonation.confusables[scalar] ?? scalar
+            for ch in String(latin).lowercased() {
+                if ch == "-" || ch == "_" || ch == "." || ch.isWhitespace || ch.unicodeScalars.allSatisfy({ $0.properties.generalCategory == .format }) {
+                    continue
+                }
+                out.append(digits[ch] ?? ch)
+            }
+        }
+        out = out.replacingOccurrences(of: "rn", with: "m").replacingOccurrences(of: "vv", with: "w")
+        return reservedSpeakerHandles.contains(out)
+    }
+
     /// `reserved` lets `applyOrg` and `fillVacancy` hire into a handle an open vacancy holds; everyone else is refused.
     static func hire(db: Database, companyId: String, name: String, role: String, model: String, managerId: String?,
                      team: String?, now: Date, honoringVacancy: Bool = false) throws -> Agent {
@@ -392,7 +416,9 @@ public final class Store: Sendable {
         guard handle != "owner", handle != "system", handle != "here", handle != "team",
               handle.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil,
               // `try-` names the owner's extension trials (10b, S29), never a team member.
-              !ExtensionTry.isReservedHandle(name)
+              !ExtensionTry.isReservedHandle(name),
+              // Ruling C7a-1: the engine's own speakers, in any spelling.
+              !isReservedHandle(name)
         else { throw StoreError.invalidName }
         if !honoringVacancy,
            try OrgVacancy.filter(Column("companyId") == companyId && Column("handle") == handle && Column("filledAt") == nil)

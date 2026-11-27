@@ -260,7 +260,7 @@ extension AppModel {
         let owner = ctx.owner
         let gate = GlobalSearch.TextGate(knownValues: ctx.knownValues)
         do {
-            if case .showAnswer(let requestId, let by) = opened.origin {
+            if case .showAnswer(let requestId, let by, _) = opened.origin {
                 let request = try? await Task.detached { try store.showRequest(companyId: companyId, id: requestId) }.value
                 let answer: Message? = try? await Task.detached { () -> Message? in
                     guard let id = request?.answerMessageId else { return nil }
@@ -463,7 +463,7 @@ extension AppModel {
         guard let first = auto.refs.first, let companyId = selectedCompanyId else { return }
         let steps = auto.refs.count > 1 ? auto.refs.map(OpenedRef.stripped) : nil
         let opened = OpenedRef(ref: OpenedRef.stripped(first), title: title, kindChip: OpenedRef.kindChip(for: first),
-                               origin: .showAnswer(requestId: auto.requestId, by: auto.by), steps: steps, stepIndex: steps == nil ? nil : 0)
+                               origin: .showAnswer(requestId: auto.requestId, by: auto.by, concierge: auto.concierge), steps: steps, stepIndex: steps == nil ? nil : 0)
         switch decision {
         case .cardOnly:
             return

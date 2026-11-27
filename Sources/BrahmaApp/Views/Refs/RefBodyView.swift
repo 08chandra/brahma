@@ -24,23 +24,13 @@ struct RefBodyView: View {
             Hairline()
             if !inspector, let opened, let chips = opened.stepChips {
                 StepChips(chips: chips, current: opened.stepIndex, select: { i in Task { await model.step(to: i) } }, note: nil,
-                          from: Self.answeredBy(opened.origin))
+                          from: opened.origin.answeredBy)
                 Hairline()
             }
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(BrahmaTheme.bg0)
-    }
-
-    /// `Concierge` for Brahma's answers (never engine text), else the agent's handle.
-    static func answeredBy(_ origin: OpenOrigin) -> String? {
-        guard case .showAnswer(_, let by) = origin else { return nil }
-        return label(by: by)
-    }
-
-    static func label(by: String) -> String {
-        by == "Brahma" || by.lowercased().contains("concierge") ? "Concierge" : by
     }
 
     @ViewBuilder private var content: some View {
@@ -75,9 +65,11 @@ struct RefBodyView: View {
                 FactCardView(answer: answer, timeZone: model.ownerTimeZone) { ref in RefActions.openInPreview(model: model, ref: ref) }
                     .padding(BrahmaTheme.spaceS)
             }
-        case .answer(_, let claims, let refs, let refNotes, let verified, let by):
+        case .answer(_, let claims, let refs, let refNotes, let verified, let by, let concierge):
             ScrollView {
-                AnswerClaimsView(claims: claims, refs: refs, refNotes: refNotes, verified: verified, by: Self.label(by: by)) { ref in
+                // Ruling C7a-1: "Concierge" only from the model's flag, never from a name.
+                AnswerClaimsView(claims: claims, refs: refs, refNotes: refNotes, verified: verified,
+                                 by: RefBodies.authorLabel(by: by, concierge: concierge)) { ref in
                     Task { await model.openRef(ref, origin: opened?.origin ?? .owner) }
                 }
                 .padding(BrahmaTheme.spaceM)

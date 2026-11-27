@@ -46,7 +46,8 @@ public enum RefContent: Equatable, Sendable {
     /// A `show` answer: the agent's note (gated), its claims with their citations, the refs, the citation verdict and who answered.
     /// `refNotes` are the agent's per-ref notes, gated as final strings (impersonation flagged, a value withholds the note); the refs
     /// themselves carry no `note` parameter.
-    case answer(note: String, claims: [Claim], refs: [WorkRef], refNotes: [String?], verified: Bool, by: String)
+    /// Ruling C7a-1: `concierge` is set only when the engine's concierge wrote the answer (its sender id), never from a name.
+    case answer(note: String, claims: [Claim], refs: [WorkRef], refNotes: [String?], verified: Bool, by: String, concierge: Bool)
     case unavailable(String)
 }
 
@@ -346,7 +347,8 @@ public enum RefBodies {
         let citation = CitationCheck.verify(note: note, refCount: refs.count)
         let verified = message.answerVerified ?? citation.verified
         let claims = citation.claims + citation.uncited.map { Claim(text: $0, cites: []) }
-        let concierge = message.senderId == ConciergeCaps.agentId || by == "Brahma"
+        // Ruling C7a-1: the engine's sender id alone says the concierge answered; a name (`@concierge-helper`, "Brahma") never does.
+        let concierge = message.senderId == ConciergeCaps.agentId
         let who = concierge ? "Brahma (concierge)" : by
         var chips: [RefChip] = []
         if !verified { chips.append(RefChip(text: "UNVERIFIED", tone: .warn)) }
@@ -359,7 +361,14 @@ public enum RefBodies {
         let shownTitle = title.flatMap { gate.final($0, max: SafeTitle.max) } ?? "answered"
         let header = RefHeader(title: shownTitle, subtitle: gate.final("from \(who)", max: SafeTitle.max) ?? "answer", chips: chips,
                                actions: [.copyRef, .shareTo, .askToExplain, .openInChat])
-        return RefBody(header: header, content: .answer(note: note, claims: claims, refs: refs, refNotes: refNotes, verified: verified, by: who))
+        return RefBody(header: header, content: .answer(note: note, claims: claims, refs: refs, refNotes: refNotes, verified: verified, by: who,
+                                                        concierge: concierge))
+    }
+
+    /// Ruling C7a-1: how a view names an answer's author — "Concierge" only when the engine's flag says so, else the author as
+    /// the engine wrote it (`@handle`).
+    public static func authorLabel(by: String, concierge: Bool) -> String {
+        concierge ? "Concierge" : by
     }
 
     // MARK: Agent now

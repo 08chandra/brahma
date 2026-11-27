@@ -109,7 +109,7 @@ import GRDB
         m.answerVerified = false
         let body = RefBodies.answerBody(message: m, refs: refs, by: "@eng-1", knownValues: [])
         #expect(body.header.chips.contains(RefChip(text: "UNVERIFIED", tone: .warn)))
-        guard case .answer(let note, let claims, let shownRefs, _, let verified, let by) = body.content else {
+        guard case .answer(let note, let claims, let shownRefs, _, let verified, let by, _) = body.content else {
             Issue.record("expected an answer body, got \(body.content)")
             return
         }
@@ -122,7 +122,7 @@ import GRDB
         m.answerVerified = true
         let good = RefBodies.answerBody(message: m, refs: refs, by: "@eng-1", knownValues: [])
         #expect(!good.header.chips.contains { $0.text == "UNVERIFIED" })
-        if case .answer(_, let claims, _, _, let verified, _) = good.content {
+        if case .answer(_, let claims, _, _, let verified, _, _) = good.content {
             #expect(verified && claims.count == 2 && claims.allSatisfy { !$0.cites.isEmpty })
         } else { Issue.record("not an answer") }
 
@@ -134,7 +134,7 @@ import GRDB
         let secret = "sk_" + "live_" + String(repeating: "z", count: 24)
         m.text = "The key is \(secret) [1]."
         let gated = RefBodies.answerBody(message: m, refs: refs, by: "@eng-1", knownValues: [("STRIPE", secret)])
-        if case .answer(let note, _, _, _, _, _) = gated.content { #expect(!note.contains(secret)) } else { Issue.record("not an answer") }
+        if case .answer(let note, _, _, _, _, _, _) = gated.content { #expect(!note.contains(secret)) } else { Issue.record("not an answer") }
     }
 
     /// Controller Ruling C6-1: workspace, worktree and commit content is agent-made (whoever committed it), so its bytes decode

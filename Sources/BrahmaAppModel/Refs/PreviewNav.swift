@@ -5,8 +5,16 @@ import BrahmaCore
 /// opened it (`requestId`, and who answered: `"@eng-1"` or `"Brahma"`), or the owner opened a card in chat.
 public enum OpenOrigin: Equatable, Sendable, Codable {
     case owner
-    case showAnswer(requestId: String, by: String)
+    /// Ruling C7a-1: `concierge` is the engine's routing (the request went to Brahma's concierge), never read from `by`.
+    case showAnswer(requestId: String, by: String, concierge: Bool = false)
     case card(messageId: String)
+
+    /// Who answered, as the steps' strip and chips show it: "Concierge" only for the engine's concierge flag, else `by` as the
+    /// engine wrote it (`@handle`); nil when no show answer opened it.
+    public var answeredBy: String? {
+        guard case .showAnswer(_, let by, let concierge) = self else { return nil }
+        return RefBodies.authorLabel(by: by, concierge: concierge)
+    }
 }
 
 /// The ref in the OPENED slot: its engine title (gated before it is stored here), a kind chip (`ITEM`, `FILE`, …) and, for a

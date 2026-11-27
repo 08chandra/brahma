@@ -85,6 +85,9 @@ public struct AutoOpen: Equatable, Sendable {
     public var refs: [WorkRef]
     /// `"Brahma"` or `"@<handle>"`.
     public var by: String
+    /// Ruling C7a-1: the request went to Brahma's concierge (the engine's routing, never a name): only then is the answer
+    /// labelled "Concierge".
+    public var concierge: Bool = false
 }
 
 /// The Budget view's one "owner requests" line: what show requests cost, as shares of the windows (percent).
@@ -493,7 +496,7 @@ extension Store {
                 guard !refs.isEmpty else { continue }
                 let by = try r.targetAgentId.flatMap { try String.fetchOne(db, sql: "SELECT name FROM agent WHERE id = ?", arguments: [$0]) }
                     .map { "@" + $0 } ?? "Brahma"
-                out.append(AutoOpen(requestId: r.id, answerMessageId: messageId, refs: refs, by: by))
+                out.append(AutoOpen(requestId: r.id, answerMessageId: messageId, refs: refs, by: by, concierge: r.showTarget == .concierge))
             }
             return out
         }
