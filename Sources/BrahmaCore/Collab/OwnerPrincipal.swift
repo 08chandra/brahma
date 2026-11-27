@@ -5,6 +5,15 @@ import Foundation
 /// back.
 public enum ProcessRole: Equatable, Sendable {
     case unknown, owner, agent
+
+    /// Controller Ruling C6-4, the interim guard until the final wave threads `OwnerPrincipal` through every owner API: the
+    /// generic refusal (`WorkError.forbidden`) in an agent process, before any lookup; silent in an owner's. Called first thing by
+    /// the public entry points of the owner decisions (`ownerDecide`, `ownerAnswer`, `ownerRescind`, `acknowledge`), the vouches
+    /// (`vouchFile`, `vouchResource`, `vouchItem` takes the token), `purgeResource`, `setResourceScope`, `approveAccess`,
+    /// `provideSecret`, `declineFileRequest` and `answerFileRequest`. The `db:` overloads the engine's own presets use are not guarded.
+    public static func refuseInAgentProcess() throws {
+        guard OwnerPrincipal.processRole != .agent else { throw WorkError.forbidden(OwnerPrincipal.refusal) }
+    }
 }
 
 public enum OwnerPrincipalError: Error, Equatable, CustomStringConvertible {
@@ -28,8 +37,12 @@ public struct OwnerPrincipal: Sendable, Equatable {
     private static let roleLock = NSLock()
     nonisolated(unsafe) private static var role: ProcessRole = .unknown
 
-    /// This process's role.
-    public static var processRole: ProcessRole { roleLock.withLock { role } }
+    /// Tests only: a role scoped to the current task (`$roleOverride.withValue(.agent) { … }`), so a test of agent mode never
+    /// touches the process-wide role the other tests run under.
+    @TaskLocal static var roleOverride: ProcessRole?
+
+    /// This process's role (the task-local override first).
+    public static var processRole: ProcessRole { roleOverride ?? roleLock.withLock { role } }
 
     /// An agent's process (`brahma mcp`, a turn's entry point): from here on `mint` throws. Sticky.
     public static func enterAgentProcess() { roleLock.withLock { role = .agent } }
@@ -43,12 +56,21 @@ public struct OwnerPrincipal: Sendable, Equatable {
         guard processRole == .agent else { throw OwnerPrincipalError.refused("this entry point runs only as an agent process") }
     }
 
-    /// The owner principal of this process. Throws (and logs) in an agent process (`role`, this process's by default), and for a
-    /// process the owner-shell guard refuses. The owner CLI passes `Store.recordedTurnLeaders(paths:)` as the running turns.
-    public static func mint(role: ProcessRole? = nil, environment: [String: String] = ProcessInfo.processInfo.environment,
-                            ancestors: [Int32] = ProcessAncestry.chain(of: getpid()), runningTurnPids: Set<Int32> = []) throws -> OwnerPrincipal {
-        let effective = role ?? processRole
-        if effective == .agent {
+    /// The owner principal of this process. Throws (and logs) in an agent process — always: no argument lifts that (round 3,
+    /// I-1) — and for a process the owner-shell guard refuses (BRAHMA_AGENT_ID set, or a running turn among the ancestors).
+    public static func mint() throws -> OwnerPrincipal {
+        try mint(role: nil, environment: ProcessInfo.processInfo.environment, ancestors: ProcessAncestry.chain(of: getpid()), runningTurnPids: [])
+    }
+
+    /// The owner CLI's form: the running turns' leaders (`Store.recordedTurnLeaders(paths:)`) count as ancestors to refuse.
+    public static func mint(runningTurnPids: Set<Int32>) throws -> OwnerPrincipal {
+        try mint(role: nil, environment: ProcessInfo.processInfo.environment, ancestors: ProcessAncestry.chain(of: getpid()), runningTurnPids: runningTurnPids)
+    }
+
+    /// The seam the tests use (`@testable`): `role` can only make the check stricter (simulate an agent role); the process's own
+    /// agent role refuses first, whatever is passed.
+    static func mint(role: ProcessRole?, environment: [String: String], ancestors: [Int32], runningTurnPids: Set<Int32>) throws -> OwnerPrincipal {
+        if processRole == .agent || role == .agent {
             log("owner principal refused: this is an agent process")
             throw OwnerPrincipalError.refused("an agent process can't act as the owner")
         }

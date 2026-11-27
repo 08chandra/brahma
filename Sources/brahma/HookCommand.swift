@@ -19,6 +19,8 @@ struct HookGroup: ParsableCommand {
         @Option(help: "The turn's agent id (with --db).") var agent: String?
 
         func run() throws {
+            // Ruling C6-3: a turn's hook is an agent process before anything opens a Store.
+            OwnerPrincipal.enterAgentProcess()
             signal(SIGPIPE, SIG_IGN)
             let input = FileHandle.standardInput.readDataToEndOfFile()
             // A foreign agent is never this turn's: its session counts as tainted (fail closed).
@@ -38,6 +40,8 @@ struct HookGroup: ParsableCommand {
         @Option(help: "The turn's agent id.") var agent: String
 
         func run() throws {
+            // Ruling C6-3: a turn's hook is an agent process before anything opens a Store.
+            OwnerPrincipal.enterAgentProcess()
             signal(SIGPIPE, SIG_IGN)
             let input = FileHandle.standardInput.readDataToEndOfFile()
             let outcome = PostToolHook.handle(stdin: input, database: db, agentId: agent, environment: ProcessInfo.processInfo.environment)

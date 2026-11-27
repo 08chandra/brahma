@@ -194,7 +194,8 @@ extension Store {
     /// The owner takes back an approved ask (a policy-approved FYI too): `rescinded`, then its effects are reversed.
     @discardableResult
     public func ownerRescind(askId: String, note: String = "", now: Date = Store.now()) throws -> Ask {
-        try writer.write { db in
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+        return try writer.write { db in
             var ask = try requireAsk(db, askId)
             guard ask.status == .approved else {
                 throw WorkError.conflict(ask.status == .rescinded ? "\(ask.ref) is already rescinded"

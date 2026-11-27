@@ -159,6 +159,7 @@ extension Store {
     @discardableResult
     public func approveAccess(askId: String, scope: GrantScope, duration: GrantDuration, note: String = "",
                               environment: SandboxEnvironment = .owner, now: Date = Store.now()) throws -> Grant {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
         let approval = try grantApproval(askId: askId, scope: scope, duration: duration, approvedBy: "owner", environment: environment)
         return try writer.write { db in
             let ask = try ownerDecide(db: db, askId: askId, approve: true, note: note, acknowledgeChange: false, currentHash: nil,

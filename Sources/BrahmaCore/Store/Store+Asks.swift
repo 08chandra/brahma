@@ -556,6 +556,7 @@ extension Store {
     @discardableResult
     public func ownerDecide(askId: String, approve: Bool, note: String = "", acknowledgeChange: Bool = false,
                             now: Date = Store.now()) throws -> Ask {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
         if let seen = try ask(id: askId), let ref = Self.quarantineRef(of: seen) {
             guard seen.status.isPending else { throw WorkError.conflict("\(seen.ref) is already \(seen.status.rawValue)") }
             if approve {
@@ -648,7 +649,8 @@ extension Store {
     /// `Store.answerFileRequest`, `declineFileRequest`); the requester gets the answer as a DM from the owner.
     @discardableResult
     public func ownerAnswer(askId: String, text: String, now: Date = Store.now()) throws -> Ask {
-        try writer.write { db in try ownerAnswer(db: db, askId: askId, text: text, now: now).ask }
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+        return try writer.write { db in try ownerAnswer(db: db, askId: askId, text: text, now: now).ask }
     }
 
     /// `ownerAnswer` inside the caller's write transaction, with the answer DM's stored `kind` and chips (Plan C Task C5: a file
@@ -674,7 +676,8 @@ extension Store {
     /// The owner acknowledges an FYI (a policy-approved ask) or an engine alert (which then counts as answered).
     @discardableResult
     public func acknowledge(askId: String, now: Date = Store.now()) throws -> Ask {
-        try writer.write { db in
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+        return try writer.write { db in
             var ask = try requireAsk(db, askId)
             if ask.kind == .engineAlert, ask.status == .pendingOwner {
                 ask.acknowledgedAt = now

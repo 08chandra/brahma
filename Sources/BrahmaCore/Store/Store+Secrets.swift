@@ -94,6 +94,7 @@ extension Store {
     /// value never touches the ask or any other row.
     @discardableResult
     public func provideSecret(askId: String, value: String, isTest: Bool, vault: any SecretVault, now: Date = Store.now()) throws -> Ask {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
         guard let ask = try ask(id: askId) else { throw WorkError.notFound("no such ask") }
         guard ask.kind == .request, let request = SecretRequests.requested(ask) else {
             throw WorkError.invalid("\(ask.ref) is not a secret request")

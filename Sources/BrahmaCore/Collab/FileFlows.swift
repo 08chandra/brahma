@@ -183,6 +183,7 @@ extension Store {
                                   secretVault: any SecretVault, knownValues: [(name: String, value: String)], paths: BrahmaPaths,
                                   secretChoice: SecretChoice = .none, trust: TrustChoice = .asDetected, message: String? = nil,
                                   now: Date = Store.now()) throws -> [WorkRef] {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
         _ = try pendingFileRequest(companyId: companyId, askId: askId)
         let context = DropContext.inbox(askId: askId)
         let (scope, readers) = try defaultScope(for: context, companyId: companyId)
@@ -196,6 +197,7 @@ extension Store {
     /// that wakes the requester. No file is given.
     @discardableResult
     public func declineFileRequest(companyId: String, askId: String, note: String, now: Date = Store.now()) throws -> Ask {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
         _ = try pendingFileRequest(companyId: companyId, askId: askId)
         return try ownerAnswer(askId: askId, text: FileRequests.declinedText(note), now: now)
     }

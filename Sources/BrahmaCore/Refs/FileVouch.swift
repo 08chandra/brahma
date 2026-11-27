@@ -123,6 +123,7 @@ extension Store {
     @discardableResult
     public func vouchFile(companyId: String, fileId: String, sha256: String, name: String? = nil, acknowledgeAmbiguity: Bool = false,
                           now: Date) throws -> FileVouch {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
         let hash = sha256.lowercased(), id = fileId.lowercased()
         guard hash.count == 64, hash.allSatisfy(\.isHexDigit) else {
             throw WorkError.invalid("give the file's full sha256 (all 64 hex digits), as the refusal prints it")
@@ -221,6 +222,7 @@ extension Store {
     /// (the app).
     @discardableResult
     public func vouchFile(alertAskId: String, acknowledgeAmbiguity: Bool = false, now: Date) throws -> FileVouch {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
         let zone = ownerTimeZone()
         return try writer.write { db in
             guard let ask = try Ask.fetchOne(db, key: alertAskId), Self.isFileVouchAlert(ask), let subject = ask.subjectId else {

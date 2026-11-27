@@ -33,17 +33,23 @@ import GRDB
         let mcp = root.appending(path: "Sources/BrahmaCore/MCP")
         let files = try FileManager.default.contentsOfDirectory(atPath: mcp.path).filter { $0.hasSuffix(".swift") }
         #expect(files.contains("CompanyTools.swift") && files.contains("CollabTools.swift"))
+        // Round 3: an implicit `.mint(` and every one of the 12 tokenised APIs, however the call is spelled.
+        let apis = ["renderRef(", "ownerShare(", "ownerThreadReply(", "openShowRequests(", "recordOwnerRead(", ".message(companyId", "agentUsageShareToday(",
+                    "agentActivity(", "leasedItemKey(", "viewOriginal(", ".purge(companyId", "vouchItem("]
         for f in files {
             let text = try String(contentsOf: mcp.appending(path: f), encoding: .utf8)
             #expect(!text.contains("OwnerPrincipal"), "\(f) references OwnerPrincipal")
-            for api in ["renderRef(", "ownerShare(", "ownerThreadReply(", "openShowRequests(", "recordOwnerRead(", "viewOriginal(", "vouchItem("] {
-                #expect(!text.contains("store." + api) && !text.contains("try " + api), "\(f) calls \(api)")
-            }
+            #expect(!text.contains(".mint("), "\(f) mints a principal")
+            for api in apis { #expect(!text.contains(api), "\(f) calls \(api)") }
         }
-        // The server entry marks itself an agent process before it opens a Store.
+        // The server entry and both hook processes mark themselves agent processes before they open a Store.
         let server = try String(contentsOf: root.appending(path: "Sources/brahma/MCPCommand.swift"), encoding: .utf8)
         #expect(server.contains("OwnerPrincipal.enterAgentProcess()"))
         #expect(server.range(of: "enterAgentProcess()")!.lowerBound < server.range(of: "try Store(path: db")!.lowerBound)
+        let hooks = try String(contentsOf: root.appending(path: "Sources/brahma/HookCommand.swift"), encoding: .utf8)
+        #expect(hooks.components(separatedBy: "OwnerPrincipal.enterAgentProcess()").count == 3, "both hook commands enter agent mode")
+        #expect(hooks.range(of: "enterAgentProcess()")!.lowerBound < hooks.range(of: "PreToolHook.Context(")!.lowerBound)
+        #expect(hooks.range(of: "enterAgentProcess()", options: .backwards)!.lowerBound < hooks.range(of: "PostToolHook.handle(")!.lowerBound)
     }
 
     @Test(arguments: apis) func ownerAPIsRequireThePrincipal(_ api: String) async throws {
