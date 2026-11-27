@@ -133,7 +133,8 @@ public actor Orchestrator {
     /// Final wave B1, controller Ruling 23: turns whose end could not record their taint, by turn id (`TaintHold`), and whether
     /// the hold's row is written. Their companies are held (no turn, dispatch or merge starts) until the retry succeeds or the
     /// owner clears the hold; kept here too so a hold whose row could not be written still holds while the engine runs.
-    var taintHoldMemory: [String: (hold: TaintHold, persisted: Bool)] = [:]
+    /// `alerted`: the owner's alert for it went out (fix round 1 (3): a hold whose row can't be written alerts on its own).
+    var taintHoldMemory: [String: (hold: TaintHold, persisted: Bool, alerted: Bool)] = [:]
     /// The retry pass of the held turns' taint records (`taintHoldTick`), off the actor; never overlaps itself.
     var taintRetryTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
     /// The companies whose system timers have been ensured; a change re-runs `SystemTimers.ensure`.
@@ -1959,10 +1960,31 @@ public actor Orchestrator {
     /// (de-duplicated) when the database takes them (else the next tick tries again).
     func holdForTaint(_ hold: TaintHold, now: Date) {
         log("the taint of turn \(hold.turnId) could not be recorded; company \(hold.companyId) is held until it is")
-        var persisted = false
-        do { try store.holdForTaint(hold, now: now); persisted = true } catch { log("the taint hold could not be written (\(error))") }
-        taintHoldMemory[hold.turnId] = (hold, persisted)
+        var persisted = false, alerted = false
+        do {
+            try store.holdForTaint(hold, now: now)
+            (persisted, alerted) = (true, true)
+        } catch {
+            log("the taint hold of turn \(hold.turnId) could not be written (\(error)); it holds in memory and is written again every tick")
+            alerted = alertUnwrittenHold(hold, now: now)
+        }
+        taintHoldMemory[hold.turnId] = (hold, persisted, alerted)
     }
+
+    /// FW-B1 fix round 1 (3): the owner's alert for a hold whose row could not be written (the alert is its own write: it may
+    /// land when the row did not). Keyed like the hold's own alert, so the Inbox shows one. Returns whether it was raised.
+    func alertUnwrittenHold(_ hold: TaintHold, now: Date) -> Bool {
+        do {
+            try EngineAlerts.raise(store: store, text: Store.taintHoldText + " " + Self.taintHoldUnwrittenNote, now: now,
+                                   reason: Store.taintHoldReason(hold.companyId), companyId: hold.companyId)
+            return true
+        } catch {
+            log("the alert for the taint hold of turn \(hold.turnId) could not be raised either (\(error)); retried next tick")
+            return false
+        }
+    }
+
+    static let taintHoldUnwrittenNote = "Its hold record could not be written yet; Brahma holds the company in memory and writes the record again every tick."
 
     /// Ruling 23, at the top of every tick (controller Ruling FW-1: before any step that starts work): reconciles the in-memory
     /// holds with the database (a row the owner cleared, or a retry deleted, lifts its hold; a row this engine did not know,
@@ -1975,14 +1997,22 @@ public actor Orchestrator {
             let rows = try store.taintHolds()
             let ids = Set(rows.map(\.turnId))
             taintHoldMemory = taintHoldMemory.filter { !$0.value.persisted || ids.contains($0.key) }
-            for row in rows { taintHoldMemory[row.turnId] = (row, true) }
+            for row in rows { taintHoldMemory[row.turnId] = (row, true, taintHoldMemory[row.turnId]?.alerted ?? true) }
         } catch {
             readable = false
             log("the taint holds could not be read (\(error)); no turn, merge or release starts this tick")
             try? EngineAlerts.raise(store: store, text: Self.taintHoldsUnreadableText, now: now, reason: Self.taintHoldsUnreadableReason)
         }
+        // Fix round 1 (3): every tick, a hold whose row isn't written is written again (and alerted, if that failed too).
         for (turnId, entry) in taintHoldMemory where !entry.persisted {
-            if (try? store.holdForTaint(entry.hold, now: now)) != nil { taintHoldMemory[turnId]?.persisted = true }
+            do {
+                try store.holdForTaint(entry.hold, now: now, alert: !entry.alerted)
+                taintHoldMemory[turnId]?.persisted = true
+                taintHoldMemory[turnId]?.alerted = true
+            } catch {
+                log("the taint hold of turn \(turnId) still could not be written (\(error))")
+                if !entry.alerted, alertUnwrittenHold(entry.hold, now: now) { taintHoldMemory[turnId]?.alerted = true }
+            }
         }
         if taintRetryTask == nil, !taintHoldMemory.isEmpty {
             let (store, home, blocking, holds) = (self.store, self.paths.home, self.blocking, taintHoldMemory.values.map(\.hold))

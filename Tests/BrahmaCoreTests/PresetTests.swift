@@ -83,7 +83,7 @@ import GRDB
         let designer = try g.store.hire(companyId: g.company.id, name: "des-1", role: "designer", model: "sonnet")
         _ = try g.request("web_domain", "example.org", by: designer)
         #expect(try g.ask("A-1").status == .pendingOwner, "the company's autonomy is not auto")
-        try g.store.setAutonomy(companyId: g.company.id, .auto)
+        try g.store.setAutonomy(companyId: g.company.id, .auto, owner: .test)
         _ = try g.request("web_domain", "example.net", by: designer)
         #expect(try g.ask("A-2").status == .approved)
         let grant = try #require(try g.store.grants(companyId: g.company.id).first)
@@ -122,7 +122,7 @@ import GRDB
 
     @Test func presetsOffByDefault() throws {
         let g = try GrantWorld()
-        try g.store.setAutonomy(companyId: g.company.id, .auto)
+        try g.store.setAutonomy(companyId: g.company.id, .auto, owner: .test)
         #expect(try g.store.enabledPresets(companyId: g.company.id).isEmpty)
         #expect(Set(AccessPreset.allCases.map(\.rawValue)) == ["readonly-web-engineers", "auto-low-risk"])
         _ = try g.request("web_domain", "docs.stripe.com")

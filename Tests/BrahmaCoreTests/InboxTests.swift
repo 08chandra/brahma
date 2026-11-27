@@ -15,7 +15,7 @@ import GRDB
             func hire(_ n: String, _ role: String) throws -> Agent { try s.hire(companyId: c.id, name: n, role: role, model: "sonnet") }
             store = s; company = c
             ceo = try hire("ceo", "ceo"); cto = try hire("cto", "cto"); cpo = try hire("cpo", "cpo"); eng = try hire("eng-1", "engineer")
-            try s.setAutonomy(companyId: c.id, preset)
+            try s.setAutonomy(companyId: c.id, preset, owner: .test)
         }
 
         @discardableResult
@@ -332,7 +332,7 @@ import GRDB
         let w = try W(preset: .everything)
         let a = try w.decide(try w.propose(.sprintPlan), by: w.cpo)
         #expect(a.status == .pendingOwner)
-        try w.store.setAutonomy(companyId: w.company.id, .auto)
+        try w.store.setAutonomy(companyId: w.company.id, .auto, owner: .test)
         #expect(try w.fresh(a).status == .pendingOwner)
         #expect(try w.store.company(id: w.company.id)?.autonomy == .auto)
         // New asks follow the new preset.

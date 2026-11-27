@@ -800,7 +800,10 @@ extension Store {
         return false
     }
 
-    public func setAutonomy(companyId: String, _ preset: AutonomyPreset) throws {
+    /// Owner only (final wave B1 fix round 1: the principal; never from an agent process): the autonomy preset decides what
+    /// approves without the owner, the `autoModeLowRisk` access preset included.
+    public func setAutonomy(companyId: String, _ preset: AutonomyPreset, owner: OwnerPrincipal) throws {
+        try ProcessRole.refuseInAgentProcess()
         try writer.write { db in
             guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
             _ = try Company.filter(key: companyId).updateAll(db, Column("autonomy").set(to: preset.rawValue))

@@ -16,7 +16,9 @@ import GRDB
                                           // agent mode even when handed one.
                                           "ownerReplan", "kbVouch", "vouchRestoredCommits", "exportRef", "sendFileAsk", "ownerDrop",
                                           "createShowRequest", "cancelShowRequest", "addResources", "addLink", "setPreset",
-                                          "clearTaintHolds", "vouchItem", "extensionApprove", "extensionRemove", "extensionRollback"]
+                                          "clearTaintHolds", "vouchItem", "extensionApprove", "extensionRemove", "extensionRollback",
+                                          // Fix round 1: the autonomy preset.
+                                          "setAutonomy"]
 
     @Test func mintRefusesInAgentModeWhateverTheArguments() throws {
         // The simulation exists only in debug builds (round 5, R4-1): a release test build (`swift test -c release -Xswiftc
@@ -121,6 +123,7 @@ import GRDB
             case "setPreset": try s.setPreset(companyId: "nope", .autoModeLowRisk, enabled: true, owner: owner)
             case "clearTaintHolds": _ = try s.clearTaintHolds(companyId: "nope", now: now, owner: owner)
             case "vouchItem": try s.vouchItem(itemId: "nope", now: now, owner: owner)
+            case "setAutonomy": try s.setAutonomy(companyId: "nope", .auto, owner: owner)
             case "extensionApprove": try ExtensionLibrary.approve(askId: "nope", roles: nil, store: s, paths: paths, now: now, owner: owner)
             case "extensionRemove": try ExtensionLibrary.remove(companyId: cId, id: "nope", store: s, paths: paths, now: now, owner: owner)
             case "extensionRollback": try ExtensionLibrary.rollback(companyId: cId, id: "nope", store: s, paths: paths, now: now, owner: owner)

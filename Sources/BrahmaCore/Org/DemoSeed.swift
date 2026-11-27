@@ -30,7 +30,7 @@ public enum DemoSeed {
     /// through `log` and the company stands.
     @discardableResult
     public static func live(store: Store, paths: BrahmaPaths, name: String, goal: String?, now: Date = Store.now(),
-                            log: (String) -> Void = { _ in }) throws -> (Company, Ask) {
+                            log: (String) -> Void = { _ in }, owner: OwnerPrincipal) throws -> (Company, Ask) {
         let goal = goal?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? goal! : liveGoal(name: name)
         let company = try store.createCompany(name: name, goal: goal, workspacesRoot: paths.workspaces, packId: "software")
         do {
@@ -40,7 +40,7 @@ public enum DemoSeed {
         do { try BuiltinExtensions.materialize(workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true)) } catch {
             log("could not write the built-in extensions: \(error)")
         }
-        try store.setAutonomy(companyId: company.id, liveAutonomy)
+        try store.setAutonomy(companyId: company.id, liveAutonomy, owner: owner)
         var managers: [String: String] = [:]
         for hire in liveHires {
             let manager: String? = switch hire.name {

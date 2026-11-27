@@ -156,6 +156,51 @@ import GRDB
         #expect(try store.taintHeldCompanies().isEmpty)
     }
 
+    /// FW-B1 fix round 1 (3), Ruling 23: when the hold's own row can't be written either, the company is still held (in the
+    /// engine's memory), the owner is alerted at once (one alert), and the row is written again every tick; once it is written
+    /// the hold carries on as a recorded one and lifts when the retry succeeds.
+    @Test func unwrittenTaintHoldHoldsAlertsAndIsWrittenLater() async throws {
+        let h = try Holder()
+        let (store, engId, wt) = (h.store, h.eng.id, h.worktree(h.item))
+        store.refHooks.setFailTaintRecords(true)
+        store.refHooks.setFailTaintHoldWrite(true)
+        defer { store.refHooks.setFailTaintRecords(false); store.refHooks.setFailTaintHoldWrite(false) }
+        try await h.turn {
+            try store.markTainted(agentId: engId, source: "docs.swift.org")
+            _ = try Holder.commit(wt, "src/a.ts", "a\n")
+        }
+        let cId = h.company.id
+        func alerts() throws -> [Ask] {
+            try store.writer.read { db in
+                try Ask.fetchAll(db, sql: "SELECT * FROM ask WHERE companyId = ? AND kind = 'engineAlert' AND subjectId = ?",
+                                 arguments: [cId, Store.engineAlertKey("taint-hold:\(cId)")])
+            }
+        }
+        #expect(try store.taintHeldCompanies().isEmpty, "the row could not be written")
+        #expect(try alerts().count == 1 && alerts().first?.status == .pendingOwner, "the owner was not alerted")
+        // Held in memory: no turn starts while the row keeps failing.
+        let before = try h.turns().count
+        try h.world.dm(h.company, h.eng)
+        for _ in 0..<2 {
+            await h.world.orchestrator.tick()
+            try await h.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        }
+        #expect(try h.turns().count == before, "a company held in memory started a turn")
+        // The row can be written again: the next tick writes it; still one alert.
+        store.refHooks.setFailTaintHoldWrite(false)
+        await h.world.orchestrator.tick()
+        try await h.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        #expect(try store.taintHeldCompanies() == [cId])
+        #expect(try alerts().count == 1)
+        #expect(try h.turns().count == before)
+        // The records can be written: the retry lifts the hold.
+        store.refHooks.setFailTaintRecords(false)
+        await h.world.orchestrator.tick()
+        try await h.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        #expect(try store.taintHeldCompanies().isEmpty)
+        #expect(try alerts().first?.status == .answered)
+    }
+
     @Test func taintedSnapshotTaintsReader() throws {
         let cf = try CollabFixture()
         try cf.store.markTainted(agentId: cf.fx.eng1.id, source: "docs.swift.org")

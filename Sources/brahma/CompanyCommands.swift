@@ -23,7 +23,7 @@ struct CompanyGroup: ParsableCommand {
         enum Demo: String, ExpressibleByArgument { case live }
 
         func run() throws {
-            try requireOwnerShell()
+            let owner = try requireOwnerShell()
             if let demo {
                 guard fromRepo == nil else { throw fail("--demo \(demo.rawValue) can't be combined with --from-repo") }
                 // The demo builds its own org; a dry run of it would still create a company and post the kickoff.
@@ -33,9 +33,9 @@ struct CompanyGroup: ParsableCommand {
                 switch demo {
                 case .live:
                     let (store, paths) = try openStore()
-                    let (c, task) = try DemoSeed.live(store: store, paths: paths, name: name, goal: goal) {
+                    let (c, task) = try DemoSeed.live(store: store, paths: paths, name: name, goal: goal, log: {
                         FileHandle.standardError.write(Data("brahma: \(safe($0))\n".utf8))
-                    }
+                    }, owner: owner)
                     print(safe("Created \(c.name) with \(DemoSeed.liveHires.count) agents. Do Inbox task \(task.ref) (hosting account) now; "
                                + "approve the brief and the deploy when they arrive."))
                 }
@@ -202,14 +202,14 @@ struct CompanyGroup: ParsableCommand {
             abstract: "How much you are asked: everything, important (default) or auto. Reserved matters always come to you.")
         @Argument var company: String
         @Argument(help: "everything, important or auto.") var preset: AutonomyPreset
-        func run() throws { try requireOwnerShell(); try CompanyGroup.setAutonomy(company, preset) }
+        func run() throws { let owner = try requireOwnerShell(); try CompanyGroup.setAutonomy(company, preset, owner: owner) }
     }
 
     struct Auto: ParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Shorthand: 'auto on' is autonomy auto, 'auto off' is important.")
         @Argument var company: String
         @Argument(help: "on or off.") var state: OnOff
-        func run() throws { try requireOwnerShell(); try CompanyGroup.setAutonomy(company, state == .on ? .auto : .important) }
+        func run() throws { let owner = try requireOwnerShell(); try CompanyGroup.setAutonomy(company, state == .on ? .auto : .important, owner: owner) }
     }
 
     enum OnOff: String, ExpressibleByArgument { case on, off }
@@ -237,10 +237,10 @@ struct CompanyGroup: ParsableCommand {
         }
     }
 
-    private static func setAutonomy(_ query: String, _ preset: AutonomyPreset) throws {
+    private static func setAutonomy(_ query: String, _ preset: AutonomyPreset, owner: OwnerPrincipal) throws {
         let (store, _) = try openStore()
         let c = try resolveCompany(store, query)
-        try store.setAutonomy(companyId: c.id, preset)
+        try store.setAutonomy(companyId: c.id, preset, owner: owner)
         print(safe("\(c.name) autonomy: \(preset.rawValue)"))
     }
 

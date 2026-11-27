@@ -38,16 +38,18 @@ extension Store {
     /// The reason keying a company's taint-hold alert.
     static func taintHoldReason(_ companyId: String) -> String { "taint-hold:\(companyId)" }
 
-    /// Records the hold (its row, unless one for the turn exists) and raises the company's alert when it had no hold before.
-    /// Throws when the database refuses (the orchestrator's in-memory hold still holds).
-    public func holdForTaint(_ hold: TaintHold, now: Date) throws {
+    /// Records the hold (its row, unless one for the turn exists) and raises the company's alert when it had no hold before
+    /// (`alert` false: the owner was already alerted for it). Throws when the database refuses (the orchestrator's in-memory
+    /// hold still holds, and it writes the row again every tick).
+    public func holdForTaint(_ hold: TaintHold, now: Date, alert: Bool = true) throws {
+        if refHooks.failTaintHoldWrite { throw WorkError.conflict("injected: the taint hold could not be written") }
         let payload = String(decoding: try JSONEncoder().encode(hold), as: UTF8.self)
         try writer.write { db in
             let before = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM taintHold WHERE companyId = ?", arguments: [hold.companyId]) ?? 0
             try db.execute(sql: """
                 INSERT OR IGNORE INTO taintHold (turnId, companyId, agentId, payload, createdAt) VALUES (?, ?, ?, ?, ?)
                 """, arguments: [hold.turnId, hold.companyId, hold.agentId, payload, now])
-            guard before == 0, try Company.fetchOne(db, key: hold.companyId) != nil else { return }
+            guard alert, before == 0, try Company.fetchOne(db, key: hold.companyId) != nil else { return }
             try EngineAlerts.raise(store: self, db: db, text: Self.taintHoldText, now: now, reason: Self.taintHoldReason(hold.companyId),
                                    companyId: hold.companyId)
         }

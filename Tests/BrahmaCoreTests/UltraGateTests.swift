@@ -41,7 +41,7 @@ private struct ApprovalWorld {
         company = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
         mgr = try store.hire(companyId: company.id, name: "mgr", role: "manager", model: "sonnet")
         eng = try store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet", managerId: mgr.id)
-        try store.setAutonomy(companyId: company.id, preset)
+        try store.setAutonomy(companyId: company.id, preset, owner: .test)
         if profile != .sandboxed {
             try store.writer.write { db in try db.execute(sql: "UPDATE company SET permissionProfile = ? WHERE id = ?",
                                                           arguments: [profile.rawValue, company.id]) }

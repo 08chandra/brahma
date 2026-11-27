@@ -198,6 +198,11 @@ struct RestoreCarry {
                 + "(off main as the snapshot recorded it) reads as outside content until you vouch for it")
         }
 
+        // FW-B1 fix round 1 (2): whatever the live database said (or when it couldn't be read, and nothing was carried), every
+        // ref counter is raised to the highest number its kind ever used in the restored database, rows and mentions alike
+        // (`vC-ref-counter-seed`'s logic): a number the snapshot still names is never handed out again.
+        if try db.tableExists("refCounter") { try Migrations.seedRefCounters(db) }
+
         // The machine-wide lab mark, kept with an earlier source if one stands; the owner's last clear time is kept too.
         let source = Store.flat("restored from \(snapshot): lab commits made after the snapshot are not trusted", max: 200)
         try db.execute(sql: """

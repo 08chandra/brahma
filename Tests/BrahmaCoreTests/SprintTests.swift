@@ -22,7 +22,7 @@ import GRDB
             eng2 = try hire("eng-2", "engineer", team: "core", manager: mgr.id)
             for i in 0..<extraAgents { _ = try hire("x-\(i)", "engineer", team: "other") }
             _ = try s.createChannel(companyId: c.id, name: "team-core", members: [mgr.id, eng1.id, eng2.id])
-            try s.setAutonomy(companyId: c.id, preset)
+            try s.setAutonomy(companyId: c.id, preset, owner: .test)
         }
 
         func approveGates() throws {

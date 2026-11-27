@@ -797,7 +797,7 @@ struct LiveSmokeTests {
 
         // The company, as `brahma company create Lumen --demo live` makes it.
         monitor.set(phase: "seed")
-        let (seeded, hostingTask) = try DemoSeed.live(store: store, paths: paths, name: "Lumen", goal: nil, log: { print("seed: \($0)") })
+        let (seeded, hostingTask) = try DemoSeed.live(store: store, paths: paths, name: "Lumen", goal: nil, log: { print("seed: \($0)") }, owner: .test)
         var company = try #require(try store.company(id: seeded.id))
         company.usageMode = .balanced
         company.ownerReserve = -1   // weekly pacing depends on the real account's usage; off for this test

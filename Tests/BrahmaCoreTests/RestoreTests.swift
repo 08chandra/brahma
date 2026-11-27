@@ -460,10 +460,10 @@ import GRDB
     @Test func restoreKeepsTheStricterAutonomy() throws {
         let env = try BackupEnv()
         let acme = try env.company("Acme")
-        try env.store.setAutonomy(companyId: acme.id, .auto)
+        try env.store.setAutonomy(companyId: acme.id, .auto, owner: .test)
         let service = env.service()
         let snapshot = try service.snapshot(reason: .manual)
-        try env.store.setAutonomy(companyId: acme.id, .important)
+        try env.store.setAutonomy(companyId: acme.id, .important, owner: .test)
         try env.store.close()
         let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
         let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
@@ -530,10 +530,10 @@ import GRDB
     @Test func restoreNeverLoosensASetting() throws {
         let env = try BackupEnv()
         let acme = try env.company("Acme")
-        try env.store.setAutonomy(companyId: acme.id, .everything)
+        try env.store.setAutonomy(companyId: acme.id, .everything, owner: .test)
         let service = env.service()
         let snapshot = try service.snapshot(reason: .manual)
-        try env.store.setAutonomy(companyId: acme.id, .auto)
+        try env.store.setAutonomy(companyId: acme.id, .auto, owner: .test)
         try env.store.close()
         let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
         let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
@@ -740,6 +740,27 @@ import GRDB
         #expect(try w.tainted(restored, "commit:\(sha.prefix(7))"))
         #expect(try w.tainted(restored, "src/late.ts@\(sha)"))
         #expect(try w.tainted(restored, "\(item.key):diff"))
+    }
+
+    /// FW-B1 fix round 1 (2): a restore over a live database that can't be read has no counters to carry, so the restored
+    /// database's own counters are re-seeded from the highest number every kind used there, rows and mentions alike
+    /// (`Migrations.seedRefCounters`, the `vC-ref-counter-seed` logic): a number a read, a purge or a message still names is
+    /// never handed out again, even when the snapshot's counter rows are behind or gone.
+    @Test func unreadableRestoreReseedsRefCounters() throws {
+        let w = try TaintWorld()
+        let acme = w.acme.id
+        let snapshot = try w.service.snapshot(reason: .manual)
+        try w.editSnapshot(snapshot, """
+            DELETE FROM refCounter;
+            INSERT INTO refRead (id, companyId, readerKind, canonical, tainted, via, createdAt) VALUES ('rr-1', ?, 'owner', 'A-77', 0, 'tab', ?);
+            INSERT INTO refRead (id, companyId, readerKind, canonical, tainted, via, createdAt) VALUES ('rr-2', ?, 'owner', 'mem:12', 0, 'tab', ?)
+            """, [acme, Date(), acme, Date()])
+        let restored = try w.restoreOverUnreadable(snapshot)
+        func next(_ kind: RefCounterKind) throws -> Int {
+            try restored.writer.write { db in try Store.nextRefNumber(db: db, companyId: acme, kind: kind, floor: 0) }
+        }
+        #expect(try next(.ask) == 78, "an ask number a read still names was handed out again")
+        #expect(try next(.memory) == 13)
     }
 
     /// Final wave B1, controller Ruling 28: the restore vouch binds to the epochs the owner was shown. Epoch 1 is listed; then

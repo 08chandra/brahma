@@ -18,7 +18,7 @@ struct WorkWorld {
         func hire(_ n: String, _ role: String) throws -> Agent { try store.hire(companyId: company.id, name: n, role: role, model: "sonnet") }
         let ceo = try hire("ceo", "ceo"), cto = try hire("cto", "cto")
         let eng = try hire("eng-1", "engineer"), eng2 = try hire("eng-2", "engineer")
-        try store.setAutonomy(companyId: company.id, autonomy)
+        try store.setAutonomy(companyId: company.id, autonomy, owner: .test)
         let model = AppModel(store: store, paths: paths)
         await model.load()
         return WorkWorld(model: model, store: store, paths: paths, company: company, ceo: ceo, cto: cto, eng: eng, eng2: eng2)

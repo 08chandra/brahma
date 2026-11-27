@@ -228,7 +228,7 @@ extension AppModel {
     public func setAutonomy(_ preset: AutonomyPreset) async {
         guard let companyId = selectedCompanyId else { return }
         // Only the autonomy column is written, so a setting changed elsewhere since the last snapshot is not overwritten.
-        await ownerWrite("change autonomy") { store in try store.setAutonomy(companyId: companyId, preset) }
+        await ownerAct("change autonomy") { store, owner in try store.setAutonomy(companyId: companyId, preset, owner: owner) }
     }
 
     public func setManager(agentId: String, managerId: String?) async {

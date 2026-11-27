@@ -124,7 +124,7 @@ import GRDB
             }
         }
         let fx = try Self.fixture()
-        try fx.store.setAutonomy(companyId: fx.company.id, .auto)
+        try fx.store.setAutonomy(companyId: fx.company.id, .auto, owner: .test)
         for p in AccessPreset.allCases { try fx.store.setPreset(companyId: fx.company.id, p, enabled: true, owner: .test) }
         let ceo = try fx.store.hire(companyId: fx.company.id, name: "ceo-1", role: "ceo", model: "m")
         let (r, ask) = try fx.propose("0.1.0")
