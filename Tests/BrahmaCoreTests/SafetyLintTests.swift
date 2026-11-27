@@ -79,6 +79,29 @@ enum SafetyLint {
         return String(decoding: try encoder.encode(byName), as: UTF8.self) + "\n"
     }
 
+    /// The baseline to paste after a shrink: every baseline entry lowered to what was found (`min`), entries that fell to 0
+    /// dropped, and no file the baseline does not list. A rise never appears in it, so pasting cannot raise a count
+    /// (spec §6.8.2: the printed baseline only shrinks); `noRuleExceedsBaseline` reports rises separately.
+    static func shrunk(baseline: [Rule: [String: Int]], counts: [Rule: [String: Int]]) -> [Rule: [String: Int]] {
+        var out: [Rule: [String: Int]] = [:]
+        for rule in Rule.allCases {
+            var files: [String: Int] = [:]
+            for (path, allowed) in baseline[rule] ?? [:] {
+                let kept = min(allowed, counts[rule]?[path] ?? 0)
+                if kept > 0 { files[path] = kept }
+            }
+            out[rule] = files
+        }
+        return out
+    }
+
+    /// The hits inside a rule's `zero` directories. A prefix names a directory: `Sources/BrahmaCore/Refs` (with or without
+    /// the trailing `/`) covers `Sources/BrahmaCore/Refs/…` and not `Sources/BrahmaCore/RefsX/…`.
+    static func zeroOffenders(_ hits: [Hit], zero: [String]) -> [Hit] {
+        let dirs = zero.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
+        return hits.filter { hit in dirs.contains { hit.path.hasPrefix($0) } }
+    }
+
     /// The checked-in baseline, or nil when there is none yet.
     static func baseline(root: URL) throws -> [Rule: [String: Int]]? {
         let url = root.appending(path: baselinePath)
@@ -184,7 +207,7 @@ enum SafetyLint {
     }
 }
 
-@Suite struct SafetyLintTests {
+@Suite(.scratch) struct SafetyLintTests {
     static let root = EngineGitGuardTests.packageRoot
 
     /// A (rule, file) count above its baseline, or a hit in a file the baseline does not list, fails and names the hits.
@@ -217,8 +240,11 @@ enum SafetyLint {
             }
         }
         if baseline == nil || !slack.isEmpty {
+            // With a baseline, only the shrink is printed (never a rise, which noRuleExceedsBaseline reports); without one,
+            // the first baseline is the whole scan.
+            let paste = baseline.map { SafetyLint.shrunk(baseline: $0, counts: counts) } ?? counts
             print("--- \(SafetyLint.baselinePath) (paste this) ---")
-            print(try SafetyLint.json(counts), terminator: "")
+            print(try SafetyLint.json(paste), terminator: "")
             print("--- end of baseline ---")
         }
         #expect(baseline != nil, "no baseline at \(SafetyLint.baselinePath); the one to check in was printed")
@@ -230,7 +256,20 @@ enum SafetyLint {
             for rule in SafetyLint.Rule.allCases {
                 #expect(baseline[rule] ?? [:] == counts[rule] ?? [:], "\(rule.rawValue): baseline and scan differ")
             }
+            // The paste map never exceeds the baseline, on the live data...
+            let paste = SafetyLint.shrunk(baseline: baseline, counts: counts)
+            for rule in SafetyLint.Rule.allCases {
+                for (path, kept) in paste[rule] ?? [:] { #expect(kept <= baseline[rule]?[path] ?? 0, "\(rule.rawValue) \(path)") }
+            }
         }
+        // ...and on a synthetic rise + fall: the fall is lowered, the rise stays at the baseline, a file that dropped to 0 is
+        // gone, and a file the baseline does not list never enters it.
+        let synthetic = SafetyLint.shrunk(
+            baseline: [.spawn: ["a.swift": 3, "b.swift": 2, "c.swift": 1], .turnScope: ["t.swift": 1]],
+            counts: [.spawn: ["a.swift": 1, "b.swift": 5, "d.swift": 4], .turnScope: ["t.swift": 1]])
+        #expect(synthetic[.spawn] == ["a.swift": 1, "b.swift": 2])
+        #expect(synthetic[.turnScope] == ["t.swift": 1])
+        #expect(synthetic[.descriptor] == [:], "every rule is present, empty when it has no entry")
     }
 
     /// A rule's `zero` directories have no hit. The lists are empty in S1; later tasks fill them as families reach zero.
@@ -238,13 +277,19 @@ enum SafetyLint {
         let hits = try SafetyLint.hits(root: Self.root)
         var offenders: [String] = []
         for rule in SafetyLint.Rule.allCases {
-            for prefix in rule.zero {
-                for hit in hits[rule] ?? [] where hit.path.hasPrefix(prefix) {
-                    offenders.append("\(rule.rawValue): \(hit)")
-                }
-            }
+            offenders += SafetyLint.zeroOffenders(hits[rule] ?? [], zero: rule.zero).map { "\(rule.rawValue): \($0)" }
         }
         #expect(offenders.isEmpty, Comment(rawValue: "hits in a zero scope:\n" + offenders.joined(separator: "\n")))
+
+        // The prefix logic, while the lists are empty: a hit inside a zero directory is an offender, one outside is not, and
+        // a directory prefix matches whole path components only (Refs/ is not RefsX/), with or without its trailing slash.
+        let synthetic = ["Sources/BrahmaCore/Refs/A.swift", "Sources/BrahmaCore/RefsX/B.swift", "Sources/BrahmaCore/Git/C.swift",
+                         "Sources/BrahmaCore/Refs.swift"].map { SafetyLint.Hit(path: $0, line: 1, text: "") }
+        for zero in [["Sources/BrahmaCore/Refs/"], ["Sources/BrahmaCore/Refs"]] {
+            #expect(SafetyLint.zeroOffenders(synthetic, zero: zero).map(\.path) == ["Sources/BrahmaCore/Refs/A.swift"], "\(zero)")
+        }
+        #expect(SafetyLint.zeroOffenders(synthetic, zero: []).isEmpty)
+        #expect(SafetyLint.zeroOffenders(synthetic, zero: ["Sources/BrahmaCore/Git", "Sources/brahma"]).map(\.path) == ["Sources/BrahmaCore/Git/C.swift"])
     }
 
     /// The scan is live: known sites are found, and the `alertScope` argument-list matcher reads to the matching `)`.
