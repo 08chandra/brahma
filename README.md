@@ -772,18 +772,19 @@ was never recorded prints `not measured: <reason>`. Nothing is estimated. Every 
 [docs/measure/metrics.md](docs/measure/metrics.md). Every mode runs only from your shell: each refuses to run inside an agent turn.
 
 ```
-brahma measure <co> [--since <YYYY-MM-DD|all>] [--format md|json]   the report (default window: the last 28 days)
+brahma measure <co> [--since <YYYY-MM-DD|all>] [--format md|json]   the report (default window: the last 28 days, from your midnight)
 brahma measure <co> --mission [--since …] [--format md|json]       only the mission subset
 brahma measure <co> --compare <baseline-co> [--mission] [--since …] [--format md|json]   two companies side by side
 brahma measure <co> --verify-landings [--since <date>] [--format md|json]  audit main: exit 0 / 1 / 2
 brahma measure <co> --log-owner-minutes <n> [--day YYYY-MM-DD]     log your own time on the company (owner only)
 brahma measure <co> --soak-checkpoint <file>                       soak harness: write a checkpoint
 brahma measure <co> --soak-verify <file> [--format md|json]        soak harness: judge against it: exit 0 / 1 / 3 / 2
+brahma measure <co> --print-day                                    today's date in your time zone (the soak script records it)
 brahma items link <co> <KEY> regression-of|revert-of <LANDED-KEY>   record a regression or a revert (owner only)
 ```
 
 - **The report.** `--since <date>` starts at midnight of that day in your time zone; `--since all` starts when the company was
-  created; the default is the last 28 days. `--format json` prints the same report as JSON (every value, its numerator and
+  created; the default is the last 28 days, starting at your midnight (the app's 7- and 28-day windows do the same). `--format json` prints the same report as JSON (every value, its numerator and
   denominator, its status and basis). The revert rate's 30-day row needs a window of at least 30 days (`--since` a date 30 or
   more days back, or `all`); with the default window it reads `not measured` and says why.
 - **The Budget view's MEASURE panel** shows the same report for the selected company: one row per metric with the value exactly
