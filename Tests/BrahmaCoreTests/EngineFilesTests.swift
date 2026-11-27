@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// The removal probe is process-wide, so these run one at a time; each probe only acts on its own temporary directory.
 @Suite(.scratch, .serialized) struct EngineFilesTests {

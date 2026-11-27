@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// Counts its `stopAll` calls (Task 7c observers).
 private actor CountingObserver: EmergencyStopObserver {

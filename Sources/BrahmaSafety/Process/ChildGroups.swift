@@ -25,7 +25,7 @@ public struct ChildGroups: Sendable {
 
     enum Event: Equatable, Sendable { case recorded(pid_t), forgotten(pid_t) }
 
-    @TaskLocal static var current: ChildGroups?
+    @TaskLocal public static var current: ChildGroups?
 
     public init(dir: URL, kind: String) {
         self.dir = dir; self.kind = kind
@@ -36,7 +36,7 @@ public struct ChildGroups: Sendable {
 
     /// Records a leader just spawned (its start time is its identity). A record that cannot be written is not fatal: the
     /// engine's own cancellation still reaches the child; only the engine-less stop would miss it.
-    func record(_ pid: pid_t) -> URL? {
+    public func record(_ pid: pid_t) -> URL? {
         guard pid > 1, kind.range(of: "^[a-z]{1,16}$", options: .regularExpression) != nil,
               let entry = ProcessTable.entry(pid) else { return nil }
         let url = dir.appending(path: "\(kind)-\(pid)-\(UUID().uuidString.prefix(8)).group")
@@ -48,7 +48,7 @@ public struct ChildGroups: Sendable {
     }
 
     /// The child was reaped: its record goes (never through a link).
-    func forget(_ url: URL?, pid: pid_t) {
+    public func forget(_ url: URL?, pid: pid_t) {
         guard let url else { return }
         unlink(url.path)
         observer?(.forgotten(pid))
@@ -56,7 +56,7 @@ public struct ChildGroups: Sendable {
 
     /// The leaders recorded in `dir` that are still the process that was recorded (same pid and start time): a reused pid
     /// never counts. Read without following links; a damaged record is skipped.
-    static func liveLeaders(in dir: URL) -> Set<Int32> {
+    public static func liveLeaders(in dir: URL) -> Set<Int32> {
         var out = Set<Int32>()
         for record in records(in: dir) {
             if let entry = ProcessTable.entry(record.value.leader), entry.start == record.value.leaderStart, !entry.isZombie {
@@ -67,7 +67,7 @@ public struct ChildGroups: Sendable {
     }
 
     /// Start-up: records whose leader is gone (or is another process now) are removed.
-    static func removeStale(in dir: URL) {
+    public static func removeStale(in dir: URL) {
         for record in records(in: dir) {
             let entry = ProcessTable.entry(record.value.leader)
             if entry == nil || entry?.start != record.value.leaderStart { unlink(record.url.path) }

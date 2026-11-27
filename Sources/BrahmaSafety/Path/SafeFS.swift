@@ -168,13 +168,14 @@ public final class SafeFS: @unchecked Sendable {
     /// The real directory `.brahma/wt/<KEY>`, opened by the walk (`O_NOFOLLOW` at `wt` and at the key) and held by the caller
     /// for as long as one operation needs the same directory for every step (`SafeGit.worktreeDiff`: git is anchored to it,
     /// and the files are read from it).
-    func worktreeDirectory(key: String) throws -> EngineFiles.OpenDirectory {
-        guard (try? GitWorkspace.validKey(key)) != nil else { throw SafeFSError.badPath }
+    public func worktreeDirectory(key: String) throws -> EngineFiles.OpenDirectory {
+        // 3a's item-key alphabet (`GitWorkspace.validKey`, `SandboxScope.forTurn`).
+        guard key.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) != nil else { throw SafeFSError.badPath }
         do { return try brahma.child("wt").child(key) } catch let e as UnsafeEngineFile { throw Self.map(e) }
     }
 
     /// A file in the held worktree directory `tree` (from `worktreeDirectory(key:)`) by its worktree-relative path.
-    func open(_ relativePath: String, in tree: EngineFiles.OpenDirectory, key: String, maxBytes: Int) throws -> SafeFile {
+    public func open(_ relativePath: String, in tree: EngineFiles.OpenDirectory, key: String, maxBytes: Int) throws -> SafeFile {
         let parts = try Self.components(relativePath)
         do { return try walk(from: tree, parts, state: .place(.worktree(key: key)), maxBytes: maxBytes) }
         catch let e as UnsafeEngineFile { throw Self.map(e) }
@@ -293,7 +294,7 @@ public final class SafeFS: @unchecked Sendable {
     // MARK: Names
 
     /// The components of an agent-named relative path, each checked (`checkComponent`); `.badPath` otherwise.
-    static func components(_ path: String) throws -> [String] {
+    public static func components(_ path: String) throws -> [String] {
         guard !path.isEmpty else { throw SafeFSError.badPath }
         let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         for part in parts { try checkComponent(part) }

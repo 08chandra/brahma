@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// Task 1b Step 1: one real haiku turn (at most $0.05) on the real compiled sandboxed argv and settings file, the real shell
 /// prefix and sentinel, and the built `brahma mcp`, in a seeded throwaway company. It records:

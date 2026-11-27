@@ -160,20 +160,8 @@ struct GitCommand: Sendable {
     static let lockRetryDelay: TimeInterval = 0.2
     static let maxCapture = 8 * 1024 * 1024
 
-    /// Applied to every call, before the subcommand: what git may run is switched off whatever any config says (command-line
-    /// config outranks every file, and reaches child git processes, such as one in a nested repository, too).
-    static let configFlags = [
-        "-c", "user.name=Brahma", "-c", "user.email=engine@brahma.local", "-c", "commit.gpgsign=false", "-c", "tag.gpgSign=false",
-        "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat", "-c", "diff.external=",
-        "-c", "core.sshCommand=/usr/bin/false", "-c", "core.gitProxy=", "-c", "core.askPass=/usr/bin/false",
-        "-c", "credential.helper=", "-c", "gpg.program=/usr/bin/false", "-c", "gpg.ssh.program=/usr/bin/false",
-        "-c", "gpg.x509.program=/usr/bin/false", "-c", "log.showSignature=false", "-c", "merge.verifySignatures=false",
-        "-c", "submodule.recurse=false", "-c", "diff.ignoreSubmodules=dirty", "-c", "protocol.allow=never",
-        "-c", "protocol.ext.allow=never", "-c", "core.alternateRefsCommand=", "-c", "uploadpack.packObjectsHook=",
-        "-c", "core.editor=/usr/bin/false", "-c", "sequence.editor=/usr/bin/false",
-        "-c", "core.quotepath=false", "-c", "gc.auto=0",
-        "-c", "core.attributesFile=/dev/null", "-c", "advice.graftFileDeprecated=false",
-    ]
+    /// `GitHardening.flags`: what git may run is switched off whatever any config says (see there).
+    static let configFlags = GitHardening.flags
 
     /// The engine's `info/attributes` (it outranks every other attributes file): no filter, no diff driver (git decides text
     /// or binary as usual), the built-in text merge, and nothing left out of or substituted in what `git archive` writes.
@@ -277,22 +265,13 @@ struct GitCommand: Sendable {
         // a config, attributes and refs the engine never checked.
         env["GIT_COMMON_DIR"] = (commonDir ?? gitDir).path
         if let indexFile { env["GIT_INDEX_FILE"] = indexFile.path }
-        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        env["GIT_CONFIG_NOSYSTEM"] = "1"
-        env["GIT_ATTR_NOSYSTEM"] = "1"
-        env["GIT_NO_REPLACE_OBJECTS"] = "1"
-        env["GIT_GRAFT_FILE"] = "/dev/null"
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        env["GIT_ASKPASS"] = "/usr/bin/false"
-        env["SSH_ASKPASS"] = "/usr/bin/false"
-        env["GIT_OPTIONAL_LOCKS"] = "0"
+        for (name, value) in GitHardening.environment { env[name] = value }
         if let homeDirectory {
             env["HOME"] = homeDirectory.path
             env["XDG_CONFIG_HOME"] = homeDirectory.path
         }
         // Never inherited (the allowlist keeps them out already); named so that no later change lets one through.
-        for name in ["GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
-                     "GIT_EXEC_PATH", "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR"] { env[name] = nil }
+        for name in GitHardening.neverInherited { env[name] = nil }
         return env
     }
 

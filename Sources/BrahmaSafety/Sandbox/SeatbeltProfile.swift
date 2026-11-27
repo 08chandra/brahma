@@ -43,6 +43,15 @@ import Foundation
 /// Every string is escaped (`quote`, `regexEscape`) and every path is resolved; paths holding characters no profile string
 /// may carry are refused before rendering (`SandboxPolicyCheck`).
 public enum SeatbeltProfile {
+    /// The `.brahma` children every turn may read when they exist (5L-1). `hooks` and the shell prefix must be readable for
+    /// git and Bash to start; `ext` holds mounted extension parts whose scripts run in Bash; `cache/shared` is the read-only
+    /// layer checks write. `ext-review` is not one (10b, B-M9): a proposed extension's review page quotes unapproved skill
+    /// text, so only the turns of its internal reviewer read it (`reviewPages`), and the owner in the app. `ext-try` (the owner's
+    /// `ext try` copies) is readable only by that one throwaway turn. `preview/logs` holds the preview servers' logs
+    /// (Plan L): a failure DM points the setter at it.
+    public static let readableDotBrahma = ["wt", "artifacts", "progress", "handoffs", "releases", "resources/company", "kb", "ext",
+                                    "hooks", "cache/shared", "preview/logs"]
+
     /// Mach services no sandboxed command may look up: the Keychain, the pasteboard, screen capture, LaunchServices (`open`),
     /// Apple events (`osascript`), accessibility, TCC, and cfprefsd (preference writes land outside the sandbox).
     static let deniedServices: [(prefix: Bool, name: String)] = [
@@ -155,7 +164,7 @@ public enum SeatbeltProfile {
         let others = baseline.companyWorkspaces.map(r).filter { ws in !mine.contains { SandboxPath.isInside($0, ws) } }
 
         // Final review I1: in a company workspace the policy does read, its `.brahma` is read like a sandboxed turn reads it
-        // (`SandboxScope.readableDotBrahma`): every other part (other agents' homes, labs and notes, extension review pages,
+        // (`readableDotBrahma`, shared with `SandboxScope.forTurn`): every other part (other agents' homes, labs and notes, extension review pages,
         // `ext-try` copies, trash, plans, the engine's own places) is unreadable, whatever exists there now or later. A policy
         // entry inside `.brahma` keeps its own reads. `.brahma` itself stays stat-able (path walks), never listable. The
         // protected denies below still win over these re-allowances.
@@ -165,7 +174,7 @@ public enum SeatbeltProfile {
             // Both spellings: should `.brahma` ever be a link, what it names is hidden whole (nothing is re-allowed there).
             hidden += [dot, SandboxPath.resolve(dot)]
             statOnly.append(dot)
-            reallowed += SandboxScope.readableDotBrahma.map { dot + "/" + $0 }
+            reallowed += readableDotBrahma.map { dot + "/" + $0 }
             reallowed += mine.filter { SandboxPath.isInside($0, dot) }
         }
         if !hidden.isEmpty {

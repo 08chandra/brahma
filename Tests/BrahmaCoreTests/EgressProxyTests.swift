@@ -6,6 +6,7 @@ import Darwin
 import Glibc
 #endif
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// The egress proxy (CONNECT only, port 443, allow-list, public addresses only, one resolution) and its matchers.
 @Suite(.scratch) struct EgressProxyTests {

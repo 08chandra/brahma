@@ -103,7 +103,7 @@ extension SandboxedRunner {
             box.value = await run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, policy: policy)
             box.done.signal()
         }
-        guard box.done.wait(timeout: .now() + SafeGit.seconds(timeout) + 30) == .success, let value = box.value else {
+        guard box.done.wait(timeout: .now() + Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18 + 30) == .success, let value = box.value else {
             return CheckOutcome(exitCode: nil, timedOut: true, tail: "the sandboxed run never reported back")
         }
         return value
@@ -174,8 +174,8 @@ public struct SandboxBaseline: Equatable, Sendable {
     }
 
     /// The owner's baseline now: the resolved home, `ProtectedPaths.defaults` plus `otherWorkspaces` and `backupTargets`
-    /// (each as given and resolved), the Darwin per-user temp and cache directories, and `paths.home` as the engine home.
-    public static func current(paths: BrahmaPaths, otherWorkspaces: [URL], backupTargets: [URL]) -> SandboxBaseline {
+    /// (each as given and resolved), the Darwin per-user temp and cache directories, and `engineHome` (the data home) as the engine home.
+    public static func current(engineHome: URL, otherWorkspaces: [URL], backupTargets: [URL]) -> SandboxBaseline {
         let home = FileManager.default.homeDirectoryForCurrentUser
         func both(_ url: URL) -> [URL] { [url, url.resolvedForSandbox] }
         let protected = dedupe((ProtectedPaths.defaults(userHome: home) + otherWorkspaces + backupTargets).flatMap(both)
@@ -190,11 +190,11 @@ public struct SandboxBaseline: Equatable, Sendable {
         let temp: URL? = nil, cache: URL? = nil, user: URL? = nil, problem: String? = nil
         #endif
         return SandboxBaseline(userHome: home.resolvedForSandbox, protected: protected, darwinUserTemp: temp, darwinUserCache: cache,
-                               darwinUserDir: user, engineHomes: [paths.home.resolvedForSandbox], problem: problem)
+                               darwinUserDir: user, engineHomes: [engineHome.resolvedForSandbox], problem: problem)
     }
 
     #if canImport(Darwin)
-    static func darwinDirectory(_ name: Int32) -> URL? {
+    public static func darwinDirectory(_ name: Int32) -> URL? {
         let size = confstr(name, nil, 0)
         guard size > 0 else { return nil }
         var buffer = [CChar](repeating: 0, count: size)
@@ -206,7 +206,7 @@ public struct SandboxBaseline: Equatable, Sendable {
     }
     #endif
 
-    static func dedupe(_ urls: [URL]) -> [URL] {
+    public static func dedupe(_ urls: [URL]) -> [URL] {
         var seen: Set<String> = []
         return urls.filter { seen.insert($0.path).inserted }
     }
@@ -215,9 +215,12 @@ public struct SandboxBaseline: Equatable, Sendable {
     /// (`claude-<uid>`: edit diffs of the owner's files, background task output), `claude-tool-results`, `claude`, and the
     /// root of every sandboxed agent's private temp directory in every company (`b-<uid>`, `SandboxEnvironment`). No
     /// sandboxed command reads them, as no sandboxed turn does (`SandboxScope.forTurn`).
+    /// `/private/tmp/b-<uid>`: the root of every sandboxed agent's private Claude temp directory, in every company.
+    public static var defaultClaudeTmpRoot: URL { URL(fileURLWithPath: "/private/tmp/b-\(getuid())", isDirectory: false) }
+
     static var claudeTempPlaces: [URL] {
         // Fix-wave F4: Claude Code's daemon-control and pty socket folders too.
-        let names = ["claude-\(getuid())", "claude-tool-results", "claude", SandboxEnvironment.defaultClaudeTmpRoot.lastPathComponent,
+        let names = ["claude-\(getuid())", "claude-tool-results", "claude", defaultClaudeTmpRoot.lastPathComponent,
                      "cc-daemon-\(getuid())", "cc-socks"]
         return names.flatMap { name in ["/private/tmp/\(name)", "/tmp/\(name)"].map { URL(fileURLWithPath: $0, isDirectory: false) } }
     }
@@ -283,7 +286,7 @@ enum SandboxPolicyCheck {
             throw SandboxError.linkedPath(url.path)
         }
         let roots = [baseline.userHome] + baseline.engineHomes + [URL(fileURLWithPath: "/Volumes"), URL(fileURLWithPath: "/")]
-        // The same alias/identity helper as turn scopes (`SandboxScope.checkAllowed`): no alias spelling, and overlaps judged by
+        // The same alias/identity helper as turn scopes (`SandboxPath.checkAllowed`): no alias spelling, and overlaps judged by
         // spelling and by device and inode (a firmlink spelling of a protected place is that place).
         let identities = (SandboxPath.IdentityRoots(baseline.protected), SandboxPath.IdentityRoots(roots))
         for url in policy.writable + policy.readable {
@@ -291,7 +294,7 @@ enum SandboxPolicyCheck {
             if SandboxPath.resolve(path) != path || path.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }) {
                 throw SandboxError.linkedPath(path)
             }
-            try SandboxScope.checkAllowed(url, protected: baseline.protected, deniedRoots: roots, byIdentity: identities)
+            try SandboxPath.checkAllowed(url, protected: baseline.protected, deniedRoots: roots, byIdentity: identities)
         }
         for url in policy.writable {
             if let hit = baseline.companyWorkspaces.first(where: { SandboxPath.isInside($0.path, url.path) }) {

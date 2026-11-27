@@ -67,17 +67,20 @@ import BrahmaKeychain
         #expect(selection.kind == .file); #expect(selection.vault is FileVault)
     }
 
+    /// Neither `BrahmaCore` nor the `BrahmaSafety` kernel (Plan S; the same portability rule) holds Keychain code.
     @Test func brahmaCoreHasNoKeychainCode() throws {
-        let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
-            .deletingLastPathComponent().appending(path: "Sources/BrahmaCore")
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         var offenders: [String] = []
         var scanned = 0
-        for case let file as URL in try #require(FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil)) {
-            guard file.pathExtension == "swift" else { continue }
-            scanned += 1
-            let text = try String(contentsOf: file, encoding: .utf8)
-            for needle in ["import Security", "SecItem", "SecKeychain", "SecAccessCreate", "SecTrustedApplication", "KeychainVault"]
-            where text.contains(needle) { offenders.append("\(file.lastPathComponent): \(needle)") }
+        for target in ["Sources/BrahmaCore", "Sources/BrahmaSafety"] {
+            let sources = root.appending(path: target)
+            for case let file as URL in try #require(FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil)) {
+                guard file.pathExtension == "swift" else { continue }
+                scanned += 1
+                let text = try String(contentsOf: file, encoding: .utf8)
+                for needle in ["import Security", "SecItem", "SecKeychain", "SecAccessCreate", "SecTrustedApplication", "KeychainVault"]
+                where text.contains(needle) { offenders.append("\(file.lastPathComponent): \(needle)") }
+            }
         }
         #expect(scanned > 50)
         #expect(offenders.isEmpty, "Keychain code belongs in BrahmaKeychain, behind KeychainAccessLog: \(offenders)")

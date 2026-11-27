@@ -322,7 +322,7 @@ public enum EngineFiles {
     /// meanwhile is skipped, never followed; `enter` (given its relative path) may skip one. At most `maxDepth` levels and
     /// `maxEntries` entries in all are looked at. Returns the relative paths removed (nothing when `relative` is missing or a
     /// part of the way to it is a link).
-    static func removeFilesNoFollow(under root: URL, _ relative: String, maxDepth: Int, maxEntries: Int,
+    public static func removeFilesNoFollow(under root: URL, _ relative: String, maxDepth: Int, maxEntries: Int,
                                     enter: (String) -> Bool, shouldRemove: (String, stat) -> Bool) throws -> [String] {
         let parts = relative.split(separator: "/").map { Array(String($0).utf8) }
         guard case .open(let top) = try openWay(root: root, parts[...], shown: root.appending(path: relative).path) else { return [] }
@@ -382,7 +382,7 @@ public enum EngineFiles {
     /// that a sandboxed process can reach (a preview's log). Nil when the file or a directory on the way does not exist.
     /// Throws `UnsafeEngineFile` when a part of the way is a link or not a directory, the file is a link, or it fails
     /// `copyProblem` (not regular, another hard link, another owner). The caller closes the descriptor.
-    static func openFileNoFollow(under root: URL, _ relative: String, flags: Int32) throws -> Int32? {
+    public static func openFileNoFollow(under root: URL, _ relative: String, flags: Int32) throws -> Int32? {
         let parts = relative.split(separator: "/").map { Array($0.utf8) }
         guard let name = parts.last, isValidName(name) else {
             throw UnsafeEngineFile(path: root.appending(path: relative).path, problem: "is not a valid file name")
@@ -411,12 +411,12 @@ public enum EngineFiles {
 
     /// An engine directory opened by the safe walk and held open, so a caller that must hand its path to another program
     /// (git, tar) can check it is still where the walk found it before and after that program runs.
-    final class OpenDirectory: @unchecked Sendable {
-        let fd: Int32
+    public final class OpenDirectory: @unchecked Sendable {
+        public let fd: Int32
         /// The kernel's path for it when it was opened.
-        let real: String
+        public let real: String
         /// The path as the caller names it.
-        let shown: URL
+        public let shown: URL
 
         init(fd: Int32, real: String, shown: URL) { self.fd = fd; self.real = real; self.shown = shown }
         deinit { close(fd) }
@@ -424,7 +424,7 @@ public enum EngineFiles {
         /// True while the directory is still at the path it was opened at (no part of the way to it was moved or swapped):
         /// the kernel's path for the descriptor is unchanged, and the path the caller names (`shown`, the last part not
         /// followed) is this same directory by (device, inode), so a program handed that path reaches this directory.
-        var isInPlace: Bool {
+        public var isInPlace: Bool {
             guard EngineFiles.path(of: fd) == real else { return false }
             var held = stat(), named = stat()
             guard fstat(fd, &held) == 0, lstat(shown.path, &named) == 0 else { return false }
@@ -432,7 +432,7 @@ public enum EngineFiles {
         }
 
         /// What is at `name` in it, never following a link.
-        func kind(of name: String) -> Kind {
+        public func kind(of name: String) -> Kind {
             var st = stat()
             guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { return errno == ENOENT ? .missing : .other }
             switch st.st_mode & S_IFMT {
@@ -442,11 +442,11 @@ public enum EngineFiles {
             }
         }
 
-        enum Kind: Equatable { case missing, directory, link, other }
+        public enum Kind: Equatable, Sendable { case missing, directory, link, other }
 
         /// The `fstatat(AT_SYMLINK_NOFOLLOW)` of `name` in it (never following a link); nil when it is not there or the name is
         /// not a valid entry name.
-        func status(of name: String) -> stat? {
+        public func status(of name: String) -> stat? {
             guard (try? EngineFiles.checkName(name, shown.appending(path: name).path)) != nil else { return nil }
             var st = stat()
             guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { return nil }
@@ -454,7 +454,7 @@ public enum EngineFiles {
         }
 
         /// The target bytes of the symbolic link `name` in it (`readlinkat`, never followed); nil when it is not a link.
-        func linkTarget(of name: String) -> [UInt8]? {
+        public func linkTarget(of name: String) -> [UInt8]? {
             guard (try? EngineFiles.checkName(name, shown.appending(path: name).path)) != nil else { return nil }
             var buffer = [UInt8](repeating: 0, count: Int(PATH_MAX) + 1)
             let n = readlinkat(fd, name, &buffer, buffer.count - 1)
@@ -463,7 +463,7 @@ public enum EngineFiles {
         }
 
         /// Creates the directory `name` in it (which must not exist) and opens it.
-        func makeDirectory(_ name: String, mode: mode_t = 0o755) throws -> OpenDirectory {
+        public func makeDirectory(_ name: String, mode: mode_t = 0o755) throws -> OpenDirectory {
             let shownChild = shown.appending(path: name, directoryHint: .isDirectory)
             try EngineFiles.checkName(name, shownChild.path)
             guard mkdirat(fd, name, mode) == 0 else {
@@ -473,7 +473,7 @@ public enum EngineFiles {
         }
 
         /// The real directory `name` in it, opened without following a link.
-        func child(_ name: String) throws -> OpenDirectory {
+        public func child(_ name: String) throws -> OpenDirectory {
             let shownChild = shown.appending(path: name, directoryHint: .isDirectory)
             try EngineFiles.checkName(name, shownChild.path)
             let child = try EngineFiles.openChild(fd, name, shown: shownChild)
@@ -485,7 +485,7 @@ public enum EngineFiles {
         }
 
         /// The `(device, inode)` of the directory itself, from its open descriptor.
-        func identity() throws -> (dev: dev_t, ino: ino_t) {
+        public func identity() throws -> (dev: dev_t, ino: ino_t) {
             var st = stat()
             guard fstat(fd, &st) == 0 else { throw UnsafeEngineFile(path: shown.path, problem: "cannot be inspected") }
             return (st.st_dev, st.st_ino)
@@ -495,7 +495,7 @@ public enum EngineFiles {
         /// `fstat` of that open descriptor, for a caller that judges the descriptor itself and refuses by its own rules
         /// (`SafeFS`: regular, one link, the workspace's device, a size cap). Nothing is read here. Throws `UnsafeEngineFile`
         /// when the name is a link, does not exist or cannot be opened or inspected. The caller closes `fd`.
-        func openEntry(_ name: String) throws -> (fd: Int32, st: stat) {
+        public func openEntry(_ name: String) throws -> (fd: Int32, st: stat) {
             let shownEntry = shown.appending(path: name).path
             try EngineFiles.checkName(name, shownEntry)
             let fd = openat(self.fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
@@ -511,11 +511,11 @@ public enum EngineFiles {
         }
 
         /// The names in it (without `.` and `..`).
-        func names() throws -> [String] { try EngineFiles.entryNames(fd: fd, shown: shown.path) }
+        public func names() throws -> [String] { try EngineFiles.entryNames(fd: fd, shown: shown.path) }
 
         /// The names in it, stopping right after `limit` names or right after the name that takes their summed UTF-8 bytes
         /// past `byteLimit` (a caller bounding a walk sees the overflow and refuses).
-        func names(limit: Int, byteLimit: Int) throws -> [String] {
+        public func names(limit: Int, byteLimit: Int) throws -> [String] {
             guard let names = DirectoryListing.names(fd: fd, limit: limit, byteLimit: byteLimit) else {
                 throw UnsafeEngineFile(path: shown.path, problem: "cannot be listed")
             }
@@ -523,13 +523,13 @@ public enum EngineFiles {
         }
 
         /// Removes `name` from it (`EngineFiles.removeEntry`).
-        func remove(_ name: String) throws {
+        public func remove(_ name: String) throws {
             try EngineFiles.removeEntry(dfd: fd, name: name, shown: shown.appending(path: name).path)
         }
     }
 
     /// `<workspace>/<relative>` opened as a real directory (created when missing), as `directory(workspace:_:)` walks it.
-    static func openWalked(workspace: URL, _ relative: String) throws -> OpenDirectory {
+    public static func openWalked(workspace: URL, _ relative: String) throws -> OpenDirectory {
         let fd = try openDirectory(workspace: workspace, relative)
         guard let real = path(of: fd) else {
             close(fd)
@@ -544,7 +544,7 @@ public enum EngineFiles {
     /// descriptors only: every directory on the way opened `O_NOFOLLOW` relative to the one before, the name itself opened
     /// `O_NOFOLLOW`, and the verdict taken from `fstat` of that open descriptor, never from a look at the path. Whatever the
     /// agent swaps in afterwards, the bytes git gets are the bytes of the file that was checked.
-    enum Staged {
+    public enum Staged: Sendable {
         /// Nothing there (or a directory on the way is gone).
         case missing
         /// A regular file that passes `copyProblem`, open for reading; the caller closes `fd`. `executable` is the owner's x bit.
@@ -562,7 +562,7 @@ public enum EngineFiles {
     }
 
     /// Opens `parts` (a path relative to `top`, raw bytes, no `.`/`..`) as `Staged`.
-    static func staged(in top: OpenDirectory, relative parts: [[UInt8]], shown: String) -> Staged {
+    public static func staged(in top: OpenDirectory, relative parts: [[UInt8]], shown: String) -> Staged {
         guard let name = parts.last, parts.allSatisfy(isValidName) else {
             return .refused(UnsafeEngineFile(path: shown, problem: "is not a valid path"))
         }
@@ -601,7 +601,7 @@ public enum EngineFiles {
 
     /// At most `limit` bytes of the regular file at `parts` under `top`, reached as `staged` reaches it and read from its own
     /// descriptor only when it passes `copyProblem`; nil when it does not exist. Throws `UnsafeEngineFile` for every other shape.
-    static func readStaged(in top: OpenDirectory, relative parts: [[UInt8]], limit: Int, shown: String) throws -> Data? {
+    public static func readStaged(in top: OpenDirectory, relative parts: [[UInt8]], limit: Int, shown: String) throws -> Data? {
         switch staged(in: top, relative: parts, shown: shown) {
         case .missing: return nil
         case .file(let fd, _, _):
@@ -614,9 +614,9 @@ public enum EngineFiles {
     }
 
     /// What the directory way `parts` under `top` is, walked with `O_NOFOLLOW | O_DIRECTORY` part by part.
-    enum WayKind: Equatable { case real, missing, blocked }
+    public enum WayKind: Equatable, Sendable { case real, missing, blocked }
 
-    static func wayKind(in top: OpenDirectory, relative parts: [[UInt8]]) -> WayKind {
+    public static func wayKind(in top: OpenDirectory, relative parts: [[UInt8]]) -> WayKind {
         guard parts.allSatisfy(isValidName) else { return .blocked }
         switch walkWay(from: top.fd, parts[...], shown: top.shown.path) {
         case .missing: return .missing
@@ -626,7 +626,7 @@ public enum EngineFiles {
     }
 
     /// The (device, inode) of `name` directly in `top`, never following a link; nil when it is not there.
-    static func identity(in top: OpenDirectory, name: [UInt8]) -> (dev: dev_t, ino: ino_t)? {
+    public static func identity(in top: OpenDirectory, name: [UInt8]) -> (dev: dev_t, ino: ino_t)? {
         guard isValidName(name) else { return nil }
         var st = stat()
         guard withCName(name, { fstatat(top.fd, $0, &st, AT_SYMLINK_NOFOLLOW) }) == 0 else { return nil }
@@ -670,7 +670,7 @@ public enum EngineFiles {
     /// The directory, opened: the workspace resolved (it may sit behind a link the owner chose), then every part under it
     /// opened relative to the one before with `O_NOFOLLOW` (created with `mkdirat` when missing), so no link is ever
     /// followed on the way. The opened directory must still be where the walk put it, inside the resolved workspace.
-    static func openDirectory(workspace: URL, _ relative: String) throws -> Int32 {
+    public static func openDirectory(workspace: URL, _ relative: String) throws -> Int32 {
         let fm = FileManager.default
         if !fm.fileExists(atPath: workspace.path) { try fm.createDirectory(at: workspace, withIntermediateDirectories: true) }
         guard let root = resolved(workspace.path) else {
@@ -734,7 +734,7 @@ public enum EngineFiles {
     /// first renamed to a fresh name in the same directory (so nothing can be put back under its old name while it is
     /// emptied), then opened with `O_NOFOLLOW` and emptied entry by entry relative to its own descriptor, then removed with
     /// `AT_REMOVEDIR`. A link (anywhere in the tree) is unlinked; what it points at is never touched.
-    static func removeEntry(dfd: Int32, name: String, shown: String) throws {
+    public static func removeEntry(dfd: Int32, name: String, shown: String) throws {
         try checkName(name, shown)
         removalProbe?(path(of: dfd) ?? "", name)
         var st = stat()

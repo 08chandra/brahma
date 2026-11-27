@@ -9,273 +9,6 @@ import Glibc
 // common git dir and the other agents. This file computes what one turn may touch (`SandboxScope.forTurn`); Task 1b
 // compiles it into the Claude Code sandbox settings and Task 2 into the Seatbelt policy for checks.
 
-/// Why a sandbox scope (or a change to a company's sandbox settings) was refused.
-public enum SandboxError: Error, Equatable, CustomStringConvertible, LocalizedError {
-    /// A path a turn would run in, write or read equals, contains or lies inside a protected path (or equals or contains a
-    /// path every turn is denied reading: the owner's home, the data home, `/Volumes`, `<ws>/.brahma`).
-    case overlapsProtected(path: String, protected: String)
-    case writableOutsideCompany(path: String)
-    case dataHomeInsideWorkspace(String)
-    /// The platform sandbox is missing (Tasks 1b/2).
-    case unavailable
-    /// A path holds `'`, `"`, `\`, a control character (NUL, tab, line breaks, ESC …), DEL or `%00`, which no sandbox
-    /// profile, settings file or shell prefix may carry (`SandboxPath.isUnsafe`).
-    case unsafePathCharacter(String)
-    /// A domain that would route to Anthropic's API (`anthropic.com`, `claude.ai`, `claude.com` or a subdomain).
-    case forbiddenDomain(String)
-    /// Not a domain pattern the sandbox routes (the `DomainMatcher.isValidPattern` rules, Task 2).
-    case invalidDomain(String)
-    /// An agent handle that is not a safe single path component (3a's handle alphabet). Agent notes live under
-    /// `notes/agents/`, so a handle can no longer name a team's or the company's notes file.
-    case invalidHandle(String)
-    /// A path that is not absolute (or `~`, `~/…`), or an item key that is not a valid key.
-    case invalidPath(String)
-    /// A place the turn would run in, write or read (its own lab, home, notes, worktree, admin dir, ref, progress file, plan
-    /// directory) has a symbolic link at or above it inside the workspace: an agent can plant one, and following it would
-    /// grant the turn whatever it names.
-    case linkedPath(String)
-    /// A path spelled through an alias namespace (`/System/Volumes/…`, `/.nofollow`, `/.resolve`, `/.vol`) that names another
-    /// place: never an allowed entry; the real path must be used.
-    case aliasSpelling(path: String, alias: String)
-
-    public var description: String {
-        switch self {
-        case .overlapsProtected(let path, let protected): "\(path) overlaps the protected path \(protected)"
-        case .writableOutsideCompany(let path): "\(path) is outside the company workspace and cannot be writable"
-        case .dataHomeInsideWorkspace(let path): "the Brahma data home \(path) is inside a company workspace"
-        case .unavailable: "the sandbox is not available on this Mac"
-        case .unsafePathCharacter(let path): "the path \(path.debugDescription) holds a quote, a backslash or a control character"
-        case .forbiddenDomain(let domain): "\(domain) routes to Anthropic's API and is never allowed"
-        case .invalidDomain(let domain): "\(domain.debugDescription) is not a valid domain pattern"
-        case .invalidHandle(let handle): "\(handle.debugDescription) cannot be an agent's sandbox handle"
-        case .invalidPath(let path): "\(path.debugDescription) is not an absolute path"
-        case .linkedPath(let path): "\(path) is a symbolic link where the sandbox expects a real file or directory"
-        case .aliasSpelling(let path, let alias): "\(path) is an alias spelling (under \(alias)) of another path; use the real path"
-        }
-    }
-    public var errorDescription: String? { description }
-}
-
-// MARK: Paths
-
-/// Path resolution and comparison for sandbox scopes. Every path is resolved like realpath(3): links followed (`/tmp`
-/// becomes `/private/tmp`), `.` and `..` removed. A path that does not exist (yet) keeps its missing tail, appended to its
-/// longest existing resolved parent; a dangling link on the way is followed by its text.
-enum SandboxPath {
-    /// `'`, `"`, `\`, every C0 control (NUL, tab, line breaks, ESC …) and DEL: no sandbox profile (SBPL string escapes) or
-    /// settings file may carry them. Also `%00`: `URL.path` keeps a NUL percent-encoded.
-    static func isUnsafe(_ path: String) -> Bool {
-        path.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F || $0 == "'" || $0 == "\"" || $0 == "\\" }
-            || path.contains("%00")
-    }
-
-    /// The resolved form of an absolute path. A relative or unsafe path is returned unchanged (validation refuses it).
-    static func resolve(_ path: String) -> String {
-        guard path.hasPrefix("/"), !isUnsafe(path) else { return path }
-        var hops = 0
-        return resolve(parts: path.split(separator: "/").map(String.init), hops: &hops)
-    }
-
-    private static func resolve(parts: [String], hops: inout Int) -> String {
-        let joined = "/" + parts.joined(separator: "/")
-        if let real = realpathString(joined) { return real }
-        guard let last = parts.last else { return "/" }
-        let parent = resolve(parts: Array(parts.dropLast()), hops: &hops)
-        switch last {
-        case ".": return parent
-        case "..": return parentOf(parent)
-        default: break
-        }
-        let candidate = parent == "/" ? "/" + last : parent + "/" + last
-        // A dangling link: what it names is where a later write would land.
-        if hops < 40, let target = readLink(candidate) {
-            hops += 1
-            let next = target.hasPrefix("/") ? target : (parent == "/" ? "/" : parent + "/") + target
-            return resolve(parts: next.split(separator: "/").map(String.init), hops: &hops)
-        }
-        return candidate
-    }
-
-    private static func parentOf(_ path: String) -> String {
-        guard let slash = path.lastIndex(of: "/"), path != "/" else { return "/" }
-        let up = String(path[..<slash])
-        return up.isEmpty ? "/" : up
-    }
-
-    private static func realpathString(_ path: String) -> String? {
-        guard let r = realpath(path, nil) else { return nil }
-        defer { free(r) }
-        return String(cString: r)
-    }
-
-    private static func readLink(_ path: String) -> String? {
-        var st = stat()
-        guard lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFLNK else { return nil }
-        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
-        let n = readlink(path, &buffer, buffer.count - 1)
-        guard n > 0 else { return nil }
-        return String(decoding: buffer[0..<n].map { UInt8(bitPattern: $0) }, as: UTF8.self)
-    }
-
-    /// The first component of `path` below `root` that is a symbolic link (or a `.`/`..` part, or `path` itself when it is
-    /// not under `root`); nil when there is none. A missing component ends the walk: what does not exist cannot be a link.
-    static func linkedComponent(_ path: String, under root: String) -> String? {
-        guard path != root else { return nil }
-        guard path.hasPrefix(root + "/") else { return path }
-        var current = root
-        for part in path.dropFirst(root.count + 1).split(separator: "/") {
-            current += "/" + part
-            if part == "." || part == ".." { return current }
-            switch kind(current) {
-            case .link: return current
-            case .missing: return nil
-            default: continue
-            }
-        }
-        return nil
-    }
-
-    /// Paths compare case-insensitively on Darwin (APFS and HFS+ default): an overlap that differs only in case is still one.
-    static func key(_ path: String) -> String {
-        #if canImport(Darwin)
-        return path.lowercased()
-        #else
-        return path
-        #endif
-    }
-
-    /// `a` is `b` or lies inside it.
-    static func isInside(_ a: String, _ b: String) -> Bool {
-        let a = key(a), b = key(b)
-        if b == "/" { return a.hasPrefix("/") }
-        return a == b || a.hasPrefix(b + "/")
-    }
-
-    static func overlaps(_ a: String, _ b: String) -> Bool { isInside(a, b) || isInside(b, a) }
-
-    /// `~` and `~/…` against `userHome`; an absolute path as is; anything else throws `.invalidPath`.
-    static func expand(_ raw: String, userHome: URL) throws -> URL {
-        if isUnsafe(raw) { throw SandboxError.unsafePathCharacter(raw) }
-        if raw == "~" { return userHome }
-        if raw.hasPrefix("~/") { return userHome.appending(path: String(raw.dropFirst(2))) }
-        guard raw.hasPrefix("/") else { throw SandboxError.invalidPath(raw) }
-        return URL(fileURLWithPath: raw, isDirectory: false)
-    }
-
-    enum Kind { case missing, directory, file, link, other }
-
-    static func kind(_ path: String) -> Kind {
-        var st = stat()
-        guard lstat(path, &st) == 0 else { return .missing }
-        switch st.st_mode & S_IFMT {
-        case S_IFDIR: return .directory
-        case S_IFREG: return .file
-        case S_IFLNK: return .link
-        default: return .other
-        }
-    }
-
-    // MARK: Aliases and identity
-
-    /// Spellings `realpath` leaves alone that name another place: the Data volume's firmlinked view
-    /// (`/System/Volumes/Data/Users/…` is `/Users/…`) and the kernel's alias namespaces. No allowed entry may use one.
-    static let aliasPrefixes = ["/System/Volumes", "/.nofollow", "/.resolve", "/.vol"]
-
-    /// The alias prefix `path` is spelled under, if any.
-    static func alias(_ path: String) -> String? { aliasPrefixes.first { isInside(path, $0) } }
-
-    /// A file system object: compared by device and inode, two spellings of one directory (a firmlink, an alias namespace)
-    /// are the same place.
-    struct Identity: Hashable { let dev: UInt64; let ino: UInt64 }
-
-    /// The identity of what `path` names (links followed); nil when it does not exist.
-    static func identity(_ path: String) -> Identity? {
-        var st = stat()
-        guard stat(path, &st) == 0 else { return nil }
-        return Identity(dev: UInt64(truncatingIfNeeded: st.st_dev), ino: UInt64(truncatingIfNeeded: st.st_ino))
-    }
-
-    /// The identities of `/` and of every existing prefix of `path`, `path` itself last (the walk stops at a missing part).
-    static func lineage(_ path: String) -> [Identity] {
-        var out: [Identity] = identity("/").map { [$0] } ?? []
-        var current = ""
-        for part in path.split(separator: "/") {
-            current += "/" + part
-            guard let id = identity(current) else { break }
-            out.append(id)
-        }
-        return out
-    }
-
-    /// Roots compared by identity: whatever spelling a path uses, it overlaps a root when it is the root, lies inside it, or
-    /// contains it.
-    struct IdentityRoots {
-        private let roots: [(path: String, id: Identity, lineage: Set<Identity>)]
-
-        /// Each root's lineage is built from its resolved path (a root spelled through a link is the place it names). A root
-        /// that does not exist (yet) is kept with the lineage of its existing part, so a path that contains where it would
-        /// be still overlaps it.
-        private let missing: [(path: String, lineage: Set<Identity>)]
-
-        init(_ urls: [URL]) {
-            var seen: Set<Identity> = []
-            var kept: [(path: String, id: Identity, lineage: Set<Identity>)] = []
-            var absent: [(path: String, lineage: Set<Identity>)] = []
-            for url in urls {
-                let resolved = SandboxPath.resolve(url.path)
-                if let id = SandboxPath.identity(resolved) {
-                    if seen.insert(id).inserted { kept.append((url.path, id, Set(SandboxPath.lineage(resolved)))) }
-                } else {
-                    absent.append((url.path, Set(SandboxPath.lineage(resolved))))
-                }
-            }
-            roots = kept
-            missing = absent
-        }
-
-        /// The first root `path` equals, lies inside or contains.
-        func overlapping(_ path: String) -> String? {
-            let mine = SandboxPath.lineage(path)
-            let inside = Set(mine)
-            let id = SandboxPath.identity(path)
-            if let hit = roots.first(where: { inside.contains($0.id) || (id.map($0.lineage.contains) ?? false) }) { return hit.path }
-            // A missing root: `path` contains it when `path` is an existing ancestor of it.
-            return id.flatMap { id in missing.first { $0.lineage.contains(id) }?.path }
-        }
-
-        /// The first root `path` equals or contains.
-        func containedIn(_ path: String) -> String? {
-            guard let id = SandboxPath.identity(path) else { return nil }
-            return (roots.first { $0.lineage.contains(id) }?.path) ?? (missing.first { $0.lineage.contains(id) }?.path)
-        }
-    }
-
-    /// An existing directory reached without a symbolic link or an alias spelling: absolute and safe, it resolves to itself,
-    /// and an `lstat` walk from `/` finds a real directory at every part. A read-path grant must stay this.
-    static func isPinnedDirectory(_ path: String) -> Bool {
-        guard path.hasPrefix("/"), !isUnsafe(path), alias(path) == nil, key(resolve(path)) == key(path) else { return false }
-        var current = ""
-        for part in path.split(separator: "/") {
-            if part == "." || part == ".." { return false }
-            current += "/" + part
-            guard kind(current) == .directory else { return false }
-        }
-        return true
-    }
-
-    /// The names in a directory (not following a link at `path`), sorted; empty when it is missing or not a real directory.
-    static func entries(_ path: String) -> [String] {
-        guard kind(path) == .directory, let names = try? FileManager.default.contentsOfDirectory(atPath: path) else { return [] }
-        return names.sorted()
-    }
-}
-
-extension URL {
-    /// This path resolved for a sandbox scope (`SandboxPath.resolve`), as a file URL without a directory hint.
-    public var resolvedForSandbox: URL { URL(fileURLWithPath: SandboxPath.resolve(path), isDirectory: false) }
-
-}
-
 // MARK: Layout
 
 /// Where one agent's sandboxed turns live inside its company's workspace. Paths are as the workspace path names them;
@@ -393,28 +126,6 @@ public struct SandboxLayout: Equatable, Sendable {
     }
 }
 
-// MARK: Protected paths
-
-/// What no turn may read or write under the owner's home, whatever the company's settings.
-public enum ProtectedPaths {
-    static let credentials = [
-        ".ssh", ".aws", ".config/gh", ".gnupg", ".netrc", ".docker", ".kube", ".claude", ".claude.json", ".npmrc", ".pypirc",
-        ".git-credentials", ".gitconfig", ".cargo/credentials", ".cargo/credentials.toml", ".m2", ".gem", ".zsh_history",
-        ".bash_history", ".zshrc",
-    ]
-    static let library = [
-        "Library/Keychains", "Library/Cookies", "Library/Safari", "Library/Messages", "Library/Mail", "Library/Containers",
-        "Library/Group Containers",
-    ]
-    static let applicationSupport = ["Google/Chrome", "BraveSoftware", "Firefox", "Microsoft Edge", "Arc", "Claude", "Slack",
-                                     "1Password", "Code"]
-
-    public static func defaults(userHome: URL) -> [URL] {
-        (credentials + library + applicationSupport.map { "Library/Application Support/\($0)" })
-            .map { userHome.appending(path: $0) }
-    }
-}
-
 // MARK: Network
 
 public struct NetworkScope: Equatable, Sendable {
@@ -448,28 +159,6 @@ public enum CompanyNetwork {
         return NetworkScope(allowedDomains: set(defaultRegistries, company.allowedDomains, grantDomains),
                             webDomains: set(defaultRegistries, defaultDocs, company.webDomains, grantWebDomains),
                             allowLocalBinding: company.allowLocalBinding)
-    }
-}
-
-/// The forbidden-domain rule and the one check every owner-set domain passes; the pattern rules are `DomainMatcher`'s.
-enum SandboxDomains {
-    /// Anthropic's API and apps: nested `claude` must have no route to them (the V-9 barrier is network plus exec, Task 3).
-    static let forbiddenRoots = ["anthropic.com", "claude.ai", "claude.com"]
-
-    static func normalize(_ s: String) -> String { DomainMatcher.normalize(s) }
-
-    /// The pattern covers one of Anthropic's domains: it is one of them, a subdomain of one, or a parent of one.
-    static func isForbidden(_ pattern: String) -> Bool {
-        let p = normalize(pattern)
-        let base = p.hasPrefix("*.") ? String(p.dropFirst(2)) : p
-        if base == "*" || base.isEmpty { return true }
-        return forbiddenRoots.contains { root in base == root || base.hasSuffix("." + root) || root.hasSuffix("." + base) }
-    }
-
-    /// Refuses a forbidden domain first (so any Anthropic name reports as such), then an invalid one.
-    static func check(_ domain: String) throws {
-        if isForbidden(domain) { throw SandboxError.forbiddenDomain(normalize(domain)) }
-        if !DomainMatcher.isValidPattern(domain) { throw SandboxError.invalidDomain(domain) }
     }
 }
 
@@ -552,7 +241,7 @@ public struct SandboxScope: Equatable, Sendable {
         let allowed = [cwd] + writable + readable + readOnlyDirs + (toolchainTempWrite.map { [$0] } ?? [])
         let identities = (SandboxPath.IdentityRoots(protected), SandboxPath.IdentityRoots(deniedRoots))
         for entry in allowed {
-            try Self.checkAllowed(entry, protected: protected, deniedRoots: deniedRoots, byIdentity: identities)
+            try SandboxPath.checkAllowed(entry, protected: protected, deniedRoots: deniedRoots, byIdentity: identities)
         }
         for entry in [cwd] + writable where !SandboxPath.isInside(entry.path, workspace.path) {
             throw SandboxError.writableOutsideCompany(path: entry.path)
@@ -588,39 +277,8 @@ public struct SandboxScope: Equatable, Sendable {
         try validate()
     }
 
-    static func checkAllowed(_ entry: URL, protected: [URL], deniedRoots: [URL]) throws {
-        try checkAllowed(entry, protected: protected, deniedRoots: deniedRoots,
-                         byIdentity: (SandboxPath.IdentityRoots(protected), SandboxPath.IdentityRoots(deniedRoots)))
-    }
-
-    /// The overlap checks by spelling and by identity (device and inode: a firmlink or alias spelling of a protected place is
-    /// that place), and no alias spelling at all (`SandboxPath.aliasPrefixes`). Every allowed entry goes through here: cwd,
-    /// writable, readable, read-only, toolchain and grant read paths.
-    static func checkAllowed(_ entry: URL, protected: [URL], deniedRoots: [URL],
-                             byIdentity: (protected: SandboxPath.IdentityRoots, denied: SandboxPath.IdentityRoots)) throws {
-        if let prefix = SandboxPath.alias(entry.path) { throw SandboxError.aliasSpelling(path: entry.path, alias: prefix) }
-        if let hit = protected.first(where: { SandboxPath.overlaps(entry.path, $0.path) }) {
-            throw SandboxError.overlapsProtected(path: entry.path, protected: hit.path)
-        }
-        if let hit = deniedRoots.first(where: { SandboxPath.isInside($0.path, entry.path) }) {
-            throw SandboxError.overlapsProtected(path: entry.path, protected: hit.path)
-        }
-        if let hit = byIdentity.protected.overlapping(entry.path) {
-            throw SandboxError.overlapsProtected(path: entry.path, protected: hit)
-        }
-        if let hit = byIdentity.denied.containedIn(entry.path) {
-            throw SandboxError.overlapsProtected(path: entry.path, protected: hit)
-        }
-    }
-
-    /// The `.brahma` children every turn may read when they exist (5L-1). `hooks` and the shell prefix must be readable for
-    /// git and Bash to start; `ext` holds mounted extension parts whose scripts run in Bash; `cache/shared` is the read-only
-    /// layer checks write. `ext-review` is not one (10b, B-M9): a proposed extension's review page quotes unapproved skill
-    /// text, so only the turns of its internal reviewer read it (`reviewPages`), and the owner in the app. `ext-try` (the owner's
-    /// `ext try` copies) is readable only by that one throwaway turn. `preview/logs` holds the preview servers' logs
-    /// (Plan L): a failure DM points the setter at it.
-    static let readableDotBrahma = ["wt", "artifacts", "progress", "handoffs", "releases", "resources/company", "kb", "ext",
-                                    "hooks", "cache/shared", "preview/logs"]
+    /// The `.brahma` children every turn may read (`SeatbeltProfile.readableDotBrahma`: the Seatbelt render re-allows the same set).
+    static let readableDotBrahma = SeatbeltProfile.readableDotBrahma
 
     /// Engine-only `.brahma` places (3a, L, 4a), write-denied on every turn even before they exist. `preview` is Plan L's
     /// (`EngineLayout.previewDir`; its runs are data-home exports, its logs are written by the engine only).
@@ -764,7 +422,7 @@ public struct SandboxScope: Equatable, Sendable {
         // equal to or containing them.
         let claudeTemps = claudeShared + (tmpRoot.map(both) ?? []) + both(SandboxEnvironment.defaultClaudeTmpRoot)
         for path in extraReads {
-            try checkAllowed(path, protected: protected + both(dot) + claudeTemps, deniedRoots: deniedRoots)
+            try SandboxPath.checkAllowed(path, protected: protected + both(dot) + claudeTemps, deniedRoots: deniedRoots)
         }
         let existingExtra = extraReads.filter { SandboxPath.kind($0.path) != .missing }
 
@@ -882,7 +540,7 @@ public struct SandboxScope: Equatable, Sendable {
             guard tmp.path.utf8.count <= claudeTmpMaxLength else {
                 throw SandboxError.invalidPath("\(tmp.path) is too long for Claude Code's temp directory (\(claudeTmpMaxLength) bytes)")
             }
-            try checkAllowed(tmp, protected: protected, deniedRoots: deniedRoots)
+            try SandboxPath.checkAllowed(tmp, protected: protected, deniedRoots: deniedRoots)
             scope.claudeTmp = tmp
         }
         try scope.validate()
@@ -892,5 +550,14 @@ public struct SandboxScope: Equatable, Sendable {
     private static func dedupe(_ urls: [URL]) -> [URL] {
         var seen: Set<String> = []
         return urls.filter { seen.insert(SandboxPath.key($0.path)).inserted }
+    }
+}
+
+// MARK: Engine bridges to the kernel
+
+extension SandboxBaseline {
+    /// `current(engineHome:otherWorkspaces:backupTargets:)` with `paths.home` as the engine home.
+    public static func current(paths: BrahmaPaths, otherWorkspaces: [URL], backupTargets: [URL]) -> SandboxBaseline {
+        current(engineHome: paths.home, otherWorkspaces: otherWorkspaces, backupTargets: backupTargets)
     }
 }

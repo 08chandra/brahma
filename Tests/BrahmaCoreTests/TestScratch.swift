@@ -2,7 +2,7 @@ import Testing
 import Foundation
 import CryptoKit
 
-// Shared by BrahmaCoreTests, BrahmaAppModelTests and BrahmaMapKitTests: the three copies are byte-identical (TempHygieneTests checks). Both targets
+// Shared by BrahmaCoreTests, BrahmaAppModelTests, BrahmaMapKitTests and BrahmaSafetyTests: the copies are byte-identical (TempHygieneTests checks). All targets
 // run in one test process; each module keeps its own registry, so each works in its own subroot (`Scratch.moduleTag`).
 
 /// Test scratch space, structural. One root per test process (`$TMPDIR/brahma-test-<pid>/<TestTarget>/`), one directory
@@ -20,7 +20,7 @@ enum Scratch {
     static let rootName = "brahma-test-\(pid)"
     fileprivate static let temporaryBase = FileManager.default.temporaryDirectory
     fileprivate static let homeBase = FileManager.default.homeDirectoryForCurrentUser
-    /// The test target this copy is compiled into (`BrahmaCoreTests`, `BrahmaAppModelTests`, `BrahmaMapKitTests`).
+    /// The test target this copy is compiled into (`BrahmaCoreTests`, `BrahmaAppModelTests`, `BrahmaMapKitTests`, `BrahmaSafetyTests`).
     static let moduleTag = String(#fileID.prefix { $0 != "/" })
 
     /// `$TMPDIR/brahma-test-<pid>/<TestTarget>/`, created on first use; stale roots are swept first.

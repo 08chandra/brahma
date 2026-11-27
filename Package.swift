@@ -16,9 +16,12 @@ let package = Package(
     targets: [
         // The one caller of the variadic `sandbox_check` (what another process's sandbox allows); a stub off macOS.
         .target(name: "CSandboxCheck"),
+        // The safety kernel (Plan S): the path layer, the process primitives and the Seatbelt runtime. No GRDB, no engine types;
+        // `CSandboxCheck` for `SandboxCheck` (what another process's sandbox allows). BrahmaCore re-exports it (`Exports.swift`).
+        .target(name: "BrahmaSafety", dependencies: ["CSandboxCheck"]),
         .target(
             name: "BrahmaCore",
-            dependencies: [.product(name: "GRDB", package: "GRDB.swift"), "CSandboxCheck"]
+            dependencies: [.product(name: "GRDB", package: "GRDB.swift"), "BrahmaSafety"]
         ),
         // Platform owner-key hash store (macOS Keychain); kept out of BrahmaCore so the core stays portable.
         .target(name: "BrahmaKeychain", dependencies: ["BrahmaCore"]),
@@ -36,9 +39,10 @@ let package = Package(
         // The sandboxed PDF extraction helper (C2b, ruling 33): PDFKit and CoreGraphics decode a PDF outside the engine, under
         // Seatbelt; BrahmaCore never parses a PDF. Foundation, PDFKit and CoreGraphics only (nothing of Brahma's own).
         .executableTarget(name: "brahma-pdf"),
+        .testTarget(name: "BrahmaSafetyTests", dependencies: ["BrahmaSafety"]),
         .testTarget(
             name: "BrahmaCoreTests",
-            dependencies: ["BrahmaCore", "BrahmaKeychain"],
+            dependencies: ["BrahmaCore", "BrahmaSafety", "BrahmaKeychain"],
             resources: [.copy("Fixtures")]
         ),
         .testTarget(name: "BrahmaAppModelTests", dependencies: ["BrahmaAppModel", "BrahmaKeychain"]),

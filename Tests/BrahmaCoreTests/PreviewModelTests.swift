@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 @Suite(.scratch) struct PreviewModelTests {
     static func surface(name: String = "web", kind: String = "web", run: String? = "npm start", url: String? = "http://127.0.0.1:{port}/",

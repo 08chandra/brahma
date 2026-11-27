@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// Task 9: access asks (`request_access`), the owner's scoped grants, how they compile into a sandboxed turn, the ledger,
 /// and what kills and revocations do to them.
@@ -276,7 +277,7 @@ func refusal(_ body: () throws -> Any) -> String? {
     @Test func aliasSpellingHasItsOwnReason() throws {
         let probe = URL(fileURLWithPath: "/System/Volumes/Data/Applications/Xcode.app/Contents/Developer")
         do {
-            try SandboxScope.checkAllowed(probe, protected: [], deniedRoots: [])
+            try SandboxPath.checkAllowed(probe, protected: [], deniedRoots: [])
             Issue.record("an alias spelling was allowed")
         } catch let e as SandboxError {
             guard case .aliasSpelling(let path, let alias) = e else { Issue.record("\(e)"); return }

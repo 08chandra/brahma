@@ -45,8 +45,8 @@ public struct SandboxEnvironment: Sendable {
                                   shell: ShellPrefix.shell(), claudeTmpRoot: defaultClaudeTmpRoot)
     }
 
-    /// `/private/tmp/b-<uid>`: the root of every sandboxed agent's private Claude temp directory, in every company.
-    public static var defaultClaudeTmpRoot: URL { URL(fileURLWithPath: "/private/tmp/b-\(getuid())", isDirectory: false) }
+    /// `/private/tmp/b-<uid>` (`SandboxBaseline.defaultClaudeTmpRoot`).
+    public static var defaultClaudeTmpRoot: URL { SandboxBaseline.defaultClaudeTmpRoot }
 }
 
 /// A sandboxed turn's prepared places.

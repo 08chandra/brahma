@@ -228,8 +228,8 @@ public struct SeatbeltRunner: SandboxedRunner {
         }
         close(fds[1])
         return SeatbeltProcess(child: child, marker: marker, since: since, onStraggler: onStraggler,
-                               capture: OutputCapture(readEnd: fds[0], file: file, cap: ProcessCheckRunner.outputCap,
-                                                      tailBytes: 4096, marker: ProcessCheckRunner.truncationMarker))
+                               capture: OutputCapture(readEnd: fds[0], file: file, cap: GroupRun.outputCap,
+                                                      tailBytes: 4096, marker: GroupRun.truncationMarker))
     }
 }
 

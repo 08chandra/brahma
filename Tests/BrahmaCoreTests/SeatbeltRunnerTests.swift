@@ -6,6 +6,7 @@ import Darwin
 import Glibc
 #endif
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// The Seatbelt backend, run for real: only where `/usr/bin/sandbox-exec` exists. Every test works in `~/.brahma-test-<pid>/<n>`
 /// (removed when the test ends), under the owner's real home, so the home denial is the real one.

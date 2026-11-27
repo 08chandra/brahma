@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// Engine-run checks through the sandbox: the route the Orchestrator builds (company, purpose and place from the engine's
 /// own record of the run), the policy it gets, and the fallbacks. A fake `SandboxedRunner` records what it is asked.

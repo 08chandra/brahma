@@ -7,6 +7,7 @@ import Darwin
 import Glibc
 #endif
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// The engine's preview runner: fresh exports of `main`, restarts on merges (debounced), on changes and on the owner's flag,
 /// the crash loop, memory pressure, pauses, failure notices, the safety cap and shutdown. A file-backed store (so exports go

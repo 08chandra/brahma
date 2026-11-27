@@ -6,6 +6,7 @@ import Darwin
 import Glibc
 #endif
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// A `SimulatorControlling` that records every call and answers from fixed values (Plan 4a Task 7).
 final class FakeSimulator: SimulatorControlling, @unchecked Sendable {

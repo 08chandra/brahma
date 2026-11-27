@@ -1,18 +1,5 @@
 import Foundation
 
-/// What one run of a check came to. `exitCode` is nil when the command did not finish by itself (timed out, or could not
-/// be started: then `timedOut` is false and `tail` says why).
-public struct CheckOutcome: Equatable, Sendable {
-    public var exitCode: Int32?
-    public var timedOut: Bool
-    /// The last `ProcessCheckRunner.tailChars` characters of the output.
-    public var tail: String
-
-    public init(exitCode: Int32?, timedOut: Bool, tail: String) {
-        self.exitCode = exitCode; self.timedOut = timedOut; self.tail = tail
-    }
-}
-
 /// Runs a check command. Never throws: whatever goes wrong is part of the outcome.
 public protocol CheckRunning: Sendable {
     func run(command: String, workingDirectory: URL, timeout: TimeInterval, outputURL: URL,
@@ -27,9 +14,9 @@ public protocol CheckRunning: Sendable {
 /// unsandboxed Full check can still leave one running. The process handling (`GroupRun`, `ProcessGroupChild`) is shared
 /// with `SeatbeltRunner`; it never signals a group it has reaped and never touches a descriptor after it was closed.
 public struct ProcessCheckRunner: CheckRunning {
-    public static let outputCap = 1_048_576
-    public static let tailChars = 4000
-    public static let truncationMarker = "[output truncated]"
+    public static let outputCap = GroupRun.outputCap
+    public static let tailChars = GroupRun.tailChars
+    public static let truncationMarker = GroupRun.truncationMarker
 
     public var termGrace: TimeInterval
     /// Seconds on a clock that does not advance while the Mac sleeps, so a night's sleep cannot expire a check's timeout.

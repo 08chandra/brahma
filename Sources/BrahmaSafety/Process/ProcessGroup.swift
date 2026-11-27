@@ -5,6 +5,19 @@ import Darwin
 import Glibc
 #endif
 
+/// What one run of a check came to. `exitCode` is nil when the command did not finish by itself (timed out, or could not
+/// be started: then `timedOut` is false and `tail` says why).
+public struct CheckOutcome: Equatable, Sendable {
+    public var exitCode: Int32?
+    public var timedOut: Bool
+    /// The last `GroupRun.tailChars` characters of the output.
+    public var tail: String
+
+    public init(exitCode: Int32?, timedOut: Bool, tail: String) {
+        self.exitCode = exitCode; self.timedOut = timedOut; self.tail = tail
+    }
+}
+
 /// One child process spawned as the leader of its own process group, signalled only while the runner still owns that group.
 ///
 /// The descriptor- and pid-reuse window (carry-over): once a child is reaped, its pid (and so its process-group id) can be
@@ -14,25 +27,25 @@ import Glibc
 /// - it is reaped only after that sweep (`finish`), under the same lock every signal takes;
 /// - after the reap nothing is ever signalled again, whoever asks (`signalGroup` returns false).
 /// A child that is reaped by someone else (`ECHILD`) counts as reaped: no signal is sent after that either.
-final class ProcessGroupChild: @unchecked Sendable {
+public final class ProcessGroupChild: @unchecked Sendable {
     /// What the child went through, for tests (`observer`).
-    enum Event: CustomStringConvertible, Sendable {
+    public enum Event: CustomStringConvertible, Sendable {
         case signal(pid_t, Int32)
         case reaped(pid_t)
-        var description: String {
+        public var description: String {
             switch self {
             case .signal(let pid, let sig): "killpg \(pid) \(sig)"
             case .reaped(let pid): "reaped \(pid)"
             }
         }
     }
-    typealias Observer = @Sendable (Event) -> Void
+    public typealias Observer = @Sendable (Event) -> Void
 
-    let pid: pid_t
+    public let pid: pid_t
     /// The leader's exact start time (`ProcessTable`), read right after the spawn, before anything could reap it (nothing
     /// reaps it before `finish`): proof that a later process with this pid and this start is this child. Nil when the table
     /// could not be read.
-    let leaderStart: Double?
+    public let leaderStart: Double?
     private let lock = NSLock()
     private var exited = false
     private var status: Int32?
@@ -55,7 +68,7 @@ final class ProcessGroupChild: @unchecked Sendable {
     /// Throws a message when it cannot be started.
     /// `workingDirectoryFD`: an open directory descriptor the child `fchdir`s into instead of `workingDirectory`'s path
     /// (`SafeGit`: an item worktree held `O_NOFOLLOW`, so no path an agent can retarget is ever resolved for it).
-    static func spawn(executable: String, arguments: [String], environment: [String: String], workingDirectory: URL,
+    public static func spawn(executable: String, arguments: [String], environment: [String: String], workingDirectory: URL,
                       output: Int32, stdin: Int32 = -1, stderr: Int32? = nil, newSession: Bool = false,
                       workingDirectoryFD: Int32? = nil, observer: Observer? = nil) throws -> ProcessGroupChild {
         #if canImport(Darwin)
@@ -124,7 +137,7 @@ final class ProcessGroupChild: @unchecked Sendable {
     }
 
     /// True once the leader has exited. It is not reaped here: it stays a zombie, so the group id stays this child's.
-    func hasExited() -> Bool {
+    public func hasExited() -> Bool {
         lock.withLock {
             if exited || status != nil { return true }
             var info = siginfo_t()
@@ -161,11 +174,11 @@ final class ProcessGroupChild: @unchecked Sendable {
 
     /// True when the check's own exit status was lost (it was reaped out from under the engine): the outcome is inconclusive,
     /// never a pass (B-M1).
-    var lostTrack: Bool { lock.withLock { lost } }
+    public var lostTrack: Bool { lock.withLock { lost } }
 
     /// Blocks until the leader exits and leaves it unreaped (a zombie: its pid and group id stay this child's). Returns its
     /// exit code, or the number of the signal that ended it (as Foundation's `terminationStatus` does).
-    func waitForExit() -> Int32 {
+    public func waitForExit() -> Int32 {
         var info = siginfo_t()
         while true {
             let r = waitid(P_PID, id_t(pid), &info, WEXITED | WNOWAIT)
@@ -184,7 +197,7 @@ final class ProcessGroupChild: @unchecked Sendable {
     /// reaches it even after it moved itself out of its process group (`setpgid`/`setsid`) to dodge the `killpg` (B-I1).
     /// Returns whether it was sent.
     @discardableResult
-    func signalGroup(_ sig: Int32) -> Bool {
+    public func signalGroup(_ sig: Int32) -> Bool {
         lock.withLock {
             guard status == nil else { return false }
             killpg(pid, sig)
@@ -198,7 +211,7 @@ final class ProcessGroupChild: @unchecked Sendable {
     /// Blocks until the leader exits (unreaped), then kills whatever is left in its group while the zombie still holds the
     /// group id, then reaps it. Returns the wait status (the same one on every later call; nothing is signalled again).
     @discardableResult
-    func finish() -> Int32 {
+    public func finish() -> Int32 {
         while !hasExited() {
             var info = siginfo_t()
             // Blocks without reaping; a signal interrupting it just loops.
@@ -222,7 +235,7 @@ final class ProcessGroupChild: @unchecked Sendable {
     }
 
     /// The shell convention for a wait status: the exit code, or 128 + the signal that ended it.
-    static func exitCode(_ status: Int32) -> Int32 {
+    public static func exitCode(_ status: Int32) -> Int32 {
         status & 0x7f == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f)
     }
 }
@@ -338,20 +351,26 @@ enum MemoryFootprint {
 /// The shared blocking body of `ProcessCheckRunner` and `SeatbeltRunner`: spawn into its own process group, capture the
 /// output, enforce the timeout (SIGTERM to the group, SIGKILL `termGrace` later) and cancellation (SIGKILL), sweep the
 /// group when the leader exits, and decode the outcome.
-enum GroupRun {
-    /// The last line of the tail of a run its memory limit stopped (C2b fix round 3).
-    static let memoryExceeded = "the run used more memory than it may, and was stopped"
-    /// The last line of the tail of a run whose standard output passed its cap (C2b fix round 4, R4-4).
-    static let outputExceeded = "the run wrote more output than it may, and was stopped"
+public enum GroupRun {
+    /// The output cap, the tail length and the truncation marker of every run (`ProcessCheckRunner` re-exports them).
+    public static let outputCap = 1_048_576
+    public static let tailChars = 4000
+    public static let truncationMarker = "[output truncated]"
 
-    final class CancelFlag: @unchecked Sendable {
+    /// The last line of the tail of a run its memory limit stopped (C2b fix round 3).
+    public static let memoryExceeded = "the run used more memory than it may, and was stopped"
+    /// The last line of the tail of a run whose standard output passed its cap (C2b fix round 4, R4-4).
+    public static let outputExceeded = "the run wrote more output than it may, and was stopped"
+
+    public final class CancelFlag: @unchecked Sendable {
         private let lock = NSLock()
         private var value = false
-        func set() { lock.withLock { value = true } }
+        public init() {}
+        public func set() { lock.withLock { value = true } }
         var isSet: Bool { lock.withLock { value } }
     }
 
-    static func fail(_ message: String, outputURL: URL) -> CheckOutcome {
+    public static func fail(_ message: String, outputURL: URL) -> CheckOutcome {
         try? FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? message.write(to: outputURL, atomically: true, encoding: .utf8)
         return CheckOutcome(exitCode: nil, timedOut: false, tail: message)
@@ -361,14 +380,14 @@ enum GroupRun {
         var text = String(decoding: data, as: UTF8.self)
         // A cut inside a multi-byte character leaves replacement characters at the start.
         while text.first == "\u{FFFD}" { text.removeFirst() }
-        return String(text.suffix(ProcessCheckRunner.tailChars))
+        return String(text.suffix(GroupRun.tailChars))
     }
 
     /// `stdout` (C2b fix round 4, R4-4): the run's standard output goes to that file (created anew), at most `cap` bytes;
     /// one byte more and the run is killed (`outputExceeded`); its standard error then goes to `outputURL` alone. An output
     /// that never ends (a descriptor held elsewhere) makes the run inconclusive. `newSession`: the child leads a new session
     /// (`setsid`), so it can't leave its process group. The memory watchdog sums the child itself and its group.
-    static func run(executable: String, arguments: [String], workingDirectory: URL, timeout: TimeInterval, outputURL: URL,
+    public static func run(executable: String, arguments: [String], workingDirectory: URL, timeout: TimeInterval, outputURL: URL,
                     environment: [String: String], termGrace: TimeInterval, clock: @Sendable () -> TimeInterval,
                     cancel: CancelFlag, observer: ProcessGroupChild.Observer? = nil, groups: ChildGroups? = nil,
                     memoryLimit: Int? = nil, stdout: (url: URL, cap: Int)? = nil, newSession: Bool = false) -> CheckOutcome {
@@ -421,8 +440,8 @@ enum GroupRun {
         let record = groups?.record(child.pid)
         defer { groups?.forget(record, pid: child.pid) }
         // From here the readers own `readEnd` and `file`, and the standard output's two descriptors.
-        let capture = OutputCapture(readEnd: readEnd, file: file, cap: ProcessCheckRunner.outputCap,
-                                    tailBytes: ProcessCheckRunner.tailChars * 4, marker: ProcessCheckRunner.truncationMarker)
+        let capture = OutputCapture(readEnd: readEnd, file: file, cap: GroupRun.outputCap,
+                                    tailBytes: GroupRun.tailChars * 4, marker: GroupRun.truncationMarker)
         let capped = out.map { CappedCapture(readEnd: $0.read, file: $0.file, cap: stdout?.cap ?? 0) }
 
         let deadline = clock() + timeout
@@ -538,35 +557,35 @@ final class CappedCapture: @unchecked Sendable {
 /// group (`ProcessGroupChild`), waited on in awake time (`AwakeTime`), and past `timeout` SIGTERMed as a group, then
 /// SIGKILLed as a group `killGrace` later, so a hung tool's children go with it. When the leader exits its group is swept
 /// before it is reaped (`finish`). Blocking: call it inside a `Blocking` body (or a CLI's main thread).
-enum GroupExec {
+public enum GroupExec {
     /// Where the child's standard output goes.
-    enum Output {
+    public enum Output: Sendable {
         /// Captured through a pipe: at most the last `cap` bytes are kept; `stderr` joins it (else `/dev/null`).
         case capture(cap: Int, stderr: Bool)
         /// This descriptor (the caller keeps it); standard error goes to `/dev/null`.
         case descriptor(Int32)
     }
 
-    struct Result: Sendable {
+    public struct Result: Sendable {
         /// False when it could not be started (`error` says why).
-        var launched: Bool
+        public var launched: Bool
         /// The exit code, or 128 + the signal that ended it.
-        var status: Int32
-        var output: Data
-        var timedOut: Bool
-        var error: String?
+        public var status: Int32
+        public var output: Data
+        public var timedOut: Bool
+        public var error: String?
     }
 
     /// Once SIGKILL has been sent, how long to wait for the leader before giving up on it by default (INT-M4): bounded, so a
     /// process stuck in an uninterruptible wait cannot hang the engine.
-    static let defaultAbandonAfter: TimeInterval = 10
+    public static let defaultAbandonAfter: TimeInterval = 10
 
     /// `arguments` excludes argv[0]. `stdin` `-1`: `/dev/null`. The working directory defaults to `/` (never the engine's own
     /// current directory, INT-M5). `abandonAfter`: once SIGKILL has been sent, how long to wait for the leader before giving up
     /// on it (`defaultAbandonAfter`). Captured output is drained for up to 2 s after a normal exit and not waited on after a
     /// timeout, so a process outside the group that holds the pipe cannot hang the caller. A leader that was abandoned, or
     /// whose exit status was lost, is reported as not succeeded (`status` -1, `error` set), never as status 0 (INT-I2).
-    static func run(executable: String, arguments: [String], environment: [String: String],
+    public static func run(executable: String, arguments: [String], environment: [String: String],
                     workingDirectory: URL = URL(fileURLWithPath: "/", isDirectory: true),
                     stdin: Int32 = -1, output: Output, timeout: TimeInterval, killGrace: TimeInterval = 1,
                     abandonAfter: TimeInterval? = GroupExec.defaultAbandonAfter,

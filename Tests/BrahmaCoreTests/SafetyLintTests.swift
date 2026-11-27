@@ -28,11 +28,25 @@ enum SafetyLint {
             }
         }
 
-        /// Repo-relative directory prefixes where the rule must have no hit at all. Empty in S1; S7, S9–S12 and S15 fill them.
+        /// Repo-relative directory prefixes where the rule must have no hit at all. S3 emptied `Verify/` and `Sandbox/` of
+        /// spawns (the process primitives and the Seatbelt runtime moved to `BrahmaSafety`); S7, S9–S12 and S15 fill the rest.
         var zero: [String] {
             switch self {
-            case .spawn, .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope:
+            case .spawn: return ["Sources/BrahmaCore/Verify/", "Sources/BrahmaCore/Sandbox/"]
+            case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope:
                 return []
+            }
+        }
+
+        /// Files inside a `zero` directory whose hits are not what the rule hunts, each with its reason (spec §6.8.2: "ClaudeSettings'
+        /// script-text line allowlisted with a reason"). Exempt from the zero check only; the baseline still bounds their count.
+        var zeroExempt: [String: String] {
+            switch self {
+            case .spawn:
+                return ["Sources/BrahmaCore/Sandbox/ClaudeSettings.swift":
+                            "`ShellPrefix.tools`: the absolute tool paths the agent's shell prefix script runs, as script text; the engine spawns nothing here"]
+            case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope:
+                return [:]
             }
         }
     }
@@ -95,11 +109,12 @@ enum SafetyLint {
         return out
     }
 
-    /// The hits inside a rule's `zero` directories. A prefix names a directory: `Sources/BrahmaCore/Refs` (with or without
-    /// the trailing `/`) covers `Sources/BrahmaCore/Refs/…` and not `Sources/BrahmaCore/RefsX/…`.
-    static func zeroOffenders(_ hits: [Hit], zero: [String]) -> [Hit] {
+    /// The hits inside a rule's `zero` directories, less those in an exempted file. A prefix names a directory:
+    /// `Sources/BrahmaCore/Refs` (with or without the trailing `/`) covers `Sources/BrahmaCore/Refs/…` and not
+    /// `Sources/BrahmaCore/RefsX/…`.
+    static func zeroOffenders(_ hits: [Hit], zero: [String], exempt: [String: String] = [:]) -> [Hit] {
         let dirs = zero.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
-        return hits.filter { hit in dirs.contains { hit.path.hasPrefix($0) } }
+        return hits.filter { hit in dirs.contains { hit.path.hasPrefix($0) } && exempt[hit.path] == nil }
     }
 
     /// The checked-in baseline, or nil when there is none yet.
@@ -272,16 +287,23 @@ enum SafetyLint {
         #expect(synthetic[.descriptor] == [:], "every rule is present, empty when it has no entry")
     }
 
-    /// A rule's `zero` directories have no hit. The lists are empty in S1; later tasks fill them as families reach zero.
+    /// A rule's `zero` directories have no hit. S3 set the first (`spawn` in `Verify/` and `Sandbox/`); later tasks fill the rest.
     @Test func zeroScopesAreZero() throws {
         let hits = try SafetyLint.hits(root: Self.root)
         var offenders: [String] = []
         for rule in SafetyLint.Rule.allCases {
-            offenders += SafetyLint.zeroOffenders(hits[rule] ?? [], zero: rule.zero).map { "\(rule.rawValue): \($0)" }
+            offenders += SafetyLint.zeroOffenders(hits[rule] ?? [], zero: rule.zero, exempt: rule.zeroExempt).map { "\(rule.rawValue): \($0)" }
+            // An exemption names a file inside one of the rule's zero directories, with a reason, and the baseline still bounds it.
+            for (path, reason) in rule.zeroExempt {
+                #expect(!reason.isEmpty, "\(rule.rawValue): \(path) needs a reason")
+                #expect(SafetyLint.zeroOffenders([SafetyLint.Hit(path: path, line: 1, text: "")], zero: rule.zero).count == 1,
+                        "\(rule.rawValue): \(path) is not inside a zero directory; drop the exemption")
+                #expect((try SafetyLint.baseline(root: Self.root))?[rule]?[path] != nil, "\(rule.rawValue): \(path) must stay in the baseline")
+            }
         }
         #expect(offenders.isEmpty, Comment(rawValue: "hits in a zero scope:\n" + offenders.joined(separator: "\n")))
 
-        // The prefix logic, while the lists are empty: a hit inside a zero directory is an offender, one outside is not, and
+        // The prefix logic: a hit inside a zero directory is an offender, one outside is not, and
         // a directory prefix matches whole path components only (Refs/ is not RefsX/), with or without its trailing slash.
         let synthetic = ["Sources/BrahmaCore/Refs/A.swift", "Sources/BrahmaCore/RefsX/B.swift", "Sources/BrahmaCore/Git/C.swift",
                          "Sources/BrahmaCore/Refs.swift"].map { SafetyLint.Hit(path: $0, line: 1, text: "") }
@@ -289,6 +311,7 @@ enum SafetyLint {
             #expect(SafetyLint.zeroOffenders(synthetic, zero: zero).map(\.path) == ["Sources/BrahmaCore/Refs/A.swift"], "\(zero)")
         }
         #expect(SafetyLint.zeroOffenders(synthetic, zero: []).isEmpty)
+        #expect(SafetyLint.zeroOffenders(synthetic, zero: ["Sources/BrahmaCore/Refs/"], exempt: ["Sources/BrahmaCore/Refs/A.swift": "why"]).isEmpty)
         #expect(SafetyLint.zeroOffenders(synthetic, zero: ["Sources/BrahmaCore/Git", "Sources/brahma"]).map(\.path) == ["Sources/BrahmaCore/Git/C.swift"])
     }
 
