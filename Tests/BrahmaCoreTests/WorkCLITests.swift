@@ -242,6 +242,20 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         #expect(try brahma(["dev", "autopages", "Acme"], home: home, env: devEnv).stdout == "no auto page changed\n")
     }
 
+    /// Plan C Task C7b's seed hook: `dev file-ask` (the owner's file ask, a `kind = fileAsk` DM). Refused without BRAHMA_DEV=1.
+    @Test func devFileAskSeedHook() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        let refused = try brahma(["dev", "file-ask", "Acme", "--to", "eng-1", "The latency export"], home: home)
+        #expect(refused.status != 0); #expect(refused.stderr.contains("dev commands need BRAHMA_DEV=1"))
+        let asked = try brahma(["dev", "file-ask", "Acme", "--to", "@eng-1", "The latency export"], home: home, env: devEnv)
+        #expect(asked.status == 0, "\(asked.stderr)"); #expect(asked.stdout.hasPrefix("msg:"))
+        let dm = try brahma(["log", "Acme", "@eng-1"], home: home)
+        #expect(dm.stdout.contains("The latency export"), "\(dm.stdout)")
+        #expect(try brahma(["dev", "file-ask", "Acme", "--to", "nobody", "x"], home: home, env: devEnv).status != 0)
+    }
+
     @Test func inboxApproveAnswerRescindFlow() throws {
         // Covers propose, decide, approve, answer, replan and autonomy (rescind is in rescindFlow).
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }

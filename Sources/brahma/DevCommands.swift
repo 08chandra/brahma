@@ -19,7 +19,7 @@ struct DevGroup: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dev", abstract: "Developer test hooks (BRAHMA_DEV=1).", shouldDisplay: false,
         subcommands: [Propose.self, Decide.self, Request.self, Access.self, DigestNow.self, ReleaseScenario.self, MergeScenario.self, Claim.self,
-                      Tool.self, SeedTurn.self, Drop.self, AutoPagesNow.self])
+                      Tool.self, SeedTurn.self, Drop.self, FileAsk.self, AutoPagesNow.self])
 
     /// `request_access` as an agent would call it (the seed's pending access ask). Owner-side approval stays `brahma access approve`.
     struct Access: ParsableCommand {
@@ -283,6 +283,24 @@ struct DevGroup: AsyncParsableCommand {
             } catch let e as WorkError {
                 throw fail(e.message)
             }
+        }
+    }
+
+    /// Plan C Task C7b (the seed): the owner asks an agent for a file, as the app's "Ask for a file" does (`Store.sendFileAsk`:
+    /// a `kind = fileAsk` DM from the owner). The app has no CLI for it, hence this hook. Prints the ask's `msg:<id>`.
+    struct FileAsk: ParsableCommand {
+        static let configuration = CommandConfiguration(commandName: "file-ask", abstract: "Ask an agent for a file as the owner.")
+        @Argument var company: String
+        @Option(help: "Handle of the agent asked.") var to: String
+        @Option(help: "Work item key the file is for.") var item: String?
+        @Argument(help: "What file the owner needs.") var description: String
+
+        func run() throws {
+            try requireDev()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            let message = try refusing { try store.sendFileAsk(companyId: c.id, toHandle: to, description: description, itemKey: item) }
+            print("msg:\(message.id)")
         }
     }
 

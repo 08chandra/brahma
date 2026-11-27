@@ -814,7 +814,11 @@ public struct GitWorkspace: Sendable {
     var gitDir: URL { root.appending(path: ".git", directoryHint: .isDirectory) }
     private func adminDir(key: String) -> URL { gitDir.appending(path: "worktrees/\(key)", directoryHint: .isDirectory) }
     /// `<root>/.brahma/hooks` for a company workspace; nil when the root lies inside a `.brahma` directory (a lab).
-    private var engineHooksPath: String? {
+    private var engineHooksPath: String? { Self.engineHooksPath(root: root) }
+
+    /// The `core.hooksPath` the config allowlist admits for the repository at `root` (C7b: `SafeGit` scans with the same rule,
+    /// so Collab's reads work in a workspace whose hooks `CompanyHooks` installed).
+    static func engineHooksPath(root: URL) -> String? {
         root.pathComponents.contains(".brahma") ? nil : root.appending(path: ".brahma/hooks").path
     }
 

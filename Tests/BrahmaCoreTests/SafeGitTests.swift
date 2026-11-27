@@ -176,6 +176,17 @@ import Foundation
         #expect(threw == 5)
     }
 
+    /// C7b: a company workspace whose config names the engine's own hooks directory (`CompanyHooks`, Task 5a) is read as
+    /// `GitWorkspace` reads it; any other `core.hooksPath` is still refused.
+    @Test func engineHooksPathAdmitted() throws {
+        let r = try Repo()
+        try r.f.git(["config", "core.hooksPath", r.root.appending(path: ".brahma/hooks").path])
+        let git = SafeGit(workspace: r.root)
+        #expect(try git.head("main") == (try r.head("main")))
+        try r.f.git(["config", "core.hooksPath", r.root.appending(path: "hooks").path])
+        #expect(throws: SafeGitError.self) { try git.head("main") }
+    }
+
     @Test func perWorktreeConfigIgnored() throws {
         let r = try Repo()
         let marker = try tempDir().appending(path: "ran")

@@ -926,6 +926,9 @@ public struct SafeGit: Sendable {
             timeout = min(timeout, budget.remaining)
         }
         var git = GitCommand(gitDir: workspace.appending(path: ".git", directoryHint: .isDirectory), workTree: workTree ?? workspace, commonDir: nil)
+        // C7b: the config allowlist admits the engine's own hooks directory of this workspace, exactly as `GitWorkspace` does
+        // (the forced `core.hooksPath=/dev/null` still applies to every call, so no hook ever runs).
+        git.engineHooksPath = GitWorkspace.engineHooksPath(root: workspace)
         git.indexFile = index
         git.extraEnvironment = literalPathspecs ? Self.extraEnvironment : [:]
         git.extraConfig = Self.extraConfig

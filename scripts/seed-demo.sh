@@ -165,3 +165,34 @@ fi
 # Plan ML Task 10: one auto-page refresh now (the engine does it every 60 active seconds), so the generated pages (roster,
 # org chart, release history, sprint summaries, decisions log) reflect everything seeded above.
 BRAHMA_DEV=1 "$B" dev autopages Initech >/dev/null
+
+# Plan C (C7b): sharing, a thread, a file ask, a company resource and a live CHANGES row. Every step goes through the real
+# tools or the owner's Store calls the app uses: `dev tool` calls the agent tool directly (`share`, `read_channel`,
+# `post_message`); `dev file-ask` is the app's "Ask for a file" (`Store.sendFileAsk`; no owner CLI for it); `resource add` is
+# ML's owner drop. @devops-1 and @mgr-1 are untainted sessions (the tainted @eng-1 and @cto write nothing here).
+# 1. An agent share: @devops-1 shares lines 1-20 of the landing page with #general (pinned at main's commit).
+BRAHMA_DEV=1 "$B" dev tool Initech share --by devops-1 \
+  --args '{"refs":["index.html:1-20"],"to":"#general","note":"The landing page header, for the mobile pass"}' >/dev/null
+# 2. A diff share: @mgr-1 shares INITE-5's committed diff (the item the merge queue bounced, still leased by @mgr-1).
+BRAHMA_DEV=1 "$B" dev tool Initech share --by mgr-1 \
+  --args '{"refs":["INITE-5:diff"],"to":"#general","note":"INITE-5 bounced on streak.txt; here is its diff"}' >/dev/null
+# 3. A three-message thread: the diff share is its root (its msg:<id> read back the way an agent reads it), two replies.
+ROOT="$(BRAHMA_DEV=1 "$B" dev tool Initech read_channel --by mgr-1 --args '{"channel":"general"}' 2>/dev/null \
+  | python3 -c 'import json,sys; print([m["id"] for m in json.load(sys.stdin) if m["sender"] == "@mgr-1"][-1])')"
+BRAHMA_DEV=1 "$B" dev tool Initech post_message --by devops-1 \
+  --args "{\"channel\":\"general\",\"reply_to\":\"$ROOT\",\"text\":\"streak.txt conflicts with the counter from INITE-2; rebase on main first?\"}" >/dev/null
+BRAHMA_DEV=1 "$B" dev tool Initech post_message --by mgr-1 \
+  --args "{\"channel\":\"general\",\"reply_to\":\"$ROOT\",\"text\":\"Yes: rebasing on main, then resubmitting.\"}" >/dev/null
+# 4. The owner asks @devops-1 for a file (a fileAsk DM; it answers with share(..., reply_to) in that thread).
+BRAHMA_DEV=1 "$B" dev file-ask Initech --to devops-1 --item INITE-2 "The build log from the last web preview run" >/dev/null
+# 5. One owner-dropped company resource (the scope `resource add` gives a file from you: company).
+D="$(mktemp -d)"
+printf '# Launch checklist\n\n- Streaks count across midnight\n- Reminders fire once\n- The weekly summary lists every habit\n' >"$D/launch-checklist.md"
+"$B" resource Initech add "$D/launch-checklist.md" >/dev/null
+rm -rf "$D"
+# 6. An uncommitted edit in a leased item worktree: @mgr-1's INITE-5, so the CHANGES tab has a live row with + and - lines.
+WT="$W/.brahma/wt/INITE-5"
+if [ -d "$WT" ]; then
+  printf 'Weekly summary: habits done, streaks kept, reminders sent\n' >"$WT/streak-summary.txt"
+  printf 'Summary layout\n\n- one row per habit\n- the longest streak first\n' >"$WT/summary-layout.md"
+fi
