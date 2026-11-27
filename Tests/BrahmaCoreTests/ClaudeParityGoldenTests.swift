@@ -157,7 +157,8 @@ private func decision(kind: TurnKind, mode: ParityCell.Mode, launch: ParityCell.
 
 /// A company on a file-backed store whose data home, workspaces root, owner's home and Darwin temp dir all sit in one resolved
 /// temp dir (`SettingsCompilerTests.CompileWorld`), so every compiled path is known and can be written as a placeholder.
-private struct GoldenWorld {
+/// Internal (not private): Task 2's `RuntimeTypesTests.subscriptionShapeKeyUnchanged` iterates the same shapes.
+struct GoldenWorld {
     let root: URL
     let userHome: URL
     let paths: BrahmaPaths
@@ -361,9 +362,19 @@ private func capture(name: String, world: GoldenWorld) throws -> Capture {
     return try capture(cell: cell, world: world)
 }
 
+/// The request behind the golden `name`, as `capture(name:)` builds it (shared with Task 2's `RuntimeTypesTests`).
+func goldenRequest(name: String, world: GoldenWorld) throws -> TurnRequest {
+    if name == ParityShapes.conciergeName { return try world.conciergeRequest() }
+    if let canary = ModeCanary.shapes().first(where: { ParityShapes.modeCanaryName($0.0) == name }) {
+        return world.modeCanaryRequest(canary.1)
+    }
+    let cell = try #require(ParityShapes.enumerate().first { $0.name == name }, "no such shape: \(name)")
+    return try world.request(cell)
+}
+
 // MARK: - Golden files
 
-private enum Goldens {
+enum Goldens {
     static let recording = ProcessInfo.processInfo.environment["BRAHMA_RECORD_GOLDENS"] == "1"
     /// The source tree's `Fixtures/turn-shapes` (where recording writes; `everyShapeCovered` lists it).
     static let sourceDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appending(path: "Fixtures/turn-shapes")
