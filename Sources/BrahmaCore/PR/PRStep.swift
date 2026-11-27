@@ -17,15 +17,19 @@ import Foundation
 ///   item back (GitHub's protection still decides whether the PR can merge).
 ///   Not read: legacy commit statuses (`GET /commits/{ref}/status`). A repository whose required checks are statuses shows no
 ///   failing check runs; its `blocked` reads as waiting for a review — an X4 follow-up.
-/// - `checksFailed`, `changesRequested`, `mergeable`: watched for a close upstream (`closedUpstream`, the owner agent told);
-///   merging is Tasks 5–6.
+/// - `checksFailed`, `changesRequested`: watched for a close upstream (`closedUpstream`, the item given back) or a merge;
+/// - `mergeable`, `merging` (Task 5): `PRLandingMachine.advance` — a human merges on GitHub, or with `--engine-merge` the
+///   machine presses merge behind the owner's card; a merge that goes back to `open` (409, 405, GitHub no longer `clean`) is
+///   read again at the normal interval, a merge refused for good is a hold for good;
+/// - `merged` with its item not yet completed: `PRLandingMachine.complete` (the remote `main` fetch, then the item Done).
 ///
 /// "Paused" holds everything — no GitHub call, no state change: the owner's stop, a paused company, or a merge hold that does
 /// not lift itself (`Store.liftsItself`); it is checked before each landing and again right before feedback is written. A
 /// GitHub error or any hold recorded by a pass backs the landing off (`firstBackoff`, doubling to `maxBackoff`; in memory, as
 /// the merge queue's) with its state kept and `lastError` saying why; an owner card being waited on is polled at the normal
-/// interval. A hold for good (`isDurableHold`: a push or open GitHub refused, a PR Brahma did not open on the branch, the
-/// branch moved outside Brahma) is retried only every `maxBackoff` and raises ONE owner alert per (item, commit)
+/// interval. A hold for good (`isDurableHold`: a push or open GitHub refused, the push credential refused, a PR Brahma did not
+/// open on the branch, the branch moved outside Brahma, a merge refused for good) is retried only every `maxBackoff` and raises
+/// ONE owner alert per (item, commit)
 /// (`Store.raisePRHoldAlert`, naming `brahma merge abandon-pr`); the alert resolves once the landing moves on. Every write is
 /// a compare-and-set on what the pass read (`Store.casPRLanding`, `returnPRFeedback`, `closePRLandingUpstream`).
 ///
@@ -72,7 +76,7 @@ public actor PRStep {
         var open = Set<String>()
         for company in companies {
             let landings: [PRLanding]
-            do { landings = try store.openPRLandings(companyId: company.id) } catch {
+            do { landings = try store.openPRLandings(companyId: company.id) + store.prLandingsAwaitingCompletion(companyId: company.id) } catch {
                 note("\(company.name): the landings could not be read: \(error)")
                 continue
             }
@@ -81,7 +85,7 @@ public actor PRStep {
                 // Re-read every time: a stop, a pause or a hold that came during this tick holds the rest of it.
                 guard !paused(companyId: company.id) else { break }
                 let outcome = await pass(landing, now: now)
-                record(landing.itemId, outcome, now: now)
+                record(landing, outcome, now: now)
             }
         }
         due = due.filter { open.contains($0.key) }
@@ -89,19 +93,24 @@ public actor PRStep {
     }
 
     /// The owner's stop, a paused company, or a merge hold that does not lift itself. A read that fails counts as paused.
-    func paused(companyId: String) -> Bool {
+    func paused(companyId: String) -> Bool { Self.paused(store, companyId: companyId) }
+
+    /// `paused`, for the landing machine too (checked again right before it presses merge).
+    static func paused(_ store: Store, companyId: String) -> Bool {
         do {
             if try store.engineStopped() != nil { return true }
             guard let company = try store.company(id: companyId) else { return true }
             return company.status != .running || (company.mergeHold != nil && !Store.liftsItself(company.mergeHold))
         } catch {
-            note("company \(companyId): the stop and hold could not be read (held): \(error)")
+            FileHandle.standardError.write(Data("brahma PR step: company \(companyId): the stop and hold could not be read (held): \(error)\n".utf8))
             return true
         }
     }
 
-    /// Schedules the landing's next pass, raises the hold alert of a hold for good, and resolves it once the landing moved on.
-    private func record(_ itemId: String, _ outcome: Outcome, now: Date) {
+    /// Schedules the landing's next pass, raises the hold alert of a hold for good — for the commit the pass held on, and only
+    /// while the landing is still open there (`raisePRHoldAlert`) — and resolves it once the landing moved on.
+    private func record(_ landing: PRLanding, _ outcome: Outcome, now: Date) {
+        let itemId = landing.itemId
         let current: PRLanding?
         do { current = try store.prLanding(itemId: itemId) } catch {
             note("\(itemId): the landing could not be read: \(error)")
@@ -119,8 +128,8 @@ public actor PRStep {
         case .durable(let why):
             backoff[itemId] = Self.maxBackoff
             due[itemId] = now.addingTimeInterval(Self.maxBackoff)
-            guard let current else { return }
-            do { try store.raisePRHoldAlert(itemId: itemId, sha: current.pushedSHA, why: why, now: now) } catch {
+            guard current != nil else { return }
+            do { try store.raisePRHoldAlert(itemId: itemId, sha: landing.pushedSHA, why: why, now: now) } catch {
                 note("\(itemId): the hold alert could not be raised: \(error)")
             }
             return
@@ -135,18 +144,28 @@ public actor PRStep {
     /// One pass over one landing.
     private func pass(_ landing: PRLanding, now: Date) async -> Outcome {
         switch landing.state {
-        case .pushing, .pushed, .opening:
+        case .pushing, .pushed, .opening, .mergeable, .merging:
             await machine.advance(itemId: landing.itemId)
             let after: PRLanding?
             do { after = try store.prLanding(itemId: landing.itemId) } catch {
                 note("\(landing.itemId): the landing could not be read: \(error)")
                 return .retry
             }
-            // The machine clears `lastError` on every step that moved; one it records is a refusal, a failure or a hold.
-            guard let after, after.state.isOpen, let why = after.lastError else { return .ok }
+            // The machine clears `lastError` on every step that moved; one it records is a refusal, a failure or a hold. A merge
+            // that went back to `open` (409, 405, no longer `clean`) is read again at the normal interval: no hold.
+            guard let after, after.state.isOpen, after.pushedSHA == landing.pushedSHA, let why = after.lastError else { return .ok }
+            if after.state == .open, landing.state == .mergeable || landing.state == .merging { return .ok }
             if why.hasPrefix(PRLandingMachine.waitingText("")) { return .ok }
             return Self.isDurableHold(why) ? .durable(why) : .retry
-        case .open, .checksFailed, .changesRequested, .mergeable:
+        case .merged:
+            await machine.complete(itemId: landing.itemId)
+            let after: PRLanding?
+            do { after = try store.prLanding(itemId: landing.itemId) } catch {
+                note("\(landing.itemId): the landing could not be read: \(error)")
+                return .retry
+            }
+            return after?.lastError == nil ? .ok : .retry
+        case .open, .checksFailed, .changesRequested:
             return await statusStep(landing, now: now)
         default:
             return .ok
@@ -154,11 +173,21 @@ public actor PRStep {
     }
 
     /// A hold no retry soon will lift: GitHub refused the push (`[rejected]`, `[remote rejected]`: the branch moved, a
-    /// protection hook) or the open-pr (`GitHub refused`), a PR Brahma did not open is on the branch, the branch moved outside
-    /// Brahma.
+    /// protection hook) or the open-pr (`GitHub refused`), GitHub refused the push's credential (`isCredentialRefusal`), a PR
+    /// Brahma did not open is on the branch, the branch moved outside Brahma, a merge refused for good (no merge method allowed,
+    /// a base that is not the default branch, a refusal other than 409/405: `PRLandingMachine.mergeHeldMarker`).
     static func isDurableHold(_ why: String) -> Bool {
         why.contains("[rejected]") || why.contains("[remote rejected]") || why.hasPrefix("GitHub refused")
             || why.hasPrefix("a pull request Brahma did not open") || why.hasSuffix(headMovedSuffix)
+            || why.contains(PRLandingMachine.mergeHeldMarker) || isCredentialRefusal(why)
+    }
+
+    /// Git's words (as `GitPush` stores them: path-like words dropped) when GitHub turned the push's credential down: a 401 or
+    /// 403 over HTTPS, a failed authentication, no credential at all. Another try with the same token fails the same way.
+    static func isCredentialRefusal(_ why: String) -> Bool {
+        let lower = why.lowercased()
+        return ["returned error: 401", "returned error: 403", "authentication failed", "could not read username", "could not read password",
+                "invalid username or password", "permission to", "write access to repository not granted"].contains { lower.contains($0) }
     }
 
     /// The statuses an open landing records in `lastError` while it waits on GitHub (not errors: polled at the normal interval).
@@ -187,7 +216,10 @@ public actor PRStep {
             return failed("could not read PR #\(number) on GitHub: \(Store.flat("\(error)", max: 200))")
         }
         if !pr.isOpen {
-            guard !pr.merged else { return touch(landing, now: now, lastError: landing.lastError) }   // the merge step's (Tasks 5–6)
+            if pr.merged {
+                await machine.mergedUpstream(landing, pr: pr)   // a human merged it on GitHub (Task 5)
+                return .ok
+            }
             do {
                 try store.closePRLandingUpstream(itemId: landing.itemId, number: number, from: landing.state, sha: landing.pushedSHA, now: now)
             } catch {
@@ -196,11 +228,12 @@ public actor PRStep {
             }
             return .ok
         }
-        // Already brought back or mergeable: nothing more to read until the owner agent resubmits (or the merge step runs).
+        // Already brought back: nothing more to read until the owner agent resubmits.
         guard landing.state == .open else { return touch(landing, now: now, lastError: landing.lastError) }
         guard pr.headSHA == landing.pushedSHA else {
             let why = "PR #\(number)'s head on GitHub is \(pr.headSHA.prefix(7)), not the pushed \(landing.pushedSHA.prefix(7)): " + Self.headMovedSuffix
-            transition(landing) { $0.lastError = why }
+            // Not recorded (the landing moved on while GitHub was read): no hold of this pass's; the next pass reads it anew.
+            guard transition(landing, { $0.lastError = why }) else { return .ok }
             return .durable(why)
         }
         let checks: [GitHubCheckRun], reviews: [GitHubReview], trust: TrustList

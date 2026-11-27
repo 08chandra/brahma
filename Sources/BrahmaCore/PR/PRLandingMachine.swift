@@ -1,13 +1,24 @@
 import Foundation
 
-/// One company's (or the engine's) PR landings, item by item (Plan X8 Task 3, spec §8.5.1 steps 3–4): the merge queue hands a
-/// verified commit to `begin`; the machine pushes it (`PushBranchStage`), opens the pull request (`open-pr`, body by `PRBody`)
-/// and watches it for a close upstream. Task 4's `PRStep` calls `advance` for every open landing each tick; the waits on checks,
-/// reviews and the merge are Tasks 4–6.
+/// One company's (or the engine's) PR landings, item by item (Plan X8 Tasks 3 and 5, spec §8.5.1 steps 3–7): the merge queue
+/// hands a verified commit to `begin`; the machine pushes it (`PushBranchStage`), opens the pull request (`open-pr`, body by
+/// `PRBody`), watches it for a close upstream, and once Task 4's `PRStep` found it `mergeable`, merges it or waits for it to be
+/// merged. Task 4's `PRStep` calls `advance` for every open landing each tick (the waits on checks and reviews are its own).
 ///
-/// `pushing` → `pushed` → `opening` → `open`. Every transition is written to `prLanding` as a compare-and-set on the (state,
-/// commit) the pass read (`Store.casPRLanding`): when an owner's abandon, a newer `begin` or a close upstream got there first,
-/// nothing is written and the pass stops — no push is recorded over it and no PR is opened for it. A refused or failed action
+/// `pushing` → `pushed` → `opening` → `open` (→ `mergeable` by `PRStep`) → `merging` → `merged`. The merge (Task 5, spec §8.5.1
+/// step 6, §8.4.5 rule 4, §9.3.4): by default a human merges on GitHub and the landing waits for GitHub to report it `merged`.
+/// With the company's `--engine-merge`, while GitHub says the pushed commit is the head and `mergeable_state` is `clean`, the
+/// machine files `merge-pr` through the one gate — irreversible, so it always asks: one owner card bound to the PR number, the
+/// head commit, the method and the base (`PRActionDigest.Merge`); the approval presses merge once (`merging` and the approval
+/// spent in one write before the `PUT`), with `sha` pinned. 409 (the branch moved) and 405 (not mergeable) go back to `open`;
+/// any other refusal holds for good; an unknown outcome is read back (`merging` only ever reads), never sent again — every
+/// further merge needs a fresh card. Never a bypass field, a protection or settings call, or a branch deleted. After `merged`,
+/// the remote `main` is fetched (`RemoteMainFetching`) and the item completes through the merge queue's own landing record
+/// (`Store.completePRLanding`); without a fetch the landing stays `merged` and says it waits for one.
+///
+/// Every transition is written to `prLanding` as a compare-and-set on the (state, commit) the pass read (`Store.casPRLanding`,
+/// and `Store.startPRMerge` for `merging`): when an owner's abandon, a newer `begin` or a close upstream got there first,
+/// nothing is written and the pass stops — no push is recorded over it, no PR is opened and no merge is sent for it. A refused or failed action
 /// records `lastError` and the state stays (the next `advance` tries again, reconciling first). Every action goes through the one
 /// gate (`PRActionGate`; production's `NoChannelGate` refuses everything, so nothing reaches GitHub on this tree):
 /// - `refuse`: `lastError` is the rule;
@@ -26,12 +37,17 @@ public actor PRLandingMachine: PRLandingBeginning {
     /// The company's GitHub repository (a channel core will supply it); nil holds every landing of the company.
     let repo: @Sendable (_ companyId: String) -> GitHubRepoRef?
     let clock: @Sendable () -> Date
+    /// The remote `main` fetch a merged landing waits for before its item completes (Task 6's `RemoteMain`; the merge queue's
+    /// own). Nil: merged landings wait, their items not Done.
+    let remoteMain: (any RemoteMainFetching)?
     /// Items with a pass in flight: a second `advance` for one of them returns at once (the actor is reentrant across awaits).
     private var busy: Set<String> = []
 
     public init(store: Store, github: any GitHubAPI, gate: any PRActionGate, push: PushBranchStage,
-                repo: @escaping @Sendable (String) -> GitHubRepoRef?, clock: @escaping @Sendable () -> Date = Store.now) {
+                repo: @escaping @Sendable (String) -> GitHubRepoRef?, clock: @escaping @Sendable () -> Date = Store.now,
+                remoteMain: (any RemoteMainFetching)? = nil) {
         self.store = store; self.github = github; self.gate = gate; self.push = push; self.repo = repo; self.clock = clock
+        self.remoteMain = remoteMain
     }
 
     static let noRepoText = "no GitHub repository is linked to this company"
@@ -40,6 +56,11 @@ public actor PRLandingMachine: PRLandingBeginning {
     static func foreignPRText(_ branch: String, _ number: Int) -> String {
         "a pull request Brahma did not open exists on \(branch) (#\(number)); close it or abandon the landing"
     }
+    /// A merged landing whose item waits for the remote `main` fetch (none wired).
+    static let waitingForFetchText = "PR merged; waiting for the remote main fetch"
+    /// How a merge refused for good reads (`PRStep.isDurableHold`: the owner is told once).
+    static let mergeHeldMarker = " cannot be merged by Brahma: "
+    static func mergeHeldText(_ number: Int, _ why: String) -> String { "PR #\(number)\(mergeHeldMarker)\(why)" }
 
     // MARK: Entry points
 
@@ -81,8 +102,10 @@ public actor PRLandingMachine: PRLandingBeginning {
                 continue   // pushed now: open in the same pass (re-read: the CAS tells whether it still is ours)
             case .pushed, .opening:
                 await openStep(landing, item, repo)
-            case .open, .checksFailed, .changesRequested, .mergeable:
+            case .open, .checksFailed, .changesRequested:
                 await watchStep(landing, item, repo)
+            case .mergeable, .merging:
+                await mergeStep(landing, item, repo)
             default:
                 break
             }
@@ -266,8 +289,8 @@ public actor PRLandingMachine: PRLandingBeginning {
 
     // MARK: Watch
 
-    /// A PR closed on GitHub without being merged ends the landing `closedUpstream` and tells the item's owner agent. A merged
-    /// one is left for the merge step (Tasks 5–6).
+    /// A PR closed on GitHub without being merged ends the landing `closedUpstream` and gives the item back. A merged one is
+    /// `merged` (a human pressed merge on GitHub).
     private func watchStep(_ landing: PRLanding, _ item: WorkItem, _ repo: GitHubRepoRef) async {
         guard let number = landing.prNumber else { return }
         let pr: GitHubPR?
@@ -275,7 +298,8 @@ public actor PRLandingMachine: PRLandingBeginning {
             return hold(landing, "could not read PR #\(number) on GitHub: \(Store.flat("\(error)", max: 200))")
         }
         guard let pr else { return hold(landing, "PR #\(number) was not found on GitHub") }
-        if !pr.isOpen, !pr.merged {
+        if pr.merged { return await mergedUpstream(landing, pr: pr) }
+        if !pr.isOpen {
             do {
                 try store.closePRLandingUpstream(itemId: item.id, number: number, from: landing.state, sha: landing.pushedSHA, now: clock())
             } catch {
@@ -285,6 +309,204 @@ public actor PRLandingMachine: PRLandingBeginning {
         }
         let now = clock()
         transition(landing, from: [landing.state]) { $0.lastPolled = now }
+    }
+
+    // MARK: merge-pr (Task 5)
+
+    /// `mergeable` and `merging`. GitHub is read first: merged → `merged`; closed → `closedUpstream`. A `merging` landing only
+    /// reconciles (its merge's answer was lost): not merged → back to `open`. Without `--engine-merge` a human merges on GitHub
+    /// and this only watches. With it: GitHub must still say the pushed commit is the head and `clean` (else back to `open`,
+    /// where the checks and reviews are read again), then `merge-pr` through the gate and the owner's card, then the `PUT`.
+    private func mergeStep(_ landing: PRLanding, _ item: WorkItem, _ repo: GitHubRepoRef) async {
+        guard let number = landing.prNumber else { return hold(landing, "no pull request is recorded for \(landing.branch)") }
+        let pr: GitHubPR
+        do {
+            guard let read = try await github.pull(repo, number: number) else { return hold(landing, "PR #\(number) was not found on GitHub") }
+            pr = read
+        } catch {
+            return hold(landing, "could not read PR #\(number) on GitHub: \(Store.flat("\(error)", max: 200))")
+        }
+        if pr.merged { return await mergedUpstream(landing, pr: pr) }
+        if !pr.isOpen {
+            do {
+                try store.closePRLandingUpstream(itemId: item.id, number: number, from: landing.state, sha: landing.pushedSHA, now: clock())
+            } catch {
+                note("\(item.key): the close of PR #\(number) could not be recorded: \(error)")
+            }
+            return
+        }
+        let now = clock()
+        if landing.state == .merging {
+            transition(landing, from: [.merging]) {
+                $0.state = .open; $0.lastPolled = now
+                $0.lastError = "the merge of PR #\(number) may not have run (its answer was lost); GitHub reports it not merged"
+            }
+            return
+        }
+        let engineMerge: Bool
+        do { engineMerge = try store.landing(companyId: landing.companyId).engineMerge } catch {
+            return hold(landing, "the company's landing mode could not be read: \(Store.flat("\(error)", max: 200))")
+        }
+        // The default: the owner merges on GitHub; the landing waits for GitHub to say so.
+        guard engineMerge else {
+            transition(landing, from: [.mergeable]) { $0.lastPolled = now; $0.lastError = nil }
+            return
+        }
+        // GitHub no longer says the pushed commit can merge: the open step reads its checks and reviews again.
+        guard pr.headSHA == landing.pushedSHA, pr.mergeableState == "clean" else {
+            transition(landing, from: [.mergeable]) { $0.state = .open; $0.lastPolled = now; $0.lastError = nil }
+            return
+        }
+        let card: PRActionCardState
+        do { card = try store.prActionCardState(companyId: landing.companyId, itemId: item.id, action: .mergePR, sha: landing.pushedSHA) } catch {
+            return hold(landing, "the owner's cards could not be read: \(Store.flat("\(error)", max: 200))")
+        }
+        if let held = Self.heldByCard(card) { return hold(landing, held) }
+        let info: RepoInfo
+        do { info = try await github.repo(repo) } catch {
+            return hold(landing, "could not read \(repo.owner)/\(repo.name) on GitHub: \(Store.flat("\(error)", max: 200))")
+        }
+        guard pr.baseRef == info.defaultBranch else {
+            return hold(landing, Self.mergeHeldText(number, "its base is \(Store.flat(pr.baseRef, max: 100)), not the default branch "
+                                                    + "\(Store.flat(info.defaultBranch, max: 100)); merge it yourself or abandon the landing"))
+        }
+        guard let method = MergeMethod.preferred(info) else {
+            return hold(landing, Self.mergeHeldText(number, "the repository allows no merge method (merge, squash or rebase); "
+                                                    + "allow one on GitHub, or merge it yourself"))
+        }
+        let facts = PRActionDigest.Merge(number: number, head: pr.headSHA, method: method, base: pr.baseRef)
+        let action: PRActionRequest
+        do {
+            action = PRActionRequest(type: .mergePR, companyId: item.companyId, itemId: item.id, payload: nil,
+                                     taintedSession: try PushBranchStage.sessionTainted(item, store: store), itemTainted: item.taintedOrigin,
+                                     externalInput: false, firstUse: false, repoVisibility: info.visibility)
+        } catch {
+            return hold(landing, "could not prepare the merge: \(Store.flat("\(error)", max: 200))")
+        }
+        let cardGate = CardGate(inner: gate, action: .mergePR, itemId: item.id, sha: landing.pushedSHA, repoURL: repo.pushURL, open: nil,
+                                merge: facts, approved: card.approval)
+        switch await cardGate.decide(action) {
+        case .refuse(let rule):
+            return hold(landing, rule)
+        case .ask(let reason):
+            let checks: [GitHubCheckRun], reviews: [GitHubReview]
+            do {
+                checks = try await github.checkRuns(repo, sha: pr.headSHA).filter { $0.headSHA == pr.headSHA }
+                reviews = try await github.reviews(repo, number: number)
+            } catch {
+                return hold(landing, "\(Self.waitingText(reason)) (the checks and reviews for the card could not be read: "
+                            + "\(Store.flat("\(error)", max: 160)))")
+            }
+            return fileCard(landing, action: .mergePR, reason: reason,
+                            digest: PRActionDigest.of(action, reason: reason, sha: landing.pushedSHA, repoURL: repo.pushURL, open: nil, merge: facts),
+                            replacing: card,
+                            card: PRActionCard.mergePR(item: item, repo: repo, pr: pr, merge: facts, checks: checks, reviews: reviews, reason: reason))
+        case .auto:
+            break
+        }
+        // The owner's stop or a pause that came meanwhile: nothing is sent.
+        guard !PRStep.paused(store, companyId: landing.companyId) else { return }
+        // Sending: `merging` and the approval spent in one write first, so a crash, a lost answer or any refusal is read back,
+        // never merged again on this approval. Not written (moved on, or the approval went) → nothing is sent.
+        do {
+            guard try store.startPRMerge(itemId: item.id, sha: landing.pushedSHA, approvalAskId: card.approval?.askId, now: clock()) else { return }
+        } catch {
+            return hold(landing, "the merge could not be recorded: \(Store.flat("\(error)", max: 200))")
+        }
+        var sent = landing
+        sent.state = .merging
+        let result: GitHubMergeResult
+        do {
+            result = try await github.mergePR(repo, number: number, MergePullRequest(sha: landing.pushedSHA, mergeMethod: method))
+        } catch GitHubAPIError.rejected(let status, let message) where status == 409 || status == 405 {
+            // 409: the branch is not at the pinned commit any more; 405: GitHub will not merge it now. Never a bypass: back to
+            // `open`, read again; another merge needs a fresh card.
+            let why = status == 409 ? "the branch moved" : "not mergeable"
+            transition(sent, from: [.merging]) {
+                $0.state = .open; $0.lastPolled = now
+                $0.lastError = "GitHub did not merge PR #\(number) (\(status), \(why)): \(Store.flat(message, max: 200))"
+            }
+            return
+        } catch GitHubAPIError.rejected(let status, let message) {
+            transition(sent, from: [.merging]) {
+                $0.state = .mergeable
+                $0.lastError = Self.mergeHeldText(number, "GitHub refused the merge (\(status)): \(Store.flat(message, max: 200))")
+            }
+            return
+        } catch {
+            return await reconcileMerge(sent, repo, number, why: Store.flat("\(error)", max: 160))
+        }
+        guard result.merged else { return await reconcileMerge(sent, repo, number, why: "GitHub answered without merging") }
+        await recordMerged(sent, mergedSHA: result.sha, status: nil)
+    }
+
+    /// A merge whose outcome is unknown: GitHub says. Merged → `merged`; not merged → back to `open` (the approval is spent: a
+    /// fresh card asks before any other merge); unreadable → still `merging` (read again later, never merged again blind).
+    private func reconcileMerge(_ sent: PRLanding, _ repo: GitHubRepoRef, _ number: Int, why: String) async {
+        do {
+            guard let pr = try await github.pull(repo, number: number) else {
+                return hold(sent, "the merge of PR #\(number) may have run (\(why)), and GitHub did not find the PR; it is read again, "
+                            + "never merged again blind")
+            }
+            if pr.merged { return await mergedUpstream(sent, pr: pr) }
+            let now = clock()
+            transition(sent, from: [.merging]) {
+                $0.state = .open; $0.lastPolled = now
+                $0.lastError = "the merge of PR #\(number) may not have run (\(why)); GitHub reports it not merged"
+            }
+        } catch {
+            hold(sent, "the merge of PR #\(number) may have run (\(why)); GitHub could not be read (\(Store.flat("\(error)", max: 120))); "
+                 + "it is read again, never merged again blind")
+        }
+    }
+
+    /// GitHub reports the PR merged (by a human, or by the engine's merge whose answer was lost).
+    func mergedUpstream(_ landing: PRLanding, pr: GitHubPR) async {
+        let status: String? = landing.state == .checksFailed || landing.state == .changesRequested
+            ? "PR #\(pr.number) was merged on GitHub after its item was brought back; the item stays with its holder" : nil
+        await recordMerged(landing, mergedSHA: pr.mergeCommitSHA ?? landing.pushedSHA, status: status)
+    }
+
+    /// `merged` (compare-and-set on what the pass read), then the item completes.
+    private func recordMerged(_ landing: PRLanding, mergedSHA: String, status: String?) async {
+        let now = clock()
+        guard transition(landing, from: [landing.state], {
+            $0.state = .merged; $0.mergedSHA = mergedSHA; $0.lastError = status; $0.lastPolled = now
+        }) else { return }
+        do { try store.supersedePendingPRActionCards(itemId: landing.itemId, now: now) } catch {
+            note("\(landing.itemId): a pending card of the merged PR could not be superseded: \(error)")
+        }
+        await complete(itemId: landing.itemId)
+    }
+
+    /// A merged landing whose item has not completed (its merge request still handed to the PR): the remote `main` is fetched,
+    /// then the item completes through the merge queue's own landing record (`Store.completePRLanding`, on the engine's
+    /// `Blocking`: it runs git). No fetch wired, or a fetch or record that failed: the landing stays `merged` and says why; the
+    /// item is not Done. Nothing to do for any other landing.
+    public func complete(itemId: String) async {
+        let landing: PRLanding
+        do {
+            guard let l = try store.prLandingAwaitingCompletion(itemId: itemId) else { return }
+            landing = l
+        } catch {
+            return note("\(itemId): the merged landing could not be read: \(error)")
+        }
+        guard let remoteMain else { return setMergedStatus(landing, Self.waitingForFetchText) }
+        do { _ = try await remoteMain.fetch(companyId: landing.companyId) } catch {
+            return setMergedStatus(landing, "PR merged; the remote main fetch failed: \(Store.flat("\(error)", max: 200))")
+        }
+        let (store, clock) = (self.store, self.clock)
+        let (sha, mergedCommit) = (landing.pushedSHA, landing.mergedSHA ?? landing.pushedSHA)
+        do {
+            _ = try await push.blocking.tryRun { try store.completePRLanding(itemId: itemId, sha: sha, mergedCommit: mergedCommit, now: clock()) }
+        } catch {
+            return setMergedStatus(landing, "PR merged; the item could not be completed: \(Store.flat("\(error)", max: 200))")
+        }
+        setMergedStatus(landing, nil)
+    }
+
+    private func setMergedStatus(_ landing: PRLanding, _ why: String?) {
+        transition(landing, from: [.merged]) { $0.lastError = why }
     }
 
     // MARK: Owner cards
@@ -360,14 +582,16 @@ final class CardGate: PRActionGate, @unchecked Sendable {
     /// The repository the action is for (a push's own payload names it too).
     let repoURL: String
     let open: OpenPullRequest?
+    /// For `merge-pr`: the PR, head, method and base the merge would use (Task 5).
+    let merge: PRActionDigest.Merge?
     let approved: (askId: String, digest: String)?
     private let lock = NSLock()
     private var lastAsk: String?
 
     init(inner: any PRActionGate, action: GitHubActionType, itemId: String, sha: String, repoURL: String, open: OpenPullRequest?,
-         approved: (askId: String, digest: String)?) {
+         merge: PRActionDigest.Merge? = nil, approved: (askId: String, digest: String)?) {
         self.inner = inner; self.action = action; self.itemId = itemId; self.sha = sha; self.repoURL = repoURL; self.open = open
-        self.approved = approved
+        self.merge = merge; self.approved = approved
     }
 
     /// The digest of the last ask about this action of this item.
@@ -376,7 +600,7 @@ final class CardGate: PRActionGate, @unchecked Sendable {
     func decide(_ r: PRActionRequest) async -> PRActionDecision {
         let decision = await inner.decide(r)
         guard case .ask(let reason) = decision, r.type == action, r.itemId == itemId else { return decision }
-        let digest = PRActionDigest.of(r, reason: reason, sha: sha, repoURL: repoURL, open: open)
+        let digest = PRActionDigest.of(r, reason: reason, sha: sha, repoURL: repoURL, open: open, merge: merge)
         lock.withLock { lastAsk = digest }
         if let approved, approved.digest == digest { return .auto }
         return decision

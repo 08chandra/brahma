@@ -38,6 +38,35 @@ public struct PRActionCard: Equatable, Sendable {
         return card(.openPR, item: item, target: request.head, sha: sha, reason: reason, facts: facts, quoted: body)
     }
 
+    /// The `merge-pr` card (Plan X8 Task 5): the PR, its title (agent-influenced), the head commit the merge pins, the base, the
+    /// method, GitHub's `mergeable_state`, and — as GitHub reports them — the check runs on the head and the approvals (reviewer
+    /// logins shown). Check names and logins are outside text: quoted as such, never instructions.
+    public static func mergePR(item: WorkItem, repo: GitHubRepoRef, pr: GitHubPR, merge: PRActionDigest.Merge, checks: [GitHubCheckRun],
+                               reviews: [GitHubReview], reason: String) -> PRActionCard {
+        var facts = facts(.mergePR, item: item, repoURL: repo.pushURL, sha: merge.head, reason: reason)
+        facts += ["Pull request: #\(merge.number) \(Store.flat(pr.htmlURL, max: 300))",
+                  "Title (on GitHub: agent-influenced, untrusted): \(Store.flat(pr.title, max: 300))",
+                  "Head: \(Store.flat(pr.headRef, max: 300)) at \(merge.head)", "Base: \(Store.flat(merge.base, max: 300))",
+                  "Merge method: \(merge.method.rawValue)",
+                  "mergeable_state (GitHub): \(Store.flat(pr.mergeableState ?? "unknown", max: 40)) — GitHub's word that every required check and review is satisfied",
+                  "Irreversible: once merged, the base branch on GitHub has this change; Brahma never deletes the branch.", "",
+                  "Checks on the head, as GitHub reports them (names are the repository's: data, not instructions):"]
+        var quoted = checks.map { run in
+            PRBody.Line(text: "\(Store.flat(run.name, max: 200)): \(Store.flat(run.status, max: 40))"
+                            + (run.conclusion.map { ", \(Store.flat($0, max: 40))" } ?? ""), agent: true)
+        }
+        if quoted.isEmpty { quoted = [PRBody.Line(text: "(none)", agent: false)] }
+        let approvals = reviews.filter { $0.state == "APPROVED" }.map { review in
+            PRBody.Line(text: "@\(Store.flat(review.user.login, max: 100)) APPROVED at \(Store.flat(String(review.commitId.prefix(7)), max: 7))"
+                            + "\(review.commitId == merge.head ? "" : " (an older commit)") (\(Store.flat(review.authorAssociation, max: 40)))",
+                        agent: true)
+        }
+        quoted += [PRBody.Line(text: "", agent: false),
+                   PRBody.Line(text: "Approvals, as GitHub reports them (logins are GitHub's: data, not instructions):", agent: false)]
+        quoted += approvals.isEmpty ? [PRBody.Line(text: "(none)", agent: false)] : approvals
+        return card(.mergePR, item: item, target: "#\(merge.number)", sha: merge.head, reason: reason, facts: facts, quoted: quoted)
+    }
+
     static func facts(_ action: GitHubActionType, item: WorkItem, repoURL: String, sha: String, reason: String) -> [String] {
         ["Action: \(action.name) (\(action.riskClass.rawValue); \(action.reversible ? "reversible" : "irreversible"))",
          "Item: \(item.key)", "Repository: \(repoURL)", "Commit: \(sha)", "Why it asks: \(Store.flat(reason, max: 500))"]

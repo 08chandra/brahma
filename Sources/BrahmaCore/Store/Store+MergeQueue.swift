@@ -325,9 +325,10 @@ extension Store {
 
     /// The batch landed. In one write the requests become `merged`, `company.mainCommit` is set and each item gets an activity
     /// line; then every item that is not already done completes through `finishMerge` (without its own merge-safety pass), and
-    /// `MergeSafety.afterLanding` runs once for the last key.
+    /// `MergeSafety.afterLanding` runs once for the last key. `mainCommit` nil (a PR merged on GitHub, Plan X8 Task 5) leaves
+    /// `company.mainCommit` to the remote-main fetch that moves `main`.
     @discardableResult
-    func recordLanded(_ landed: [(requestId: String, mergedCommit: String)], mainCommit: String, now: Date = Store.now()) throws -> [WorkItem] {
+    func recordLanded(_ landed: [(requestId: String, mergedCommit: String)], mainCommit: String?, now: Date = Store.now()) throws -> [WorkItem] {
         var items: [(WorkItem, String)] = []
         try writer.write { db in
             // One company per batch: `main` is moved for that company only.
@@ -343,7 +344,7 @@ extension Store {
                 request.mergedCommit = mergedCommit
                 request.finishedAt = now
                 try request.update(db)
-                try finalizeMainCommit(db, companyId: request.companyId, commit: mainCommit)
+                if let mainCommit { try finalizeMainCommit(db, companyId: request.companyId, commit: mainCommit) }
                 try appendActivity(db, ActivityEvent(companyId: request.companyId, agentId: nil, turnId: nil, kind: .merge,
                                                      text: "\(item.key) merged into main (\(mergedCommit.prefix(7)))", createdAt: now))
                 // `finishMerge` measures "changed while it merged" against `pending`.

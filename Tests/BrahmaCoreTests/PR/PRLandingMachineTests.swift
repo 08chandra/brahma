@@ -11,7 +11,7 @@ import GRDB
 
     /// A push runner that is GitHub's side of the push: a landed push puts the commit on the fake's branch. Runs no git.
     final class GitHubPushRunner: GitPushRunning, @unchecked Sendable {
-        enum Mode { case land, reject, hangUp }
+        enum Mode { case land, reject, hangUp, authFail }
         let github: FakeGitHub
         private let lock = NSLock()
         private var currentMode = Mode.land
@@ -54,6 +54,11 @@ import GRDB
             case .hangUp:
                 return GitPushProcessResult(status: 128, stdout: Data(), stderr: Data("fatal: the remote end hung up unexpectedly\n".utf8),
                                             timedOut: false)
+            case .authFail:
+                // The token lacks the right (or was revoked): git over HTTPS gets GitHub's 403.
+                let stderr = "remote: Permission to acme/app.git denied to brahma-bot.\n"
+                    + "fatal: unable to access 'https://github.com/acme/app.git/': The requested URL returned error: 403\n"
+                return GitPushProcessResult(status: 128, stdout: Data(), stderr: Data(stderr.utf8), timedOut: false)
             }
         }
     }
@@ -100,7 +105,7 @@ import GRDB
 
         /// `firstPushDone`: an earlier push of the company reached GitHub, so the first-push ask is behind it.
         init(firstPushDone: Bool = true, gate: any PRActionGate = PRLandingMachineTests.granted, defaultBranch: String = "main",
-             visibility: String = "private") throws {
+             visibility: String = "private", remoteMain: (any RemoteMainFetching)? = nil) throws {
             env = try GitPushTests.Env()
             try env.setToken(["machine", "push", "Tq5Wn2Ld8"].joined(separator: "-"))
             if firstPushDone { try env.seedEarlierPush() }
@@ -109,7 +114,8 @@ import GRDB
             self.gate = SwitchGate(gate)
             // The stage's own gate is never used: the machine decides through its gate.
             let stage = env.stage(github: github, gate: NoChannelGate(), push: GitPush(runner: runner, tempRoot: try tempDir()))
-            machine = PRLandingMachine(store: env.store, github: github, gate: self.gate, push: stage, repo: { _ in PRLandingMachineTests.repo })
+            machine = PRLandingMachine(store: env.store, github: github, gate: self.gate, push: stage, repo: { _ in PRLandingMachineTests.repo },
+                                       remoteMain: remoteMain)
             eng = try env.store.hire(companyId: env.company.id, name: "eng-1", role: "engineer", model: "sonnet")
         }
 
@@ -333,12 +339,12 @@ import GRDB
         await w.machine.advance(itemId: item.id)
         #expect(w.github.requests.count == calls)
         #expect(try w.landing(item).state == .closedUpstream)
-        // A merged PR is not a close upstream (the merge step's, Tasks 5–6).
+        // A merged PR is not a close upstream: the landing is merged (Task 5's merge step).
         let (merged, mergedSHA) = try w.handedOff("Merged upstream", ["d.txt": "d\n"])
         await w.machine.begin(item: merged, verifiedSHA: mergedSHA)
-        w.github.update(Self.repo) { $0.pulls[1].state = "closed"; $0.pulls[1].merged = true }
+        w.github.humanMerge(Self.repo, number: 2)
         await w.machine.advance(itemId: merged.id)
-        #expect(try w.landing(merged).state == .open)
+        #expect(try w.landing(merged).state == .merged)
     }
 
     // MARK: Ruling 26

@@ -98,9 +98,11 @@ extension Store {
         }
     }
 
-    /// The PR was closed on GitHub without being merged: the landing ends `closedUpstream`, its owner cards are void, and the
-    /// item's owner agent gets a work notice (a `mergeFailed` event: the item did not land, back to its holder).
-    /// CAS on (`state`, `sha`) the watch read.
+    /// The PR was closed on GitHub without being merged: the landing ends `closedUpstream` and its owner cards are void. In the
+    /// same write (Plan X8 Task 5, carried from Task 4) the item's merge request handed to the PR is bounced and the item goes
+    /// back to its holder through the merge queue's own path (`returnUnmerged`: In progress, a `mergeFailed` notice, a DM), so
+    /// nothing stays locked in review — as an owner's abandon does. Without such a request (already released) the item's owner
+    /// agent still gets the `mergeFailed` notice. CAS on (`state`, `sha`, PR number) the watch read.
     func closePRLandingUpstream(itemId: String, number: Int, from state: PRLandingState, sha: String, now: Date) throws {
         try writer.write { db in
             guard var landing = try PRLanding.fetchOne(db, key: itemId), landing.state == state, landing.pushedSHA == sha,
@@ -111,8 +113,10 @@ extension Store {
             landing.updatedAt = now
             try landing.save(db)
             try voidPRActionCards(db, itemId: itemId, keepingSHA: nil, now: now)
-            try recordItemEvent(db: db, item: item, actor: "system", kind: .mergeFailed,
-                                text: "PR #\(number) was closed on GitHub without merging: \(item.key) did not land; resubmit it to open a new one",
+            try resolveEngineAlerts(db, reasons: try Self.openPRHoldAlertReasons(db, itemId: itemId), now: now)
+            let text = "PR #\(number) was closed on GitHub without merging: \(item.key) did not land; resubmit it to open a new one"
+            guard try !releaseHandedToPR(db, item: item, sha: sha, failure: nil, detail: text, now: now) else { return }
+            try recordItemEvent(db: db, item: item, actor: "system", kind: .mergeFailed, text: text,
                                 alsoNotify: item.ownerId.map { [$0] } ?? [], alsoNotifyRole: .owner, onlyAlsoNotify: true, now: now)
         }
     }

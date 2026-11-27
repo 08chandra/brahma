@@ -64,14 +64,15 @@ extension Store {
     static func prHoldAlertReason(itemId: String, sha: String) -> String { "prhold:\(itemId)@\(sha)" }
 
     /// The owner hears once that the item's landing is held for good at its commit (a push GitHub refused, a PR Brahma did not
-    /// open on the branch, the branch moved outside Brahma): the engine alert (a DM, an activity line and an Inbox card) names
-    /// the hold and what to do. Once per (item, commit): never again for that commit, however often the hold is retried, even
-    /// after the owner dismissed the card. False when it was raised before.
+    /// open on the branch, the branch moved outside Brahma, a merge refused for good): the engine alert (a DM, an activity line
+    /// and an Inbox card) names the hold and what to do. Once per (item, commit): never again for that commit, however often
+    /// the hold is retried, even after the owner dismissed the card. False when it was raised before, or when the landing is no
+    /// longer open at `sha` (it moved on while the hold was found: nothing to tell).
     @discardableResult
     func raisePRHoldAlert(itemId: String, sha: String, why: String, now: Date) throws -> Bool {
         let reason = Self.prHoldAlertReason(itemId: itemId, sha: sha)
         return try writer.write { db in
-            guard let landing = try PRLanding.fetchOne(db, key: itemId), landing.pushedSHA == sha,
+            guard let landing = try PRLanding.fetchOne(db, key: itemId), landing.pushedSHA == sha, landing.state.isOpen,
                   let item = try WorkItem.fetchOne(db, key: itemId), let company = try Company.fetchOne(db, key: item.companyId) else { return false }
             // An alert for an older commit of the item is over.
             try resolveEngineAlerts(db, reasons: try Self.openPRHoldAlertReasons(db, itemId: itemId).filter { $0 != reason }, now: now)
@@ -85,10 +86,11 @@ extension Store {
         }
     }
 
-    /// What the alert says: the hold, and the owner's two ways out.
+    /// What the alert says: the hold — marked as what GitHub (or git talking to it) said, since it may carry remote text — and
+    /// the owner's two ways out.
     static func prHoldAlertText(company: Company, item: WorkItem, pr: String, why: String) -> String {
-        "\(company.name): \(item.key)'s \(pr) is held: \(Self.flat(why, max: 300)). Brahma never force-pushes; it retries at most every "
-            + "\(Int(PRStep.maxBackoff / 60)) minutes. Fix the branch on GitHub, or abandon the landing so the item goes back to its owner "
+        "\(company.name): \(item.key)'s \(pr) is held. GitHub said: \(Self.flat(why, max: 300)). Brahma never force-pushes; it retries at most every "
+            + "\(Int(PRStep.maxBackoff / 60)) minutes. Fix it on GitHub, or abandon the landing so the item goes back to its owner "
             + "agent: brahma merge abandon-pr \(company.slug) \(item.key)"
     }
 

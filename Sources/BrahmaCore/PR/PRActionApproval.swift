@@ -52,9 +52,23 @@ public enum PRActionCardState: Equatable, Sendable {
 /// The digest an owner card binds its approval to (Rulings X8-21 and 29): the canonical request the owner saw — the action,
 /// the item, the repository, the commit, the ref (the head for `open-pr`), the base, the PR title and body (digested), for a
 /// push its diffstat and changed paths (digested), every fact the gate decides on (visibility, taint, external input, first
-/// use, `.github/workflows/`) and the reason it asked. Any change to any of it is a different request: a fresh card. Rows filed
-/// under an earlier form of this digest never match.
+/// use, `.github/workflows/`) and the reason it asked; for `merge-pr` (Plan X8 Task 5) also the PR number, the head commit the
+/// merge pins, the merge method and the base it merges into. Any change to any of it is a different request: a fresh card.
+/// Rows filed under an earlier form of this digest never match.
 public enum PRActionDigest {
+    /// What a `merge-pr` card binds beyond the request: the PR, the head commit GitHub reported mergeable (sent as `sha`), the
+    /// method and the base branch.
+    public struct Merge: Equatable, Sendable {
+        public var number: Int
+        public var head: String
+        public var method: MergeMethod
+        public var base: String
+
+        public init(number: Int, head: String, method: MergeMethod, base: String) {
+            self.number = number; self.head = head; self.method = method; self.base = base
+        }
+    }
+
     struct Canonical: Encodable {
         var action: String
         var itemId: String
@@ -72,21 +86,28 @@ public enum PRActionDigest {
         var firstUse: Bool
         var touchesWorkflows: String
         var reason: String
+        /// `merge-pr` only (absent from the JSON otherwise, so the push and open-pr digests are unchanged).
+        var number: Int?
+        var head: String?
+        var method: String?
     }
 
     /// For `push-branch` the repository, commit, ref and change come from the request's payload; for `open-pr`, from `repoURL`,
-    /// `sha` and `open`.
-    public static func of(_ r: PRActionRequest, reason: String, sha: String, repoURL: String, open: OpenPullRequest?) -> String {
+    /// `sha` and `open`; for `merge-pr`, from `repoURL`, `sha` and `merge`.
+    public static func of(_ r: PRActionRequest, reason: String, sha: String, repoURL: String, open: OpenPullRequest?,
+                          merge: Merge? = nil) -> String {
         let ref = open.map { PRBranch.ref($0.head) } ?? r.payload.map(\.ref) ?? "-"
         let change = r.payload.map { p in
             PRBody.hex(SHA256.hash(Data((Store.flat(p.diffstat, max: 500) + "\u{0}" + p.paths.joined(separator: "\u{0}")).utf8)))
         } ?? "-"
         let canonical = Canonical(action: r.type.name, itemId: r.itemId, companyId: r.companyId, repo: r.payload.map(\.url) ?? repoURL,
                                   change: change, sha: r.payload.map(\.sha) ?? sha, ref: ref,
-                                  base: open.map(\.base) ?? "-", content: open.map { PRBody.contentDigest(title: $0.title, body: $0.body) } ?? "-",
+                                  base: open.map(\.base) ?? merge.map(\.base) ?? "-",
+                                  content: open.map { PRBody.contentDigest(title: $0.title, body: $0.body) } ?? "-",
                                   repoVisibility: r.repoVisibility, taintedSession: r.taintedSession, itemTainted: r.itemTainted,
                                   externalInput: r.externalInput, firstUse: r.firstUse,
-                                  touchesWorkflows: r.payload.map { $0.touchesWorkflows ? "yes" : "no" } ?? "-", reason: reason)
+                                  touchesWorkflows: r.payload.map { $0.touchesWorkflows ? "yes" : "no" } ?? "-", reason: reason,
+                                  number: merge?.number, head: merge?.head, method: merge?.method.rawValue)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         do { return PRBody.hex(SHA256.hash(try encoder.encode(canonical))) } catch {

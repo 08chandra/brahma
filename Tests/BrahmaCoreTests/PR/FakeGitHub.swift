@@ -4,8 +4,8 @@ import Foundation
 /// An in-memory GitHub for PR mode's tests (Plan X8): repositories with visibility, a default branch and branch protection;
 /// branches; pull requests whose `mergeable_state` follows the protection (`blocked`, `unstable`, `behind`, `clean`); check
 /// runs (with their output); reviews pinned to a `commit_id`; comments; issues; commits with `verification.verified` and
-/// `author.login`. Every call is logged (`requests`: `GET /repos/o/r`, ...). Conforms to `GitHubAPI`; later tasks add the
-/// merge and issue calls.
+/// `author.login`. Every call is logged (`requests`: `GET /repos/o/r`, ...), every `PUT /pulls/{n}/merge` body as sent
+/// (`mergeBodies`). Conforms to `GitHubAPI`; later tasks add the issue calls.
 final class FakeGitHub: GitHubAPI, @unchecked Sendable {
     struct Protection: Equatable { var requiredChecks: [String] = []; var requiredReviews = 0 }
     struct CheckRun: Equatable {
@@ -35,6 +35,8 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
         var maintainerCanModify = false
         /// A `mergeable_state` GitHub reports whatever the protection says (`dirty`, `unknown`, ...).
         var mergeableOverride: String? = nil
+        /// `merge_commit_sha` once merged.
+        var mergeCommitSHA: String? = nil
     }
     struct Repo {
         var visibility: String
@@ -45,6 +47,9 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
         var checkRuns: [CheckRun] = []
         var issues: [IssueRecord] = []
         var commits: [String: Commit] = [:]
+        var allowMergeCommit = true
+        var allowSquashMerge = true
+        var allowRebaseMerge = true
     }
 
     enum Failure: Error, Equatable { case notFound(String), unavailable, lostResponse }
@@ -52,6 +57,8 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
     /// How the next `POST /pulls` fails, if it does: `lostResponse` opens the PR and then loses the answer (an unknown
     /// outcome); `lostRequest` loses the call before GitHub saw it (also unknown); `rejected` is GitHub's own 4xx.
     enum OpenFailure: Equatable { case lostResponse, lostRequest, rejected(Int, String) }
+    /// How the next `PUT /pulls/{n}/merge` fails, if it does (as `OpenFailure`: `lostResponse` merges, then loses the answer).
+    typealias MergeFailure = OpenFailure
 
     private let lock = NSLock()
     private var repos: [GitHubRepoRef: Repo] = [:]
@@ -60,6 +67,8 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
     private var down = false
     private var nextOpenFailure: OpenFailure?
     private var opens: [OpenPullRequest] = []
+    private var nextMergeFailure: MergeFailure?
+    private var merges: [String] = []
     /// Called after each request is logged, outside the lock (tests read the landing's state at that moment).
     private var hook: (@Sendable (String) -> Void)?
 
@@ -71,7 +80,26 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
     /// Every `POST /pulls` body, as sent.
     var openRequests: [OpenPullRequest] { lock.withLock { opens } }
 
+    /// Every `PUT /pulls/{n}/merge` body, as sent (JSON, sorted keys).
+    var mergeBodies: [String] { lock.withLock { merges } }
+
     func failNextOpen(_ failure: OpenFailure?) { lock.withLock { nextOpenFailure = failure } }
+    func failNextMerge(_ failure: MergeFailure?) { lock.withLock { nextMergeFailure = failure } }
+
+    /// The owner presses merge on GitHub: the PR is closed and merged, its base branch moves to the merge commit.
+    func humanMerge(_ repo: GitHubRepoRef, number: Int) {
+        update(repo) { r in
+            guard let i = r.pulls.firstIndex(where: { $0.number == number }) else { return }
+            let sha = Self.mergeCommit(r.pulls[i])
+            r.pulls[i].state = "closed"
+            r.pulls[i].merged = true
+            r.pulls[i].mergeCommitSHA = sha
+            r.branches[r.pulls[i].base] = sha
+        }
+    }
+
+    /// The merge commit GitHub would make for the PR: 40 hex digits, distinct from its head.
+    static func mergeCommit(_ pr: PullRequest) -> String { String(pr.headSHA.reversed()) }
     func onRequest(_ hook: (@Sendable (String) -> Void)?) { lock.withLock { self.hook = hook } }
 
     /// Logs a request, then runs the hook outside the lock.
@@ -86,7 +114,8 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
 
     static func pr(_ repo: GitHubRepoRef, _ p: PullRequest, mergeableState: String? = nil) -> GitHubPR {
         GitHubPR(number: p.number, htmlURL: "https://github.com/\(repo.owner)/\(repo.name)/pull/\(p.number)", state: p.state, merged: p.merged,
-                 headRef: p.head, headSHA: p.headSHA, baseRef: p.base, title: p.title, body: p.body, mergeableState: mergeableState)
+                 headRef: p.head, headSHA: p.headSHA, baseRef: p.base, title: p.title, body: p.body, mergeableState: mergeableState,
+                 mergeCommitSHA: p.mergeCommitSHA)
     }
 
     func update(_ repo: GitHubRepoRef, _ change: (inout Repo) -> Void) {
@@ -127,7 +156,8 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
         try logged("GET /repos/\(repo.owner)/\(repo.name)") {
             if down { throw Failure.unavailable }
             guard let r = repos[repo] else { throw Failure.notFound("/repos/\(repo.owner)/\(repo.name)") }
-            return RepoInfo(visibility: r.visibility, defaultBranch: r.defaultBranch)
+            return RepoInfo(visibility: r.visibility, defaultBranch: r.defaultBranch, allowMergeCommit: r.allowMergeCommit,
+                            allowSquashMerge: r.allowSquashMerge, allowRebaseMerge: r.allowRebaseMerge)
         }
     }
 
@@ -202,6 +232,46 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
                 GitHubReview(id: i + 1, user: GitHubUser(login: review.user), state: review.state, body: review.body, commitId: review.commitId,
                              authorAssociation: review.association)
             }
+        }
+    }
+
+    /// `PUT /pulls/{n}/merge`, as GitHub answers it: 405 when the PR is not open, the method is not allowed or it is not
+    /// mergeable (`blocked`, `behind`, `dirty`, ...); 409 when `sha` is not the head; else merged (the base branch moves to the
+    /// merge commit).
+    func mergePR(_ repo: GitHubRepoRef, number: Int, _ request: MergePullRequest) async throws -> GitHubMergeResult {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let body = String(decoding: try encoder.encode(request), as: UTF8.self)
+        return try logged("PUT /repos/\(repo.owner)/\(repo.name)/pulls/\(number)/merge") {
+            merges.append(body)
+            if down { throw Failure.unavailable }
+            let failure = nextMergeFailure
+            nextMergeFailure = nil
+            if failure == .lostRequest { throw Failure.unavailable }
+            if case .rejected(let status, let message) = failure { throw GitHubAPIError.rejected(status: status, message: message) }
+            guard var r = repos[repo] else { throw Failure.notFound("/repos/\(repo.owner)/\(repo.name)") }
+            guard let i = r.pulls.firstIndex(where: { $0.number == number }) else { throw GitHubAPIError.rejected(status: 404, message: "Not Found") }
+            let pr = r.pulls[i]
+            let allowed = switch request.mergeMethod {
+            case .merge: r.allowMergeCommit
+            case .squash: r.allowSquashMerge
+            case .rebase: r.allowRebaseMerge
+            }
+            guard pr.state == "open", allowed else { throw GitHubAPIError.rejected(status: 405, message: "Pull Request is not mergeable") }
+            guard request.sha == pr.headSHA else {
+                throw GitHubAPIError.rejected(status: 409, message: "Head branch was modified. Review and try the merge again.")
+            }
+            guard ["clean", "unstable", "has_hooks"].contains(Self.mergeableState(r, pr)) else {
+                throw GitHubAPIError.rejected(status: 405, message: "Pull Request is not mergeable")
+            }
+            let sha = Self.mergeCommit(pr)
+            r.pulls[i].state = "closed"
+            r.pulls[i].merged = true
+            r.pulls[i].mergeCommitSHA = sha
+            r.branches[pr.base] = sha
+            repos[repo] = r
+            if failure == .lostResponse { throw Failure.lostResponse }
+            return GitHubMergeResult(sha: sha, merged: true, message: "Pull Request successfully merged")
         }
     }
 }

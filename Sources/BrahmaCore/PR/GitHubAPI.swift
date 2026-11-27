@@ -68,4 +68,9 @@ public protocol GitHubAPI: Sendable {
     func checkRuns(_ repo: GitHubRepoRef, sha: String) async throws -> [GitHubCheckRun]
     /// `GET /repos/{o}/{r}/pulls/{number}/reviews`, every page, oldest first.
     func reviews(_ repo: GitHubRepoRef, number: Int) async throws -> [GitHubReview]
+    /// The `merge-pr` action (`--engine-merge` only, behind an owner card): `PUT /repos/{o}/{r}/pulls/{number}/merge` with exactly
+    /// `request` as the body (`{ sha, merge_method }`). Throws `GitHubAPIError.rejected` when GitHub refused it — 409: the head
+    /// is not `sha` (the branch moved); 405: not mergeable (protection, rules, checks, method); any other error leaves the
+    /// outcome unknown: the engine reads the PR back (`pull`), never merges again blind. Never a protection or settings call.
+    func mergePR(_ repo: GitHubRepoRef, number: Int, _ request: MergePullRequest) async throws -> GitHubMergeResult
 }

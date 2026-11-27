@@ -22,12 +22,14 @@ public struct GitHubPR: Equatable, Sendable {
     /// `unstable`, `unknown`, `has_hooks`, `draft`. `clean` is GitHub's word that every required check and review is satisfied
     /// (Plan X8 Task 4 reads no branch protection: this is how "required" is known).
     public var mergeableState: String?
+    /// `merge_commit_sha` once `merged`: the commit the base branch got for this PR (nil before, and from the `POST`).
+    public var mergeCommitSHA: String?
 
     public init(number: Int, htmlURL: String, state: String, merged: Bool, headRef: String, headSHA: String, baseRef: String,
-                title: String, body: String, mergeableState: String? = nil) {
+                title: String, body: String, mergeableState: String? = nil, mergeCommitSHA: String? = nil) {
         self.number = number; self.htmlURL = htmlURL; self.state = state; self.merged = merged
         self.headRef = headRef; self.headSHA = headSHA; self.baseRef = baseRef; self.title = title; self.body = body
-        self.mergeableState = mergeableState
+        self.mergeableState = mergeableState; self.mergeCommitSHA = mergeCommitSHA
     }
 
     public var isOpen: Bool { state == "open" }

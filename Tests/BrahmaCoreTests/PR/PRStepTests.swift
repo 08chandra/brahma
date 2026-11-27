@@ -266,7 +266,7 @@ import GRDB
         var alerts = try Self.alerts(w.store)
         #expect(alerts.count == 1 && alerts.first?.status == .pendingOwner, "\(alerts)")
         let text = try #require(alerts.first?.summary)
-        #expect(text.contains("\(item.key)'s pull request is held") && text.contains("rejected"), "\(text)")
+        #expect(text.contains("\(item.key)'s pull request is held. GitHub said: ") && text.contains("rejected"), "\(text)")
         #expect(text.contains("brahma merge abandon-pr \(w.env.company.slug) \(item.key)") && text.contains("never force-pushes"), "\(text)")
         // Not retried before `maxBackoff`; retried then, and still one alert.
         await step.tick(now: Self.t0.addingTimeInterval(PRStep.firstBackoff * 4))
@@ -425,5 +425,98 @@ import GRDB
         await step.tick(now: Self.t0.addingTimeInterval(3 + PRStep.interval))
         #expect(try w.landing(item).state == .checksFailed)
         #expect(try w.landing(pending).state == .open && w.runner.pushes.contains { $0.hasPrefix(pendingSHA) })
+    }
+
+    // MARK: Plan X8 Task 5 (carried from Task 4)
+
+    /// A PR closed on GitHub without merging gives the item back: its handed-to-PR request is bounced in the same write as the
+    /// close, so nothing stays locked in review, and the holder hears once.
+    @Test func closedUpstreamReleasesTheItem() async throws {
+        let w = try World()
+        let step = PRStep(store: w.store, machine: w.machine)
+        let (item, _) = try await Self.openPR(w, "Closed by a maintainer")
+        w.github.update(Self.repo) { $0.pulls[0].state = "closed" }
+        await step.tick(now: Self.t0)
+        let landing = try w.landing(item)
+        #expect(landing.state == .closedUpstream && landing.lastError == "PR #1 was closed on GitHub without merging", "\(landing)")
+        let back = try #require(try w.store.workItem(id: item.id))
+        #expect(back.status == .inProgress && back.mergeState == .none && back.verifiedCommit == nil, "\(back)")
+        #expect(try Self.request(w.store, item)?.status == .bounced)
+        #expect(try !w.store.isMerging(itemId: item.id))
+        let notices = try Self.notices(w.store, item, kind: .mergeFailed)
+        #expect(notices.count == 1 && notices.first?["agentId"] as String? == w.eng.id, "\(notices)")
+        #expect((notices.first?["text"] as String?)?.contains("PR #1 was closed on GitHub without merging") == true)
+        // A close whose request is gone (already released) still ends the landing and tells the owner agent.
+        let (other, _) = try await Self.openPR(w, "Closed after its request went")
+        try Self.execute(w.store, "UPDATE mergeRequest SET status = 'bounced' WHERE itemId = ?", [other.id])
+        w.github.update(Self.repo) { $0.pulls[1].state = "closed" }
+        await step.tick(now: Self.t0.addingTimeInterval(PRStep.interval))
+        #expect(try w.landing(other).state == .closedUpstream)
+        #expect(try Self.notices(w.store, other, kind: .mergeFailed).count == 1)
+    }
+
+    /// The hold alert names the commit the pass held on and only an open landing: a landing that moved on during the pass (a
+    /// newer commit, an abandon) raises nothing, and a head-moved hold whose record did not land is no hold for good.
+    @Test func holdAlertNamesThePassCommitAndOnlyAnOpenLanding() async throws {
+        let w = try World()
+        let step = PRStep(store: w.store, machine: w.machine)
+        let (item, sha) = try await Self.openPR(w, "Moves twice")
+        // The head moved on GitHub, and while the engine reads the PR the item is resubmitted (a newer commit).
+        w.github.update(Self.repo) { $0.pulls[0].headSHA = "f00d" + String(sha.dropFirst(4)) }
+        let sha2 = try w.env.commit(["twice.txt": "2\n"])
+        try w.handOff(item, sha2)
+        let (store, github) = (w.store, w.github)
+        github.onRequest { line in
+            guard line == "GET /repos/acme/app/pulls/1" else { return }
+            github.onRequest(nil)
+            do { _ = try store.beginPRLanding(item: item, sha: sha2, branch: "brahma/x", now: Self.t0) } catch { Issue.record("\(error)") }
+        }
+        await step.tick(now: Self.t0)
+        var landing = try w.landing(item)
+        #expect(landing.pushedSHA == sha2 && landing.state == .pushing && landing.lastError == nil, "\(landing)")
+        #expect(try Self.alerts(w.store).isEmpty, "no alert for a hold the landing moved past")
+
+        // Abandoned while the engine reads the PR: nothing raised either.
+        let (other, otherSHA) = try await Self.openPR(w, "Abandoned mid-read")
+        w.github.update(Self.repo) { $0.pulls[$0.pulls.count - 1].headSHA = "f00d" + String(otherSHA.dropFirst(4)) }
+        github.onRequest { line in
+            guard line == "GET /repos/acme/app/pulls/2" else { return }
+            github.onRequest(nil)
+            do { try store.abandonPRLanding(itemId: other.id, reason: "", by: .owner) } catch { Issue.record("\(error)") }
+        }
+        await step.tick(now: Self.t0.addingTimeInterval(PRStep.maxBackoff))
+        landing = try w.landing(other)
+        #expect(landing.state == .abandoned, "\(landing)")
+        #expect(try Self.alerts(w.store).isEmpty)
+        // And directly: a closed landing is never alerted.
+        #expect(try !w.store.raisePRHoldAlert(itemId: other.id, sha: otherSHA, why: "held", now: Self.t0))
+        #expect(try Self.alerts(w.store).isEmpty)
+    }
+
+    /// A push GitHub refuses for the credential (403, an authentication failure) is a hold for good: one alert, retried only
+    /// every `maxBackoff`.
+    @Test func pushAuthFailureIsAHoldForGood() async throws {
+        for why in ["remote: Permission to denied to bot. fatal: unable to access The requested URL returned error: 403",
+                    "fatal: Authentication failed for", "fatal: could not read Username for terminal prompts disabled",
+                    "remote: Invalid username or password.", "The requested URL returned error: 401"] {
+            #expect(PRStep.isDurableHold(why), "\(why)")
+        }
+        #expect(!PRStep.isDurableHold("fatal: the remote end hung up unexpectedly"))
+        let w = try World()
+        let step = PRStep(store: w.store, machine: w.machine)
+        let (item, sha) = try w.handedOff("Token refused", ["t.txt": "t\n"])
+        try Self.inReview(w.store, item)
+        w.runner.mode = .authFail
+        try _ = w.store.beginPRLanding(item: item, sha: sha, branch: "brahma/\(item.key)-token-refused", now: Self.t0)
+        await step.tick(now: Self.t0)
+        #expect(w.runner.pushes.count == 1)
+        let landing = try w.landing(item)
+        #expect(landing.state == .pushing && landing.lastError?.contains("returned error: 403") == true, "\(landing)")
+        let alerts = try Self.alerts(w.store)
+        #expect(alerts.count == 1 && alerts.first?.summary.contains("GitHub said: ") == true, "\(alerts.map(\.summary))")
+        await step.tick(now: Self.t0.addingTimeInterval(PRStep.firstBackoff * 4))
+        #expect(w.runner.pushes.count == 1)
+        await step.tick(now: Self.t0.addingTimeInterval(PRStep.maxBackoff))
+        #expect(try w.runner.pushes.count == 2 && Self.alerts(w.store).count == 1)
     }
 }
