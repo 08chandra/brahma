@@ -17,9 +17,14 @@ extension Store {
         }
     }
 
-    /// Records the landing mode. The grant checks are the caller's (`LandingSwitch.apply`); switching to `local` abandons no
-    /// open PR landing. `updateCompany` never overwrites either column.
-    public func setLanding(_ mode: LandingMode, engineMerge: Bool, companyId: String, now: Date = Store.now()) throws {
+    /// What every PR-mode setter says to a non-owner sender (Ruling 21): the landing mode, the trust list and the issue links
+    /// are the owner's alone; no agent tool reaches them.
+    static let prOwnerOnly = "only the owner can change the landing mode, the trusted logins and the issue links"
+
+    /// Owner only. Records the landing mode; the grant checks are `LandingSwitch.apply`'s, the one caller that should switch to
+    /// `pr`. Switching to `local` abandons no open PR landing. `updateCompany` never overwrites either column.
+    public func setLanding(_ mode: LandingMode, engineMerge: Bool, companyId: String, by sender: Sender) throws {
+        guard sender == .owner else { throw WorkError.forbidden(Self.prOwnerOnly) }
         try writer.write { db in
             guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
             _ = try Company.filter(key: companyId)
@@ -48,8 +53,6 @@ extension Store {
 
     // MARK: Trusted logins
 
-    static let trustOwnerOnly = "only the owner can change the trusted logins"
-
     /// The company's trusted logins, by login.
     public func trustedLogins(companyId: String) throws -> [TrustedLogin] {
         try writer.read { db in
@@ -59,7 +62,7 @@ extension Store {
 
     /// Owner only. Adding a login already listed keeps the first record.
     public func addTrustedLogin(_ login: String, companyId: String, by sender: Sender, now: Date = Store.now()) throws {
-        guard sender == .owner else { throw WorkError.forbidden(Self.trustOwnerOnly) }
+        guard sender == .owner else { throw WorkError.forbidden(Self.prOwnerOnly) }
         let login = login.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !login.isEmpty, login.unicodeScalars.allSatisfy({ !CharacterSet.whitespacesAndNewlines.contains($0) }) else {
             throw WorkError.invalid("a login has no spaces")
@@ -72,7 +75,7 @@ extension Store {
 
     /// Owner only. Items already imported keep the trust they were imported with.
     public func removeTrustedLogin(_ login: String, companyId: String, by sender: Sender) throws {
-        guard sender == .owner else { throw WorkError.forbidden(Self.trustOwnerOnly) }
+        guard sender == .owner else { throw WorkError.forbidden(Self.prOwnerOnly) }
         try writer.write { db in
             let removed = try TrustedLogin.filter(Column("companyId") == companyId && Column("login") == login).deleteAll(db)
             guard removed > 0 else { throw WorkError.notFound("no trusted login '\(login)'") }
@@ -85,15 +88,18 @@ extension Store {
         try writer.read { db in try IssueLink.fetchOne(db, key: ["companyId": companyId, "provider": provider.rawValue]) }
     }
 
-    /// Writes the company's link for the provider (one per provider: the cursor and poll time move with it).
-    public func setIssueLink(_ link: IssueLink) throws {
+    /// Owner only. Writes the company's link for the provider (one per provider: the cursor and poll time move with it).
+    public func setIssueLink(_ link: IssueLink, by sender: Sender) throws {
+        guard sender == .owner else { throw WorkError.forbidden(Self.prOwnerOnly) }
         try writer.write { db in
             guard try Company.fetchOne(db, key: link.companyId) != nil else { throw WorkError.notFound("no such company") }
             try link.save(db)
         }
     }
 
-    public func clearIssueLink(companyId: String, provider: IssueProvider) throws {
+    /// Owner only.
+    public func clearIssueLink(companyId: String, provider: IssueProvider, by sender: Sender) throws {
+        guard sender == .owner else { throw WorkError.forbidden(Self.prOwnerOnly) }
         try writer.write { db in
             _ = try IssueLink.filter(Column("companyId") == companyId && Column("provider") == provider.rawValue).deleteAll(db)
         }

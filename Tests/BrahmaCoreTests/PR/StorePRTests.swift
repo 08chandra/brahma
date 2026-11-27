@@ -17,7 +17,7 @@ import GRDB
         #expect(fresh.0 == .local); #expect(fresh.engineMerge == false)
         #expect(c.landing == .local); #expect(c.engineMerge == false)
 
-        try store.setLanding(.pr, engineMerge: true, companyId: c.id)
+        try store.setLanding(.pr, engineMerge: true, companyId: c.id, by: .owner)
         let switched = try store.landing(companyId: c.id)
         #expect(switched.0 == .pr); #expect(switched.engineMerge == true)
         #expect(try #require(try store.company(id: c.id)).landing == .pr)
@@ -30,9 +30,14 @@ import GRDB
         #expect(after.goal == "renamed"); #expect(after.landing == .pr); #expect(after.engineMerge == true)
 
         // Back to local, and nothing but the mode changes.
-        try store.setLanding(.local, engineMerge: false, companyId: c.id)
+        try store.setLanding(.local, engineMerge: false, companyId: c.id, by: .owner)
         #expect(try store.landing(companyId: c.id) == (.local, engineMerge: false))
-        #expect(throws: WorkError.notFound("no such company")) { try store.setLanding(.pr, engineMerge: false, companyId: "nope") }
+        #expect(throws: WorkError.notFound("no such company")) { try store.setLanding(.pr, engineMerge: false, companyId: "nope", by: .owner) }
+        // Ruling 21: the setters are the owner's; an agent or the engine cannot flip the mode past the grant gate.
+        for sender in [Sender.agent("a1"), .system] {
+            #expect(throws: WorkError.forbidden(Store.prOwnerOnly)) { try store.setLanding(.pr, engineMerge: false, companyId: c.id, by: sender) }
+        }
+        #expect(try store.landing(companyId: c.id) == (.local, engineMerge: false))
     }
 
     /// S35: a restore keeps the stricter landing, whichever database holds it: `local` over `pr`, engine-merge off over on.
@@ -130,20 +135,24 @@ import GRDB
         try store.addTrustedLogin("Hubot", companyId: c.id, by: .owner, now: now)
         #expect(try store.trustedLogins(companyId: c.id) == [TrustedLogin(companyId: c.id, login: "Hubot", addedBy: "owner", addedAt: now),
                                                              TrustedLogin(companyId: c.id, login: "octocat", addedBy: "owner", addedAt: now)])
-        #expect(throws: WorkError.forbidden(Store.trustOwnerOnly)) { try store.addTrustedLogin("x", companyId: c.id, by: .agent("a1")) }
+        #expect(throws: WorkError.forbidden(Store.prOwnerOnly)) { try store.addTrustedLogin("x", companyId: c.id, by: .agent("a1")) }
+        #expect(throws: WorkError.forbidden(Store.prOwnerOnly)) { try store.removeTrustedLogin("Hubot", companyId: c.id, by: .system) }
         #expect(throws: WorkError.self) { try store.addTrustedLogin(" ", companyId: c.id, by: .owner) }
         try store.removeTrustedLogin("octocat", companyId: c.id, by: .owner)
         #expect(try store.trustedLogins(companyId: c.id).map(\.login) == ["Hubot"])
         #expect(throws: WorkError.notFound("no trusted login 'ghost'")) { try store.removeTrustedLogin("ghost", companyId: c.id, by: .owner) }
 
         let link = IssueLink(companyId: c.id, provider: .github, target: "acme/app", label: "brahma", cursor: nil, lastPolled: nil)
-        try store.setIssueLink(link)
+        #expect(throws: WorkError.forbidden(Store.prOwnerOnly)) { try store.setIssueLink(link, by: .agent("a1")) }
+        try store.setIssueLink(link, by: .owner)
         #expect(try store.issueLink(companyId: c.id, provider: .github) == link)
         #expect(try store.issueLink(companyId: c.id, provider: .linear) == nil)
         var moved = link; moved.cursor = "2026-01-01T00:00:00Z"; moved.lastPolled = now
-        try store.setIssueLink(moved)
+        try store.setIssueLink(moved, by: .owner)
         #expect(try store.issueLink(companyId: c.id, provider: .github) == moved)
-        try store.clearIssueLink(companyId: c.id, provider: .github)
+        #expect(throws: WorkError.forbidden(Store.prOwnerOnly)) { try store.clearIssueLink(companyId: c.id, provider: .github, by: .system) }
+        #expect(try store.issueLink(companyId: c.id, provider: .github) == moved)
+        try store.clearIssueLink(companyId: c.id, provider: .github, by: .owner)
         #expect(try store.issueLink(companyId: c.id, provider: .github) == nil)
     }
 }

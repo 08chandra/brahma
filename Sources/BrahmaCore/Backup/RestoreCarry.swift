@@ -13,7 +13,9 @@ import GRDB
 /// is revoked (the owner approves again what is still wanted) and every session is treated as tainted.
 ///
 /// The security-relevant company settings (`CompanySecurity`, S35: autonomy, profiles, read paths, domains, local listening,
-/// auto-merge, the pause) and the owner-wide auto-merge keep the stricter of the live and the restored value.
+/// auto-merge, the pause) and the owner-wide auto-merge keep the stricter of the live and the restored value. The owner's trust
+/// list (`trustedLogin`, Ruling X8-20) is kept at its intersection with the live database and the issue links at the stricter
+/// link: a restore can only ever narrow trust, never widen it.
 ///
 /// Grants the live database no longer counts for any reason (expired on company-active time, sprint ended, used up) are
 /// revoked in the restored one (fix-wave F1): both clocks roll back with the database, so carrying `revokedAt` alone is not
@@ -183,6 +185,11 @@ struct RestoreCarry {
                   taintSources = CASE WHEN taintSources = '' THEN 'restore: the previous database could not be read' ELSE taintSources END
                 """)
             try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE status <> 'done'")
+            // Ruling X8-20: the trust list cannot be checked against the live database, so nothing imported is trusted.
+            if try db.tableExists("trustedLogin") {
+                try db.execute(sql: "DELETE FROM trustedLogin")
+                try db.execute(sql: "UPDATE workItem SET originTrusted = 0 WHERE originTrusted = 1")
+            }
             try markEveryOpenItemsCommits(db, now: now)
             try recordRestoreEpochs(db, now: now, gitTempRoot: gitTempRoot)
             notes.append("the current database could not be read (\(Store.flat(why, max: 160))): every grant was revoked and every "
@@ -276,7 +283,13 @@ struct RestoreCarry {
     ///
     /// Where auto-merge is kept off (owner-wide, or a company's), the snapshot's auto-approvals that have not landed are taken
     /// back exactly as switching it off live does (`Store.revokeAutoApprovals`), so none lands on a switch the owner turned off.
+    ///
+    /// Ruling X8-20: the trust list (`trustedLogin`) is kept at the intersection with the live database: a login the owner removed
+    /// after the snapshot is deleted from the staged snapshot, and every item imported under it (`originAuthor`, same company)
+    /// reads untrusted again. An issue link keeps the stricter of the two (`Settings.stricterIssueLink`). Implementer rule: any
+    /// later trust or allowlist table follows the same rule — a restore can only ever narrow trust, never widen it.
     static func keepStricterSettings(_ live: Settings, into db: Database, now: Date) throws {
+        try keepNarrowerTrust(live, into: db)
         var revokeScopes: [String] = []
         for restored in try Company.fetchAll(db) {
             guard let current = live.companies[restored.id] else { continue }
@@ -309,6 +322,33 @@ struct RestoreCarry {
             }
         }
         if keptOffOwnerWide { try revoke(nil) } else { for id in revokeScopes { try revoke(id) } }
+    }
+
+    /// Ruling X8-20: deletes every trusted login the live database no longer lists (and marks that login's imported items
+    /// untrusted), and keeps each issue link at the stricter of the live and the restored one.
+    static func keepNarrowerTrust(_ live: Settings, into db: Database) throws {
+        if try db.tableExists("trustedLogin") {
+            for key in Set(try Settings.readTrustedLogins(db)).subtracting(live.trustedLogins).sorted() {
+                let (companyId, login) = Settings.split(key)
+                try db.execute(sql: "DELETE FROM trustedLogin WHERE companyId = ? AND login = ?", arguments: [companyId, login])
+                try db.execute(sql: "UPDATE workItem SET originTrusted = 0 WHERE companyId = ? AND originAuthor = ? AND originTrusted = 1",
+                               arguments: [companyId, login])
+            }
+        }
+        if try db.tableExists("issueLink") {
+            for (key, restored) in try Settings.readIssueLinks(db) {
+                let kept = Settings.stricterIssueLink(live: live.issueLinks[key], restored: restored)
+                guard kept != restored else { continue }
+                let (companyId, provider) = Settings.split(key)
+                if let kept {
+                    // The cursor belonged to the snapshot's target and filter: the next poll starts over (items dedupe by origin).
+                    try db.execute(sql: "UPDATE issueLink SET target = ?, label = ?, cursor = NULL, lastPolled = NULL WHERE companyId = ? AND provider = ?",
+                                   arguments: [kept.target, kept.label, companyId, provider])
+                } else {
+                    try db.execute(sql: "DELETE FROM issueLink WHERE companyId = ? AND provider = ?", arguments: [companyId, provider])
+                }
+            }
+        }
     }
 
     private static func carry(_ c: RestoreCarry, into db: Database, now: Date) throws {
@@ -520,6 +560,41 @@ extension RestoreCarry {
         var ownerAutoMerge: Bool?
         /// `ownerSettings.autoMergePaths` (S36): nil is the pack's list (else the default).
         var ownerAutoMergePaths: [String]?
+        /// Ruling X8-20: `companyId|login` of every trusted login.
+        var trustedLogins: Set<String> = []
+        /// Ruling X8-20: `companyId|provider` → the issue link's target and label filter.
+        var issueLinks: [String: IssueLinkSetting] = [:]
+
+        /// What a restore compares of an issue link (`IssueLink` without its poll state).
+        struct IssueLinkSetting: Equatable {
+            var target: String
+            var label: String?
+        }
+
+        /// Ruling X8-20: the stricter issue link. No link is stricter than a link, so a link the owner cleared live stays cleared
+        /// and a link only the snapshot had is not re-added. Both set: the live target wins (the snapshot's target is not what
+        /// the owner points the import at now), and a label filter is stricter than none: the live label, else the snapshot's.
+        static func stricterIssueLink(live: IssueLinkSetting?, restored: IssueLinkSetting?) -> IssueLinkSetting? {
+            guard let live, let restored else { return nil }
+            return IssueLinkSetting(target: live.target, label: live.label ?? restored.label)
+        }
+
+        static func split(_ key: String) -> (String, String) {
+            let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
+            return (parts.first ?? key, parts.count > 1 ? parts[1] : "")
+        }
+
+        static func readTrustedLogins(_ db: Database) throws -> [String] {
+            try Row.fetchAll(db, sql: "SELECT companyId, login FROM trustedLogin").map { "\($0["companyId"] as String)|\($0["login"] as String)" }
+        }
+
+        static func readIssueLinks(_ db: Database) throws -> [String: IssueLinkSetting] {
+            var out: [String: IssueLinkSetting] = [:]
+            for row in try Row.fetchAll(db, sql: "SELECT companyId, provider, target, label FROM issueLink") {
+                out["\(row["companyId"] as String)|\(row["provider"] as String)"] = IssueLinkSetting(target: row["target"], label: row["label"])
+            }
+            return out
+        }
 
         /// Every `ownerSettings` column, classified for restores (S36; `OwnerSettingsSecurityTests` fails on a new column in
         /// neither list). Security-relevant ones keep the stricter value (`keepStricterSettings`).
@@ -559,6 +634,8 @@ extension RestoreCarry {
             if try db.tableExists("secret") {
                 s.secrets = Set(try Row.fetchAll(db, sql: "SELECT companyId, name FROM secret").map { "\($0["companyId"] as String)|\($0["name"] as String)" })
             }
+            if try db.tableExists("trustedLogin") { s.trustedLogins = Set(try readTrustedLogins(db)) }
+            if try db.tableExists("issueLink") { s.issueLinks = try readIssueLinks(db) }
             if try db.tableExists("ownerSettings"), try db.columns(in: "ownerSettings").contains(where: { $0.name == "autoMerge" }) {
                 s.ownerAutoMerge = try Bool.fetchOne(db, sql: "SELECT autoMerge FROM ownerSettings WHERE id = 1")
                 s.ownerAutoMergePaths = try String.fetchOne(db, sql: "SELECT autoMergePaths FROM ownerSettings WHERE id = 1")
@@ -573,10 +650,6 @@ extension RestoreCarry {
         static func rolledBack(live: Settings, restored: Settings) -> [String] {
             var out: [String] = []
             func companyName(_ id: String) -> String { restored.companies[id]?.name ?? live.companies[id]?.name ?? id }
-            func split(_ key: String) -> (String, String) {
-                let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
-                return (parts.first ?? key, parts.count > 1 ? parts[1] : "")
-            }
             for (id, c) in restored.companies.sorted(by: { $0.value.name < $1.value.name }) {
                 guard let now = live.companies[id] else { out.append("company \(c.name), removed after the snapshot, is back"); continue }
                 // S35: every security-relevant company setting keeps the stricter value (`CompanySecurity`); reported here.
@@ -602,6 +675,19 @@ extension RestoreCarry {
             for key in restored.secrets.subtracting(live.secrets).sorted() {
                 let (company, name) = split(key)
                 out.append("\(companyName(company)): secret \(name), removed after the snapshot, is listed again (its value is not)")
+            }
+            // Ruling X8-20: trust is kept at the intersection; the stricter issue link wins.
+            for key in restored.trustedLogins.subtracting(live.trustedLogins).sorted() {
+                let (company, login) = split(key)
+                out.append("\(companyName(company)): trusted login \(login), removed after the snapshot, stays removed")
+            }
+            func showLink(_ l: IssueLinkSetting) -> String { l.label.map { "\(l.target) label \($0)" } ?? "\(l.target), no label" }
+            for (key, link) in restored.issueLinks.sorted(by: { $0.key < $1.key }) {
+                let (company, provider) = split(key)
+                let kept = stricterIssueLink(live: live.issueLinks[key], restored: link)
+                guard kept != link else { continue }
+                out.append(kept.map { "\(companyName(company)): \(provider) issue link kept at \(showLink($0)) (the snapshot had \(showLink(link)))" }
+                           ?? "\(companyName(company)): \(provider) issue link \(link.target), cleared after the snapshot, stays cleared")
             }
             if restored.ownerAutoMerge != false, live.ownerAutoMerge == false { out.append("owner-wide auto-merge kept off (the snapshot had it on)") }
             let paths = narrowerAutoMergePaths(live: live.ownerAutoMergePaths, restored: restored.ownerAutoMergePaths)

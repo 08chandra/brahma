@@ -70,14 +70,21 @@ public enum LandingSwitch {
         return nil
     }
 
-    /// Checks the grants, then records the mode. Returns the status it decided on. Throws `WorkError.forbidden` with the
-    /// refusal text; the mode is unchanged then.
+    /// The owner's switch: for `pr`, reads the grants and refuses (`WorkError.forbidden` with the refusal text, the mode
+    /// unchanged) unless they suffice; for `local`, records the mode without consulting the checker, so `local` always succeeds,
+    /// and resets `engineMerge` to false. Returns the status it decided on (`nil` for `local`).
     @discardableResult
     public static func apply(_ mode: LandingMode, engineMerge: Bool, companyId: String, store: Store,
-                             checker: any LandingGrantChecking, now: Date = Store.now()) throws -> LandingGrantStatus {
-        let status = try checker.status(companyId: companyId)
-        if let why = refusal(mode: mode, engineMerge: engineMerge, status: status) { throw WorkError.forbidden(why) }
-        try store.setLanding(mode, engineMerge: mode == .pr && engineMerge, companyId: companyId, now: now)
-        return status
+                             checker: any LandingGrantChecking) throws -> LandingGrantStatus? {
+        switch mode {
+        case .local:
+            try store.setLanding(.local, engineMerge: false, companyId: companyId, by: .owner)
+            return nil
+        case .pr:
+            let status = try checker.status(companyId: companyId)
+            if let why = refusal(mode: .pr, engineMerge: engineMerge, status: status) { throw WorkError.forbidden(why) }
+            try store.setLanding(.pr, engineMerge: engineMerge, companyId: companyId, by: .owner)
+            return status
+        }
     }
 }

@@ -33,6 +33,12 @@ private struct StubGrantChecker: LandingGrantChecking {
     func status(companyId: String) throws -> LandingGrantStatus { status }
 }
 
+/// A checker whose channel core is down: `pr` cannot be decided, `local` must not care.
+private struct ThrowingGrantChecker: LandingGrantChecking {
+    struct Down: Error {}
+    func status(companyId: String) throws -> LandingGrantStatus { throw Down() }
+}
+
 /// `brahma company landing <co> [local|pr] [--engine-merge]` (Plan X8 Task 1). No github channel exists on this tree, so the
 /// production checker refuses PR mode; the in-process tests inject a stub to cover the grant rules and the success path.
 @Suite(.scratch) struct LandingCommandTests {
@@ -86,13 +92,13 @@ private struct StubGrantChecker: LandingGrantChecking {
                 try LandingSwitch.apply(.pr, engineMerge: false, companyId: c.id, store: store, checker: StubGrantChecker(status: broken))
             }
         }
-        // `local` needs no grant and abandons nothing: the landings stay as they are.
+        // `local` never consults the checker (a throwing one cannot stop it), resets engine-merge, and abandons nothing: the
+        // landings stay as they are.
         let item = try store.createWorkItem(companyId: c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "one"))
         let landing = PRLanding(itemId: item.id, companyId: c.id, branch: "brahma/ACME-1", pushedSHA: String(repeating: "a", count: 40),
                                 state: .open, updatedAt: Date(timeIntervalSince1970: 1_800_000_000))
         try store.upsertPRLanding(landing)
-        try LandingSwitch.apply(.local, engineMerge: false, companyId: c.id, store: store,
-                                checker: StubGrantChecker(status: LandingGrantStatus(channelConnected: false, grantedActions: [], tokenPresent: false)))
+        #expect(try LandingSwitch.apply(.local, engineMerge: true, companyId: c.id, store: store, checker: ThrowingGrantChecker()) == nil)
         #expect(try store.landing(companyId: c.id) == (.local, engineMerge: false))
         #expect(try store.openPRLandings(companyId: c.id) == [landing])
         // The production checker on this tree: no channel, no grants; the token is read from the secret's metadata only.
