@@ -569,6 +569,12 @@ public actor Orchestrator {
         cfg.planTier = store.planTier()
         cfg.ownerReserve = 1 - store.weeklyShare()
         let companies = try store.companies()
+        // Ruling 23 + controller Ruling FW-1: the taint holds first, before any step below starts work. `taintHeld` is every
+        // company a hold holds (memory and a fresh read of the store); when the store's holds can't be read, nothing that
+        // ships or starts work (turns, dispatch, merges, releases) starts this tick (fail closed).
+        let taintHolds = taintHoldTick(now: now)
+        let taintHeld = taintHolds.held
+        let taintUnknown = !taintHolds.readable
         // Turns, checks and merges in flight keep the Mac awake (and for a minute after the last one), if the owner allows it.
         sleepGuard.update(running: awakeWork, enabled: (try? store.ownerPrefs().preventSleep) ?? false, now: now)
         let calibration = try store.usageCalibration()
@@ -736,19 +742,21 @@ public actor Orchestrator {
         startChecks(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
         // 5a. The main guard (Plan 4a Task 3): for every company, `main` is where the queue left it, before the merge step.
         mainGuardTick(now: now, held: held, companies: companies)
-        // Ruling 23: no merge of a company held for an unrecorded taint (its commits may read clean until the record is written).
+        // Ruling 23 / FW-1: no merge of a company held for an unrecorded taint (its commits may read clean until the record is
+        // written), and none at all while the holds can't be read.
         startMerges(now: now, config: cfg, held: held, pressure: pressure,
-                    companies: companies.filter { c in !taintHoldMemory.values.contains { $0.hold.companyId == c.id } })
+                    companies: taintUnknown ? [] : companies.filter { !taintHeld.contains($0.id) })
         // 5b. Previews (Plan L): one reconcile pass at a time, after the merge step.
         previewTick(held: held)
         // 5c. The smoke check on main (Plan L): queue a run for a new main, run queued ones one at a time per company.
         smokeTick(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
         // 5d. Releases (Plan L): an approved deploy is carried out once, after the main smoke step.
-        releaseTick(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
+        releaseTick(now: now, config: cfg, held: held, pressure: pressure,
+                    companies: taintUnknown ? [] : companies.filter { !taintHeld.contains($0.id) })
 
         infraCooldown = infraCooldown.filter { $0.value > now }
-        // Ruling 23: companies held because a turn's taint could not be recorded start no turn, dispatch or merge.
-        let taintHeld = taintHoldTick(now: now)
+        // Ruling 23: companies held because a turn's taint could not be recorded start no turn, dispatch or merge (`taintHeld`,
+        // read at the top of the tick).
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
         let ready = try store.agents(states: [.ready])
         // The holder of an item whose merge is running gets no work turn until the merge ends.
@@ -758,7 +766,7 @@ public actor Orchestrator {
         let canaryHeldIds = canaryTick(ready: ready, companies: byId)
         let candidates = ready.compactMap { a -> Candidate? in
             guard !a.paused, tasks[a.id] == nil, !dispatching.contains(a.id), infraCooldown[a.id] == nil, !mergingHolders.contains(a.id),
-                  !canaryHeldIds.contains(a.id), !taintHeld.contains(a.companyId), let c = byId[a.companyId] else { return nil }
+                  !canaryHeldIds.contains(a.id), !taintUnknown, !taintHeld.contains(a.companyId), let c = byId[a.companyId] else { return nil }
             return Candidate(agent: a, company: c, blockingCount: blocking[a.id] ?? 0)
         }
         let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: cfg,
@@ -774,7 +782,7 @@ public actor Orchestrator {
 
         // 6. Engine dispatch, after admission: only into the slots admission left over, and only for companies whose gate,
         //    pace and concurrency cap would let a new agent run. Leases are never reserved for agents admission would refuse.
-        if !held {
+        if !held, !taintUnknown {
             let free = Scheduler.freeSlots(config: cfg, running: runningCount(), otherChildren: otherChildren,
                                            safetyOnly: previewChildren + conciergeTasks.count,
                                            pressure: pressure, held: held)
@@ -1956,14 +1964,22 @@ public actor Orchestrator {
         taintHoldMemory[hold.turnId] = (hold, persisted)
     }
 
-    /// Ruling 23, every tick: reconciles the in-memory holds with the database (a row the owner cleared, or a retry deleted,
-    /// lifts its hold; a row this engine did not know, e.g. after a restart, holds), writes the rows not yet written, and starts
-    /// the retry pass when none runs. Returns the held companies.
-    func taintHoldTick(now: Date) -> Set<String> {
-        if let rows = try? store.taintHolds() {
+    /// Ruling 23, at the top of every tick (controller Ruling FW-1: before any step that starts work): reconciles the in-memory
+    /// holds with the database (a row the owner cleared, or a retry deleted, lifts its hold; a row this engine did not know,
+    /// e.g. after a restart, holds at once), writes the rows not yet written, and starts the retry pass when none runs. Returns
+    /// the held companies, and whether the database's holds could be read (unreadable: the caller starts nothing that ships,
+    /// and the owner is alerted once).
+    func taintHoldTick(now: Date) -> (held: Set<String>, readable: Bool) {
+        var readable = true
+        do {
+            let rows = try store.taintHolds()
             let ids = Set(rows.map(\.turnId))
             taintHoldMemory = taintHoldMemory.filter { !$0.value.persisted || ids.contains($0.key) }
             for row in rows { taintHoldMemory[row.turnId] = (row, true) }
+        } catch {
+            readable = false
+            log("the taint holds could not be read (\(error)); no turn, merge or release starts this tick")
+            try? EngineAlerts.raise(store: store, text: Self.taintHoldsUnreadableText, now: now, reason: Self.taintHoldsUnreadableReason)
         }
         for (turnId, entry) in taintHoldMemory where !entry.persisted {
             if (try? store.holdForTaint(entry.hold, now: now)) != nil { taintHoldMemory[turnId]?.persisted = true }
@@ -1977,8 +1993,13 @@ public actor Orchestrator {
                 await taintRetryDone(lifted)
             }
         }
-        return Set(taintHoldMemory.values.map(\.hold.companyId))
+        return (Set(taintHoldMemory.values.map(\.hold.companyId)), readable)
     }
+
+    /// FW-1: the alert when the taint holds can't be read (keyed once; nothing that ships starts until they can).
+    static let taintHoldsUnreadableReason = "taint-holds-unreadable"
+    static let taintHoldsUnreadableText = "Brahma couldn't read whether any company is held for an unrecorded taint, so no turn, merge or "
+        + "release starts until it can. Check the database (brahma doctor)."
 
     private func taintRetryDone(_ lifted: [String]) {
         for turnId in lifted {

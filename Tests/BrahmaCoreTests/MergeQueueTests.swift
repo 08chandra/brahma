@@ -53,6 +53,52 @@ import GRDB
 
     func text(_ s: String) -> Data { Data(s.utf8) }
 
+    // MARK: Controller Ruling FW-1 (taint holds before merges)
+
+    /// FW-1: a company held in the store for an unrecorded taint (a hold an earlier engine recorded, not yet in this engine's
+    /// memory) starts no merge on the first tick, nor while it stays held; once the owner clears the hold, the merge lands.
+    @Test func storeHeldCompanyStartsNoMergeOnTheFirstTick() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        // The retry keeps failing (the held-item mark can't be written), so the hold stands.
+        m.store.refHooks.setFailTaintRecords(true)
+        defer { m.store.refHooks.setFailTaintRecords(false) }
+        try m.store.holdForTaint(TaintHold(turnId: "t-earlier-engine", companyId: m.company.id, agentId: m.eng.id, heldAtStart: [:],
+                                           heldItemsAtStart: [], leasedItemId: nil, source: nil, markItems: true, createdAt: m.now), now: m.now)
+        try await m.cycle()
+        m.world.clock.advance(3600)
+        try await m.cycle()
+        #expect(try m.fresh(i).status != .done, "a held company's merge ran")
+        #expect(try request(m, i).status == .queued)
+        #expect(try m.store.clearTaintHolds(companyId: m.company.id, now: m.now, owner: .test) == 1)
+        try await m.cycle()
+        m.world.clock.advance(3600)
+        try await m.cycle()
+        #expect(try m.fresh(i).status == .done, "the merge did not land once the hold was cleared")
+    }
+
+    /// FW-1: when the taint holds can't be read, no merge starts that tick (fail closed), and the owner is alerted.
+    @Test func unreadableTaintHoldsStartNoMerge() async throws {
+        let m = try MergeFixture()
+        let i = try await m.approved()
+        m.store.refHooks.setFailTaintHoldRead(true)
+        try await m.cycle()
+        m.world.clock.advance(3600)
+        try await m.cycle()
+        #expect(try m.fresh(i).status != .done, "a merge ran while the holds couldn't be read")
+        let cId = m.company.id
+        let alerts = try await m.store.writer.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM ask WHERE companyId = ? AND kind = 'engineAlert' AND subjectId = ?",
+                             arguments: [cId, Store.engineAlertKey(Orchestrator.taintHoldsUnreadableReason)]) ?? 0
+        }
+        #expect(alerts == 1)
+        m.store.refHooks.setFailTaintHoldRead(false)
+        try await m.cycle()
+        m.world.clock.advance(3600)
+        try await m.cycle()
+        #expect(try m.fresh(i).status == .done)
+    }
+
     // MARK: Landing
 
     @Test func landsFastForwardThroughFinishMerge() async throws {

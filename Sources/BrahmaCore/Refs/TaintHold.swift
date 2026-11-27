@@ -55,9 +55,15 @@ extension Store {
 
     /// Every hold the database records (oldest first).
     public func taintHolds() throws -> [TaintHold] {
-        try writer.read { db in
-            try String.fetchAll(db, sql: "SELECT payload FROM taintHold ORDER BY createdAt, rowid").compactMap {
-                try? JSONDecoder().decode(TaintHold.self, from: Data($0.utf8))
+        if refHooks.failTaintHoldRead { throw WorkError.conflict("injected: the taint holds could not be read") }
+        return try writer.read { db in
+            // A row whose payload can't be decoded still holds its company (fail closed): only the retry needs the payload.
+            try Row.fetchAll(db, sql: "SELECT turnId, companyId, agentId, payload, createdAt FROM taintHold ORDER BY createdAt, rowid").map { row in
+                let payload: String = row["payload"]
+                return (try? JSONDecoder().decode(TaintHold.self, from: Data(payload.utf8)))
+                    ?? TaintHold(turnId: row["turnId"], companyId: row["companyId"], agentId: row["agentId"], heldAtStart: [:],
+                                 heldItemsAtStart: [], leasedItemId: nil, source: "an unreadable hold record", markItems: true,
+                                 createdAt: row["createdAt"])
             }
         }
     }
