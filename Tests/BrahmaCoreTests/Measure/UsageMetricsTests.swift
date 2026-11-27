@@ -310,7 +310,7 @@ import GRDB
         let store = try Store.inMemory()
         let acme = try MeasureFixtures.seed(store, name: "Acme", landed: 3, now: t0)
         let c = try ctx(store, acme)
-        let task = Task.detached { () throws -> MetricValue in
+        let task = Task.detached { () throws -> MetricValue in  // scope-escape: cancels itself and ranks an in-memory store; no scratch dirs
             withUnsafeCurrentTask { $0?.cancel() }
             return try UsageMetrics.modelRanking(c)
         }
