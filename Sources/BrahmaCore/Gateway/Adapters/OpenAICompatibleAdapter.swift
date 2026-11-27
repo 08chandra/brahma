@@ -23,8 +23,9 @@ import Foundation
 ///   (`thinking`, `context_management`, `output_config`, `safeguards`, `speed`, `inference_geo`, `service_tier`).
 /// - Tool search (Ruling 58): a `tool_reference` in a tool result becomes the text `Tool <name> loaded.`; a `tool_addition`
 ///   / `tool_removal` in a `role: "system"` message is dropped, a removal leaving that function out of `tools` (a later
-///   addition brings it back). Each must reference, by a plain name, a tool in the request's own policy-checked `tools`
-///   — the only place a definition enters — and nothing but `{type: "tool_reference", name | tool_name}`; anything else is
+///   addition brings it back). Each must be exactly `{type: "tool_reference", name | tool_name}` with a plain name; a
+///   reference or an addition must name a tool in the request's own policy-checked `tools` — the only place a definition
+///   enters — while a removal of a tool the request does not hold changes nothing and is dropped; anything else is
 ///   refused. The rest of the function list is sent as checked.
 /// - Anything else (a document, a server-tool block, a URL image) is refused with a reason: it has no Chat Completions form,
 ///   and dropping it would change what the model is asked.
@@ -37,7 +38,8 @@ import Foundation
 /// the meter neither reserves nor charges it.
 ///
 /// **Responses**: content → a text block; `tool_calls` → `tool_use` blocks (arguments parsed strictly; arguments that are not
-/// a JSON object become `{}`, so the turn sees a tool error on its next request, never a crash); `finish_reason` → `stop_reason`;
+/// a JSON object, or are not text at all, become the marker input `{"_brahma_invalid_arguments": true}` that no tool takes,
+/// so the turn sees a tool error, never a run on garbage; none at all is `{}`); `finish_reason` → `stop_reason`;
 /// `usage` → `GatewayUsage` (`OpenAICompatibleStream.usage`). Errors are relayed redacted, like the `anthropic` adapter's.
 /// **Billing of errors** (Ruling 55): a 4xx bills nothing; a 5xx is charged the estimate (an aggregator may bill partial work).
 public struct OpenAICompatibleAdapter: ProviderAdapter {
@@ -198,25 +200,37 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
     private static let droppedBlocks: Set<String> = ["thinking", "redacted_thinking"]
 
     /// Tool search's changes to the tool list (Ruling 58): the request's own tool names, and those removed so far.
+    /// `allowed` is false for the top-level system, where no tool change belongs.
     struct ToolChanges {
         let known: Set<String>
+        var allowed = true
         var removed: Set<String> = []
     }
 
-    /// The tool a `{type: "tool_reference", name | tool_name}` names: exactly that shape, a plain name (`^[A-Za-z0-9_-]{1,64}$`)
-    /// of one of the request's tools; anything else is refused.
-    static func referencedTool(_ reference: StrictJSON?, known: Set<String>) throws(GatewayError) -> String {
-        let refused = GatewayError.policy("a tool reference must name one of the request's tools")
+    static let refusedReference = GatewayError.policy("a tool reference must name one of the request's tools")
+
+    /// The name a `{type: "tool_reference", name | tool_name}` holds: exactly that shape and a plain name
+    /// (`^[A-Za-z0-9_-]{1,64}$`); anything else is refused.
+    static func referencedName(_ reference: StrictJSON?) throws(GatewayError) -> String {
         guard let reference, let members = reference.members, members.count == 2, reference["type"] == .string("tool_reference") else {
-            throw refused
+            throw refusedReference
         }
         let named = reference["name"] ?? reference["tool_name"]
-        guard let name = named?.stringValue, OpenAICompatibleStream.isToolName(name), known.contains(name) else { throw refused }
+        guard let name = named?.stringValue, OpenAICompatibleStream.isToolName(name) else { throw refusedReference }
         return name
     }
 
-    /// System content as one text: its text blocks, joined. In a `role: "system"` message (`changes` given) a
-    /// `tool_addition` / `tool_removal` is applied to `changes` and dropped; at the top level it is refused.
+    /// The tool a tool reference names: `referencedName`, and one of the request's tools; anything else is refused.
+    static func referencedTool(_ reference: StrictJSON?, known: Set<String>) throws(GatewayError) -> String {
+        let name = try referencedName(reference)
+        guard known.contains(name) else { throw refusedReference }
+        return name
+    }
+
+    /// System content as one text: its text blocks, joined. In a `role: "system"` message a `tool_addition` /
+    /// `tool_removal` is applied to `changes` and dropped; at the top level (`changes.allowed` false) it is refused. An
+    /// addition must name one of the request's tools; a well-formed removal of a tool the request does not hold changes
+    /// nothing and is dropped (Task 10 minor, fixed in Task 11: refusing it protected nothing and ended the session).
     static func systemText(_ content: StrictJSON, changes: inout ToolChanges) throws(GatewayError) -> String {
         if case .string(let s) = content { return s }
         var texts: [String] = []
@@ -225,17 +239,23 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
             if droppedBlocks.contains(type) { continue }
             switch type {
             case "text": texts.append(try text(of: block))
-            case "tool_addition": changes.removed.remove(try referencedTool(block["tool"], known: changes.known))
-            case "tool_removal": changes.removed.insert(try referencedTool(block["tool"], known: changes.known))
+            case "tool_addition", "tool_removal":
+                guard changes.allowed else { throw refusedReference }
+                if type == "tool_addition" {
+                    changes.removed.remove(try referencedTool(block["tool"], known: changes.known))
+                } else {
+                    let name = try referencedName(block["tool"])
+                    if changes.known.contains(name) { changes.removed.insert(name) }
+                }
             default: throw unsupported("a \(GatewayPolicy.shown(type)) block in a system message")
             }
         }
         return texts.joined(separator: "\n")
     }
 
-    /// Top-level system content, where no tool change belongs: with no request tools known, any reference is refused.
+    /// Top-level system content, where no tool change belongs: any tool change is refused.
     static func topLevelSystemText(_ content: StrictJSON) throws(GatewayError) -> String {
-        var none = ToolChanges(known: [])
+        var none = ToolChanges(known: [], allowed: false)
         return try systemText(content, changes: &none)
     }
 
@@ -424,15 +444,21 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
         case .some(.array(let calls)):
             for call in calls {
                 guard case .object = call, let function = call["function"], case .object = function else { throw malformed }
-                let arguments = function["arguments"]?.stringValue ?? ""
                 guard let name = function["name"]?.stringValue, OpenAICompatibleStream.isToolName(name) else {
                     throw .upstream(status: 502, message: OpenAICompatibleStream.invalidToolName)
+                }
+                // Arguments that are not text get the marker, never `{}` (Task 10 minor, fixed in Task 11; Ruling 58 m1).
+                let input: StrictJSON
+                switch function["arguments"] {
+                case .none, .some(.null): input = OpenAICompatibleStream.toolInput("")
+                case .some(.string(let arguments)): input = OpenAICompatibleStream.toolInput(arguments)
+                case .some: input = OpenAICompatibleStream.invalidArguments
                 }
                 content.append(.object([
                     .init("type", .string("tool_use")),
                     .init("id", .string(OpenAICompatibleStream.toolUseId(call["id"]?.stringValue ?? ""))),
                     .init("name", .string(name)),
-                    .init("input", OpenAICompatibleStream.toolInput(arguments)),
+                    .init("input", input),
                 ]))
             }
         default: throw malformed

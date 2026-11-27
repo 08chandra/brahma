@@ -223,6 +223,27 @@ enum OpenAIFixture {
         #expect(try await Self.respond(try OpenAIFixture.data("stream-text", "sse"), contentType: "text/event-stream").error?.status == 502)
     }
 
+    /// Task 10 minor (fixed in Task 11): in a whole response, `arguments` that are not a string (an object, a number, a list,
+    /// a bool) get the marker input, as unparsable text does — never `{}`, which fails open. Absent or null arguments are a
+    /// call with no parameters (`{}`), as in the stream.
+    @Test func nonStringArgumentsGetTheMarker() async throws {
+        func whole(_ arguments: String) -> Data {
+            Data(#"{"id":"c","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read"\#(arguments)}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#.utf8)
+        }
+        for arguments in [#","arguments":{"path":"x"}"#, #","arguments":7"#, #","arguments":["x"]"#, #","arguments":true"#] {
+            let (outcome, error, response) = try await Self.respond(whole(arguments))
+            #expect(error == nil && outcome?.complete == true, "\(arguments)")
+            #expect(response?.text.contains(#"{"type":"tool_use","id":"call_1","name":"Read","input":{"_brahma_invalid_arguments":true}}"#) == true,
+                    "\(arguments): \(response?.text ?? "")")
+        }
+        for arguments in ["", #","arguments":null"#] {
+            let (_, error, response) = try await Self.respond(whole(arguments))
+            #expect(error == nil, "\(arguments)")
+            #expect(response?.text.contains(#"{"type":"tool_use","id":"call_1","name":"Read","input":{}}"#) == true,
+                    "\(arguments): \(response?.text ?? "")")
+        }
+    }
+
     /// Arguments that are not a JSON object (cut, an array, a repeated key, prose) become a `tool_use` with the marker input
     /// `{"_brahma_invalid_arguments": true}` (Ruling 58 m1: never `{}`, which a tool with only optional parameters would run
     /// on): the reply is still relayed and the tool's validation refuses the marker, whole or streamed.
@@ -281,6 +302,32 @@ enum OpenAIFixture {
         for request in refused {
             let error = Self.refusal(request)
             #expect(error?.status == 400, "\(request): \(String(describing: error))")
+        }
+    }
+
+    /// Task 10 minor (fixed in Task 11): a well-formed removal naming a tool the request does not hold changes nothing and is
+    /// dropped (refusing it protected nothing and made the 400 permanent for the session). An addition of such a tool, a
+    /// malformed removal and any tool change in the top-level system stay refused.
+    @Test func removalOfAnAbsentToolIsDropped() throws {
+        let tools = #""tools":[{"name":"Search","input_schema":{"type":"object"}},{"name":"get_forecast","input_schema":{"type":"object"}}]"#
+        func change(_ type: String, _ name: String) -> String {
+            #"{"role":"system","content":[{"type":"\#(type)","tool":{"type":"tool_reference","name":"\#(name)"}}]}"#
+        }
+        let body = #"{"model":"m","max_tokens":5,\#(tools),"messages":[\#(change("tool_removal", "gone_tool")),{"role":"user","content":"hi"}]}"#
+        let sent = try Self.sentText(body)
+        #expect(sent.contains(#""name":"Search""#) && sent.contains(#""name":"get_forecast""#), "\(sent)")
+        #expect(!sent.contains("gone_tool") && !sent.contains("tool_removal"), "\(sent)")
+        // Removing an absent tool does not disturb a real removal next to it.
+        let both = #"{"model":"m","max_tokens":5,\#(tools),"messages":[\#(change("tool_removal", "gone_tool")),\#(change("tool_removal", "get_forecast"))]}"#
+        let removed = try Self.sentText(both)
+        #expect(!removed.contains("get_forecast") && removed.contains(#""name":"Search""#), "\(removed)")
+        for refused in [
+            #"{"model":"m","max_tokens":5,\#(tools),"messages":[\#(change("tool_addition", "gone_tool"))]}"#,
+            #"{"model":"m","max_tokens":5,\#(tools),"messages":[\#(change("tool_removal", "gone tool"))]}"#,
+            #"{"model":"m","max_tokens":5,\#(tools),"system":[{"type":"tool_removal","tool":{"type":"tool_reference","name":"gone_tool"}}],"messages":[]}"#,
+            #"{"model":"m","max_tokens":5,\#(tools),"system":[{"type":"tool_removal","tool":{"type":"tool_reference","name":"Search"}}],"messages":[]}"#,
+        ] {
+            #expect(Self.refusal(refused)?.status == 400, "\(refused)")
         }
     }
 
