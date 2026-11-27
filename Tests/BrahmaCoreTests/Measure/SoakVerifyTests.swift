@@ -214,6 +214,23 @@ import GRDB
         #expect(held.result == .fail && held.detail.contains("on hold (network"), "\(held.detail)")
     }
 
+    /// Task 7 review minor #3: with no restart since the checkpoint, companyRunning is `wait` (nothing to count turns from), never
+    /// `pass`; a hold or a pause still fails it.
+    @Test func noRestartCompanyRunningNeverPasses() throws {
+        let rig = try Rig()
+        let before = try rig.checkpoint()
+        let idle = try #require(Self.check(try rig.verify(before, engineStartedAt: before.engineStartedAt), "companyRunning"))
+        #expect(idle.result == .wait && idle.detail.contains("no restart since the checkpoint"), "\(idle.detail)")
+        try rig.sql("INSERT INTO engineHold (id, reason, detail, since) VALUES (1, 'network', 'offline', ?)", [SoakVerifyTests.restarted])
+        let held = try #require(Self.check(try rig.verify(before, engineStartedAt: before.engineStartedAt), "companyRunning"))
+        #expect(held.result == .fail && held.detail.contains("on hold (network"), "\(held.detail)")
+        #expect(held.detail.contains("no restart since the checkpoint"), "\(held.detail)")
+        try rig.sql("DELETE FROM engineHold")
+        try rig.sql("UPDATE company SET status = 'paused' WHERE id = ?", [rig.company.id])
+        let paused = try #require(Self.check(try rig.verify(before, engineStartedAt: nil), "companyRunning"))
+        #expect(paused.result == .fail && paused.detail.contains("paused"), "\(paused.detail)")
+    }
+
     /// Fix round 1 #9: a lease whose holder is no agent at all.
     @Test func leaseOfMissingAgentFails() throws {
         let rig = try Rig()

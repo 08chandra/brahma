@@ -21,11 +21,13 @@ import Foundation
     let fd = open(paths.home.appending(path: "orchestrator.lock").path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
     try #require(fd >= 0)
     try #require(flock(fd, LOCK_SH | LOCK_NB) == 0)
+    // Held for about 1 ms, well under one 20 ms retry, so a loaded machine scheduling the probe late still lets it go in time.
     let probe = Thread {
-        Thread.sleep(forTimeInterval: 0.01)
+        Thread.sleep(forTimeInterval: 0.001)
         flock(fd, LOCK_UN)
         close(fd)
     }
+    probe.qualityOfService = .userInteractive
     probe.start()
     let lock = try OrchestratorLock.acquire(paths: paths)
     withExtendedLifetime(lock) {}

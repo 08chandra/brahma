@@ -763,6 +763,64 @@ images (decoded in process only up to 64 Mpx), tables (CSV, 2000 × 100), spread
 clip plays inside a **phone frame**), text and code. Content is sniffed, not trusted by extension; playlists, FIFOs and
 symlinks that leave the run are refused; a company holds 2 GB of artifacts and an agent publishes 20 an hour.
 
+## Measuring a company
+
+`brahma measure` reports how a company is doing, from the engine's own records (the database and the company's own workspace
+repository). Every number carries its denominator (`97.4% (38/39)`). A rate over fewer than 20 events prints
+`insufficient data (n=<n>)`. A metric whose source this build does not have prints `not applicable: <reason>`, and one whose data
+was never recorded prints `not measured: <reason>`. Nothing is estimated. Every metric, its source and its basis is defined in
+[docs/measure/metrics.md](docs/measure/metrics.md). Every mode runs only from your shell: each refuses to run inside an agent turn.
+
+```
+brahma measure <co> [--since <YYYY-MM-DD|all>] [--format md|json]   the report (default window: the last 28 days)
+brahma measure <co> --mission [--since …] [--format md|json]       only the mission subset
+brahma measure <co> --compare <baseline-co> [--mission] [--since …] [--format md|json]   two companies side by side
+brahma measure <co> --verify-landings [--since <date>] [--format md|json]  audit main: exit 0 / 1 / 2
+brahma measure <co> --log-owner-minutes <n> [--day YYYY-MM-DD]     log your own time on the company (owner only)
+brahma measure <co> --soak-checkpoint <file>                       soak harness: write a checkpoint
+brahma measure <co> --soak-verify <file> [--format md|json]        soak harness: judge against it: exit 0 / 1 / 3 / 2
+brahma items link <co> <KEY> regression-of|revert-of <LANDED-KEY>   record a regression or a revert (owner only)
+```
+
+- **The report.** `--since <date>` starts at midnight of that day in your time zone; `--since all` starts when the company was
+  created; the default is the last 28 days. `--format json` prints the same report as JSON (every value, its numerator and
+  denominator, its status and basis). The revert rate's 30-day row needs a window of at least 30 days (`--since` a date 30 or
+  more days back, or `all`); with the default window it reads `not measured` and says why.
+- **The Budget view's MEASURE panel** shows the same report for the selected company: one row per metric with the value exactly
+  as the CLI prints it, the basis beside it, detail rows under a metric that has them, and a 7 days / 28 days / all window
+  picker. It measures again when the company's work or usage changes while Budget is open, or when you press Refresh.
+- **`--verify-landings`** walks `main`'s first-parent history back to the company's first commit and classifies each commit:
+  landed by the merge queue (verified), accepted by you (`brahma main accept`, `brahma merge adopt-main`, a quarantine accept;
+  recorded in `mainAccept`), the imported first commit, or unverified. It prints `landings verified: <p>% (<n>/<d>)` and lists
+  each unverified commit. Exit **0**: every commit is classified. Exit **1**: there are unverified commits, or the walk stopped at
+  its bound of 10,000 commits. Exit **2**: it could not audit (no `main`, an unknown company, a git failure, planted history
+  files, a merge batch moving `main`). An adopt from before `mainAccept` existed covers only the one commit its activity line
+  names. If such an adopt brought in several commits, audit from after it with `--since <a day after it>`.
+- **`--log-owner-minutes <n>`** adds `n` minutes (1–1440) of your own time to that day's count (today when `--day` is omitted).
+  It is the only source of the owner-minutes metric: Brahma never records or estimates your time, and no agent can write it.
+  Without a log the row reads `not measured: no owner-time records`.
+- **`--compare <baseline-co>`** prints both reports over the same window and the same metrics, each cell with its own
+  denominator. A baseline that does not exist or has no landings in the window reads `not measured: <reason>`. For a
+  **single-agent baseline**, create a one-agent company on the same repository and backlog, run it under the same pacing for the
+  same span, then compare. The full procedure is in [docs/measure/metrics.md §15](docs/measure/metrics.md#15-single-agent-baseline-owner-addition-1124-spec-864-baselines-is-the-authority).
+  No script runs the baseline for you.
+- **`--mission`** prints only what a long run is judged on: items landed, owner touches, usage per landed item, green-main
+  rate, turns wasted on rate limits, reserve breaches and idle while actionable.
+- **`--soak-checkpoint <file>`** records the company's `main`, item branches, leases, releases, open merges and running turns
+  (0600, in a directory that exists). **`--soak-verify <file>`** judges the company now against it. Exit **0**: pass. Exit
+  **1**: fail (lost commits, unrecovered leases, stuck merges, a repeated deploy, a turn not recorded as interrupted, or the
+  company not running). Exit **3**: wait, because the engine has not restarted since the checkpoint or has not run 300 s yet.
+  Exit **2**: could not verify.
+
+**The 72-hour soak** (`scripts/soak/run-72h.sh <co> [--hours 72] [--kill-at 24] [--state <dir>] [--resume]`) is yours to run.
+It never runs in the test suite. **It spends real usage:** it runs the company with real agent turns for days, and it refuses to
+start unless `BRAHMA_LIVE=1` is set. It starts `brahma run` itself in a process group of its own, so Ctrl-C on the script never
+stops the engine. It keeps the Mac awake, writes a checkpoint every hour, and at `--kill-at` sends SIGKILL to that engine (after
+checking its pid, start time and command line). It then restarts the engine and records the `--soak-verify` verdict. At hour 48
+it asks you to reboot; after you log in, `--resume` verifies and carries on. At the end it stops its engine, prints `--mission`
+over the soak's days and prints every verdict. It writes only under `--state` (default `~/.brahma-soak/<co>`). Quit the Brahma
+app (or any other `brahma run`) before you start it: only one engine may hold a data home.
+
 ## Memory, Handbook and Resources
 
 Agents and you can find anything the company already knows. One search index covers every source, and the engine filters

@@ -115,8 +115,9 @@ window-filtered query). Writes: `advanceBatch(id:to:base:candidates:landCommit:l
 
 **Landing, as the tree records it (refines the brief):** a landing is a `mergeBatch` row with `landCommit` set **and `step` in
 (`landed`, `recorded`, `cleaned`, `done`)** — `landCommit` alone is written one step before `main` moves. A batch at `landing`
-with `landCommit` set is a landing only if git confirms `landCommit` is an ancestor of `main` (what `repairUnrecordedLandings`
-checks). Landed items = `mergeRequest.itemId` for each id in `landedIds` **whose request is `merged` with `batchId` = that batch**,
+or any earlier step is **not** a landing, even when git shows `main` holds `landCommit`: recovery (`repairUnrecordedLandings`,
+run when the owner resumes the merge queue, or the engine's journal recovery finishing the batch) records it as `landed`, and
+from then it is one. `measure` never asks git whether a batch landed. Landed items = `mergeRequest.itemId` for each id in `landedIds` **whose request is `merged` with `batchId` = that batch**,
 and a batch with no such request is not a landing (ruling R24: the abort paths after `checked` — stopped, main moved, blocked, off
 main, a git error, recovery abandoning the batch — finish the batch to `done` keeping `landCommit`/`landedIds` and requeue the
 requests with the same ids; `mergeBatch.error IS NULL` is no filter, since an inconclusive result sets it after a real landing).
@@ -396,7 +397,10 @@ There is **no per-rejection history row**: `usageState` is overwritten (§2.11).
 `company.ownerReserve` `Migrations.swift:190`). A reserve breach is `sevenDayUtilization >= 1 - reserve`
 (`Pace.reserveLine`, `Pacing.swift:18`; `criticalPathExempt` false at `:29`), the condition that puts a company in
 `paceStrict` (`Orchestrator.swift:705`). **Owner-wide, not per company** (one `usageState` row). The row is overwritten on every
-observation, so breaches have **no history** → Task 5's `reserveBreaches` counter (plan).
+observation, so breaches have **no history** → Task 5's `reserveBreaches` counter. As built (ruling R30): the recorder judges
+each **new** snapshot once (`measureEpoch('usageSnapshotJudged')`) against the **owner-wide** reserve (`SchedulerConfig.ownerReserve`,
+not a company's `ownerReserve` override) and adds one breach per snapshot at or over `1 − reserve` to the owner-wide counter
+(company id `""`) on the day it was observed.
 
 ### 2.12 `sandboxCanary` (`Migrations.swift:840–848`, `v5-owner-guard`) — no record type, raw SQL
 
@@ -497,7 +501,8 @@ lastAccruedAt, 0), CompanyClock.maxGap = 60)`; `lastAccruedAt = now` for every c
 `Store.activeNow(companyId:)` (`:96`), in-transaction `Store.activeNow(db:companyId:)` (`:101`).
 **It is a running total with no history.** "Company-active seconds in the window" (idle-while-actionable denominator, R7(a)
 plan-hours) is **NOT FOUND for a window** → Task 2's `measureCounter` must also carry a daily `activeSeconds` counter that Task 5's
-recorder accrues per tick with the same gap rule; `--since all` may use `companyActivity.activeSeconds` directly.
+recorder accrues per tick with the same gap rule. As built (ruling R31): every window, `--since all` included, reads only the
+daily counters; `companyActivity.activeSeconds` is not read by `measure`.
 
 ### 2.17 `workLease` (`Migrations.swift:277–284` `v3-leases`; `:1648` `vC-refs`) and item status
 
@@ -571,9 +576,11 @@ at <sha7> by the owner|the engine` (`:113`). The current record of `main` is `co
   `paceClosed`; `:775` `dispatchTick(…)` — **the last step**. The measure recorder goes right after it (R5), receiving
   `decisions`, `paceClosed`, `paceStrict`, the per-company running-turn counts (`runningByCompany`) and `now`.
 
-Idle-while-actionable per tick for a running company `c`: no running turn (`runningByCompany[c.id] == 0`) **and** (some agent
-of `c` is `blocked` with a `usageLimit` blocker, or `decisions[c.id]` is `.closed`, or `paceClosed.contains(c.id)` with at
-least one `ready` agent). Reserve breach per tick: `paceStrict.contains(c.id)` (count the transition into it, not every tick).
+Idle-while-actionable per tick for a running company `c`, as built (`MeasureRecorder.idleCause`): no running turn
+(`runningByCompany[c.id] == 0`) **and**, among its unpaused agents, one `blocked` with a `usageLimit` blocker, or one `ready`
+while `decisions[c.id]` is `.closed` (five-hour gate), or one `ready` while `paceStrict` (owner reserve) or `paceClosed` (weekly
+pace) holds the company. The hourly `turnBudget` blocker is not usage-waiting and is not counted (ruling R31). Reserve breach:
+one per new usage snapshot at or over `1 − owner reserve` (ruling R30, §2.11), not a per-tick transition.
 Turn-level: `turn.outcome = 'usageLimited'` (§2.10).
 
 ### 3.2 `openAuditFollowUp` (Task 2 adds the `regressionOf` link)
@@ -633,7 +640,10 @@ ancestry/environment check is the "refuses inside an agent turn" the plan asks f
   `:52`, `load()` `:62`, `refresh()` `:73`; the measurement runs off the main actor in `Task.detached` (`:85`) over `store`
   (`Store` is `Sendable`). **Pattern for `MeasureModel`:** an `@Observable` class owned by `AppModel`, `show(companyId:)` running
   `Measure.report(…)` in `Task.detached`, a fourth `Panel(title: "MEASURE")` appended after `StoragePanel` in `BudgetView`
-  (ruling R10), and `BudgetModel.panels` gaining `"MEASURE"`.
+  (ruling R10). As built (Task 8): `MeasureModel` (`Sources/BrahmaAppModel/Measure/MeasureModel.swift`) owned by `AppModel.measure`
+  (`ensureMeasure()`), titled `MeasureModel.title` = `"MEASURE"`; `MeasurePanel` (`Sources/BrahmaApp/Views/MeasurePanel.swift`)
+  after `StoragePanel`; `BudgetModel.panels` is unchanged. Refreshed when `refreshSnapshot` sees the work or usage snapshot change
+  while Budget is shown (no change topics on this tree, ruling R1).
 - `AppModel.storage` / `storageSizing`: `Sources/BrahmaAppModel/AppModel.swift:92–94`.
 
 ---
@@ -662,7 +672,7 @@ ancestry/environment check is the "refuses inside an agent turn" the plan asks f
 |---|---|---|
 | `reviewAudit.verdict = 'fail'` | the stored values are `ok` / `failed` (`Store+Audit.swift:488`) | Task 4 uses `'failed'` |
 | `mergeBatch.landedIds` as item ids | they are `mergeRequest.id`s; item = `mergeRequest.itemId` (`MergeQueue.swift:537`) | Tasks 2–4, 6 join through `mergeRequest` |
-| "landing = `landCommit` set" | `landCommit` is written at step `checked`, before `main` moves; post-`checked` aborts finish to `done` keeping it | Task 3: require `step` ≥ `landed` (or git confirmation at `landing`) and, per R24, a `landedIds` request `merged` with `batchId` = the batch |
+| "landing = `landCommit` set" | `landCommit` is written at step `checked`, before `main` moves; post-`checked` aborts finish to `done` keeping it | Task 3: require `step` ≥ `landed` (a batch at `landing` or earlier is not a landing until recovery records it) and, per R24, a `landedIds` request `merged` with `batchId` = the batch |
 | per-item base commit for a batch | `mergeRequest.baseCommit` is the batch base for every member | Tasks 3–4: base = `<mergedCommit>^1` / previous candidate |
 | company-active seconds **in a window** | `companyActivity` is a running total | Task 2 schema + Task 5 recorder: daily `activeSeconds` counter |
 | reserve breach / cap overrun records | none (`usageState` is one overwritten row; no cap record) | Task 5 recorder `reserveBreaches`; cap overruns are `not applicable: no cap-overrun record` (no source exists) |

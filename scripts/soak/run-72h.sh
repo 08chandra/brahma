@@ -4,8 +4,9 @@
 #   BRAHMA_LIVE=1 scripts/soak/run-72h.sh <company> [--hours 72] [--kill-at <h>] [--state <dir>] [--resume]
 #
 # What it does:
-#   - starts `brahma run` itself and records its pid and start time (<state>/engine.pid, engine.lstart); a process is treated
-#     as that engine only while both match and its command line is `brahma run` (there is no engine service on this tree);
+#   - starts `brahma run` itself, in a process group of its own (so a Ctrl-C on this script never reaches the engine), and
+#     records its pid and start time (<state>/engine.pid, engine.lstart); a process is treated as that engine only while both
+#     match and its command line is `brahma run` (there is no engine service on this tree);
 #   - keeps the Mac awake for its own lifetime (`caffeinate -i -w <this script>`);
 #   - takes a checkpoint every hour: `brahma measure <co> --soak-checkpoint <state>/checkpoints/hNN.json`;
 #   - at --kill-at (default 24) checks that the recorded pid's command line is `brahma run`, sends SIGKILL to that pid only
@@ -49,14 +50,18 @@ while [ $# -gt 0 ]; do
         *) usage ;;
     esac
 done
-for n in "$HOURS" "$KILL_AT"; do
-    case "$n" in ''|*[!0-9]*) echo "run-72h.sh: --hours and --kill-at take whole hours" >&2; exit 2 ;; esac
-done
+# Exits 2 unless `$2` is a whole number; `$1` names where it came from.
+whole() {
+    case "$2" in ''|*[!0-9]*) echo "run-72h.sh: $1 must be a whole number, not '$2'" >&2; exit 2 ;; esac
+}
+whole --hours "$HOURS"
+whole --kill-at "$KILL_AT"
 [ "$HOURS" -ge 1 ] || usage
 [ -n "$STATE" ] || STATE="$HOME/.brahma-soak/$CO"
 BRAHMA="${BRAHMA_BIN:-brahma}"
 command -v "$BRAHMA" >/dev/null 2>&1 || { echo "run-72h.sh: '$BRAHMA' not found (set BRAHMA_BIN to the built brahma)" >&2; exit 2; }
 command -v caffeinate >/dev/null 2>&1 || { echo "run-72h.sh: caffeinate not found (macOS only)" >&2; exit 2; }
+command -v perl >/dev/null 2>&1 || { echo "run-72h.sh: perl not found (it starts the engine in its own process group)" >&2; exit 2; }
 
 # Wall seconds the engine runs before a verdict is asked for; the verdict itself waits (exit 3) until the engine has settled.
 SETTLE=330
@@ -87,8 +92,11 @@ engine_pid() {
     esac
 }
 
+# `brahma run` in a process group of its own: perl makes itself a group leader and execs the engine in place, so `$!` (perl's
+# pid) is the engine's pid, and its start time is the one `ps` reads now. A Ctrl-C at the terminal signals the script's group
+# only; the engine is stopped by the SIGTERM this script sends, or by the owner.
 start_engine() {
-    "$BRAHMA" run >>"$STATE/engine.log" 2>&1 &
+    perl -e 'setpgrp(0, 0); exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n"' "$BRAHMA" run >>"$STATE/engine.log" 2>&1 &
     echo $! > "$STATE/engine.pid"
     ps -o lstart= -p $! > "$STATE/engine.lstart" 2>/dev/null || true
     sleep 5
@@ -149,12 +157,13 @@ sleep_until_hour() {
     while [ "$(date +%s)" -lt "$due" ]; do sleep 60; done
 }
 
-# Ctrl-C or a TERM stops the soak, never the engine: say what is left running and how to go on.
+# Ctrl-C or a TERM stops the soak, never the engine (it runs in its own process group, out of the terminal's reach): say what
+# is left running and how to go on.
 on_signal() {
     local pid
     pid="$(engine_pid)"
     if [ -n "$pid" ]; then
-        log "soak script stopped by a signal; brahma run (pid $pid) keeps running. Stop it with: kill -TERM $pid; or go on with --resume"
+        log "soak script stopped by a signal; brahma run (pid $pid, its own process group) keeps running. Stop it with: kill -TERM $pid; or go on with --resume"
     else
         log "soak script stopped by a signal; no engine of this soak is running"
     fi
@@ -166,12 +175,17 @@ if [ "$RESUME" -eq 1 ]; then
     [ -f "$STATE/started-at" ] && [ -f "$STATE/hour" ] && [ -f "$STATE/params" ] && [ -f "$STATE/last-checkpoint" ] || { echo "run-72h.sh: nothing to resume in $STATE" >&2; exit 2; }
     START="$(cat "$STATE/started-at")"
     HOUR="$(cat "$STATE/hour")"
-    case "$START$HOUR" in ''|*[!0-9]*) echo "run-72h.sh: $STATE/started-at or $STATE/hour is not a number" >&2; exit 2 ;; esac
-    # The run's own --hours and --kill-at, unless given again now.
-    read -r SAVED_HOURS SAVED_KILL < "$STATE/params"
+    whole "$STATE/started-at" "$START"
+    whole "$STATE/hour" "$HOUR"
+    # The run's own --hours and --kill-at, unless given again now. `read` fails on a file without a final newline: not fatal,
+    # each value is checked on its own below.
+    SAVED_HOURS=""; SAVED_KILL=""
+    read -r SAVED_HOURS SAVED_KILL < "$STATE/params" || true
     [ "$HOURS_GIVEN" -eq 1 ] || HOURS="$SAVED_HOURS"
     [ "$KILL_GIVEN" -eq 1 ] || KILL_AT="$SAVED_KILL"
-    case "$HOURS$KILL_AT" in ''|*[!0-9]*) echo "run-72h.sh: $STATE/params is not two whole numbers" >&2; exit 2 ;; esac
+    whole "--hours (or the first number in $STATE/params)" "$HOURS"
+    whole "--kill-at (or the second number in $STATE/params)" "$KILL_AT"
+    [ "$HOURS" -ge 1 ] || usage
     log "resuming at hour $HOUR after the reboot ($HOURS h, kill at h$KILL_AT)"
     # A pid from before the reboot names nothing of ours now.
     rm -f "$STATE/engine.pid" "$STATE/engine.lstart"
@@ -224,7 +238,7 @@ PID="$(engine_pid)"
 if [ -n "$PID" ]; then
     log "stopping brahma run (pid $PID) with SIGTERM"
     kill -TERM "$PID" 2>/dev/null || log "pid $PID already gone"
-    wait_gone "$PID" 120 || log "pid $PID still there 120 s after SIGTERM; stop it yourself (Ctrl-C in its terminal or SIGTERM)"
+    wait_gone "$PID" 120 || log "pid $PID still there 120 s after SIGTERM; stop it yourself: kill -TERM $PID"
 fi
 echo
 echo "== mission =="

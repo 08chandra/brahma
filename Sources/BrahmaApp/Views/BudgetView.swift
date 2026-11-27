@@ -1,8 +1,8 @@
 import SwiftUI
 import BrahmaAppModel
 
-/// Work › Budget (Plan ML, ruling h): WEEKLY (the 7-day pace), BY MODE (where this week's spend went) and STORAGE. The top
-/// bar's "Budget by mode" popover stays as it is.
+/// Work › Budget (Plan ML, ruling h): WEEKLY (the 7-day pace), BY MODE (where this week's spend went), STORAGE and MEASURE
+/// (Plan X6a, `brahma measure` of the selected company). The top bar's "Budget by mode" popover stays as it is.
 struct BudgetView: View {
     let model: AppModel
 
@@ -29,6 +29,7 @@ struct BudgetView: View {
                     }
                     .fixedSize(horizontal: false, vertical: true)
                     StoragePanel(storage: budget.storage, timeZone: model.ownerTimeZone)
+                    if let measure = model.measure { MeasurePanel(measure: measure) }
                 }
                 .padding(BrahmaTheme.spaceS)
             } else {
@@ -36,7 +37,10 @@ struct BudgetView: View {
             }
         }
         .background(BrahmaTheme.bg0)
-        .task(id: model.selectedCompanyId) { model.ensureStorage() }
+        .task(id: model.selectedCompanyId) {
+            model.ensureStorage()
+            model.ensureMeasure()
+        }
     }
 
     private func paceColor(_ budget: BudgetModel) -> Color {

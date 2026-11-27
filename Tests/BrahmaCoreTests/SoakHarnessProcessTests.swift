@@ -76,6 +76,18 @@ import GRDB
         return try condition()
     }
 
+    /// A process's short name (the executable's, as `ps -o comm` shows it), or nil when it cannot be read.
+    static func processName(_ pid: pid_t) -> String? {
+        #if canImport(Darwin)
+        var buffer = [CChar](repeating: 0, count: 256)
+        let n = proc_name(pid, &buffer, UInt32(buffer.count))
+        return n > 0 ? String(cString: buffer) : nil
+        #else
+        guard let data = FileManager.default.contents(atPath: "/proc/\(pid)/comm") else { return nil }
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .newlines)
+        #endif
+    }
+
     @Test func killNineThenRecover() throws {
         let home = try ShortHome()
         let bin = try FakeTools.bin(["claude": Self.fakeClaude])
@@ -116,13 +128,14 @@ import GRDB
                 engine.finish()
             }
             // Then any turn process of this company still alive (a fake `claude` the engines spawned for this test, in its own
-            // session): its group is killed, only while it is still that group's leader and started after this test began, so a
-            // recycled pid is never signalled.
+            // session): its group is killed, only while it is still that group's leader, started after this test began, and is the
+            // fake's own process (it execs `sleep`), so a recycled pid is never signalled.
             let pids = (try? store.writer.read { db in
                 try Int32.fetchAll(db, sql: "SELECT pid FROM turn WHERE companyId = ? AND pid IS NOT NULL", arguments: [company.id])
             }) ?? []
             for pid in pids {
-                guard let entry = ProcessTable.entry(pid), !entry.isZombie, entry.pgid == pid, entry.start >= testStart else { continue }
+                guard let entry = ProcessTable.entry(pid), !entry.isZombie, entry.pgid == pid, entry.start >= testStart,
+                      Self.processName(pid) == "sleep" else { continue }
                 killpg(pid, SIGKILL)
             }
         }

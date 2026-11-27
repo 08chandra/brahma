@@ -33,17 +33,17 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 
 | Term | Definition (**controller's call**) | Source |
 |---|---|---|
-| **landing** | one move of `main` by the merge queue: a `mergeBatch` row with `landCommit` set **and** `step` in `landed`, `recorded`, `cleaned`, `done` **and** at least one landed item (a batch at `landing` counts only when git confirms `landCommit` is an ancestor of `main`; one at `checked` has not moved `main` yet). **Ruling R24:** a **landed item** is a `landedIds` request with `mergeRequest.status = 'merged'` **and** `mergeRequest.batchId` = that batch. `landCommit`/`landedIds` are written at `checked`, and the abort paths after it (stopped, main moved, blocked, off main, a git error, recovery abandoning the batch) finish the batch to `done` with both still set and requeue its requests (same ids); such a batch has no merged request of its own and is not a landing, and a requeued request lands once, in the batch that merged it. `mergeBatch.error IS NULL` is not used as a filter (an inconclusive result sets it after a real landing). | `mergeBatch.landCommit`, `mergeBatch.step`, `mergeBatch.landedIds`, `mergeRequest.status/batchId` |
-| **landed item** | an item whose merge request is in that batch's `landedIds`: `mergeRequest.itemId` for each id in `landedIds` (`landedIds` hold merge-request ids). The item's own merged commit is `mergeBatch.candidates[requestId]` = `mergeRequest.mergedCommit`. | `mergeBatch.landedIds`, `mergeRequest.itemId`, `mergeRequest.mergedCommit` |
+| **landing** | one move of `main` by the merge queue: a `mergeBatch` row with `landCommit` set **and** `step` in `landed`, `recorded`, `cleaned`, `done` **and** at least one landed item. A batch at `landing` or any earlier step is **not** a landing, even when `main` already holds its `landCommit` (`checked` has not moved `main` yet; at `landing` the move may not have been recorded): recovery (`repairUnrecordedLandings`, run when the owner resumes the merge queue, or the engine's own journal recovery finishing the batch) records it as `landed`, and from then it is a landing. **Ruling R24:** a **landed item** is a `landedIds` request with `mergeRequest.status = 'merged'` **and** `mergeRequest.batchId` = that batch. `landCommit`/`landedIds` are written at `checked`, and the abort paths after it (stopped, main moved, blocked, off main, a git error, recovery abandoning the batch) finish the batch to `done` with both still set and requeue its requests (same ids); such a batch has no merged request of its own and is not a landing, and a requeued request lands once, in the batch that merged it. `mergeBatch.error IS NULL` is not used as a filter (an inconclusive result sets it after a real landing). | `mergeBatch.landCommit`, `mergeBatch.step`, `mergeBatch.landedIds`, `mergeRequest.status/batchId` |
+| **landed item** | an item whose merge request is in that batch's `landedIds` **and** that the batch merged (ruling R24): `mergeRequest.itemId` for each id in `landedIds` (`landedIds` hold merge-request ids) whose request has `mergeRequest.status = 'merged'` **and** `mergeRequest.batchId` = that batch. A request in `landedIds` that was requeued from an aborted batch is not that batch's landed item. The item's own merged commit is `mergeBatch.candidates[requestId]` = `mergeRequest.mergedCommit`. | `mergeBatch.landedIds`, `mergeRequest.itemId`, `mergeRequest.status/batchId`, `mergeRequest.mergedCommit` |
 | **landing time** | the landed requests' `mergeRequest.finishedAt` (stamped when the landing is recorded), else `mergeBatch.updatedAt` **(Task 0 proposal, not a controller's call)**. | `mergeRequest.finishedAt`, `mergeBatch.updatedAt` |
 | **approval time** | `mergeRequest.enqueuedAt`: an item is queued the moment its review approves it. | `mergeRequest.enqueuedAt` |
 | **caught in review** | a `changesRequested` event followed by a later `submitted` event on the same item (a resubmission is a code change: an unchanged worktree commits nothing). Spec §8.6.1's "follow-up changed code covered by the finding" needs path-level findings that reviews do not record yet; until they do, this is the definition. The owner's addition (2026-11-24) narrows the headline to **confirmed** catches, below. | `workItemEvent.kind` = `changesRequested`, `submitted` |
-| **confirmed catch** (owner, 11/24) | a caught-in-review sequence whose resubmission was then confirmed by a later passing check on that item: a `verificationRun` for that `itemId` (`purpose` `submit` or `merge`) with `status = 'passed'` finishing after the `submitted` event, **or** a `mergeRun` with `kind = 'item'` and that `itemId` and `status = 'passed'` finishing after it, **or** — when `company.mainCheck` is set — the `mergeRun` with `kind = 'main'` and `status = 'passed'` of the batch that landed the item (`mergeRun.batchId = mergeRequest.batchId`, `mergeRequest.status = 'merged'`) finishing after it. A change request with no later confirmed resubmission is not counted. | `verificationRun.itemId/purpose/status/finishedAt`, `mergeRun.kind/itemId/status/batchId/finishedAt`, `mergeRequest.batchId/status`, `company.mainCheck` |
+| **confirmed catch** (owner, 11/24) | a caught-in-review sequence whose resubmission was then confirmed by a later passing check on that item: a `verificationRun` for that `itemId` (`purpose` `submit` or `merge`) with `status = 'passed'` finishing after the `submitted` event, **or** a `mergeRun` with `kind = 'item'` and that `itemId` and `status = 'passed'` finishing after it, **or** a passed `main`-kind `mergeRun` of the batch that merged the item, at that batch's `landCommit` (`mergeRun.batchId = mergeRequest.batchId`, `mergeRequest.status = 'merged'`, `mergeRun.candidateCommit = mergeBatch.landCommit`, `status = 'passed'`) finishing after it. That main run confirms the catch **whether or not `company.mainCheck` is set now**: main runs exist only while it was set, so the runs are the record, not the current setting (rulings R23, R26). A change request with no later confirmed resubmission is not counted. | `verificationRun.itemId/purpose/status/finishedAt`, `mergeRun.kind/itemId/status/batchId/candidateCommit/finishedAt`, `mergeRequest.batchId/status`, `mergeBatch.landCommit` |
 | **escaped** | a defect found after landing, **keyed to the target item's landing time**: a `regressionOf` link to an item that landed in the window (the link may be created at any time up to now), **plus** a failed audit of an item that landed in the window (`reviewAudit.verdict = 'failed'` — the stored value; auto-merged items that escaped review), **deduplicated by the landed (target) item**: the audit's follow-up item carries a `regressionOf` link to the same item, so one defect counts once. The detail lists the source of each. | `workItemLink.kind = regressionOf` (migration `vX6a-measure`), `reviewAudit.verdict`, `reviewAudit.auditedAt` |
 | **revert** | a `revertOf` link to a landed item, **or** an engine-detected exact inverse: the stable patch-id of `git diff <merged> <base>` for landed item L equals the patch-id of `git diff <base'> <merged'>` of a later landed item within the lookback. `base` is the landed commit's first parent (in a batch of several items, the previous candidate), not `mergeRequest.baseCommit`, which is the batch's base. Partial reverts are found only through links. | `workItemLink.kind = revertOf`; git `patch-id --stable` over `mergeRequest.mergedCommit` |
 | **owner touch** | an ask the owner decided in the window (`ask.ownerDecidedAt` in the window **and** `ask.decidedBy = 'owner'` — an access preset also stamps `ownerDecidedAt`) **plus** an owner-authored message in the company in the window (`message.senderId = 'owner'`, `message.kind <> 'system'`). | `ask.ownerDecidedAt`, `ask.decidedBy`, `message.senderId`, `message.createdAt` |
-| **idle while actionable** | company-active seconds during which the company had no running turn **and** at least one agent was blocked by `usageLimit` or a cap closure, or was ready but held by `paceClosed` / `paceStrict`. Recorded per tick by the measure recorder (there is no such record today). | `measureCounter.idleActionableSeconds` (Task 5), ÷ company-active seconds |
-| **company-active seconds** | the engine's awake clock for the company: seconds it was `running` with no engine hold and no emergency stop, at most 60 s per tick gap (`Store.accrueActiveTime`). The database keeps only a running total, so the windowed value is a daily counter the recorder keeps with the same rule; `--since all` reads the total. | `companyActivity.activeSeconds`; `measureCounter.activeSeconds` (Task 5) |
+| **idle while actionable** | company-active seconds during which the company had no running turn **and** at least one awake (not paused) agent waited on usage: blocked by `usageLimit` (the five-hour gate), ready while that gate is closed, or ready but held by `paceClosed` (weekly pace) / `paceStrict` (owner reserve). Cap closures are X1's and absent. The hourly `turnBudget` blocker is **not** usage-waiting and is not counted (ruling R31). Recorded per tick by the measure recorder. | `measureCounter.idleActionableSeconds` (Task 5), ÷ company-active seconds |
+| **company-active seconds** | the engine's awake clock for the company: seconds it was `running` with no engine hold and no emergency stop, at most 60 s per tick gap (`Store.accrueActiveTime`). The database keeps only a running total, so the windowed value is a daily counter the recorder keeps with the same rule; every window, `--since all` included, reads the daily counters only (ruling R31), so time from before the recorder first ran is never counted. | `measureCounter.activeSeconds` (Task 5); `companyActivity.activeSeconds` is the engine's running total, not read by `measure` |
 
 ---
 
@@ -67,7 +67,7 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 | **Numerator (N)** | items of the population with a `revertOf` link pointing at them whose linked item landed within N days of the landing, or whose landed range is the exact inverse (patch-id) of a later landing within N days. |
 | **Denominator (N)** | the population. |
 | **Source** | `workItemLink` (`revertOf`), `mergeRequest.mergedCommit`, git `diff`/`patch-id --stable` in the company workspace. Bounded: ≤ 2000 landed items per run, each git call ≤ 10 s. |
-| **Status** | `insufficient data (n=…)` below 20 in the denominator; `not measured: no landings old enough` when the denominator is empty. |
+| **Status** | `insufficient data (n=…)` below 20 in the denominator. With no landing in the window: `not measured: no landings in the window`. A row whose population is empty says why (ruling R28): `not measured: no landings at least <N> d old in the window (window starts <date>)`, or `not measured: no readable landings at least <N> d old (<k> excluded)` when git could not read them. **The 30-day row needs a window of at least 30 days** (`--since` a date 30 or more days back, or `--since all`): with the default 28-day window no landing in it can be 30 days old, so the 30 d row is always `not measured` and says so. Items whose commits git could not read, without a merged commit, or past the scan bound are left out of every row with the basis saying how many. |
 
 ### 3. Review catch rate (spec §8.6.1; owner addition 11/24: confirmed catches only)
 
@@ -140,9 +140,12 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 | channel refusals | — | X4 channels not merged | `not applicable: channels (X4) absent` |
 | DLP hits | merge requests bounced for a secret: `mergeRequest.failure = 'secretFound'` | `mergeRequest.failure/finishedAt` | `ok` |
 | canary passes | `sandboxCanary` rows with `passedAt` in the window — **owner-wide** (the table has no `companyId`; a re-pass overwrites the earlier row for the same key) | `sandboxCanary.passedAt` | `ok`, basis `owner-wide` |
-| reserve breaches (target 0) | ticks where the company's weekly utilization reached the owner's reserve (`sevenDayUtilization ≥ 1 − reserve`, the `paceStrict` condition), counted as transitions into that state by the measure recorder | `measureCounter.reserveBreaches` (Task 5) | `not measured: recorder not running` until recorded |
+| reserve breaches (target 0) | **one per new usage snapshot** of the owner's account observed at or over the owner reserve line (`sevenDayUtilization ≥ 1 − reserve`, the `paceStrict` condition), judged once per snapshot by the measure recorder on the day the snapshot was observed (ruling R30). The reserve is the **owner-wide** one (`SchedulerConfig.ownerReserve`), not a company's override, and the count is **owner-wide** (the usage snapshot is the owner's account): every company's report shows the same number, basis `owner-wide`. Snapshots observed before the recorder first ran are not counted. The count scales with how often usage is observed; the target is 0 either way. | `measureCounter.reserveBreaches` under company id `""` (Task 5), `measureEpoch` (`recorder`, `usageSnapshotJudged`) | `ok` once the recorder has run; `not measured: recorder not running` before |
 | cap overruns (target 0) | running turns above the company's mode cap at any tick | no record exists; nothing today over-admits by design | `not applicable: no cap-overrun record` unless Task 5 records one |
 | access refusals | refused `request_access` calls | `accessRefusal.createdAt/kind` | `ok` (detail row) |
+| turns wasted on rate limits (target 0) | turns that ended `usageLimited` | `turn.outcome`, `turn.startedAt` | `ok` |
+
+The headline of Safety is the sum of the measured target-0 rows (turns wasted on rate limits + reserve breaches), shown as a count with target 0; the other rows are counts without a target.
 
 ### 10. Non-code acceptance (spec §8.6.1)
 
@@ -157,19 +160,20 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 | | |
 |---|---|
 | **Definition** | for each (role, model): first-pass rate, confirmed review catch rate, rework rounds and `$LE` per landed item, each with its denominator. |
-| **Attribution** | the landed item's assignee (`itemFact.ownerId` → `agent.role`, `agent.model`); the item's work turns' `turn.modelsUsed` is shown when it names a different model family than `agent.model` (the owner may have changed the agent's model since; `modelsUsed` is cumulative over resumed sessions, so it is shown, not used to split cost). **Routed model and provider: `not applicable: X1 gateway columns absent`.** |
-| **Rows** | per (role, model): landed items (n); first-pass (`itemFact.firstPass`); catches confirmed where the agent was the **reviewer** — the landed item's `itemFact.reviewerId` (the item's reviewer at completion; it exists), falling back to the `workItemEvent.actorId` of the item's `reviewApproved` / `changesRequested` events when `reviewerId` is null — ÷ (caught + escaped) for items it reviewed; rework rounds Σ `itemFact.reworkRounds` ÷ n; `$LE` Σ `itemFact.costLE` ÷ n. |
+| **Attribution** | **role:** the landed item's assignee's role (`itemFact.ownerId` → `agent.role`; an item with no assignee recorded is excluded with the basis saying how many). **Model:** the **majority family** (`haiku`, `sonnet`, `opus`) of the item's counted work turns' `turn.modelsUsed` — one family per turn (a background `haiku` beside another family is not counted; a turn naming several main families, cumulative over `--resume`, names none). Two families tied for most turns, or turns that named models but no single family: **no majority**, the item is **excluded** and the basis says how many. **Only when no turn names any model** is the agent's current `agent.model` used (the basis counts these); an `auto` agent then has no model and the item is excluded with a basis. A review is attributed the same way from the reviewer's own turns on the item. **Routed model and provider: `not applicable: X1 gateway columns absent`** (ruling R4). |
+| **Rows** | per (role, model): landed items (n); first-pass (`itemFact.firstPass`); rework rounds Σ `itemFact.reworkRounds` ÷ n; **review rejections per item** Σ `itemFact.reviewRejections` ÷ n; **turns after first submit** — counted work turns started after the item's first `submitted` event ÷ n; `$LE (subscription)` Σ `itemFact.costLE` ÷ n; and, for the pair as **reviewer**, confirmed catches ÷ (caught + escaped) over the items it reviewed — the landed item's `itemFact.reviewerId` (the item's reviewer at completion), falling back to the `workItemEvent.actorId` of the item's `reviewApproved` / `changesRequested` events when `reviewerId` is null. |
 | **Status** | each row carries its own `insufficient data (n=…)` below 20 landed items. |
-| **Source** | `itemFact.ownerId/reviewerId/firstPass/reworkRounds/costLE`, `agent.role/model`, `turn.modelsUsed`, `workItemEvent.actorId` |
+| **Source** | `itemFact.ownerId/reviewerId/firstPass/reworkRounds/reviewRejections/costLE`, `agent.role/model`, `turn.modelsUsed/kind/startedAt`, `workItemEvent.actorId/kind` |
 
 ### 12. Idle while actionable (plan X6a, controller's call)
 
 | | |
 |---|---|
-| **Definition** | company-active seconds during which the company had no running turn and at least one agent was blocked by `usageLimit` or a cap closure, or ready but held by `paceClosed` / `paceStrict`, ÷ company-active seconds in the window. |
+| **Definition** | company-active seconds during which the company had no running turn and at least one awake agent waited on usage (blocked by `usageLimit`, ready while the five-hour gate is closed, or ready but held by `paceClosed` / `paceStrict`), ÷ company-active seconds in the window. The hourly `turnBudget` blocker is not usage-waiting and is not counted; cap closures are X1's and absent (ruling R31). |
 | **Numerator** | Σ `measureCounter.idleActionableSeconds` over days in the window (accrued per tick by the recorder with the engine's own gap rule, ≤ 60 s per tick). |
-| **Denominator** | Σ `measureCounter.activeSeconds` over the same days (`companyActivity.activeSeconds` for `--since all`). |
-| **Status** | `not measured: recorder not running` when no counter rows exist for the window (the recorder ships with Task 5; days before it are stated in the basis). |
+| **Denominator** | Σ `measureCounter.activeSeconds` over the same days — for every window, `--since all` included: the daily counters only, never `companyActivity`'s running total (ruling R31). |
+| **Events (n)** | the **days** with an active-seconds record in the window, not the seconds (ruling R32): below 20 such days the metric is `insufficient data (n=<days>)`, and the basis says n counts days. |
+| **Status** | `not measured: no active-seconds records in window` when no day of the window has a counter row; days before the recorder first ran are stated in the basis (`recorded since <day>`). |
 | **Detail** | the share of idle seconds by cause: five-hour gate (`usageLimit`), weekly pace (`paceClosed`), reserve (`paceStrict`). |
 
 ### 13. Merged items per dollar and per plan-hour (owner addition 11/24)
@@ -177,16 +181,16 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 | | |
 |---|---|
 | **items per dollar** | landed items in the window ÷ Σ `itemFact.costLE` of those items, labelled **`$LE (subscription)`**. `$ (gateway)`: `not applicable: X1 gateway columns absent`. With Σ cost = 0 (no fact rows, or facts without cost): `not measured: no cost recorded for the landed items`. Printed as `<n> items per $LE 100 (n/Σ)`. |
-| **items per plan-hour** | landed items in the window ÷ company-active hours in the window (`measureCounter.activeSeconds` ÷ 3600; `companyActivity.activeSeconds` for `--since all`). "Plan-hour" is an hour the company was awake under the owner's plan, never wall-clock. With no active-time record for the window: `not measured: no company-active time recorded for the window`. |
-| **Source** | landings, `itemFact.costLE`, `measureCounter.activeSeconds`, `companyActivity.activeSeconds` |
+| **items per plan-hour** | landed items in the window ÷ company-active hours in the window (Σ `measureCounter.activeSeconds` ÷ 3600, the daily counters only, `--since all` included — ruling R31). "Plan-hour" is an hour the company was awake under the owner's plan, never wall-clock. Items that landed **before the first day with an active-seconds record** are left out of the numerator (their hours were never counted) and the basis says how many. With no active-time record for the window: `not measured: no active-seconds records in window`. The 20-event rule counts the landed items (the numerator, ruling R19). |
+| **Source** | landings, `itemFact.costLE`, `measureCounter.activeSeconds` |
 
 ### 14. Owner intervention minutes per item (owner addition 11/24)
 
 | | |
 |---|---|
 | **Definition** | Σ `measureCounter.ownerInterventionSeconds` in the window ÷ 60 ÷ landed items in the window. |
-| **Source** | **the owner's own log only**: `brahma measure <co> --log-owner-minutes <n> [--day YYYY-MM-DD]` adds `n × 60` to that day's counter (today in the owner's time zone when `--day` is omitted). |
-| **Status** | with no rows in the window: `not measured: no owner-time records`. |
+| **Source** | **the owner's own log only**: `brahma measure <co> --log-owner-minutes <n> [--day YYYY-MM-DD]` adds `n × 60` to that day's counter (today in the owner's time zone when `--day` is omitted; `n` is 1–1440 per log; a day that has not begun is refused). **Owner-only:** it runs only from the owner's shell (refused inside an agent turn) and the store write takes the owner principal (`Store.logOwnerMinutes(…owner:)`); the generic counter path refuses this counter (ruling R32), so no agent can write owner minutes. It prints one line and no report. |
+| **Status** | with no rows in the window: `not measured: no owner-time records`. Otherwise a count (never `insufficient`) ÷ landed items. |
 | **Plainly** | Brahma records no owner time on its own and never estimates it. Inbox decisions and messages are counted in metric 6 as touches, not as minutes. If the owner logs nothing, this row says so. |
 
 ### 15. Single-agent baseline (owner addition 11/24; spec §8.6.4 "Baselines" is the authority)
@@ -251,21 +255,57 @@ while something holds the `flock` on `<home>/orchestrator.lock`, and it started 
      is no execution counter). Channel actions: `not applicable` (X4 absent);
   6. `interruptedTurnsRecorded` — every turn running at the checkpoint has ended (the restart records `interrupted`), no turn
      started before the engine's start is still in progress, no agent is `running` without a turn in progress;
-  7. `companyRunning` — the company is `running`, has started a turn since the engine's start, no engine alert was filed for it
-     since the checkpoint, and the engine is not on hold (owner-wide).
+  7. `companyRunning` — the company is `running`, no engine alert was filed for it since the checkpoint, the engine is not on
+     hold (owner-wide), and it has started a turn since the engine's restart. The pause, alert and hold checks come first and
+     fail it whether or not the engine restarted; with no restart since the checkpoint there is nothing to count turns from, so
+     a check with no problem is **wait**, never pass.
 - `--mission`, `--compare`, `--verify-landings`, `--log-owner-minutes`, `--soak-checkpoint` and `--soak-verify` are exclusive
   (`--mission --compare` excepted); a combination is refused with exit 2.
 
 `scripts/soak/run-72h.sh <co> [--hours 72] [--kill-at 24] [--state <dir>] [--resume]` is the owner's 72-hour run. It refuses
-to start without `BRAHMA_LIVE=1` (a real company run spends usage). It starts `brahma run` itself and records its pid and
-start time (a process is that engine only while both match and its command line is `brahma run`), keeps the
+to start without `BRAHMA_LIVE=1` (a real company run spends usage). It starts `brahma run` itself, in a process group of its own
+(`perl -e 'setpgrp(0, 0); exec …'`, so the recorded pid is the engine's and a Ctrl-C at the terminal never reaches it), and
+records its pid and start time (a process is that engine only while both match and its command line is `brahma run`), keeps the
 Mac awake with `caffeinate -i` for its own lifetime, takes a checkpoint every hour, at `--kill-at` checks the recorded pid's
 command line is `brahma run` and sends SIGKILL to that pid only, starts `brahma run` again and asks for the verdict after the
 settle time; at hour 48 it prints the reboot instruction and exits, and `--resume` (after the reboot and login) verifies against
-the last checkpoint and continues (with the run's saved `--hours` and `--kill-at`; the pre-reboot pid is discarded). Ctrl-C
-stops the script, never the engine, and says how to stop or resume it. At the end it stops its engine with SIGTERM (after the
+the last checkpoint and continues (with the run's saved `--hours` and `--kill-at`, each checked to be a whole number; the
+pre-reboot pid is discarded). Ctrl-C stops the script, never the engine, and says how to stop it (`kill -TERM <pid>`) or resume. At the end it stops its engine with SIGTERM (after the
 same check), prints `--mission` over the soak's days (from its local start day) and every verdict. It writes only under
 `--state` (default `~/.brahma-soak/<co>`; the company must be a plain name, no `/` or `..`).
+
+### 17. The landing audit (`--verify-landings`; spec §10 row 2 (3))
+
+`brahma measure <co> --verify-landings [--since <YYYY-MM-DD|all>] [--format md|json]` walks `main`'s first-parent history from
+its tip back to the company's first commit (at most 10,000 commits) and classifies every commit once (ruling R38):
+
+- **verified** — the merge queue landed it: a landing (as defined above) whose batch has a passed `main` or `item` check at its
+  land commit verifies each candidate it merged and the rebased chain between that candidate and the one below it (the previous
+  candidate or the batch's base) on first-parent history (ruling R35);
+- **owner-accepted** — a `mainAccept` record: one row per owner acceptance of `main` (`brahma main accept`, `brahma merge
+  adopt-main`, a quarantine accept), written in the same transaction as the recorded head moves, holding the full commit and
+  the head Brahma recorded before it (`previousHead`). It covers that commit and the first-parent run below it down to
+  `previousHead` (exclusive), stopping at any commit the store records (a batch base, candidate or land commit, another accept,
+  the imported commit, a restore). A store-recorded commit is never owner-accepted (rulings R38, R38a);
+- **imported** — the company's first commit: `company.importedCommit`, else the root of first-parent history;
+- **unverified** — everything else, each listed by its short id and subject (sanitized).
+
+It prints `landings verified: <p>% (<verified>/<verified + unverified>); owner-accepted <n>; imported <n>` — a census of every
+commit, shown at any n, rounded down so 100% means every one (ruling R37) — then any history changes (restores; listed, not a
+failure) and the unverified commits. With `--since <date>` the walk stops below the land commit of the newest landing that
+finished before that day (landing time, not author dates).
+
+**Acceptances from before `mainAccept` existed** (before the migration's `measureEpoch('mainAccept')`) are known only from the
+engine's activity text (`main adopted at <sha7> by the owner`, or `the owner accepted refs/brahma/quarantine/… into main at
+<sha7>`). Such a legacy accept covers **one** commit: the single walked commit
+with that seven-digit prefix, committed before the acceptance (rulings R38, R39). A legacy adopt that brought several commits
+into `main` therefore leaves the others **unverified**. Nothing guesses them in. The remedy is to audit from after it:
+`--verify-landings --since <a day after the last legacy adopt>`, which starts the walk at the first landing after that day.
+
+**Exit codes:** **0** every audited commit is verified, owner-accepted or imported and the walk reached the first commit; **1**
+unverified commits, or the walk stopped at its bound; **2** could not audit — no `main` (or no repository), an unknown company, a
+git failure, a planted `shallow` or `info/grafts` file, a cut history, a bad `--since`, a refusal outside the owner's shell, or a
+merge batch moving `main` (`a merge batch is open; run again after it finishes`). Read-only: nothing is written.
 
 ---
 
@@ -277,7 +317,7 @@ same check), prints `--mission` over the soak's days (from its local start day) 
 | channel refusals | `not applicable` | X4 channels are not merged. |
 | non-code acceptance (`landGate: owner`, rubric) | `not applicable` | no such items or checks on this tree. |
 | cap overruns | `not applicable` unless recorded | no record; the scheduler never admits above the cap. |
-| reserve breaches, idle while actionable, plan-hours in a window | `not measured` until the recorder runs | the database holds only the current usage state and a running active-time total; the measure recorder (Task 5) keeps the daily counters. |
+| reserve breaches, idle while actionable, plan-hours in a window | `not measured` until the recorder runs | the database holds only the current usage state and a running active-time total; the measure recorder (Task 5) keeps the daily counters, and every window (`--since all` too) reads only those (ruling R31). |
 | owner minutes | `not measured` until the owner logs them | Brahma never estimates owner time. |
 | single Claude Code session baseline | `not applicable` | no engine record of a session outside Brahma. |
 | anything before `vX6a-measure` that needs links | excluded, basis stated | links did not exist; nothing is back-filled or guessed. |

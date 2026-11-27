@@ -92,6 +92,11 @@ public final class AppModel {
     public internal(set) var storage: StorageModel?
     /// How the storage meter sizes the disk (`LiveFileSizing` in the app; tests inject one that touches nothing).
     @ObservationIgnored public var storageSizing: any FileSizing = LiveFileSizing()
+    /// Work › Budget › MEASURE (Plan X6a Task 8; `ensureMeasure()` makes it; it follows the selected company and is measured
+    /// again when the work or usage snapshot changes while Budget is shown).
+    public internal(set) var measure: MeasureModel?
+    /// How MEASURE computes a report (`MeasureModel.live`, the CLI's `Measure.report`; tests inject a counting one).
+    @ObservationIgnored public var measureCompute: MeasureModel.Compute = MeasureModel.live
     /// The open replay: an agent's day (People › agent inspector › REPLAY) or an item's history (Work › item inspector ›
     /// HISTORY). Dropped when the company or store changes.
     public internal(set) var replay: ReplayModel?
@@ -253,6 +258,7 @@ public final class AppModel {
             digest = DigestModel(store: reopened)
             handbook = nil
             storage = nil
+            measure = nil
             replay = nil
             wireSubmodels()
             snapshot = .empty
@@ -416,7 +422,10 @@ public final class AppModel {
 
     public func select(_ item: SidebarItem) {
         sidebarSelection = item
-        if item == .budget { ensureStorage() }
+        if item == .budget {
+            ensureStorage()
+            ensureMeasure()
+        }
         let target: ChatTarget?
         switch item {
         case .channel(let id): target = .channel(id: id)
@@ -656,7 +665,10 @@ public final class AppModel {
         let id = selectedCompanyId
         let new = try await Task.detached { try Snapshot.load(store: store, selectedCompanyId: id) }.value
         guard id == selectedCompanyId else { return }  // selection changed mid-load: the stale snapshot is dropped
+        // Budget › MEASURE follows the work and usage the snapshot carries (this tree's change signal; no change topics).
+        let measureChanged = new.work != snapshot.work || new.usage != snapshot.usage
         if new != snapshot { snapshot = new }
+        if measureChanged { measureAfterChange(companyId: id) }
         refreshOpenAPI()
         await checkPinnedArtifact()
         // The deleted-artifact notice lasts until something is selected again (a pick, a tab, or a refresh that left one selected).

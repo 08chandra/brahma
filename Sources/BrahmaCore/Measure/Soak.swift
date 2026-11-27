@@ -532,19 +532,19 @@ public enum SoakVerify {
             : SoakCheck(name: "interruptedTurnsRecorded", result: .fail, detail: problems.joined(separator: "; ") + " (\(summary))")
     }
 
+    /// The pause, the alerts and the hold are judged first, restart or not; with no restart since the checkpoint (ruling R42(a))
+    /// there is nothing to count turns from, so a check with no problem is `wait`, never `pass`.
     static func companyRunning(_ s: State) -> SoakCheck {
         var problems: [String] = []
         if !s.companyRunning { problems.append("\(s.companyName) is paused") }
-        let turns = s.turnsSinceStart ?? 0
-        if s.turnsSinceStart == 0 { problems.append("no turn started since the engine's start") }
-        guard s.turnsSinceStart != nil else {
-            // No restart since the checkpoint (ruling R42(a)): nothing to count turns from.
-            let base = "no restart since the checkpoint to count turns from"
-            return problems.isEmpty ? SoakCheck(name: "companyRunning", result: .pass, detail: base)
-                : SoakCheck(name: "companyRunning", result: .fail, detail: problems.joined(separator: "; ") + " (\(base))")
-        }
         if !s.alerts.isEmpty { problems.append("engine alerts since the checkpoint: \(s.alerts.joined(separator: "; "))") }
         if let hold = s.hold { problems.append("the engine is on hold (\(hold))") }
+        guard let turns = s.turnsSinceStart else {
+            let base = "no restart since the checkpoint to count turns from"
+            return problems.isEmpty ? SoakCheck(name: "companyRunning", result: .wait, detail: base)
+                : SoakCheck(name: "companyRunning", result: .fail, detail: problems.joined(separator: "; ") + " (\(base))")
+        }
+        if turns == 0 { problems.append("no turn started since the engine's start") }
         let summary = "\(turns) turn\(turns == 1 ? "" : "s") started since the engine's start; no engine alert or hold"
         return problems.isEmpty ? SoakCheck(name: "companyRunning", result: .pass, detail: summary)
             : SoakCheck(name: "companyRunning", result: .fail, detail: problems.joined(separator: "; "))
