@@ -279,9 +279,12 @@ private let deniedProbes = """
         let cli = try CLIFingerprint.of(claudePath: w.claude.path).key
         #expect(verified.fingerprint == CanaryProbes.keyFingerprint(cli: cli, probes: SHA256.hex(Data(deniedProbes.utf8))))
         #expect(verified.fingerprint == CanaryProbes.keyFingerprint(cli: cli, probes: CanaryProbes.digest(paths: w.paths)))
-        // The control first, then every probe, through the prefix (never spliced: the probe travels in its variable).
-        #expect(local.probes == [SandboxCanary.controlCommand] + CanaryProbes.parse(deniedProbes).map(\.text))
-        #expect(run.probes.filter { $0.layer == .local }.count == 4); #expect(run.probes.filter { $0.layer == .turn }.count == 4)
+        // The control first, then the engine's built-in probes (C5b-8), then every probe line, through the prefix (never spliced:
+        // the probe travels in its variable).
+        #expect(local.probes == [SandboxCanary.controlCommand] + CanaryProbes.builtIn.map(\.text) + CanaryProbes.parse(deniedProbes).map(\.text))
+        let total = 4 + CanaryProbes.builtIn.count
+        #expect(run.probes.filter { $0.layer == .local }.count == total); #expect(run.probes.filter { $0.layer == .turn }.count == total)
+        #expect(run.probes.filter(\.builtin).count == 2 * CanaryProbes.builtIn.count && run.probes.filter(\.builtin).allSatisfy(\.passed))
         // The turn: the real compiled request, the four variables in its environment, a plainly worded self-test prompt.
         let request = try #require(runner.requests.first)
         #expect(runner.requests.count == 1)
@@ -769,7 +772,7 @@ private let deniedProbes = """
         })
         let b = await w.run(w.canary(), runner: canaryRunner(timeout))
         #expect(b.passes(try #require(b.verified)), "\(b.items)")
-        #expect(b.probes.first { $0.layer == .turn && $0.line == 4 }?.killed == true)
+        #expect(b.probes.first { $0.layer == .turn && !$0.builtin && $0.line == 4 }?.killed == true)
         let successText = TurnPlay(result: { command, request in
             command == "cat \"$CANARY_DATA_FILE\"" ? (false, "Exit code 1\nnot really") : TurnPlay.denied(command, request)
         })
@@ -824,7 +827,9 @@ private let deniedProbes = """
             #expect(!path.hasPrefix(dataPlace.path + "/"), "\(path)"); #expect(path.contains("-engine/"), "\(path)")
         }
         let snap = SandboxCanary.snapshot(p)
-        #expect(Set(snap.keys) == ["the owner's home/token", "the data home/token", "another company's workspace/token", "another agent's lab/token"])
+        #expect(Set(snap.keys) == ["the owner's home/token", "the data home/token", "another company's workspace/token", "another agent's lab/token",
+                                   "another item's worktree/token", "another item's progress file/CANARY-OTHER.md",
+                                   "another item's git admin dir/token"])
         #expect(snap.values.allSatisfy { $0.split(separator: " ").count == 6 }, "type, size, mtime, ctime, inode, mode")
         // A change of status alone (chmod) is a change.
         #expect(chmod(p.otherAgentToken.path, 0o400) == 0)

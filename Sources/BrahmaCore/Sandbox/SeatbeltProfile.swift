@@ -10,6 +10,7 @@ import Foundation
 /// (deny file-read* file-read-data (subpath "<each read workspace>/.brahma"))                                   ; final I1
 /// (allow file-read-metadata (literal "<each read workspace>/.brahma"))                                         ; final I1
 /// (allow file-read* file-read-data (subpath "<.brahma/each readableDotBrahma>") <policy entries in .brahma>)    ; final I1
+///     (`hiddenReads`, C5b-8: each is hidden the same way, its policy entries re-allowed, in these three rules)
 /// (deny file-read* file-read-data (subpath "<each protected>") (subpath "<each other company workspace>"))
 /// (deny file-write* (require-not (require-any (subpath "<each writable>") <toolchain writes>
 ///     (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper") (regex #"^/dev/fd/"))))
@@ -156,7 +157,8 @@ public enum SeatbeltProfile {
 
         // Final review I1: in a company workspace the policy does read, its `.brahma` is read like a sandboxed turn reads it
         // (`SandboxScope.readableDotBrahma`): every other part (other agents' homes, labs and notes, extension review pages,
-        // `ext-try` copies, trash, plans, the engine's own places) is unreadable, whatever exists there now or later. A policy
+        // `ext-try` copies, trash, plans, the engine's own places, and since C5b-8 every item's worktree and progress file) is
+        // unreadable, whatever exists there now or later. A policy
         // entry inside `.brahma` keeps its own reads. `.brahma` itself stays stat-able (path walks), never listable. The
         // protected denies below still win over these re-allowances.
         var hidden: [String] = [], reallowed: [String] = [], statOnly: [String] = []
@@ -168,10 +170,19 @@ public enum SeatbeltProfile {
             reallowed += SandboxScope.readableDotBrahma.map { dot + "/" + $0 }
             reallowed += mine.filter { SandboxPath.isInside($0, dot) }
         }
+        // C5b-8 (FW-B2): what the policy hides inside trees it reads (a turn's `.git/worktrees`), the same way: the policy's
+        // own entries inside it stay readable.
+        for place in unique(policy.hiddenReads.map(checked)) {
+            hidden += [place, SandboxPath.resolve(place)]
+            statOnly.append(place)
+            reallowed += mine.filter { SandboxPath.isInside($0, place) && SandboxPath.key($0) != SandboxPath.key(place) }
+        }
         if !hidden.isEmpty {
             lines.append("(deny file-read* file-read-data " + unique(hidden).map(subpath).joined(separator: " ") + ")")
             lines.append("(allow file-read-metadata " + unique(statOnly).map { "(literal \(quote($0)))" }.joined(separator: " ") + ")")
-            lines.append("(allow file-read* file-read-data " + unique(reallowed).map(subpath).joined(separator: " ") + ")")
+            if !reallowed.isEmpty {
+                lines.append("(allow file-read* file-read-data " + unique(reallowed).map(subpath).joined(separator: " ") + ")")
+            }
         }
         let protected = unique(baseline.protected.map(\.path) + baseline.protected.map(r) + others)
         if !protected.isEmpty { lines.append("(deny file-read* file-read-data " + protected.map(subpath).joined(separator: " ") + ")") }
@@ -206,8 +217,12 @@ public enum SeatbeltProfile {
         if !protected.isEmpty { lines.append("(deny file-clone " + protected.map(subpath).joined(separator: " ") + ")") }
         if !hidden.isEmpty {
             // The hidden parts of `.brahma` (I1) are not clonable either.
-            lines.append("(deny file-clone (require-all (require-any " + unique(hidden).map(subpath).joined(separator: " ")
-                + ") (require-not (require-any " + unique(reallowed).map(subpath).joined(separator: " ") + "))))")
+            if reallowed.isEmpty {
+                lines.append("(deny file-clone " + unique(hidden).map(subpath).joined(separator: " ") + ")")
+            } else {
+                lines.append("(deny file-clone (require-all (require-any " + unique(hidden).map(subpath).joined(separator: " ")
+                    + ") (require-not (require-any " + unique(reallowed).map(subpath).joined(separator: " ") + "))))")
+            }
         }
         let engineHomes = unique(baseline.engineHomes.map(r))
         if !engineHomes.isEmpty {

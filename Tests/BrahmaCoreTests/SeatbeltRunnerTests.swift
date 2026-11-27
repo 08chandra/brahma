@@ -1312,8 +1312,9 @@ struct SeatbeltRunnerTests {
     /// The check shape for real: the company workspace readable, the run's checkout under the data home writable, the toolchain
     /// on, the workspace listed in the baseline (as `checkBaseline` lists every company's). The check cannot read another
     /// agent's temp folder (`/private/tmp/b-<uid>/*`), the owner's Claude Code sessions (`/private/tmp/claude-<uid>`), or the
-    /// private parts of `.brahma` (other agents' homes, labs and notes, review pages, trial copies), by `cat`, `ls` or a clone;
-    /// the workspace's sources and the turn-readable `.brahma` places stay readable, and a git check in the checkout works.
+    /// private parts of `.brahma` (other agents' homes, labs and notes, review pages, trial copies, and since C5b-8 every item's
+    /// worktree and progress file), by `cat`, `ls` or a clone; the workspace's sources and the readable `.brahma` places stay
+    /// readable, and a git check in the checkout works.
     @Test func checkCannotReadAgentTempsOwnerSessionsOrPrivateDotBrahma() async throws {
         let ws = try Self.homeDir(); defer { Self.remove(ws) }
         let home = try tempDir().resolvedForSandbox.appending(path: "home")
@@ -1324,10 +1325,11 @@ struct SeatbeltRunnerTests {
         _ = try GitFixture.plainGit(["add", "src"], in: ws)
         _ = try GitFixture.plainGit(["commit", "-q", "-m", "base commit"], in: ws)
         _ = try GitFixture.plainGit(["worktree", "add", "--quiet", "--detach", checkout.path, "HEAD"], in: ws)
-        try Self.file(ws.appending(path: ".brahma/wt/K/f"), "wt-ok")
+        try Self.file(ws.appending(path: ".brahma/kb/page.md"), "kb-ok")
         let privates = ["home/other/s": "home-secret", "labs/other/s": "lab-secret", "notes/agents/other.md": "notes-secret",
                         "ext-review/A-1.md": "review-secret", "ext-try/t1/f": "try-secret", "trash/x": "trash-secret",
-                        "plans/K/p.md": "plan-secret", "resources/private/r": "resource-secret"]
+                        "plans/K/p.md": "plan-secret", "resources/private/r": "resource-secret",
+                        "wt/K/f": "wt-secret", "progress/K.md": "progress-secret"]
         for (path, text) in privates { try Self.file(ws.appending(path: ".brahma/\(path)"), text) }
         let agentTemp = try Self.tmpSecret(root: "/private/tmp/b-\(getuid())", "agent-temp-secret")
         defer { agentTemp.cleanup() }
@@ -1356,11 +1358,11 @@ struct SeatbeltRunnerTests {
             #expect(list.exitCode != 0, "\(dir) could be listed: \(listText)")
         }
         // What a turn reads stays readable, and a git check in the checkout works (it reads the workspace's `.git`).
-        let (ok, okText) = try await Self.run("cat '\(ws.path)/src/f' '\(ws.path)/.brahma/wt/K/f' && cat src/f && "
+        let (ok, okText) = try await Self.run("cat '\(ws.path)/src/f' '\(ws.path)/.brahma/kb/page.md' && cat src/f && "
                                               + "git log -1 --format=%s && git status --porcelain --untracked-files=no && echo git-ok",
                                               p, runner: r, env: env)
         #expect(ok.exitCode == 0, "\(okText)")
-        #expect(okText.contains("src-ok") && okText.contains("wt-ok") && okText.contains("base commit") && okText.contains("git-ok"), "\(okText)")
+        #expect(okText.contains("src-ok") && okText.contains("kb-ok") && okText.contains("base commit") && okText.contains("git-ok"), "\(okText)")
         // The profile names what it hides and re-allows.
         let profile = SeatbeltProfile.render(policy: p, baseline: b, proxyPort: nil)
         #expect(profile.contains("(deny file-read* file-read-data (subpath \"\(ws.path)/.brahma\"))"), "\(profile)")

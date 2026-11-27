@@ -35,6 +35,10 @@ public struct SandboxPolicy: Equatable, Sendable {
     /// `renderConfined`). `readable` entries are then the only trees it may read beyond the system; `writable` entries are
     /// the runner's own (its `TMPDIR`), never written by the command.
     public var confined: SandboxConfinement? = nil
+    /// Ruling C5b-8 (FW-B2): places read-denied even inside a readable entry (a turn's `SandboxScope.hiddenReads`:
+    /// `<ws>/.git/worktrees`); the policy's own readable and writable entries inside one stay readable. Hidden like the
+    /// private parts of `.brahma` (`SeatbeltProfile`): stat-able, never listable or readable.
+    public var hiddenReads: [URL] = []
 
     public init(writable: [URL], readable: [URL], network: SandboxNetwork, toolchain: Bool) {
         self.writable = writable; self.readable = readable; self.network = network; self.toolchain = toolchain
@@ -274,7 +278,7 @@ enum SandboxPolicyCheck {
         guard !policy.writable.isEmpty else { throw SandboxError.invalidPath("a sandbox policy needs a writable directory") }
         let baselinePaths = [baseline.userHome] + baseline.protected + baseline.engineHomes + baseline.companyWorkspaces
             + [baseline.darwinUserTemp, baseline.darwinUserCache, baseline.darwinUserDir].compactMap { $0 }
-        for url in policy.writable + policy.readable + baselinePaths + (policy.confined?.all ?? []) {
+        for url in policy.writable + policy.readable + policy.hiddenReads + baselinePaths + (policy.confined?.all ?? []) {
             if SandboxPath.isUnsafe(url.path) { throw SandboxError.unsafePathCharacter(url.path) }
             if !url.path.hasPrefix("/") { throw SandboxError.invalidPath(url.path) }
         }

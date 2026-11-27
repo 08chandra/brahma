@@ -512,6 +512,11 @@ public struct SandboxScope: Equatable, Sendable {
     /// Top-level workspace entries left out of `readable` because their names hold characters no sandbox profile may carry;
     /// the caller logs them (one activity line), the turn still runs.
     public var skippedUnsafe: [String] = []
+    /// Ruling C5b-8 (FW-B2): the read-denied roots that lie inside trees the turn otherwise reads: `<ws>/.git/worktrees`
+    /// (every item's git admin dir), in both forms. They are in `denyRead` too; a turn reads only the admin dirs of the items
+    /// whose live reader set it is in (`readable`). A Seatbelt policy that mirrors the turn (the canary's model-free layer)
+    /// hides them the same way (`SandboxPolicy.hiddenReads`).
+    public var hiddenReads: [URL] = []
     /// The read-only places that come from the owner's grants (`readOnlyDirs` holds them too): re-pinned right before spawn.
     public var grantReadDirs: [URL] = []
     /// `<claudeTmpRoot>/<6 hex of the agent's place>`: the turn's claude keeps its temp files (its Bash `TMPDIR`) here
@@ -619,8 +624,18 @@ public struct SandboxScope: Equatable, Sendable {
     /// text, so only the turns of its internal reviewer read it (`reviewPages`), and the owner in the app. `ext-try` (the owner's
     /// `ext try` copies) is readable only by that one throwaway turn. `preview/logs` holds the preview servers' logs
     /// (Plan L): a failure DM points the setter at it.
-    static let readableDotBrahma = ["wt", "artifacts", "progress", "handoffs", "releases", "resources/company", "kb", "ext",
+    ///
+    /// `wt` and `progress` are not among them (Ruling C5b-8, FW-B2): an item's worktree, its progress file and its git admin dir
+    /// (`.git/worktrees/<KEY>`) are live content, readable only by the item's live reader set (C5b-5: the lease holder, else
+    /// the assignee, plus the reviewer). `forTurn` mounts exactly those of the items the turn's agent reads live
+    /// (`liveReadKeys`); every other item's stay unreadable, at the filesystem layer as at the engine's.
+    static let readableDotBrahma = ["artifacts", "handoffs", "releases", "resources/company", "kb", "ext",
                                     "hooks", "cache/shared", "preview/logs"]
+
+    /// The names of the common git dir a turn reads (besides what exists there when the turn is compiled): files git may
+    /// create while the turn runs (an engine `pack-refs`, a fetch). Never `worktrees` (C5b-8).
+    static let gitReadableNames = ["HEAD", "config", "description", "hooks", "info", "objects", "refs", "logs", "packed-refs",
+                                   "index", "FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD", "shallow", "modules", "lfs", "rr-cache"]
 
     /// Engine-only `.brahma` places (3a, L, 4a), write-denied on every turn even before they exist. `preview` is Plan L's
     /// (`EngineLayout.previewDir`; its runs are data-home exports, its logs are written by the engine only).
@@ -651,10 +666,19 @@ public struct SandboxScope: Equatable, Sendable {
     /// - Review / audit: cwd = lab; writes to home and lab; a review also reads the worktree (read-only).
     /// - Plan (needs an item; without one it gets the audit scope): cwd = `plansDir(KEY)`; writes to home and that directory;
     ///   reads the worktree (read-only).
+    ///
+    /// Live places (Ruling C5b-8): `liveReadKeys` are the keys of the items whose live reader set the agent is in (the engine's
+    /// lease and review records, `Store.liveReaderItemKeys`, read when the turn is compiled); nil when those could not be read,
+    /// which mounts no other item's places. The turn reads `.brahma/wt/<KEY>`, `.brahma/progress/<KEY>.md` and
+    /// `.git/worktrees/<KEY>` of exactly those items and of its own item (an item, review or plan turn's), each only while it is
+    /// a real directory (or file) with no link at or above it. Every other item's worktree, progress file and git admin dir is
+    /// unreadable: `.brahma` and `.git/worktrees` are read-denied roots, `.git` is mounted by its children (never whole). The
+    /// company's main checkout (the workspace's other top-level entries) stays readable, read-only.
     public static func forTurn(layout: SandboxLayout, paths: BrahmaPaths, otherWorkspaces: [URL], backupTargets: [URL],
                                kind: TurnKind, item: WorkItem?, company: Company, grants: GrantInputs, darwinUserTemp: URL?,
                                userHome: URL = FileManager.default.homeDirectoryForCurrentUser,
-                               claudeTmpRoot: URL? = nil, reviewPages: [URL] = []) throws -> SandboxScope {
+                               claudeTmpRoot: URL? = nil, reviewPages: [URL] = [],
+                               liveReadKeys: Set<String>? = nil) throws -> SandboxScope {
         try SandboxLayout.validate(handle: layout.handle)
         if let key = item?.key, key.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) == nil {
             throw SandboxError.invalidPath(key)
@@ -748,9 +772,12 @@ public struct SandboxScope: Equatable, Sendable {
         // Final review I2: the Claude temp places and every agent's private temp root (the default one whatever this scope's
         // is) are denied roots too, so no grant or toolchain read path may equal or contain them (a read allowance would
         // otherwise win over their read deny).
+        // C5b-8: every item's git admin dir is read-denied (the live reader set's are re-allowed below); a root, so no
+        // readable entry may equal or contain it (`.git` is mounted by its children).
+        let hiddenReads = dedupe(both(git.appending(path: "worktrees")))
         let deniedRoots = dedupe(both(userHome) + both(paths.home) + both(URL(fileURLWithPath: "/Volumes", isDirectory: false))
                                  + both(dot) + (darwinUserDir.map(both) ?? []) + claudeShared + (tmpRoot.map(both) ?? [])
-                                 + both(SandboxEnvironment.defaultClaudeTmpRoot))
+                                 + both(SandboxEnvironment.defaultClaudeTmpRoot) + hiddenReads)
         let denyRead = dedupe(deniedRoots + protected)
 
         // Read paths the owner or a grant added are checked whether or not they exist yet; only existing ones are mounted.
@@ -775,7 +802,21 @@ public struct SandboxScope: Equatable, Sendable {
         for name in SandboxPath.entries(ws.path) where name != ".brahma" {
             let entry = l(name)
             if SandboxPath.isUnsafe(name) { skipped.append(entry.path); continue }
-            guard SandboxPath.kind(entry.path) != .link else { continue }
+            let kind = SandboxPath.kind(entry.path)
+            guard kind != .link else { continue }
+            if name == ".git" {
+                // C5b-8: the common git dir by its children, never whole: `worktrees` (every item's admin dir) stays denied.
+                // A `.git` that is not a real directory is not mounted.
+                guard kind == .directory else { continue }
+                var names = Set(gitReadableNames)
+                for child in SandboxPath.entries(entry.path) {
+                    if SandboxPath.isUnsafe(child) { skipped.append(entry.appending(path: child).path); continue }
+                    if SandboxPath.kind(entry.appending(path: child).path) != .link { names.insert(child) }
+                }
+                names.remove("worktrees")
+                readable += names.sorted().map { entry.appending(path: $0) }
+                continue
+            }
             readable.append(entry)
         }
         // Engine places, mounted only when they are real (no link at or above them).
@@ -786,6 +827,18 @@ public struct SandboxScope: Equatable, Sendable {
             return url
         }
         readable += readableDotBrahma.compactMap(engineChild)
+        // C5b-8: the live places of the items this agent reads live, and of the turn's own item; each only while it is real
+        // and unlinked (an agent could have put a link where one was). A key that is not a valid item key is never mounted.
+        var liveKeys = liveReadKeys ?? []
+        if let key = item?.key, kind == .work || kind == .notice || kind == .review || kind == .plan { liveKeys.insert(key) }
+        for key in liveKeys.sorted() where key.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", options: .regularExpression) != nil {
+            if let wt = engineChild("wt/\(key)"), SandboxPath.kind(wt.path) == .directory { readable.append(wt) }
+            if let progress = engineChild("progress/\(key).md"), SandboxPath.kind(progress.path) == .file { readable.append(progress) }
+            let admin = l(".git/worktrees/\(key)")
+            if SandboxPath.kind(admin.path) == .directory, SandboxPath.linkedComponent(admin.path, under: ws.path) == nil {
+                readable.append(admin)
+            }
+        }
         // The review pages of the asks this agent pre-checks (B-M9): exactly those files, real and unlinked, never the directory.
         for page in reviewPages {
             let parts = page.pathComponents.suffix(3)
@@ -877,6 +930,7 @@ public struct SandboxScope: Equatable, Sendable {
                                  toolchainTempWrite: darwinUserTemp.map(r))
         scope.skippedUnsafe = skipped
         scope.grantReadDirs = grantReads
+        scope.hiddenReads = hiddenReads
         if let tmpRoot {
             let tmp = tmpRoot.appending(path: String(StableHash.fnv1a64(SandboxPath.key(ws.path) + "\u{0}" + h).prefix(6)))
             guard tmp.path.utf8.count <= claudeTmpMaxLength else {

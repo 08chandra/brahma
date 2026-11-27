@@ -97,6 +97,29 @@ private func value(_ a: [String], _ flag: String) -> String? { a.firstIndex(of: 
         #expect(scope.readOnlyDirs.map(\.path).allSatisfy { $0.hasSuffix("/.brahma/kb") })
     }
 
+    /// Ruling C5b-8 (FW-B2): the engine compiles each sandboxed turn with the live reader set it records. The reviewer's
+    /// itemless turn reads the reviewed item's worktree, progress file and git admin dir; a non-reader's does not.
+    @Test func turnsMountOnlyTheLivePlacesOfTheirReaderSet() async throws {
+        let w = try SandboxTurnWorld()
+        let reviewer = try w.store.hire(companyId: w.company.id, name: "rev-1", role: "engineer", model: "sonnet")
+        let outsider = try w.store.hire(companyId: w.company.id, name: "eng-2", role: "engineer", model: "sonnet")
+        let i = try w.store.createWorkItem(companyId: w.company.id, by: .owner, draft: WorkItemDraft(
+            type: .task, title: "Reviewed", acceptanceCriteria: "it works", checkSpec: CheckSpec(command: "true", paths: ["src/a"]),
+            ownerId: w.eng.id, reviewerId: reviewer.id, status: .ready), now: w.world.clock.now)
+        _ = try w.tools().call(name: "claim_lease", arguments: ["key": .string(i.key)])
+        let progress = w.ws.appending(path: ".brahma/progress/\(i.key).md")
+        try FileManager.default.createDirectory(at: progress.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("progress".utf8).write(to: progress)
+        for agent in [reviewer, outsider] { try w.world.dm(w.company, agent, "hello") }
+        try await w.world.cycle()
+        let live = [".brahma/wt/\(i.key)", ".brahma/progress/\(i.key).md", ".git/worktrees/\(i.key)"].map { w.ws.appending(path: $0).path }
+        let reviewerScope = try #require(w.world.fake.requests.last { $0.agent.id == reviewer.id }?.sandbox)
+        for place in live { #expect(reviewerScope.readable.map(\.path).contains(place), "the reviewer misses \(place)") }
+        let outsiderScope = try #require(w.world.fake.requests.last { $0.agent.id == outsider.id }?.sandbox)
+        for place in live { #expect(!outsiderScope.readable.contains { SandboxPath.isInside(place, $0.path) }, "the outsider reads \(place)") }
+        #expect(outsiderScope.denyRead.map(\.path).contains(w.ws.appending(path: ".git/worktrees").path))
+    }
+
     @Test func companyProfilesUnderTheEngineCeiling() async throws {
         // No ceiling: the company's own profile.
         var w = try SandboxTurnWorld(profile: .full)

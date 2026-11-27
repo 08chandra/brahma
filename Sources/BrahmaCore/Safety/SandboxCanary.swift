@@ -70,6 +70,8 @@ public struct CanaryProbeResult: Equatable, Sendable {
     public var line: Int
     public var text: String
     public var helper: Bool
+    /// One of the engine's built-in probes (`CanaryProbes.builtIn`).
+    public var builtin = false
     /// It ran (an exit status, a kill, or a tool result came back). A probe that did not run is unverified: it fails.
     public var ran: Bool
     public var exitStatus: Int32?
@@ -85,7 +87,7 @@ public struct CanaryProbeResult: Equatable, Sendable {
 
     public init(layer: Layer, probe: CanaryProbe, ran: Bool, exitStatus: Int32?, denied: Bool, killed: Bool = false,
                 leaked: Bool, output: String, note: String? = nil) {
-        self.layer = layer; line = probe.line; text = probe.text; helper = probe.helper; self.ran = ran
+        self.layer = layer; line = probe.line; text = probe.text; helper = probe.helper; builtin = probe.builtin; self.ran = ran
         self.exitStatus = exitStatus; self.denied = denied; self.killed = killed; self.leaked = leaked; self.output = output
         self.note = note
     }
@@ -93,10 +95,13 @@ public struct CanaryProbeResult: Equatable, Sendable {
     /// The pass rule: it ran, it was denied, nothing of a token showed and nothing planted changed.
     public var passed: Bool { ran && denied && !leaked && !changedPlanted }
 
+    /// `line 3`, or `built-in 1` for an engine probe.
+    public var label: String { builtin ? "built-in \(line)" : "line \(line)" }
+
     /// `line 3: pass, exit 1, leaked false`: what a canary row and a doctor item record (never the output).
     public var summary: String {
         let exit = exitStatus.map(String.init) ?? (killed ? "killed" : (ran ? "none" : "not run"))
-        return "line \(line): \(passed ? "pass" : "FAIL"), exit \(exit), leaked \(leaked)" + (changedPlanted ? ", changed a planted place" : "")
+        return "\(label): \(passed ? "pass" : "FAIL"), exit \(exit), leaked \(leaked)" + (changedPlanted ? ", changed a planted place" : "")
             + (helper ? ", helper" : "")
     }
 }
@@ -191,7 +196,9 @@ public struct CanaryLeakMatcher: Sendable {
 /// `SandboxScope.forTurn` and `ClaudeSettingsCompiler` produce for the asking turn's shape (`TurnSpec`: its network, a plan
 /// turn's plans directory; the pre- and post-tool hooks on, as every sandboxed turn has them), checking its settings deny
 /// them. A turn whose shape the canary cannot build is refused before any model call. The probe lines are the owner's
-/// (`CanaryProbes`, `<data home>/canary/probes.txt`); none are built in. Then:
+/// (`CanaryProbes`, `<data home>/canary/probes.txt`), run after the engine's built-in probes (`CanaryProbes.builtIn`, Ruling
+/// C5b-8: reading another item's worktree, progress file and git admin dir, planted in the throwaway company, which the canary
+/// agent is no live reader of; the compiled settings must deny them, `missingDenies`). Then:
 /// - `sandbox-backend`, model-free: the Seatbelt runner's `cat` of a token in the data home must fail;
 /// - `sandbox-canary-local`, model-free: each probe through the agent's shell prefix under Brahma's own Seatbelt profile (the
 ///   one around checks and previews) with a policy mirroring the turn's scope, after a positive control that must succeed. It
@@ -327,6 +334,11 @@ public struct SandboxCanary: SandboxCanaryRunning {
         /// `.brahma/labs/canary-other`: another agent's lab in the throwaway company (5L-1), holding `token`.
         public var otherAgentLab: URL
         public var otherAgentToken: URL
+        /// Ruling C5b-8: another item's worktree (`.brahma/wt/CANARY-OTHER`, holding `token`), its progress file and its git
+        /// admin dir (`.git/worktrees/CANARY-OTHER`, holding `token`); the canary agent is not that item's live reader.
+        public var otherItemWorktree: URL
+        public var otherItemProgress: URL
+        public var otherItemGitDir: URL
         /// `own.txt` in the canary agent's own lab (its cwd): the positive control reads it.
         public var controlFile: URL
         public var controlText: String
@@ -335,7 +347,9 @@ public struct SandboxCanary: SandboxCanaryRunning {
         /// The four probe variables (`CanaryProbes.variables`), as environment variables.
         public var variables: [String: String] {
             [CanaryProbes.homeFileVariable: userHomeToken.path, CanaryProbes.dataFileVariable: dataHomeToken.path,
-             CanaryProbes.outsideDirVariable: otherCompany.path, CanaryProbes.otherAgentLabVariable: otherAgentLab.path]
+             CanaryProbes.outsideDirVariable: otherCompany.path, CanaryProbes.otherAgentLabVariable: otherAgentLab.path,
+             CanaryProbes.otherItemWorktreeVariable: otherItemWorktree.path, CanaryProbes.otherItemProgressVariable: otherItemProgress.path,
+             CanaryProbes.otherItemGitDirVariable: otherItemGitDir.path]
         }
 
         /// How a leak of the token is recognized (and redacted).
@@ -346,7 +360,9 @@ public struct SandboxCanary: SandboxCanaryRunning {
         /// The four planted places, as the snapshot names them.
         var plantedPlaces: [(name: String, url: URL)] {
             [("the owner's home", userHomeToken.deletingLastPathComponent()), ("the data home", dataHomeToken.deletingLastPathComponent()),
-             ("another company's workspace", otherCompany), ("another agent's lab", otherAgentLab)]
+             ("another company's workspace", otherCompany), ("another agent's lab", otherAgentLab),
+             ("another item's worktree", otherItemWorktree), ("another item's progress file", otherItemProgress.deletingLastPathComponent()),
+             ("another item's git admin dir", otherItemGitDir)]
         }
 
         /// Removes everything the canary made, by descriptor (`EngineFiles.removeNoFollow`: a link is removed, never followed).
@@ -404,6 +420,17 @@ public struct SandboxCanary: SandboxCanaryRunning {
             guard try EngineFiles.create(Data(token.utf8), workspace: ws, dir: otherLabRelative, name: "token", mode: 0o600),
                   try EngineFiles.create(Data(controlText.utf8), workspace: ws, dir: layout.labRelative, name: "own.txt", mode: 0o600)
             else { throw DataHomeError(reason: "the canary's lab files already exist") }
+            // Ruling C5b-8: another item's live places (worktree, progress file, git admin dir), each holding the token. The
+            // canary agent is no reader of that item (no live keys are given to its scope).
+            let otherItemKey = "CANARY-OTHER"
+            let otherItemWorktree = try EngineFiles.directory(workspace: ws, ".brahma/wt/\(otherItemKey)", mode: 0o700)
+            let otherItemGitDir = try EngineFiles.directory(workspace: ws, ".git/worktrees/\(otherItemKey)", mode: 0o700)
+            _ = try EngineFiles.directory(workspace: ws, ".brahma/progress", mode: 0o700)
+            guard try EngineFiles.create(Data(token.utf8), workspace: ws, dir: ".brahma/wt/\(otherItemKey)", name: "token", mode: 0o600),
+                  try EngineFiles.create(Data(token.utf8), workspace: ws, dir: ".git/worktrees/\(otherItemKey)", name: "token", mode: 0o600),
+                  try EngineFiles.create(Data(token.utf8), workspace: ws, dir: ".brahma/progress", name: "\(otherItemKey).md", mode: 0o600)
+            else { throw DataHomeError(reason: "the canary's item files already exist") }
+            let otherItemProgress = ws.appending(path: ".brahma/progress/\(otherItemKey).md")
             let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: environment.shell, keepNames: [])
             var scope = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: [other], backupTargets: [],
                                                  kind: .work, item: nil, company: company, grants: GrantInputs(),
@@ -453,6 +480,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
             return Prepared(request: request, settings: written.settings, token: token, userHomeToken: userHomeToken,
                             dataHomeToken: dataHomeToken, otherCompanyToken: otherToken, otherCompany: other,
                             otherAgentLab: otherLab, otherAgentToken: otherLab.appending(path: "token"),
+                            otherItemWorktree: otherItemWorktree, otherItemProgress: otherItemProgress, otherItemGitDir: otherItemGitDir,
                             controlFile: layout.lab.appending(path: "own.txt"), controlText: controlText, removals: removals)
         } catch {
             remove(removals)
@@ -494,10 +522,22 @@ public struct SandboxCanary: SandboxCanaryRunning {
 
     /// Whether the compiled settings deny reading the owner's home, the data home and the other company's workspace.
     static func missingDenies(_ prepared: Prepared, paths: BrahmaPaths, environment: SandboxEnvironment) -> [String] {
-        let denied = Set((prepared.settings.sandbox?.filesystem?.denyRead ?? []).map(SandboxPath.key))
-        return [("the owner's home", environment.userHome), ("the data home", paths.home), ("another company's workspace", prepared.otherCompany)]
+        let fs = prepared.settings.sandbox?.filesystem
+        let denied = Set((fs?.denyRead ?? []).map(SandboxPath.key))
+        var missing = [("the owner's home", environment.userHome), ("the data home", paths.home), ("another company's workspace", prepared.otherCompany)]
             .filter { !denied.contains(SandboxPath.key($0.1.path)) && !denied.contains(SandboxPath.key($0.1.resolvedForSandbox.path)) }
             .map(\.0)
+        // Ruling C5b-8: another item's live places lie inside a read-denied root and inside no re-allowed read, in both spellings.
+        let deniedRoots = fs?.denyRead ?? [], allowed = fs?.allowRead ?? []
+        for (name, url) in [("another item's worktree", prepared.otherItemWorktree), ("another item's progress file", prepared.otherItemProgress),
+                            ("another item's git admin dir", prepared.otherItemGitDir)] {
+            // The sandbox judges the resolved path: that one must be denied; neither spelling may be re-allowed.
+            let resolved = url.resolvedForSandbox.path
+            let denies = deniedRoots.contains { SandboxPath.isInside(resolved, $0) }
+            let reopened = [url.path, resolved].contains { p in allowed.contains { SandboxPath.isInside(p, $0) } }
+            if !denies || reopened { missing.append(name) }
+        }
+        return missing
     }
 
     /// The key a run verifies: the CLI build it fingerprints now and the probe file it loaded (`CanaryProbes.keyFingerprint`),
@@ -740,8 +780,10 @@ public struct SandboxCanary: SandboxCanaryRunning {
             try BrahmaPaths.ensurePrivateDirectory(scratch)
             try BrahmaPaths.ensurePrivateDirectory(logs)
         } catch { return fail("can't prepare a scratch directory: \(error)") }
-        let policy = SandboxPolicy(writable: [scratch.resolvedForSandbox] + scope.writable, readable: scope.readable,
+        var policy = SandboxPolicy(writable: [scratch.resolvedForSandbox] + scope.writable, readable: scope.readable,
                                    network: .none, toolchain: false)
+        // C5b-8: the turn's hidden places (`.git/worktrees`) are hidden here too.
+        policy.hiddenReads = scope.hiddenReads.map(\.resolvedForSandbox)
         var env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
         env.merge(p.variables) { _, new in new }
         let command = "exec '\(prefix)' \"$\(probeVariable)\""
@@ -763,7 +805,8 @@ public struct SandboxCanary: SandboxCanaryRunning {
                         + "(exit \(control.outcome.exitCode.map(String.init) ?? "none")): the sandboxed runner ran nothing, so no probe counts")
         }
         var results: [CanaryProbeResult] = []
-        for (n, probe) in file.probes.enumerated() {
+        // The engine's built-in probes first (C5b-8), then the owner's lines.
+        for (n, probe) in (CanaryProbes.builtIn + file.probes).enumerated() {
             let r = await runOne(probe.text, n + 1)
             let leaked = leak.found(in: r.output)
             let killed = r.outcome.timedOut
@@ -789,11 +832,11 @@ public struct SandboxCanary: SandboxCanaryRunning {
     /// planted place; the first reason leads the detail (what the sandbox-check alert names), then every probe's summary.
     static func verdictItem(name: String, layerText: String, results: [CanaryProbeResult], extra: [String]) -> DoctorItem {
         var problems: [String] = []
-        for r in results where r.leaked { problems.append("probe line \(r.line) leaked a canary token") }
-        for r in results where r.changedPlanted { problems.append("probe line \(r.line) changed a planted place") }
+        for r in results where r.leaked { problems.append("probe \(r.label) leaked a canary token") }
+        for r in results where r.changedPlanted { problems.append("probe \(r.label) changed a planted place") }
         for r in results where !r.helper && !r.passed && !r.leaked && !r.changedPlanted {
-            if !r.ran { problems.append("probe line \(r.line) was not run (unverified)" + (r.note.map { ": \($0)" } ?? "")) }
-            else { problems.append("probe line \(r.line) failed (it was not denied: exit \(r.exitStatus.map(String.init) ?? "none"))") }
+            if !r.ran { problems.append("probe \(r.label) was not run (unverified)" + (r.note.map { ": \($0)" } ?? "")) }
+            else { problems.append("probe \(r.label) failed (it was not denied: exit \(r.exitStatus.map(String.init) ?? "none"))") }
         }
         problems += extra
         let summary = results.map(\.summary).joined(separator: "; ")
@@ -828,10 +871,12 @@ public struct SandboxCanary: SandboxCanaryRunning {
     static func turnLayer(_ p: Prepared, file: CanaryProbeFile, runner: any TurnRunning, wallClock: Duration,
                           planted: [String: String]? = nil) async -> (item: DoctorItem, results: [CanaryProbeResult]) {
         var request = p.request
-        request.prompt = turnPrompt(probes: file.probes, readPath: p.userHomeToken.path)
+        // The engine's built-in probes first (C5b-8), then the owner's lines.
+        let probes = CanaryProbes.builtIn + file.probes
+        request.prompt = turnPrompt(probes: probes, readPath: p.userHomeToken.path)
         request.environment.merge(p.variables) { _, new in new }
         if var mode = request.mode {
-            mode.maxTurns = max(mode.maxTurns, file.probes.count + 6)
+            mode.maxTurns = max(mode.maxTurns, probes.count + 6)
             mode.maxBudgetUSD = min(mode.maxBudgetUSD, turnBudgetUSD)
             mode.wallClock = wallClock
             request.mode = mode
@@ -843,7 +888,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
         if let planted, let change = await Doctor.execBlocking.run({ plantedChange(planted, snapshot(p)) }) {
             extra.append("a planted place changed during the turn: \(change)")
         }
-        return judgeTurn(lines: collected.lines, probes: file.probes, controlText: p.controlText, leak: p.leak,
+        return judgeTurn(lines: collected.lines, probes: probes, controlText: p.controlText, leak: p.leak,
                          expectedTools: expected, runError: collected.error, extra: extra)
     }
 
@@ -1086,7 +1131,7 @@ public enum CanaryReport {
             let layer = r.layer == .local ? "model-free" : "turn"
             let verdict = r.passed ? "PASS" : (r.helper && !r.leaked ? "WARN" : "FAIL")
             let exit = r.exitStatus.map(String.init) ?? (r.killed ? "killed" : (r.ran ? "none" : "not run"))
-            out.append("\(verdict)  \(layer)  line \(r.line)  exit \(exit)\(r.leaked ? "  LEAKED A TOKEN" : "")  \(r.text)"
+            out.append("\(verdict)  \(layer)  \(r.label)  exit \(exit)\(r.leaked ? "  LEAKED A TOKEN" : "")  \(r.text)"
                        + (r.note.map { "  (\($0))" } ?? ""))
             let text = r.output.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }

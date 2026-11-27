@@ -170,3 +170,23 @@ extension CompanyNetwork {
         return lines
     }
 }
+
+extension Store {
+    /// Ruling C5b-8 (FW-B2): the keys of this company's items whose live reader set the agent is in (Ruling C5b-5, the same
+    /// rule the engine reads by, `RefAccess.liveDiffSubject`: the current lease holder, else the assignee, plus the
+    /// reviewer). The sandboxed turn mounts the live places (worktree, progress file, git admin dir) of exactly these items
+    /// (`SandboxScope.forTurn(liveReadKeys:)`). Throws when the records cannot be read: the caller then mounts none.
+    public func liveReaderItemKeys(companyId: String, agentId: String) throws -> Set<String> {
+        try writer.read { db in
+            let candidates = try WorkItem.fetchAll(db, sql: """
+                SELECT * FROM workItem WHERE companyId = ? AND (ownerId = ? OR reviewerId = ?
+                    OR id IN (SELECT itemId FROM workLease WHERE agentId = ? AND companyId = ?))
+                """, arguments: [companyId, agentId, agentId, agentId, companyId])
+            var keys: Set<String> = []
+            for item in candidates where try RefAccess.liveDiffSubject(db, companyId, item).readerSet?.contains(agentId) == true {
+                keys.insert(item.key)
+            }
+            return keys
+        }
+    }
+}

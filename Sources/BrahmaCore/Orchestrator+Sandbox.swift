@@ -234,13 +234,18 @@ extension Orchestrator {
                 let resolved = layout.workspace.resolvedForSandbox
                 let reviewPages = kind == .work || kind == .notice || kind == .plan
                     ? try store.extensionReviewPages(reviewerId: agent.id).map { resolved.appending(path: $0) } : []
+                // Ruling C5b-8: the items whose live places (worktree, progress file, git admin dir) this agent reads, from the
+                // engine's lease and review records now. Unreadable records mount no other item's places (fail closed). An
+                // `ext try` turn is no item's reader.
+                let liveKeys: Set<String>? = trialRoot == nil ? try? store.liveReaderItemKeys(companyId: company.id, agentId: agent.id) : nil
                 let rebuild: @Sendable (GrantInputs) throws -> SandboxScope = { inputs in
                     var inputs = inputs
                     inputs.domains = Array(Set(inputs.domains + extraDomains)).sorted()
                     return try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: others, backupTargets: backups,
                                                     kind: kind, item: item, company: company, grants: inputs,
                                                     darwinUserTemp: env.darwinUserTemp, userHome: env.userHome,
-                                                    claudeTmpRoot: env.claudeTmpRoot, reviewPages: reviewPages)
+                                                    claudeTmpRoot: env.claudeTmpRoot, reviewPages: reviewPages,
+                                                    liveReadKeys: liveKeys)
                 }
                 let scope = try rebuild(GrantResolver.inputs(grants))
                 if let tmp = scope.claudeTmp { try ClaudeTmp.ensure(tmp) }

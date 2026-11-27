@@ -11,8 +11,16 @@ public struct CanaryProbe: Equatable, Sendable {
     public var line: Int
     public var text: String
     public var helper: Bool
+    /// One of the engine's own probes (`CanaryProbes.builtIn`), never a line of the owner's file; `line` is then its number
+    /// among them.
+    public var builtin: Bool
 
-    public init(line: Int, text: String, helper: Bool = false) { self.line = line; self.text = text; self.helper = helper }
+    public init(line: Int, text: String, helper: Bool = false, builtin: Bool = false) {
+        self.line = line; self.text = text; self.helper = helper; self.builtin = builtin
+    }
+
+    /// How reports name it: `line 3` for an owner's line, `built-in 1` for an engine probe.
+    public var label: String { builtin ? "built-in \(line)" : "line \(line)" }
 }
 
 /// The owner's probe file as loaded: its probes and the SHA-256 of its bytes (part of the canary key, so an edit needs a new
@@ -60,14 +68,34 @@ public enum CanaryProbes {
     public static let dataFileVariable = "CANARY_DATA_FILE"
     public static let outsideDirVariable = "CANARY_OUTSIDE_DIR"
     public static let otherAgentLabVariable = "OTHER_AGENT_LAB"
-    public static let variables = [homeFileVariable, dataFileVariable, outsideDirVariable, otherAgentLabVariable]
+    /// Ruling C5b-8 (FW-B2): another item's worktree (holding a file `token`), its progress file and its git admin dir
+    /// (holding a file `token`) in the throwaway company; the canary agent is not in that item's live reader set.
+    public static let otherItemWorktreeVariable = "OTHER_ITEM_WORKTREE"
+    public static let otherItemProgressVariable = "OTHER_ITEM_PROGRESS"
+    public static let otherItemGitDirVariable = "OTHER_ITEM_GITDIR"
+    public static let variables = [homeFileVariable, dataFileVariable, outsideDirVariable, otherAgentLabVariable,
+                                   otherItemWorktreeVariable, otherItemProgressVariable, otherItemGitDirVariable]
+
+    /// The engine's own probes (Ruling C5b-8, FW-B2): "read another item's worktree" — its worktree file, its progress file
+    /// and its git admin dir, each through a link in the agent's own place too (the sandbox judges the resolved path). They
+    /// run in both layers before the owner's lines, under the same pass rule, and are part of every canary key
+    /// (`builtInDigest`), so a change to them needs a new pass.
+    public static let builtIn: [CanaryProbe] = [
+        "cat \"$OTHER_ITEM_WORKTREE/token\"",
+        "cat \"$OTHER_ITEM_PROGRESS\"",
+        "cat \"$OTHER_ITEM_GITDIR/token\"",
+        "ln -sf \"$OTHER_ITEM_WORKTREE/token\" via-link && cat via-link",
+    ].enumerated().map { CanaryProbe(line: $0.offset + 1, text: $0.element, builtin: true) }
+
+    /// The built-in probes' part of every canary key.
+    public static var builtInDigest: String { StableHash.fnv1a64(builtIn.map(\.text).joined(separator: "\n")) }
 
     /// What a key's probe part is when the file gives no pass: no canary row can ever carry it.
     public static let unavailableDigest = "probes-unavailable"
 
     public static func url(paths: BrahmaPaths) -> URL { paths.home.appending(path: "\(directory)/\(fileName)") }
 
-    /// Header comments only: the format, the pass rule and the four variables. Zero probe lines.
+    /// Header comments only: the format, the pass rule, the variables and the built-in probes. Zero probe lines.
     public static let template = """
         # Brahma sandbox canary: owner-written probe lines.
         #
@@ -101,6 +129,12 @@ public enum CanaryProbes {
         #   CANARY_DATA_FILE    a token file Brahma plants in the data home
         #   CANARY_OUTSIDE_DIR  a directory outside the agent's workspace (another company's workspace) holding a file "token"
         #   OTHER_AGENT_LAB     another agent's lab in the throwaway company, holding a file "token"
+        #   OTHER_ITEM_WORKTREE another item's worktree (the agent is not its reader), holding a file "token"
+        #   OTHER_ITEM_PROGRESS that item's progress file (holding the token)
+        #   OTHER_ITEM_GITDIR   that item's git admin dir, holding a file "token"
+        #
+        # Brahma also runs built-in probes of its own before your lines (reading another item's worktree, progress file and
+        # git admin dir, directly and through a link); they pass under the same rule.
         #
         # Keep this file a regular file you own with mode 0600 (`brahma canary edit` keeps it so).
 
@@ -188,7 +222,8 @@ public enum CanaryProbes {
 
     /// A canary key's fingerprint: the CLI build's fingerprint and the probe file's digest, so a new build or an edited probe
     /// file each need a new canary pass. Computed the same way by the per-launch gate, the doctor and the canary itself.
+    /// The built-in probes (`builtInDigest`) are part of it too (FW-B2: adding them needs a new pass of every key).
     public static func keyFingerprint(cli: String, probes: String) -> String {
-        StableHash.fnv1a64(cli + "\u{0}" + probes)
+        StableHash.fnv1a64(cli + "\u{0}" + probes + "\u{0}" + builtInDigest)
     }
 }

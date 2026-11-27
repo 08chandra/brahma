@@ -333,6 +333,11 @@ Switching a company back to Sandboxed does not rule out a process an earlier Wor
   `~/.netrc`, `~/.docker`, `~/.kube`, `~/.claude`, `~/.gitconfig`, shell histories, the Keychains, cookies, Mail, Messages,
   Safari, browser and other app profiles (Chrome, Firefox, Arc, Claude, Slack, 1Password, VS Code, ...);
 - read or write other companies' workspaces;
+- read another item's worktree (`.brahma/wt/<KEY>`), its progress file (`.brahma/progress/<KEY>.md`) or its git admin
+  dir (`.git/worktrees/<KEY>`), unless the agent is in that item's live reader set: the lease holder (else the assignee)
+  and the reviewer. The set is read from the engine's lease and review records when the turn starts; if they can't be
+  read, no other item's places are mounted. Paths are matched after links are resolved, so a link the agent plants in its
+  own place that points into another item's worktree is denied too. The company's main checkout stays readable, read-only;
 - read `/Volumes`;
 - read or delete your backup targets and the WAL replica folder;
 - write outside its own places in the workspace: the item turn's worktree, or the agent's lab, plus its home (with its
@@ -348,7 +353,8 @@ Switching a company back to Sandboxed does not rule out a process an earlier Wor
 
 **Engine-run checks** run under Brahma's own Seatbelt policy, not a turn's. A check writes only its own checkout under
 the data home. It reads the company's workspace except the private parts of `.brahma` (agents' homes, labs and notes,
-extension review pages, `ext try` copies, trash and plans), and it cannot read Claude's temp folders. Its network goes
+extension review pages, `ext try` copies, trash and plans, every item's worktree and progress file), and it cannot read
+Claude's temp folders. A check can still read `.git/worktrees` (its own checkout's admin dir lives there). Its network goes
 only through Brahma's egress proxy: HTTPS (port 443) to the company's Bash allowlist (grants are not included), and only
 at public addresses (loopback, private ranges and cloud metadata are refused). `brahma run --profile` narrows checks
 as it narrows turns: a check runs unconfined as your user only when its company's profile, and the profile of the
@@ -373,8 +379,11 @@ probes, probe line N failed, a leak). Workspace and Full companies run.
 The canary is a self-test whose probes are yours: `brahma canary edit` opens `<data home>/canary/probes.txt` (created
 with header comments only, also by the engine when it is missing; a regular file you own, mode 0600, never a link), one
 shell command per line, each expected to be DENIED. Probes refer to `$CANARY_HOME_FILE`, `$CANARY_DATA_FILE`,
-`$CANARY_OUTSIDE_DIR` and `$OTHER_AGENT_LAB`, places where Brahma plants a dummy `BRAHMA-CANARY-<uuid>` token for the run
-(passed as environment variables, never spliced into the command). Every probe runs twice. First model-free, through a
+`$CANARY_OUTSIDE_DIR`, `$OTHER_AGENT_LAB`, `$OTHER_ITEM_WORKTREE`, `$OTHER_ITEM_PROGRESS` and `$OTHER_ITEM_GITDIR`, places
+where Brahma plants a dummy `BRAHMA-CANARY-<uuid>` token for the run (passed as environment variables, never spliced into
+the command). Brahma also runs built-in probes of its own before your lines: reading another item's worktree, progress
+file and git admin dir (directly and through a link), which the canary agent is no reader of. They are part of the
+canary key, so a pass recorded before they existed no longer counts: run `brahma canary run` once after updating. Every probe runs twice. First model-free, through a
 throwaway agent's shell prefix inside Brahma's own Seatbelt profile, the one around checks and previews (10 s each,
 after a positive control that must succeed): this vouches for that sandbox, not for the agent turn's. Then in one small
 haiku turn built like a real sandboxed turn of the shape being verified (the real compiled settings, both hooks; budget-
@@ -1046,7 +1055,11 @@ Context folds can't appear yet, because the engine's patches carry git's default
 - **Reader sets.** Shares, quotes and cards resolve for each reader with the access rules of the thing they point at
   (scopes, restricted Handbook sections, private labs, DMs). A live diff or live worktree file is readable only by you,
   the concierge, the item's lease holder (else its assignee) and its reviewer; every other agent is refused. Pinned
-  snapshots keep the company's access class.
+  snapshots keep the company's access class. On the Sandboxed profile the same live reader rules hold at the filesystem
+  layer: a turn's Bash reads another item's worktree, progress file and git admin dir only when its agent is in that item's
+  live reader set (see "What Sandboxed blocks"). A live diff the engine computes (CHANGES, `:changes`, `@worktree`) hashes
+  the changed files into a private object store under the data home, removed after the diff, never into the company's
+  `.git/objects` that every turn reads.
 - **The vault.** Scoped, tainted, private and redacted bytes live only in the vault under the data home
   (`<data home>/vault/<company id>/`) and in copies in the reader's own lab. Sandboxed turns can't read the data home.
 - **Taint chips.** A share carries the taint of the session that made it. A reader that opens tainted content is marked
@@ -1074,8 +1087,9 @@ Context folds can't appear yet, because the engine's patches carry git's default
 **Profile caveat (Workspace and Full profiles):** "Resource scopes and lab privacy are enforced only by Brahma's tools;
 an agent's shell can read them." Reader sets, private labs and live diffs are Brahma's rules for its own tools; on these
 profiles an agent's Bash can still read the workspace, other items' worktrees and the vault. On the Sandboxed profile
-the data home, and so the vault, is denied to agents. Denying agents reads of other items' worktrees and progress files on
-the Sandboxed profile is final-wave work.
+the data home, and so the vault, is denied to agents, and so are other items' worktrees, progress files and git admin
+dirs unless the agent is in that item's live reader set. One residual: content a holder stages or commits itself is in
+the company's one git object store, which every turn reads to use git (an object id is needed to find it).
 
 **Not built yet (final wave):** the SHARED / MENTIONED / READ BY footer on a ref, the Handbook revision picker in the
 preview, diff folds, the concierge citing PDFs, short-secret protection (a stored value shorter than 8 characters is not
