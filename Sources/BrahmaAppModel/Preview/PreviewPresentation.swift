@@ -5,6 +5,8 @@ import BrahmaCore
 /// failed `danger`, idle/stopped `text2`, unavailable `warning`; 4a's `ran` `success`.
 public enum PreviewTone: Sendable {
     case good, busy, bad, idle, warn
+    /// Plan C: the OPENED chip (`accent`).
+    case accent
 
     public init(_ status: PreviewStatus) {
         switch status {
@@ -46,6 +48,9 @@ public struct PreviewTab: Equatable, Identifiable, Sendable {
     public init(id: String, title: String, statusTitle: String, tone: PreviewTone, surfaceId: String?) {
         self.id = id; self.title = title; self.statusTitle = statusTitle; self.tone = tone; self.surfaceId = surfaceId
     }
+
+    /// Only the OPENED tab closes; product tabs (surfaces, ARTIFACTS, LIVE) never do.
+    public var closable: Bool { id == PreviewTabID.ref }
 }
 
 public enum PreviewTabs {
@@ -63,6 +68,15 @@ public enum PreviewTabs {
         }
         if p.live != nil {
             tabs.append(PreviewTab(id: PreviewTabID.live, title: "LIVE", statusTitle: p.liveRef ?? "LIVE", tone: .good, surfaceId: nil))
+        }
+        return tabs
+    }
+
+    /// `make(p)` plus, when a ref is open (Plan C `PreviewNav.opened`), the OPENED tab (`PreviewTabID.ref`, chip = the ref's kind).
+    public static func make(_ p: PreviewSnapshot, opened: OpenedRef?) -> [PreviewTab] {
+        var tabs = make(p)
+        if let opened {
+            tabs.append(PreviewTab(id: PreviewTabID.ref, title: "OPENED", statusTitle: opened.kindChip, tone: .accent, surfaceId: nil))
         }
         return tabs
     }
@@ -103,6 +117,8 @@ public enum PreviewBody: Equatable, Sendable {
     case window(pid: Int32)
     /// The ARTIFACTS tab (4a): the shown artifact (rendered through `FileBody`; `AppModel.fileBody(for:)`) and the list.
     case artifact(Artifact, all: [Artifact])
+    /// The OPENED tab (Plan C): a ref's body (`RefBodies`), or the chat inspector's.
+    case ref(RefBody)
 }
 
 public enum PreviewBodies {

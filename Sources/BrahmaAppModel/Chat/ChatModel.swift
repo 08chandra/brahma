@@ -13,6 +13,8 @@ public struct ChatMessage: Equatable, Identifiable, Sendable {
     public var senderHandle: String
     public var isOwner: Bool
     public var id: String
+    /// Plan C (C4c, Ruling 60): the concierge's answer, labelled as the concierge's and never as engine text.
+    public var isConcierge = false
 }
 
 @MainActor @Observable
@@ -30,6 +32,12 @@ public final class ChatModel {
     /// Files, folders and links dropped on this conversation's composer (an owner DM or a channel; nil where the owner can't
     /// drop). While any is pending, Send commits them with the typed text as one message (`ResourceDropModel.commit`).
     public var drops: ResourceDropModel?
+    /// Plan C: the message the next send replies to (`msg:<id>` or the bare id), set by "Reply in thread".
+    public var replyTo: String?
+    /// Plan C: the cards of each message's attached refs (shares, quotes, inline chips), by message id, from `cardMaker`.
+    public private(set) var attachments: [String: [AttachmentCard]] = [:]
+    /// Plan C: builds the cards of a message off-main (set by `AppModel`; nil shows no cards).
+    @ObservationIgnored public var cardMaker: (@Sendable (Message) throws -> [AttachmentCard])?
 
     @ObservationIgnored private let store: Store
     @ObservationIgnored private let companyId: String
@@ -119,6 +127,9 @@ public final class ChatModel {
         let byId = Dictionary(agents.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
         return list.map { m in
             let owner = m.senderId == "owner"
+            if m.senderId == ConciergeCaps.agentId {
+                return ChatMessage(message: m, senderHandle: "Brahma (concierge)", isOwner: false, id: m.id, isConcierge: true)
+            }
             return ChatMessage(message: m, senderHandle: owner ? "owner" : (m.senderId == "system" ? "system" : byId[m.senderId] ?? "unknown"), isOwner: owner, id: m.id)
         }
     }
@@ -139,6 +150,7 @@ public final class ChatModel {
             hasEarlier = result.messages.count > n
             messages = decorate(hasEarlier ? Array(result.messages.dropFirst()) : result.messages)
             loaded = true
+            await loadAttachments(generation: gen)
         } catch {
             if gen == generation { sendError = "Couldn't load messages: \(error)" }
         }
@@ -209,19 +221,23 @@ public final class ChatModel {
         guard !text.isEmpty else { return false }
         let (store, companyId, target) = (self.store, self.companyId, self.target)
         let channelName = channel?.name
+        let replyTo = self.replyTo
         // Before the first load a channel target has no name yet: nothing to post to, and nothing gone either.
         if case .channel = target, channelName == nil { return false }
         isSending = true
         defer { isSending = false }
+        var refusal: String?
         do {
-            try await Task.detached {
+            refusal = try await Task.detached { () -> String? in
                 let router = MessageRouter(store: store)
                 switch target {
                 case .channel:
                     guard let channelName else { throw RouterError.unknownChannel("") }
-                    _ = try router.post(companyId: companyId, channel: channelName, from: .owner, text: text)
+                    // Plan C (C3a): a thread reply never broadcasts; the router's refusal of `@here`/`@team` is shown to the owner.
+                    return try router.postDetailed(companyId: companyId, channel: channelName, from: .owner, text: text, replyTo: replyTo).broadcastRefusal
                 case .dm(let h):
-                    _ = try router.sendDM(companyId: companyId, from: .owner, to: h, text: text)
+                    _ = try router.sendDM(companyId: companyId, from: .owner, to: h, text: text, replyTo: replyTo)
+                    return nil
                 }
             }.value
         } catch {
@@ -230,7 +246,8 @@ public final class ChatModel {
         }
         // Keep anything typed while the send was in flight.
         if draft.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = "" }
-        sendError = nil
+        self.replyTo = nil
+        sendError = refusal
         await refresh()
         await markRead()
         return true
@@ -255,6 +272,19 @@ public final class ChatModel {
         case .unknownAgent(let h)?: return "No agent @\(h) in this company."
         default: return "Couldn't send: \(error)"
         }
+    }
+
+    /// Plan C: the cards of the loaded messages that carry refs (shares, answers, attachments, inline chips), built off-main by
+    /// `cardMaker`; a message's cards are kept once built. Dropped when a newer load superseded this one.
+    func loadAttachments(generation gen: Int) async {
+        guard let maker = cardMaker else { return }
+        let wanted = messages.map(\.message).filter { attachments[$0.id] == nil }
+        guard !wanted.isEmpty else { return }
+        let built: [(String, [AttachmentCard])] = await Task.detached {
+            wanted.compactMap { m in (try? maker(m)).map { (m.id, $0) } }
+        }.value
+        guard gen == generation else { return }
+        for (id, cards) in built { attachments[id] = cards }
     }
 
     /// Marks everything up to the newest loaded message as read.

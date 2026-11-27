@@ -839,7 +839,7 @@ public actor Orchestrator {
     /// The engine's archive reader for gate requests: `unzip` and the PDF helper (`brahma-pdf` beside the engine's binary)
     /// under the owner's sandbox runner, each read in a fresh private vault temp directory. Where no sandbox or helper
     /// exists it refuses what it can't read (fail closed).
-    nonisolated static func gateArchives(store: Store, paths: BrahmaPaths, companyId: String) -> any ArchiveReader {
+    public nonisolated static func gateArchives(store: Store, paths: BrahmaPaths, companyId: String) -> any ArchiveReader {
         let vault = Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths))
         let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
         return SandboxedUnzipReader(runner: Orchestrator.ownerSandboxRunner(store: store, paths: paths), scratch: { try vault.makeTempDir() },

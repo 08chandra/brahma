@@ -203,7 +203,7 @@ extension Store {
 
     /// An ask's title as the owner's lines show it (`enterPendingOwner`): gated final display string, flagged when an agent's
     /// title claims to be the owner.
-    static func ownerShownTitle(_ ask: Ask, knownValues: [(name: String, value: String)]?) -> String {
+    public static func ownerShownTitle(_ ask: Ask, knownValues: [(name: String, value: String)]?) -> String {
         guard let knownValues else { return titleHeldText }
         // Flagged only on the text the owner sees (Ruling 56): a withheld title is never checked.
         guard let shown = GlobalSearch.TextGate(knownValues: knownValues).final(ask.title, max: FileRequestCard.titleMax, inert: true) else {

@@ -150,7 +150,7 @@ public struct GlobalSearch: Sendable {
 
         /// The display pipeline: NFKC; C0/C1 controls, bidi, zero-width, format characters, U+00AD and U+180E dropped; every
         /// run of white space one space (trimmed); with `inert`, `"` → `'`, `[` → `(`, `]` → `)` (the tool's line fields).
-        static func display(_ raw: String, inert: Bool) -> String {
+        public static func display(_ raw: String, inert: Bool) -> String {
             var out = String.UnicodeScalarView()
             var pendingSpace = false
             for scalar in raw.precomposedStringWithCompatibilityMapping.unicodeScalars {
@@ -175,7 +175,7 @@ public struct GlobalSearch: Sendable {
 
         /// The text holds a pattern or a value: as written, without the characters a display drops, or in the inert
         /// spelling (`"` ↔ `'`, brackets ↔ parentheses), so a value differing only by those is withheld everywhere.
-        func holdsSecret(_ s: String) -> Bool {
+        public func holdsSecret(_ s: String) -> Bool {
             if mayHold(s), ContentScan.redact(text: s, findings: [], knownValues: expanded) != s { return true }
             if skeletonHolds(s) { return true }
             let inert = Self.display(s, inert: true)
@@ -190,7 +190,7 @@ public struct GlobalSearch: Sendable {
 
         /// The final display string of `raw` (at most `max` characters, cut with `…`), or nil when the whole text or the cut
         /// holds a value.
-        func final(_ raw: String, max: Int, inert: Bool = false) -> String? {
+        public func final(_ raw: String, max: Int, inert: Bool = false) -> String? {
             let full = Self.display(raw, inert: inert)
             guard !holdsSecret(full) else { return nil }
             let cut = full.count > max ? String(full.prefix(max - 1)) + "\u{2026}" : full

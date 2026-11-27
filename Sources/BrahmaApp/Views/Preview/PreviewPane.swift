@@ -78,6 +78,7 @@ struct PreviewPane<Accessory: View>: View {
         case .bad: BrahmaTheme.danger
         case .idle: BrahmaTheme.text2
         case .warn: BrahmaTheme.warning
+        case .accent: BrahmaTheme.accent
         }
     }
 }

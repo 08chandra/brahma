@@ -42,6 +42,11 @@ public enum SelectTarget: Equatable, Sendable {
     case sheet(AppSheet)
     /// Mission Control with the agent map.
     case map
+    /// `ref:<companyId>/<canonical>` (Plan C): that company selected and the ref opened in the preview's OPENED slot. View-only: it
+    /// never asks, shares, grants or spends, and a `ref:` without a company id is refused (nil).
+    case ref(companyId: String, canonical: String)
+    /// `find:<query>` (Plan C): the Show palette open with the query typed and its results shown, Enter never pressed.
+    case find(String)
 
     public init?(_ s: String) {
         switch s {
@@ -87,6 +92,12 @@ public enum SelectTarget: Equatable, Sendable {
             case "artifact":
                 guard let number = Artifact.parseRef(value) else { return nil }
                 self = .artifact(number: number)
+            case "ref":
+                guard let slash = value.firstIndex(of: "/") else { return nil }
+                let companyId = String(value[..<slash]), canonical = String(value[value.index(after: slash)...])
+                guard !companyId.isEmpty, !canonical.isEmpty else { return nil }
+                self = .ref(companyId: companyId, canonical: canonical)
+            case "find": self = .find(value)
             default: return nil
             }
         }

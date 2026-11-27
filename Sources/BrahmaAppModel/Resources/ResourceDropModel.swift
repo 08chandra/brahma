@@ -507,8 +507,9 @@ public final class ResourceDropModel {
             // Exactly one call, so exactly one message (`commit` lets a link through only on its own).
             if let files {
                 let known = try store.knownSecretValues(companyId: companyId, vault: vault)
-                try store.addResources(companyId: companyId, plan: files.plan, drop: drop(trust: files.trust, secret: files.secret),
-                                       contentVault: content, secretVault: vault, knownValues: known, paths: paths)
+                // Plan C Task C6: through C5's `ownerDrop` (the same `addResources`, with the file-request rules).
+                try store.ownerDrop(companyId: companyId, context: context, plan: files.plan, drop: drop(trust: files.trust, secret: files.secret),
+                                    contentVault: content, secretVault: vault, knownValues: known, paths: paths)
                 result.committed = fileIds
             } else if let link, let url = link.link {
                 try store.addLink(companyId: companyId, url: url, drop: drop(trust: link.trust, secret: .none), contentVault: content)

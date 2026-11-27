@@ -117,7 +117,7 @@ extension Store {
     /// is a bare ref form (`IndustryPack.reservedKeyPrefixes`: `A`, `AR`, `F`) gets an `X` (`AX`, `ARX`, `FX`), so `A-<n>`,
     /// `AR-<n>` and `F-<n>` always mean an ask, an artifact and a resource. Items stored before keep their keys (ML's
     /// `item:<KEY>` still reaches them).
-    static func keyPrefix(slug: String) -> String {
+    public static func keyPrefix(slug: String) -> String {
         let letters = String(slug.filter { $0.isASCII && ($0.isLetter || $0.isNumber) }.uppercased().prefix(5))
         let derived = letters.isEmpty ? "ITEM" : letters
         let prefix = IndustryPack.reservedKeyPrefixes.contains(derived) ? derived + "X" : derived

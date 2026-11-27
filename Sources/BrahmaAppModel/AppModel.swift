@@ -109,6 +109,32 @@ public final class AppModel {
     /// Between `closeStore()` and a successful `reopenStore()`: `store` is closed, so no live map may be built over it.
     @ObservationIgnored private var storeClosed = false
 
+    /// Plan C: the preview's OPENED slot and its history (per company, `PreviewNavStore`).
+    public internal(set) var previewNav = PreviewNav()
+    /// Plan C: the body of the opened ref (rendered off-main; nil while it loads or with nothing open).
+    public internal(set) var openedBody: RefBody?
+    /// Plan C: the ref open in chat's inspector split, and its body.
+    public internal(set) var chatInspector: OpenedRef?
+    public internal(set) var inspectorBody: RefBody?
+    /// Plan C: the search-and-ask bar (atop the preview, and the ⌘K palette).
+    public private(set) var showBar: ShowBarModel
+    /// Plan C: the owner's open show requests, as waiting chips (refreshed every tick).
+    public internal(set) var waitingChips: [WaitingChip] = []
+    /// Plan C: answers opened in the background since the owner last looked at the OPENED tab.
+    public internal(set) var autoOpenBadge = 0
+    /// Plan C: the "owner requests" Budget line's numbers.
+    public internal(set) var ownerRequestUsage: OwnerRequestUsage?
+    /// Bumped by every open, so a body rendered for a ref the owner has since left is dropped.
+    @ObservationIgnored var openGeneration = 0
+    @ObservationIgnored let showFiles = FileIndexCache()
+    @ObservationIgnored let showCommits = CommitIndexCache()
+    /// The archive and PDF reader renders and shares pass to the gate (`Orchestrator.gateArchives` in the app; tests inject one).
+    @ObservationIgnored public var refArchives: @Sendable (Store, BrahmaPaths, String) -> any ArchiveReader = {
+        Orchestrator.gateArchives(store: $0, paths: $1, companyId: $2)
+    }
+    /// Where `PreviewNav` is kept (`.standard` in the app; tests give a suite of their own).
+    @ObservationIgnored public var navDefaults: UserDefaults = .standard
+
     /// The embedded engine, when this app hosts one. Set by the app delegate.
     public var engine: EngineHost?
     /// Runs after each tick that read the database without error.
@@ -139,6 +165,7 @@ public final class AppModel {
         self.access = AccessModel(store: store)
         self.settings = SettingsModel(store: store)
         self.digest = DigestModel(store: store)
+        self.showBar = ShowBarModel(backend: .empty)
         wireSubmodels()
     }
 
@@ -273,6 +300,7 @@ public final class AppModel {
             access.companyId = firstId
             settings.companyId = firstId
             digest.companyId = firstId
+            if let firstId { loadPreviewNav(companyId: firstId) }
             try await reloadSelected()
             loaded = true
         } catch {
@@ -321,6 +349,7 @@ public final class AppModel {
                 try await refreshSnapshot()
             }
             if turnStreamAgentId != nil { await refreshTurnStream() }
+            await refreshCollab()
             lastDBError = nil
             ticksSinceDelivery += 1
             if ticksSinceDelivery >= Self.deliveryEvery {
@@ -377,6 +406,7 @@ public final class AppModel {
         highlightedMessageId = nil
         handbook = nil
         replay = nil
+        loadPreviewNav(companyId: id)
         do { try await reloadSelected() } catch { report(error) }
     }
 
@@ -396,6 +426,7 @@ public final class AppModel {
         if chat?.target == target { return }
         let model = ChatModel(store: store, companyId: companyId, target: target)
         model.drops = dropContext(for: target).map { ResourceDropModel(app: self, context: $0, defaults: dropDefaults) }
+        model.cardMaker = makeCardMaker(companyId: companyId)
         chat = model
         Task { await model.refresh() }
     }
@@ -475,6 +506,13 @@ public final class AppModel {
         case .map:
             select(.missionControl)
             _ = ensureMapController()
+        case .ref(let companyId, let canonical):
+            // View-only: the company is selected and the ref opened; nothing is asked, shared, granted or spent.
+            Task { await applyRef(companyId: companyId, canonical: canonical) }
+        case .find(let query):
+            openShow(presentation: .overlay)
+            showBar.query = query
+            Task { await showBar.update(query: query) }
         }
     }
 

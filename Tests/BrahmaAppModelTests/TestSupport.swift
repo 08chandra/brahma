@@ -44,6 +44,9 @@ extension AppModel {
     /// The test `AppModel`: its secret store is a `MemoryVault` (no test touches the Keychain).
     convenience init(store: Store, paths: BrahmaPaths, clock: @escaping @Sendable () -> Date = { .now }) {
         self.init(store: store, paths: paths, secretVault: MemoryVault(), clock: clock)
+        // Plan C: renders read no archive or PDF (nothing is spawned), and navigation state never touches the real defaults.
+        refArchives = { _, _, _ in UnavailableArchiveReader() }
+        navDefaults = UserDefaults(suiteName: "brahma.tests.appmodel.\(UUID().uuidString)") ?? .standard
     }
 }
 

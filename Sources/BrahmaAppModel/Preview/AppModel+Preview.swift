@@ -2,8 +2,8 @@ import Foundation
 import BrahmaCore
 
 extension AppModel {
-    /// The selected company's preview tabs.
-    public var previewTabs: [PreviewTab] { PreviewTabs.make(snapshot.preview) }
+    /// The selected company's preview tabs, with the OPENED tab when a ref is open (Plan C).
+    public var previewTabs: [PreviewTab] { PreviewTabs.make(snapshot.preview, opened: previewNav.opened) }
 
     /// The body of the selected tab (an unknown or reserved selection is the default one).
     public var previewBody: PreviewBody { previewBody(forTab: selectedPreviewTab) }
@@ -12,6 +12,10 @@ extension AppModel {
     /// selected (possibly pinned) artifact, with the list and picker always present (`artifactNotice` is shown beside them, never
     /// in their place); a backend body carries the parsed OpenAPI copy (`previewForBodies`).
     public func previewBody(forTab tabId: String?) -> PreviewBody {
+        // Plan C: the OPENED tab shows the opened ref's body (or a placeholder while it renders).
+        if tabId == PreviewTabID.ref, let opened = previewNav.opened {
+            return .ref(openedBody ?? RefBody(header: RefHeader(title: opened.title, subtitle: "", chips: [], actions: []), content: .unavailable("LOADING")))
+        }
         let p = previewForBodies
         let tails = p.logTails
         return PreviewBodies.body(for: tabId, snapshot: p, logTail: { tails[$0.path] ?? [] }, selectedArtifactId: selectedArtifactId)

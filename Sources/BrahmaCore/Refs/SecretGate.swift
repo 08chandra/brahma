@@ -690,9 +690,11 @@ extension Store {
             throw WorkError.notFound(target == ref ? Self.refUnavailable
                                      : "the original of \(SecretGate.shown(ref.canonical, knownValues: knownValues)) is no longer available")
         }
-        let data = content.data
-        _ = try SecretGate.check(data, ext: content.ext, canonical: ref.canonical, archives: archives ?? UnavailableArchiveReader(),
-                                 knownValues: knownValues, store: self, companyId: companyId)
+        // Plan C Task C6 (Rulings 41/42): the bytes served go through `gatedBytes`, so a PDF the owner vouched for is its
+        // flattened copy, never the original; a stored value still refuses, and a pattern in text is shown as it is (the owner checks it here).
+        let gated = try gatedBytes(content.data, ext: content.ext, canonical: ref.canonical, companyId: companyId,
+                                   archives: archives ?? UnavailableArchiveReader(), knownValues: knownValues, paths: paths)
+        let data = gated.data
         try writer.write { db in
             try Self.recordRefRead(db: db, companyId: companyId, reader: .owner, canonical: ref.canonical, rev: content.rev,
                                    bytes: data.count, tainted: r.resolved.tainted, via: "viewOriginal", turnId: nil, now: now)

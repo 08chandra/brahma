@@ -53,14 +53,14 @@ public struct WorkRef: Codable, Hashable, Sendable {
     public static func parse(_ s: String, context: RefContext) -> WorkRef? { RefGrammar.parse(s, context: context) }
 
     /// The item key of a file or diff on an item branch or worktree.
-    var itemKey: String? {
+    public var itemKey: String? {
         guard let branch else { return nil }
         if branch.hasPrefix("item/") { return String(branch.dropFirst(5)) }
         if branch.hasPrefix("worktree:") { return String(branch.dropFirst(9)) }
         return nil
     }
 
-    var isWorktree: Bool { branch?.hasPrefix("worktree:") == true }
+    public var isWorktree: Bool { branch?.hasPrefix("worktree:") == true }
 }
 
 /// C's flat access word for a ref (what `RefDecision` carries), derived from ML's class and sensitivity.

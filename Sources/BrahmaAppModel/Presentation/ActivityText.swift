@@ -3,6 +3,8 @@ import BrahmaCore
 
 public enum ActivityFilter: String, CaseIterable, Sendable {
     case all, messages, turns, states, work, problems
+    /// Plan C: shares, access decisions and refusals, exports and show requests (design §4.7).
+    case sharing
 
     public var title: String {
         switch self {
@@ -12,6 +14,7 @@ public enum ActivityFilter: String, CaseIterable, Sendable {
         case .states: "State changes"
         case .work: "Work"
         case .problems: "Problems"
+        case .sharing: "Sharing"
         }
     }
 
@@ -23,6 +26,7 @@ public enum ActivityFilter: String, CaseIterable, Sendable {
         case .states: k == .stateChanged
         case .work: k == .work || k == .approval || k == .preview || k == .release || k == .resource || k == .merge
         case .problems: k == .usage || k == .error
+        case .sharing: k == .share || k == .access || k == .export || k == .show
         }
     }
 }
