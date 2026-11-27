@@ -82,6 +82,15 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     /// Why the merge queue is held (an engine-written reason); nil: running.
     public var mergeHold: String? = nil
 
+    // Billing (Plan X1, `"vX1-gateway"`). Changed only through `Store.setBillingMode` and `Store.setUnattendedSubscription`
+    // (owner-only); `updateCompany` keeps the stored values.
+    /// How the company's turns are paid for.
+    public var billingMode: BillingMode = .subscription
+    /// The owner's recorded opt-in to unattended runs on the subscription (Ruling 7′); off: unattended runs need an API key.
+    public var unattendedSubscription: Bool = false
+    /// When the opt-in was recorded; nil while it is off.
+    public var unattendedSubscriptionAt: Date? = nil
+
     /// The profile a turn of an agent with this role runs under: the role's override, else the company's.
     public func profile(forRole role: String) -> PermissionProfile { roleProfiles[role] ?? permissionProfile }
 }

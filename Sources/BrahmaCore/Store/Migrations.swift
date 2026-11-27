@@ -1,3 +1,4 @@
+import Foundation
 import GRDB
 
 enum Migrations {
@@ -644,6 +645,7 @@ enum Migrations {
         registerPlanL(&m)
         registerPlan4b(&m)
         registerPlanML(&m)
+        registerPlanX1(&m)
         return m
     }
 
@@ -2025,6 +2027,127 @@ enum Migrations {
                 t.add(column: "quote", .text)
                 t.add(column: "tainted", .boolean).notNull().defaults(to: false)
                 t.add(column: "messageId", .text)
+            }
+        }
+    }
+
+    /// Plan X1 migrations: registered after every Plan ML/C migration (the last is `vC-changes-quote`), never inside an earlier
+    /// plan's function, in landing order vX1-gateway. Never edit an earlier one.
+    static func registerPlanX1(_ m: inout DatabaseMigrator) {
+        m.registerMigration("vX1-gateway") { db in
+            // Plan X1 Task 5: the provider gateway's tables. Every company-owned row has `companyId` (cascading with the company);
+            // `provider`, `modelProbe` and `priceRow` are owner-wide. No column ever holds a key value: `provider.keySecret` is the
+            // NAME of the vault secret (`ANTHROPIC_API_KEY` or `BRAHMA_KEY_<PROVIDER>`).
+            try db.create(table: "provider") { t in
+                t.primaryKey("id", .text)
+                t.column("adapter", .text).notNull()
+                t.column("baseURL", .text).notNull()
+                t.column("host", .text).notNull()
+                t.column("keySecret", .text)
+                t.column("lan", .boolean).notNull().defaults(to: false)
+                t.column("builtin", .boolean).notNull().defaults(to: false)
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(table: "providerCap") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("provider", .text).notNull().references("provider")
+                t.column("monthlyUSD", .double).notNull()
+                t.column("dailyUSD", .double).notNull()
+                t.primaryKey(["companyId", "provider"])
+            }
+            // `state` (Ruling 12): reserved before the request goes upstream, then settled (or estimated when usage is missing).
+            try db.create(table: "gatewayCharge") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("turnId", .text)
+                t.column("itemId", .text)
+                t.column("agentId", .text)
+                t.column("provider", .text).notNull()
+                t.column("model", .text).notNull()
+                for c in ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"] {
+                    t.column(c, .integer).notNull().defaults(to: 0)
+                }
+                t.column("usd", .double).notNull()
+                t.column("estimated", .boolean).notNull().defaults(to: false)
+                t.column("state", .text).notNull().defaults(to: "settled")   // reserved|settled|estimated
+                t.column("at", .datetime).notNull()
+            }
+            try db.create(index: "gatewayCharge_company_provider_at", on: "gatewayCharge", columns: ["companyId", "provider", "at"])
+            try db.create(table: "modelRoute") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("scope", .text).notNull()                 // company|role|agent
+                t.column("subject", .text).notNull()               // '' | role id | agent id
+                t.column("class", .text).notNull()
+                t.column("provider", .text).notNull().references("provider")
+                t.column("model", .text).notNull()
+                t.primaryKey(["companyId", "scope", "subject", "class"])
+            }
+            try db.create(table: "modelProbe") { t in
+                t.column("provider", .text).notNull()
+                t.column("model", .text).notNull()
+                t.column("adapterVersion", .text).notNull()
+                t.column("cliVersion", .text).notNull()
+                t.column("level", .text).notNull()                 // agent|textOnly|unavailable
+                t.column("steps", .text).notNull()                 // JSON [ProbeStepResult]
+                t.column("declaredContext", .integer)
+                t.column("probedAt", .datetime).notNull()
+                t.primaryKey(["provider", "model", "adapterVersion", "cliVersion"])
+            }
+            try db.create(table: "modelProbeRequest") { t in
+                t.primaryKey("id", .text)
+                t.column("provider", .text).notNull()
+                t.column("model", .text).notNull()
+                t.column("requestedBy", .text).notNull()
+                t.column("companyId", .text).references("company", onDelete: .cascade)
+                t.column("status", .text).notNull()                // queued|done|failed
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "modelProbeRequest_status", on: "modelProbeRequest", columns: ["status", "createdAt"])
+            try db.create(table: "priceRow") { t in
+                t.column("provider", .text).notNull()
+                t.column("model", .text).notNull()
+                t.column("inPerMTok", .double).notNull()
+                t.column("outPerMTok", .double).notNull()
+                t.column("cacheReadPerMTok", .double)
+                t.column("cacheWritePerMTok", .double)
+                t.column("setBy", .text).notNull()
+                t.primaryKey(["provider", "model"])
+            }
+            // Billing (spec §8.2) and the recorded unattended-subscription opt-in (Ruling 7′); a new company's mode is chosen at
+            // creation (Task 14), so the default only keeps existing companies working.
+            try db.alter(table: "company") { t in
+                t.add(column: "billingMode", .text).notNull().defaults(to: "subscription")
+                t.add(column: "unattendedSubscription", .boolean).notNull().defaults(to: false)
+                t.add(column: "unattendedSubscriptionAt", .datetime)
+            }
+            // Pacing preset and the daily-share baseline (Task 15); the provider-policy switch (Ruling 7b).
+            try db.alter(table: "ownerSettings") { t in
+                t.add(column: "pacingPreset", .text).notNull().defaults(to: "conservative")
+                t.add(column: "dayStartUtil", .double)
+                t.add(column: "dayStartDate", .text)
+                t.add(column: "subscriptionAllowed", .boolean).notNull().defaults(to: true)
+            }
+            try db.alter(table: "turn") { t in
+                t.add(column: "runtime", .text)
+                t.add(column: "authRoute", .text)
+                t.add(column: "provider", .text)
+                t.add(column: "routedModel", .text)
+                t.add(column: "meteredUSD", .double)
+            }
+            try db.alter(table: "itemFact") { t in t.add(column: "meteredUSD", .double).notNull().defaults(to: 0) }
+            // The four built-in providers. Their key names can never be test keys (`ANTHROPIC_*` and `BRAHMA_*` are never
+            // injectable), so no provider key can reach an agent or a check.
+            let builtins: [(String, String, String, String, String)] = [
+                ("anthropic", "anthropic", "https://api.anthropic.com", "api.anthropic.com", "ANTHROPIC_API_KEY"),
+                ("openai", "openai-compatible", "https://api.openai.com/v1", "api.openai.com", "BRAHMA_KEY_OPENAI"),
+                ("openrouter", "openai-compatible", "https://openrouter.ai/api/v1", "openrouter.ai", "BRAHMA_KEY_OPENROUTER"),
+                ("groq", "openai-compatible", "https://api.groq.com/openai/v1", "api.groq.com", "BRAHMA_KEY_GROQ"),
+            ]
+            let now = Date()
+            for (id, adapter, baseURL, host, key) in builtins {
+                try db.execute(sql: """
+                    INSERT INTO provider (id, adapter, baseURL, host, keySecret, lan, builtin, createdAt) VALUES (?, ?, ?, ?, ?, 0, 1, ?)
+                    """, arguments: [id, adapter, baseURL, host, key, now])
             }
         }
     }

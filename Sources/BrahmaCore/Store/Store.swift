@@ -317,6 +317,10 @@ public final class Store: Sendable {
                 // Set once at creation (Task 14).
                 kept.importedFrom = stored.importedFrom
                 kept.importedCommit = stored.importedCommit
+                // Billing changes only through its owner-only setters (Plan X1).
+                kept.billingMode = stored.billingMode
+                kept.unattendedSubscription = stored.unattendedSubscription
+                kept.unattendedSubscriptionAt = stored.unattendedSubscriptionAt
             }
             try kept.update(db)
         }

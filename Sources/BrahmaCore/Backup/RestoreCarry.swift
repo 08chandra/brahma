@@ -271,8 +271,8 @@ struct RestoreCarry {
         }
     }
 
-    /// S35: every security-relevant company setting (`CompanySecurity.fields`) and the owner-wide auto-merge switch keep the
-    /// stricter of the live and the restored value. Rows (agents, extensions, presets, secrets) are reported only.
+    /// S35: every security-relevant company setting (`CompanySecurity.fields`) and the owner-wide auto-merge and provider-policy
+    /// (`subscriptionAllowed`) switches keep the stricter of the live and the restored value. Rows (agents, extensions, presets, secrets) are reported only.
     ///
     /// Where auto-merge is kept off (owner-wide, or a company's), the snapshot's auto-approvals that have not landed are taken
     /// back exactly as switching it off live does (`Store.revokeAutoApprovals`), so none lands on a switch the owner turned off.
@@ -289,6 +289,11 @@ struct RestoreCarry {
             try Store.ensureOwnerSettings(db)
             keptOffOwnerWide = try Store.ownerAutoMerge(db: db)   // the snapshot had it on
             try db.execute(sql: "UPDATE ownerSettings SET autoMerge = 0 WHERE id = 1")
+        }
+        // Plan X1 (Ruling 7b): subscription turns the owner switched off stay off.
+        if live.ownerSubscriptionAllowed == false, try db.tableExists("ownerSettings") {
+            try Store.ensureOwnerSettings(db)
+            try db.execute(sql: "UPDATE ownerSettings SET subscriptionAllowed = 0 WHERE id = 1")
         }
         // S36: the narrower auto-merge folder list.
         if try db.tableExists("ownerSettings") {
@@ -520,18 +525,23 @@ extension RestoreCarry {
         var ownerAutoMerge: Bool?
         /// `ownerSettings.autoMergePaths` (S36): nil is the pack's list (else the default).
         var ownerAutoMergePaths: [String]?
+        /// `ownerSettings.subscriptionAllowed` (Plan X1, Ruling 7b): the provider-policy switch for subscription turns.
+        var ownerSubscriptionAllowed: Bool?
 
         /// Every `ownerSettings` column, classified for restores (S36; `OwnerSettingsSecurityTests` fails on a new column in
         /// neither list). Security-relevant ones keep the stricter value (`keepStricterSettings`).
         static let ownerSecurityColumns: [String: String] = [
             "autoMerge": "off is stricter: kept off when it is off live",
             "autoMergePaths": "the narrower folder list: both set, their intersection; one set, the live list",
+            "subscriptionAllowed": "off is stricter: subscription turns kept off when they are off live",
         ]
         static let ownerNotSecurityColumns: [String: String] = [
             "id": "the one row", "timeZone": "calendar display", "planTier": "spend pacing", "weeklyShare": "spend pacing",
             "pctPerDollar": "usage calibration", "pctPerDollar5h": "usage calibration", "calibUtil": "usage calibration",
             "calibResetsAt": "usage calibration", "calibCost": "usage calibration", "calibration": "usage calibration",
             "hotPaths": "merge serialization against conflicts; risk tags use the built-in list, not this one",
+            "pacingPreset": "spend pacing", "dayStartUtil": "spend pacing (the daily share's baseline)",
+            "dayStartDate": "spend pacing (the daily share's baseline)",
         ]
 
         /// S36: the narrower auto-merge folder list. Both set: their intersection (in the live order); one set: the live list.
@@ -563,6 +573,9 @@ extension RestoreCarry {
                 s.ownerAutoMerge = try Bool.fetchOne(db, sql: "SELECT autoMerge FROM ownerSettings WHERE id = 1")
                 s.ownerAutoMergePaths = try String.fetchOne(db, sql: "SELECT autoMergePaths FROM ownerSettings WHERE id = 1")
                     .flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) }
+            }
+            if try db.tableExists("ownerSettings"), try db.columns(in: "ownerSettings").contains(where: { $0.name == "subscriptionAllowed" }) {
+                s.ownerSubscriptionAllowed = try Bool.fetchOne(db, sql: "SELECT subscriptionAllowed FROM ownerSettings WHERE id = 1")
             }
             return s
         }
@@ -604,6 +617,9 @@ extension RestoreCarry {
                 out.append("\(companyName(company)): secret \(name), removed after the snapshot, is listed again (its value is not)")
             }
             if restored.ownerAutoMerge != false, live.ownerAutoMerge == false { out.append("owner-wide auto-merge kept off (the snapshot had it on)") }
+            if restored.ownerSubscriptionAllowed != false, live.ownerSubscriptionAllowed == false {
+                out.append("owner-wide subscription turns kept off by provider policy (the snapshot had them on)")
+            }
             let paths = narrowerAutoMergePaths(live: live.ownerAutoMergePaths, restored: restored.ownerAutoMergePaths)
             if paths != restored.ownerAutoMergePaths {
                 func show(_ p: [String]?) -> String { p.map { $0.isEmpty ? "none" : $0.joined(separator: ", ") } ?? "the pack's list" }

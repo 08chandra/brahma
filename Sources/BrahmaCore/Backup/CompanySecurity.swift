@@ -59,6 +59,13 @@ public enum CompanySecurity {
         ordered("autoMergeSmall", \.autoMergeSmall, "auto-merge", rank: { $0 ? 1 : 0 }, show: { $0 ? "on" : "off" }),
         // The owner's pause: nothing of a paused company runs.
         ordered("status", \.status, "status", rank: { $0 == .paused ? 0 : 1 }, show: \.rawValue),
+        // Plan X1 (Ruling 7′): the opt-in to unattended subscription runs; off is stricter. Its time goes with it.
+        Field(name: "unattendedSubscription") { merged, live, restored in
+            guard !live.unattendedSubscription, restored.unattendedSubscription else { return nil }
+            merged.unattendedSubscription = false
+            merged.unattendedSubscriptionAt = live.unattendedSubscriptionAt
+            return "unattended subscription runs kept at off (the snapshot had on)"
+        },
     ] }
 
     /// Every other stored property of `Company`, and why a restore may take the snapshot's value.
@@ -81,6 +88,10 @@ public enum CompanySecurity {
         "mainCheck": "agent-set check command, not an owner switch; it runs sandboxed", "mainCheckSetById": "who set the main check",
         "mergeBatchSize": "queue throughput, not a permission", "mergeStrategy": "how approved work lands; every merge is still approved",
         "mergeHold": "engine bookkeeping: why the queue is held",
+        // Plan X1: how turns are paid for. Subscription turns stay gated by the owner-wide provider policy and the unattended
+        // opt-in, which a restore keeps at the stricter value; key spend stays under the company's provider caps.
+        "billingMode": "billing route, not a permission; subscription use is gated by settings a restore keeps stricter",
+        "unattendedSubscriptionAt": "when the unattended opt-in was recorded; follows unattendedSubscription",
     ]
 
     /// The restored company with every security-relevant field at the stricter of the two, and what that changed.
