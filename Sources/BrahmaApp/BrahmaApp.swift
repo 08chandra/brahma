@@ -21,6 +21,9 @@ struct BrahmaApp: App {
                     .keyboardShortcut("[", modifiers: .command)
                 Button("Forward") { Task { await delegate.model?.goForward() } }
                     .keyboardShortcut("]", modifiers: .command)
+                // Plan C C7c: the CHANGES tab's change stops and layout (enabled only while it shows a diff).
+                Divider()
+                ChangesMenuItems()
             }
         }
 

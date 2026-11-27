@@ -286,8 +286,8 @@ private struct PreviewBodyView: View {
         case .window(let pid):
             WindowCaptureView(pid: pid)
         case .changes:
-            // Plan C C6b: the model is in place (`model.changes`); C7c draws the board, the split view and the review gutter.
-            MonoEmptyState("CHANGES", detail: "Live changes of every leased worktree appear here.")
+            // Plan C C7c: the board, or the selected item's live diff (unified/split, compare picker, inline review).
+            ChangesTabBody(model: model)
         case .ref(let refBody):
             // Plan C C7a: the OPENED tab (or, from `inspector(body:model:)`, chat's inspector) draws the ref's body.
             RefBodyView(model: model, refBody: refBody, opened: tabId == PreviewTabID.ref ? model.previewNav.opened : model.chatInspector,

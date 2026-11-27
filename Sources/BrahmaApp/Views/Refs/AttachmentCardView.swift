@@ -72,7 +72,7 @@ struct AttachmentCardView: View {
             .background(BrahmaTheme.bg0)
         case .diffStat(let added, let removed, let files):
             HStack(spacing: BrahmaTheme.spaceS) {
-                DiffView.counts(added: added, removed: removed)
+                DiffCounts(added: added, removed: removed)
                 Text(verbatim: "\(files) \(files == 1 ? "file" : "files")").font(BrahmaTheme.monoTiny).foregroundStyle(BrahmaTheme.text2)
                 StatBar(added: added, removed: removed, width: 60)
             }

@@ -42,7 +42,7 @@ struct RefBodyView: View {
             // The header carries the model's chips (UNCOMMITTED, LIVE, TAINTED…); the diff draws none of its own.
             DiffView(diff: diff, updatedText: live ? updated : nil)
         case .changes(let key, let compare):
-            LiveDiffBody(model: model, key: key, compare: compare)
+            LiveDiffBody(model: model, key: key, compare: compare, shownAt: opened?.ref.params["at"])
         case .file(let file, let provenance):
             FileBodyView(body: file, provenance: provenance, builtBy: Self.builtBy(provenance, handles: model.handles))
         case .item(let itemId):
@@ -238,26 +238,26 @@ private struct OriginalSheet: View {
 
 // MARK: - Bodies
 
-/// A live item diff in the OPENED tab: the CHANGES model's latest verified yield (`AppModel.changes`), or its refusal. LIVE is
-/// drawn only over a diff the model verified; the header's chips are the model's (`liveOpenedBody`).
+/// A live item diff in the OPENED tab: the CHANGES model's latest verified yield (`AppModel.changes`) through `ChangesDiffView`
+/// (embedded: the header above carries the title and the model's chips; a compare change opens that compare's ref), or its
+/// refusal. LIVE is drawn only over a diff the model verified.
 private struct LiveDiffBody: View {
     let model: AppModel
     let key: String
     let compare: CompareMode
+    /// The patch hash a show answer showed it at (`params["at"]`).
+    let shownAt: String?
 
     var body: some View {
         if let changes = model.changes, changes.selectedKey == key, changes.compare == compare {
-            // Fix round 1 (M-4): a refusal first — a refused or failed generation never draws the previous diff.
-            if let error = changes.error {
-                RefUnavailableView(text: error)
-            } else if let diff = changes.diff, let snapshot = changes.snapshot {
-                // The model's chips are the header's (`liveOpenedBody`); the diff draws none of its own.
-                DiffView(diff: diff, updatedAt: snapshot.computedAt)
-            } else {
-                ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+            ChangesDiffView(model: changes, app: model, embedded: true)
         } else {
             ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
+                // C7c: the CHANGES tab may have moved the shared model to another item or compare meanwhile: show this one again.
+                .task(id: "\(key)|\(compare)") {
+                    guard let changes = model.changes, changes.selectedKey != key || changes.compare != compare else { return }
+                    changes.show(key: key, compare: compare, shownAt: shownAt)
+                }
         }
     }
 }
