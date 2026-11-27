@@ -1,7 +1,7 @@
 import Foundation
 
 /// The events a runtime's parser produces for the engine (spec §8.1.1's normalized stream). Ruling 25: `StreamEvent`
-/// (`Turns/StreamParser.swift`) stays where it is, unrenamed, every case and associated value unchanged; this is its seam name.
+/// (`Runtime/Claude/StreamParser.swift` since Task 3's move) keeps its name, every case and associated value unchanged; this is its seam name.
 ///
 /// The spec's normalized names, as cases of `StreamEvent`:
 /// - `.session`    = `.initialized(sessionId:model:)` (with `.initInfo` right after it: the init line's tools, agents, skills)

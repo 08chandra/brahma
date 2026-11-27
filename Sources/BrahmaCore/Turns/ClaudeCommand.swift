@@ -93,13 +93,7 @@ public struct TurnRequest: Sendable {
 }
 
 public enum ClaudeCommand {
-    /// Harness tools that would bypass the company's own messaging and scheduling. `Task` and `Agent` (sub-agents; the tool is named `Agent` in Claude Code 2.1.306 and later) stay off on the
-    /// Workspace profile: they would run with no model pin and outside the engine's accounting.
-    public static let disallowedTools: [String] = [
-        "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "Monitor", "RemoteTrigger",
-        "PushNotification", "SendMessage", "ListAgents", "EnterWorktree", "ExitWorktree",
-        "DesignSync", "ReportFindings", "Task", "Agent", "TaskStop", "Workflow",
-    ]
+    /// `disallowedTools` (the harness tools every turn denies) moved with the compiler: `Runtime/Claude/TurnProfile.swift`.
 
     /// Arguments only; the prompt is sent on stdin, never argv.
     public static func arguments(for r: TurnRequest) -> [String] {
