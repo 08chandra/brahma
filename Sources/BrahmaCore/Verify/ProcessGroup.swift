@@ -55,9 +55,11 @@ final class ProcessGroupChild: @unchecked Sendable {
     /// Throws a message when it cannot be started.
     /// `workingDirectoryFD`: an open directory descriptor the child `fchdir`s into instead of `workingDirectory`'s path
     /// (`SafeGit`: an item worktree held `O_NOFOLLOW`, so no path an agent can retarget is ever resolved for it).
+    /// `inherited`: child descriptor (3 or above) → this process's descriptor, given to the child at that number and to nothing
+    /// else (Plan X8's push: the credential pipe's read end at 3, which git hands on to its credential helper).
     static func spawn(executable: String, arguments: [String], environment: [String: String], workingDirectory: URL,
                       output: Int32, stdin: Int32 = -1, stderr: Int32? = nil, newSession: Bool = false,
-                      workingDirectoryFD: Int32? = nil, observer: Observer? = nil) throws -> ProcessGroupChild {
+                      workingDirectoryFD: Int32? = nil, inherited: [Int32: Int32] = [:], observer: Observer? = nil) throws -> ProcessGroupChild {
         #if canImport(Darwin)
         var actions: posix_spawn_file_actions_t? = nil
         var attr: posix_spawnattr_t? = nil
@@ -83,6 +85,17 @@ final class ProcessGroupChild: @unchecked Sendable {
             posix_spawn_file_actions_adddup2(&actions, output, 2)
         } else {
             posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
+        }
+        for (target, source) in inherited.sorted(by: { $0.key < $1.key }) {
+            guard target > 2, source >= 0 else { throw SpawnFailure(message: "descriptor \(target) cannot be handed to the child") }
+            // dup2 onto the target clears its close-on-exec flag; a source already at the target keeps it unless inherited.
+            #if canImport(Darwin)
+            let queued = target == source ? posix_spawn_file_actions_addinherit_np(&actions, source)
+                                           : posix_spawn_file_actions_adddup2(&actions, source, target)
+            #else
+            let queued = posix_spawn_file_actions_adddup2(&actions, source, target)
+            #endif
+            guard queued == 0 else { throw SpawnFailure(message: "cannot hand descriptor \(target) to the child") }
         }
         // A chdir action that cannot be queued must never let the child start in this process's directory instead.
         let chdirStatus: Int32

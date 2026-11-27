@@ -7,8 +7,12 @@ import GRDB
 /// `preparing` and `prepared` belong to the plan's "unattributed-changes commit", which Task 1b's S1 ruling retired: the queue
 /// never commits the workspace root, so it never writes either step. They stay in the enum so an older or foreign row decodes;
 /// recovery treats one defensively (the batch is abandoned and nothing moves `main`).
+///
+/// `handedToPR` (Plan X8) is a PR-mode batch's last step before `done`: its checked commit went to the PR landing machine
+/// instead of `main`. It comes after every local-landing step, so nothing that recovers a landing (`backedUp` ... `cleaned`)
+/// ever reads a PR batch, and local `main` is never moved for one.
 public enum MergeStep: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {
-    case claimed, preparing, prepared, rebased, checked, backedUp, landing, landed, recorded, cleaned, done
+    case claimed, preparing, prepared, rebased, checked, backedUp, landing, landed, recorded, cleaned, handedToPR, done
 
     /// Position in the journal; a batch only moves to a higher or equal one.
     public var order: Int { Self.allCases.firstIndex(of: self) ?? 0 }

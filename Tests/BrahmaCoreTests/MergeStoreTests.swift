@@ -221,7 +221,8 @@ import GRDB
         #expect(MergeStrategy.ff.title == "Rebase + fast-forward")
         #expect(MergeStrategy.merge.title == "Rebase + merge commit")
         #expect(try w.store.company(id: c.id)?.mergeHold == nil)
-        #expect(MergeRequestStatus.allCases.filter(\.isOpen) == [.queued, .running, .landing])
+        // Plan X8: a request handed to a pull request is still on its way into main.
+        #expect(MergeRequestStatus.allCases.filter(\.isOpen) == [.queued, .running, .landing, .handedToPR])
     }
 
     @Test func digestMergeLines() {

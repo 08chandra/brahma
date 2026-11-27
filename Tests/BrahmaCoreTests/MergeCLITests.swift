@@ -76,7 +76,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(empty.status == 0, "\(empty.stderr)")
         let main = rig.company.mainCommit.map { String($0.prefix(7)) } ?? "-"
         var lines = empty.stdout.split(separator: "\n").map(String.init)
-        #expect(lines.first == "main \(main) · batch 1 · Rebase + fast-forward · main check: none", "\(empty.stdout)")
+        #expect(lines.first == "main \(main) · batch 1 · Rebase + fast-forward · main check: none · landing local", "\(empty.stdout)")
         let name = rig.agent.name
         #expect(lines.contains { $0.hasPrefix("M-1  \(queuedItem.key)  queued  @\(name)  ") }, "\(empty.stdout)")
         #expect(lines.contains { $0.hasPrefix("M-2  \(bouncedItem.key)  bounced  @\(name)  its check failed (exit 1)") }, "\(empty.stdout)")

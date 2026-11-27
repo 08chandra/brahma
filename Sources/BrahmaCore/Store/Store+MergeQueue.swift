@@ -157,7 +157,7 @@ extension Store {
             try WorkItem.fetchAll(db, sql: """
                 SELECT * FROM workItem w WHERE w.companyId = ? AND w.status = 'inReview' AND w.mergeState = 'pending'
                 AND w.verifiedCommit IS NOT NULL
-                AND NOT EXISTS (SELECT 1 FROM mergeRequest m WHERE m.itemId = w.id AND m.status IN ('queued', 'running', 'landing'))
+                AND NOT EXISTS (SELECT 1 FROM mergeRequest m WHERE m.itemId = w.id AND m.status IN ('queued', 'running', 'landing', 'handedToPR'))
                 ORDER BY w.updatedAt, w.number
                 """, arguments: [companyId])
         }
@@ -185,7 +185,7 @@ extension Store {
             return try Bool.fetchOne(db, sql: """
                 SELECT EXISTS (SELECT 1 FROM workItem w WHERE w.companyId = ? AND w.status = 'inReview' AND w.mergeState = 'pending'
                     AND w.verifiedCommit IS NOT NULL
-                    AND NOT EXISTS (SELECT 1 FROM mergeRequest m WHERE m.itemId = w.id AND m.status IN ('queued', 'running', 'landing')))
+                    AND NOT EXISTS (SELECT 1 FROM mergeRequest m WHERE m.itemId = w.id AND m.status IN ('queued', 'running', 'landing', 'handedToPR')))
                 """, arguments: [companyId]) ?? false
         }
     }
@@ -299,6 +299,30 @@ extension Store {
         }
     }
 
+    /// One merge request by id (a synchronous read: callable from async code without the async `read` overload).
+    func mergeRequest(id: String) throws -> MergeRequest? {
+        try writer.read { db in try MergeRequest.fetchOne(db, key: id) }
+    }
+
+    /// PR mode (Plan X8): the batch's checked commits go to the PR landing machine. The requests still `running` become
+    /// `handedToPR` (`candidates`: request id → the checked commit, on top of `base`, the fetched remote `main`), one activity
+    /// line each. `main` and `company.mainCommit` are not touched: the item completes through `recordLanded` once the fetched
+    /// remote `main` carries its commit.
+    func markHandedToPR(requestIds: [String], candidates: [String: String], base: String, now: Date = Store.now()) throws {
+        try writer.write { db in
+            for var (request, item) in try Self.ownedBatch(db, ids: requestIds) {
+                guard request.status == .running else { continue }
+                request.status = .handedToPR
+                request.baseCommit = base
+                request.candidateCommit = candidates[request.id] ?? request.candidateCommit
+                try request.update(db)
+                try appendActivity(db, ActivityEvent(companyId: request.companyId, agentId: nil, turnId: nil, kind: .merge,
+                                                     text: "\(item.key) checked and handed to a pull request (\((request.candidateCommit ?? request.headCommit).prefix(7)))",
+                                                     createdAt: now))
+            }
+        }
+    }
+
     /// The batch landed. In one write the requests become `merged`, `company.mainCommit` is set and each item gets an activity
     /// line; then every item that is not already done completes through `finishMerge` (without its own merge-safety pass), and
     /// `MergeSafety.afterLanding` runs once for the last key.
@@ -310,7 +334,7 @@ extension Store {
             let batch = try Self.ownedBatch(db, ids: landed.map(\.requestId))
             for ((request, item), mergedCommit) in zip(batch, landed.map(\.mergedCommit)) {
                 var (request, item) = (request, item)
-                guard request.status == .landing || request.status == .running else {
+                guard request.status == .landing || request.status == .running || request.status == .handedToPR else {
                     // Recorded already (a recovery finishing a landing): the item still completes below if it has not yet.
                     if request.status == .merged, item.status != .done { items.append((item, request.mergedCommit ?? mergedCommit)) }
                     continue
@@ -523,7 +547,7 @@ extension Store {
     /// Refuses a release or a move out of review while the engine is checking or landing the item's request.
     static func refuseWhileMerging(db: Database, item: WorkItem) throws {
         if let request = try MergeRequest.filter(Column("itemId") == item.id
-            && [MergeRequestStatus.running.rawValue, MergeRequestStatus.landing.rawValue].contains(Column("status")))
+            && [MergeRequestStatus.running.rawValue, MergeRequestStatus.landing.rawValue, MergeRequestStatus.handedToPR.rawValue].contains(Column("status")))
             .order(Column("number").desc).fetchOne(db) {
             throw WorkError.conflict("\(item.key) is being merged (\(request.ref)); wait for the merge to finish")
         }

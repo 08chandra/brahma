@@ -261,7 +261,7 @@ extension Store {
                 // A merge request this landing completes (3a's step landing an item the queue has not claimed) is closed with it.
                 try db.execute(sql: """
                     UPDATE mergeRequest SET status = 'merged', mergedCommit = ?, finishedAt = ?
-                    WHERE itemId = ? AND status IN ('queued', 'running', 'landing')
+                    WHERE itemId = ? AND status IN ('queued', 'running', 'landing', 'handedToPR')
                     """, arguments: [head, now, itemId])
                 if triggerAfterLanding { try finalizeMainCommit(db, companyId: company.id, commit: head) }
                 try resolveEngineAlerts(db, reasons: [Self.mergeFailureAlertReason(itemId), Self.mergeHoldAlertReason(company.id)], now: now)

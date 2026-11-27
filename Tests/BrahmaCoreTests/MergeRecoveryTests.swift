@@ -95,6 +95,11 @@ import GRDB
         let m = try MergeFixture()
         let items = try await twoApproved(m)
         let base = try main(m)
+        if step == .handedToPR {
+            // Only a PR-mode batch writes it (Plan X8).
+            try await resumesFromHandedToPR(m, items: items, base: base)
+            return
+        }
         let q = queue(m)
         if step == .preparing || step == .prepared {
             // The queue never writes these (S1): a row that has one is seeded. Its commit is not adopted.
@@ -138,6 +143,33 @@ import GRDB
         if step.order >= MergeStep.backedUp.order {
             #expect(try m.ws.head(of: "refs/brahma/pre-merge/\(try request(m, items[0]).number)") == base)
         }
+    }
+
+    /// PR mode (Plan X8): stopped right after `handedToPR`; a restarted queue finishes the hand-off (once), never a landing:
+    /// `main` and the recorded head stay at `base`, the item is not done, the batch is `done`.
+    func resumesFromHandedToPR(_ m: MergeFixture, items: [WorkItem], base: String) async throws {
+        try m.store.setLanding(.pr, engineMerge: false, companyId: m.company.id, by: .owner)
+        let q = queue(m)
+        await q.wirePR(landing: PRModeQueueTests.FakeLanding(), remoteMain: PRModeQueueTests.FakeRemoteMain(tip: base))
+        m.store.journalProbe.set { $0 == MergeStep.handedToPR.rawValue }
+        try await batch(q, m)
+        m.store.journalProbe.set(nil)
+        let open = try m.store.openMergeBatches(companyId: m.company.id)
+        #expect(open.count == 1 && open.first?.step == .handedToPR, "stopped right after handedToPR")
+        let landing = PRModeQueueTests.FakeLanding()
+        let q2 = queue(m)
+        await q2.wirePR(landing: landing, remoteMain: PRModeQueueTests.FakeRemoteMain(tip: base))
+        #expect(await q2.recover(company: try #require(try m.store.company(id: m.company.id))) == 1)
+        #expect(try m.store.openMergeBatches(companyId: m.company.id).isEmpty)
+        let journal = try #require(try m.store.mergeBatches(companyId: m.company.id).first)
+        #expect(journal.step == .done && journal.error == nil)
+        #expect(landing.begins.map(\.itemId) == [items[0].id] && landing.begins.first?.sha == journal.landCommit)
+        #expect(try main(m) == base && (try m.store.company(id: m.company.id)?.mainCommit) == base)
+        #expect(try request(m, items[0]).status == .handedToPR && request(m, items[1]).status == .queued)
+        #expect(try m.fresh(items[0]).status == .inReview && mergedEvents(m, items[0]) == 0)
+        let next = try #require(try await batch(q2, m))
+        #expect(next.handedToPR == [try request(m, items[1]).id] && next.merged.isEmpty)
+        #expect(try main(m) == base)
     }
 
     /// `main` moved but the move was not journaled (a crash between the compare-and-swap and the `landed` row): the batch is
@@ -268,7 +300,7 @@ import GRDB
     @Test func stepsAreOrdered() {
         let order = MergeStep.allCases
         #expect(order.map(\.rawValue) == ["claimed", "preparing", "prepared", "rebased", "checked", "backedUp", "landing", "landed",
-                                          "recorded", "cleaned", "done"])
+                                          "recorded", "cleaned", "handedToPR", "done"])
         #expect(order == order.sorted { $0.order < $1.order })
     }
 }

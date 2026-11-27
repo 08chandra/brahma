@@ -11,10 +11,10 @@ struct MergeGroup: ParsableCommand {
         commandName: "merge", abstract: "A company's merge queue: list it, change its settings, retry a failed merge, resume a held queue.",
         subcommands: [List.self, Settings.self, Retry.self, Resume.self, AdoptMain.self], defaultSubcommand: List.self)
 
-    /// `main <sha7> · batch <n> · <strategy title> · main check: <cmd|none>[ · HELD: <reason>]`.
+    /// `main <sha7> · batch <n> · <strategy title> · main check: <cmd|none> · landing <local|pr>[ · HELD: <reason>]`.
     static func header(_ c: Company) -> String {
         var parts = ["main \(c.mainCommit.map { String($0.prefix(7)) } ?? "-")", "batch \(c.mergeBatchSize)", c.mergeStrategy.title,
-                     "main check: \(c.mainCheck?.command ?? "none")"]
+                     "main check: \(c.mainCheck?.command ?? "none")", "landing \(c.landing.rawValue)"]
         if let hold = c.mergeHold { parts.append("HELD: \(hold)") }
         return safe(parts.joined(separator: " · "))
     }

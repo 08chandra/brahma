@@ -21,11 +21,14 @@ public struct MergeBatchOutcome: Equatable, Sendable {
     public var held: String?
     /// `main`'s head after this batch landed something.
     public var mainCommit: String?
+    /// PR mode (Plan X8): requests whose checked commit was handed to the PR landing machine. Progress, like `merged`: the
+    /// company is not backed off after a hand-off.
+    public var handedToPR: [String]
 
     public init(merged: [String] = [], bounced: [String] = [], requeued: [String] = [], failed: [String] = [],
-                held: String? = nil, mainCommit: String? = nil) {
+                held: String? = nil, mainCommit: String? = nil, handedToPR: [String] = []) {
         self.merged = merged; self.bounced = bounced; self.requeued = requeued; self.failed = failed
-        self.held = held; self.mainCommit = mainCommit
+        self.held = held; self.mainCommit = mainCommit; self.handedToPR = handedToPR
     }
 }
 
@@ -63,6 +66,10 @@ public actor MergeQueue: EmergencyStopObserver {
     /// Recoveries in a row that threw, per company, and when the next one is due (a backoff, so a persistent fault is not a tick storm).
     private var recoveryFaults: [String: Int] = [:]
     private var recoveryRetryAt: [String: Date] = [:]
+    /// PR mode (Plan X8, `MergeQueue+PR.swift`): where a checked commit goes instead of `main`, and the remote `main` a PR batch
+    /// is rebased onto. Nil on this tree (Tasks 3 and 6 supply them): a PR-mode company's queue holds instead of landing.
+    var prLandingMachine: (any PRLandingBeginning)?
+    var remoteMain: (any RemoteMainFetching)?
 
     /// `knownValues` takes the company id; by default it is the company's own loaded secrets (`Store.knownSecretValues`).
     public init(store: Store, paths: BrahmaPaths, checks: any CheckRunning,
@@ -131,10 +138,29 @@ public actor MergeQueue: EmergencyStopObserver {
             guard let fresh = try? store.company(id: companyId) else { return nil }
             loaded = fresh
         }
+        // PR mode's own hold lifts once the landing machine and the fetch are wired (or the company is back to `local`).
+        if Store.isPRUnavailableHold(loaded.mergeHold), prUnavailable(loaded) == nil {
+            do {
+                try store.setMergeHold(companyId: companyId, reason: nil, now: clock())
+                guard let fresh = try store.company(id: companyId) else { return nil }
+                loaded = fresh
+            } catch {
+                note("could not lift the PR hold of \(loaded.name): \(error)")
+                return nil
+            }
+        }
         let company = loaded
         guard company.mergeHold == nil else { return nil }
+        // PR mode without its machinery claims nothing: the queue holds, nothing lands locally (fail closed).
+        if let why = prUnavailable(company) {
+            do { try store.setMergeHold(companyId: company.id, reason: why, now: clock()) } catch {
+                note("could not hold \(company.name)'s queue (\(why)): \(error)")
+            }
+            return MergeBatchOutcome(held: why)
+        }
         let git = workspace(of: company)
-        let size = company.mergeBatchSize
+        // PR mode: one request per batch, one pull request each (`MergeSettings.prBatchSize`).
+        let size = company.landing == .pr ? MergeSettings.prBatchSize : company.mergeBatchSize
         let claimed: [MergeRequest]
         do {
             claimed = try await blocking.tryRun {
@@ -339,6 +365,8 @@ public actor MergeQueue: EmergencyStopObserver {
 
         do {
             try store.journalCrash(after: .claimed)
+            // 0. PR mode (Plan X8): the remote `main` is fetched first; it, not local `main`, is the base (spec §8.5.1 step 2).
+            let remoteTip = company.landing == .pr ? try await fetchRemoteMain(company) : nil
             // 1. The base: `main` as the engine recorded it. Nothing is committed to it (3a's B1): what is uncommitted at the root
             //    goes to a quarantine ref with one owner ask and reaches `main` only through the owner's accept.
             let prepared = try await blocking.tryRun { () throws -> Prepared in
@@ -346,6 +374,15 @@ public actor MergeQueue: EmergencyStopObserver {
                     // Agent-writable state that would hold every merge (stale lock files, a planted `shallow`) is repaired and reported.
                     let repaired = try git.healWorkspace()
                     if !repaired.isEmpty { store.reportMergeTamper(company: company, removed: repaired, now: clock()) }
+                    // PR mode: nothing lands in this repository, so local `main` and the root checkout (what the main guard and the
+                    // quarantine protect) are not read; the fetched commit must be here.
+                    if let remoteTip {
+                        guard try git.revParse(remoteTip) == remoteTip else {
+                            throw MergeInfrastructureError(underlying: GitError.failed(command: "fetch remote main", status: -1,
+                                                                                         stderr: "the fetched remote main \(remoteTip.prefix(7)) is not in the repository"))
+                        }
+                        return .base(remoteTip)
+                    }
                     do { try store.checkMain(company: company, git: git) }
                     catch let error as WorkError where error.message == Store.mainChangedMessage { return .mainChanged }
                     guard let base = try git.revParse("main") else {
@@ -536,6 +573,27 @@ public actor MergeQueue: EmergencyStopObserver {
                 let landCommit = last.candidate
                 try store.advanceBatch(id: batchId, to: .checked, landCommit: landCommit, landedIds: landSet.map(\.request.id), now: clock())
                 try store.journalCrash(after: .checked)
+
+                // 6 (PR mode, Plan X8). The checked commit goes to the PR landing machine, never to `main`: journaled `handedToPR`
+                // first (a crash after it is finished by `recover`, which hands off again and never moves `main`), then `done`.
+                if company.landing == .pr {
+                    let ids = landSet.map(\.request.id)
+                    try store.advanceBatch(id: batchId, to: .handedToPR, now: clock())
+                    try store.journalCrash(after: .handedToPR)
+                    do {
+                        try await handOffToPR(landed: landSet.map { (requestId: $0.request.id, itemId: $0.item.id, candidate: $0.candidate) },
+                                              base: base, company: company)
+                    } catch {
+                        // The journal stays at `handedToPR`: the recovery hands off what is still the batch's (never a landing).
+                        note("the hand-off of \(landSet.map(\.item.key).joined(separator: ", ")) to its pull request failed: \(error)")
+                        return ledger.out
+                    }
+                    for id in ids { ledger.settled.insert(id) }
+                    ledger.out.handedToPR = ids
+                    if let m = inconclusiveMember { inconclusive(owner: m.request.id) }
+                    if let c = culprit { await bounce(c.member.request, c.failure, c.detail, tail: c.tail, path: c.path) }
+                    return finish()
+                }
 
                 // 6. The landing, under the lock: `main` must still be the base.
                 let keys = landSet.map(\.item.key).joined(separator: ", ")
@@ -840,15 +898,8 @@ public actor MergeQueue: EmergencyStopObserver {
         return await recoverCompany(company)
     }
 
-    /// How one unfinished batch fared in a recovery.
-    private enum Recovery: Sendable {
-        /// Finished or abandoned.
-        case dealt
-        /// Still open for a reason the batch itself records (a record or a hold the database refused): retried later.
-        case pending
-        /// The recovery itself threw (git, the lock, a database read): backed off and escalated.
-        case faulted(String)
-    }
+    /// How one unfinished batch fared in a recovery (`MergeRecoveryResult`, shared with PR mode's hand-off recovery).
+    private typealias Recovery = MergeRecoveryResult
 
     private func recoverCompany(_ company: Company) async -> Int {
         let (store, blocking, clock, paths) = (self.store, self.blocking, self.clock, self.paths)
@@ -933,6 +984,9 @@ public actor MergeQueue: EmergencyStopObserver {
         case .claimed, .preparing, .prepared, .rebased, .checked:
             abandon("interrupted")
             return .dealt
+        case .handedToPR:
+            // PR mode (Plan X8): the hand-off is finished (`begin` again, idempotent), never a landing: `main` is not touched.
+            return await recoverHandOff(b, company: company)
         case .backedUp, .landing, .landed, .recorded, .cleaned:
             guard let landCommit = b.landCommit, let base = b.base, !landed.isEmpty, landed.count == b.landedIds.count else {
                 abandon("interrupted")

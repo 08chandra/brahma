@@ -808,6 +808,12 @@ public enum SecretScan {
     /// place), whichever scan saw it first. Output git cut short at the capture limit cannot be scanned and is itself a
     /// finding (fail closed). Findings never carry a value.
     public static func check(git: GitWorkspace, base: String, head: String, knownValues: [(String, String)]) throws -> [String] {
+        try checkFindings(git: git, base: base, head: head, knownValues: knownValues).map(\.text)
+    }
+
+    /// `check`'s findings with where each is (`Finding.place`: a path, `a commit message`, ...), for a refusal that lists the
+    /// places (Plan X8's pre-push scan). A change too large to scan is one finding whose place is `the whole change`.
+    static func checkFindings(git: GitWorkspace, base: String, head: String, knownValues: [(String, String)]) throws -> [Finding] {
         let known = knownForms(knownValues)
         // Every commit's added lines (a value committed and deleted later is in main's history all the same), then the
         // endpoint diff (content an evil merge introduces shows in no single commit's patch), then the messages (they land
@@ -816,10 +822,13 @@ public enum SecretScan {
         let diff = try git.scanDiff(base: base, head: head)
         let messages = try git.scanMessages(base: base, head: head)
         var seen = Set<String>()
-        var out: [String] = []
+        var out: [Finding] = []
         for f in scan(diff: log.text, known: known) + scan(diff: diff.text, known: known) + messageFindings(log: messages.text, known: known)
-        where seen.insert(f.key).inserted { out.append(f.text) }
-        if log.cut || diff.cut || messages.cut { out.append("the change is too large to scan for secrets (more than \(diff.limitMB) MB of diff)") }
+        where seen.insert(f.key).inserted { out.append(f) }
+        if log.cut || diff.cut || messages.cut {
+            out.append(Finding(what: "too large", place: "the whole change",
+                               text: "the change is too large to scan for secrets (more than \(diff.limitMB) MB of diff)"))
+        }
         return out
     }
 

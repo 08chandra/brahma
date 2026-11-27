@@ -15,6 +15,9 @@ public enum LandingMode: String, Codable, CaseIterable, Sendable, DatabaseValueC
     /// What `brahma company landing <co> pr` says while no connected github channel grants the required actions.
     public static let needsChannelText = "PR mode needs a github channel with a grant for push-branch (brahma/), open-pr and comment; "
         + "see brahma accounts grant"
+    /// What `pr` says while the push token is flagged a test key (Ruling X8-17/X8-19: a test key may have been put in an agent's
+    /// environment, so it can never be the push credential).
+    public static let tokenNotEngineOnlyText = "GITHUB_PUSH_TOKEN must be an engine-only secret; re-set it without --test"
     /// What `--engine-merge` says without a `merge-pr` grant.
     public static let needsMergeGrantText = "--engine-merge needs a grant for \(engineMergeActionType); see brahma accounts grant"
 }
@@ -27,11 +30,14 @@ public struct LandingGrantStatus: Sendable, Equatable {
     public var grantedActions: Set<String>
     /// The engine-held push token (`LandingSwitch.tokenSecretName`) is recorded; decided from the secret's metadata, never its value.
     public var tokenPresent: Bool
+    /// The push token is not flagged a test key (`--test`): no agent can ever have been given it. True when there is none.
+    public var tokenEngineOnly: Bool
 
-    public init(channelConnected: Bool, grantedActions: Set<String>, tokenPresent: Bool) {
+    public init(channelConnected: Bool, grantedActions: Set<String>, tokenPresent: Bool, tokenEngineOnly: Bool = true) {
         self.channelConnected = channelConnected
         self.grantedActions = grantedActions
         self.tokenPresent = tokenPresent
+        self.tokenEngineOnly = tokenEngineOnly
     }
 }
 
@@ -48,8 +54,10 @@ public struct NoChannelGrantChecker: LandingGrantChecking {
     public init(store: Store) { self.store = store }
 
     public func status(companyId: String) throws -> LandingGrantStatus {
-        let token = try store.secrets(companyId: companyId).contains { $0.name == LandingSwitch.tokenSecretName }
-        return LandingGrantStatus(channelConnected: false, grantedActions: [], tokenPresent: token)
+        let token = try store.secrets(companyId: companyId).first { $0.name == LandingSwitch.tokenSecretName }
+        let engineOnly: Bool
+        if let token { engineOnly = !token.isTest } else { engineOnly = true }
+        return LandingGrantStatus(channelConnected: false, grantedActions: [], tokenPresent: token != nil, tokenEngineOnly: engineOnly)
     }
 }
 
@@ -63,6 +71,8 @@ public enum LandingSwitch {
     /// Why the switch to `mode` is refused under `status`, or nil when it is allowed.
     public static func refusal(mode: LandingMode, engineMerge: Bool, status: LandingGrantStatus) -> String? {
         guard mode == .pr else { return nil }
+        // First, whatever else is missing: a push token an agent may have seen is never used.
+        if status.tokenPresent, !status.tokenEngineOnly { return LandingMode.tokenNotEngineOnlyText }
         guard status.channelConnected, LandingMode.requiredActionTypes.isSubset(of: status.grantedActions), status.tokenPresent else {
             return LandingMode.needsChannelText
         }

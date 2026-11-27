@@ -110,6 +110,55 @@ private struct ThrowingGrantChecker: LandingGrantChecking {
         #expect(try NoChannelGrantChecker(store: store).status(companyId: c.id).tokenPresent)
     }
 
+    /// Ruling X8-17/X8-19: a push token flagged `--test` (a row from before X8-19, or written by other means) refuses PR mode
+    /// before anything else, in process and through the CLI.
+    @Test func prRefusesATestFlaggedToken() throws {
+        let granted = LandingGrantStatus(channelConnected: true, grantedActions: LandingMode.requiredActionTypes.union([LandingMode.engineMergeActionType]),
+                                         tokenPresent: true, tokenEngineOnly: false)
+        #expect(LandingSwitch.refusal(mode: .pr, engineMerge: false, status: granted) == LandingMode.tokenNotEngineOnlyText)
+        #expect(LandingMode.tokenNotEngineOnlyText == "GITHUB_PUSH_TOKEN must be an engine-only secret; re-set it without --test")
+        var clean = granted
+        clean.tokenEngineOnly = true
+        #expect(LandingSwitch.refusal(mode: .pr, engineMerge: true, status: clean) == nil)
+        #expect(LandingSwitch.refusal(mode: .local, engineMerge: false, status: granted) == nil, "local never cares")
+        // The production checker reads the flag from the metadata row.
+        let store = try Store.inMemory()
+        let c = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
+        let vault = MemoryVault()
+        try store.reloadRedactorIfNeeded(vault: vault, logFailures: false)
+        try store.setSecret(companyId: c.id, name: LandingSwitch.tokenSecretName, value: Self.tokenValue, isTest: false, vault: vault)
+        #expect(try NoChannelGrantChecker(store: store).status(companyId: c.id).tokenEngineOnly)
+        try store.writer.write { db in try db.execute(sql: "UPDATE secret SET isTest = 1 WHERE name = ?", arguments: [LandingSwitch.tokenSecretName]) }
+        let flagged = try NoChannelGrantChecker(store: store).status(companyId: c.id)
+        #expect(flagged.tokenPresent && !flagged.tokenEngineOnly)
+        #expect(throws: WorkError.forbidden(LandingMode.tokenNotEngineOnlyText)) {
+            try LandingSwitch.apply(.pr, engineMerge: false, companyId: c.id, store: store, checker: StubGrantChecker(status: granted))
+        }
+        #expect(try store.landing(companyId: c.id) == (.local, engineMerge: false))
+        // The token handle refuses it too.
+        #expect(throws: SecretError.engineOnly) {
+            _ = try TokenHandle.load(companyId: c.id, name: LandingSwitch.tokenSecretName, store: store, vault: vault)
+        }
+    }
+
+    @Test func prRefusesATestFlaggedTokenThroughTheCLI() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g"], home: home).status == 0)
+        // `secret set --test` refuses an engine-only name outright (X8-19).
+        let asTest = try brahma(["secret", "set", "Acme", "GITHUB_PUSH_TOKEN", "--test"], home: home, stdin: Self.tokenValue)
+        #expect(asTest.status != 0); #expect(asTest.stderr.contains("engine-only"), "\(asTest.stderr)")
+        #expect(try brahma(["secret", "set", "Acme", "GITHUB_PUSH_TOKEN"], home: home, stdin: Self.tokenValue).status == 0)
+        // A row flipped to a test key by other means.
+        let store = try Store(path: ownerPaths(home).database.path)
+        try store.writer.write { db in try db.execute(sql: "UPDATE secret SET isTest = 1 WHERE name = 'GITHUB_PUSH_TOKEN'") }
+        try store.close()
+        let refused = try brahma(["company", "landing", "Acme", "pr"], home: home)
+        #expect(refused.status != 0)
+        #expect(refused.stderr.contains("brahma: \(LandingMode.tokenNotEngineOnlyText)"), "\(refused.stderr)")
+        #expect(try brahma(["company", "landing", "Acme"], home: home).stdout.contains("token: present but a test key, not usable"))
+    }
+
     @Test func showsStatus() throws {
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
         let home = owner.url

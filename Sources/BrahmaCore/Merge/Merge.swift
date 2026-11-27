@@ -21,6 +21,8 @@ public struct MergeSettings: Equatable, Sendable {
     public var strategy: MergeStrategy
     public static let batchRange = 1...8
     public static let defaultBatchSize = 1
+    /// PR mode (Plan X8) takes one request per batch whatever `batchSize` says: each item is its own pull request.
+    public static let prBatchSize = 1
 
     public init(mainCheck: CheckSpec? = nil, batchSize: Int = MergeSettings.defaultBatchSize, strategy: MergeStrategy = .ff) {
         self.mainCheck = mainCheck; self.batchSize = batchSize; self.strategy = strategy
@@ -28,7 +30,9 @@ public struct MergeSettings: Equatable, Sendable {
 }
 
 public enum MergeRequestStatus: String, Codable, CaseIterable, Sendable, DatabaseValueConvertible {
-    case queued, running, landing, merged, bounced, failed, cancelled
+    /// `handedToPR` (Plan X8): checked and handed to the PR landing machine; it becomes `merged` when the fetched remote `main`
+    /// carries it (through `recordLanded`), or goes back to its holder. Still open: the queue never takes it again.
+    case queued, running, landing, merged, bounced, failed, cancelled, handedToPR
 
     public var title: String {
         switch self {
@@ -39,11 +43,12 @@ public enum MergeRequestStatus: String, Codable, CaseIterable, Sendable, Databas
         case .bounced: "Bounced"
         case .failed: "Failed"
         case .cancelled: "Cancelled"
+        case .handedToPR: "In a PR"
         }
     }
 
-    /// Still on its way into `main`: queued, being checked or being landed.
-    public var isOpen: Bool { self == .queued || self == .running || self == .landing }
+    /// Still on its way into `main`: queued, being checked or being landed (locally, or through a pull request).
+    public var isOpen: Bool { self == .queued || self == .running || self == .landing || self == .handedToPR }
 
     /// The statuses `isOpen` holds for, as raw values (SQL).
     static let openRaw: [String] = allCases.filter(\.isOpen).map(\.rawValue)

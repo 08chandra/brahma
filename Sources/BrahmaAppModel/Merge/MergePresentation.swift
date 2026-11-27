@@ -9,7 +9,7 @@ public enum MergeTone: Sendable {
     public init(_ status: MergeRequestStatus) {
         switch status {
         case .queued: self = .ready
-        case .running, .landing: self = .running
+        case .running, .landing, .handedToPR: self = .running
         case .merged: self = .success
         case .bounced: self = .danger
         case .failed: self = .warning
@@ -69,6 +69,7 @@ public enum MergeRows {
         case .queued: return position.map { ordinal($0) + " in queue" } ?? "queued"
         case .running: return "merging " + sha7(r.headCommit)
         case .landing: return "landing " + sha7(r.candidateCommit ?? r.headCommit)
+        case .handedToPR: return "in a pull request at " + sha7(r.candidateCommit ?? r.headCommit)
         case .merged: return r.mergedCommit.map { "main at " + sha7($0) } ?? "merged"
         case .cancelled: return "cancelled"
         case .bounced, .failed:

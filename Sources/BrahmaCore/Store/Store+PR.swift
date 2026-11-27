@@ -51,6 +51,14 @@ extension Store {
         }
     }
 
+    /// Whether any push of the company ever reached GitHub (a landing past `pushing`, in any later state): the first push asks
+    /// (`GitHubRules.firstPushAsks`) until one has.
+    public func hasPushedPRLanding(companyId: String) throws -> Bool {
+        try writer.read { db in
+            try PRLanding.filter(Column("companyId") == companyId && Column("state") != PRLandingState.pushing.rawValue).fetchCount(db) > 0
+        }
+    }
+
     // MARK: Trusted logins
 
     /// The company's trusted logins, by login.

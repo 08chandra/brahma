@@ -105,4 +105,59 @@ import GRDB
         #expect(try restored.trustedLogins(companyId: acme.id).isEmpty)
         #expect(try #require(try restored.workItem(id: item.id)).originTrusted == false)
     }
+
+    /// Plan X8 Task 2 (Ruling 22's rule): a PR landing keeps its live state and a snapshot-only one is dropped, so a restore
+    /// never resumes a landing the owner abandoned; one started after the snapshot is kept for its item.
+    @Test func restoreKeepsLivePRLandingState() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        func item(_ t: String) throws -> WorkItem {
+            try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(type: .task, title: t))
+        }
+        let abandoned = try item("abandoned live"), gone = try item("gone live"), later = try item("started later"), same = try item("same")
+        func landing(_ i: WorkItem, _ state: PRLandingState) -> PRLanding {
+            PRLanding(itemId: i.id, companyId: acme.id, branch: "brahma/\(i.key)", pushedSHA: String(repeating: "a", count: 40),
+                      prNumber: 7, state: state, updatedAt: Self.now)
+        }
+        try env.store.upsertPRLanding(landing(abandoned, .open))
+        try env.store.upsertPRLanding(landing(gone, .open))
+        try env.store.upsertPRLanding(landing(same, .checksFailed))
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        // After the snapshot: the owner abandons one, another's row goes, a new landing starts.
+        try env.store.upsertPRLanding(landing(abandoned, .abandoned))
+        try env.store.writer.write { db in try db.execute(sql: "DELETE FROM prLanding WHERE itemId = ?", arguments: [gone.id]) }
+        try env.store.upsertPRLanding(landing(later, .pushed))
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        #expect(try restored.prLanding(itemId: abandoned.id)?.state == .abandoned, "the restore resumed an abandoned landing")
+        #expect(try restored.prLanding(itemId: gone.id) == nil, "a snapshot-only landing came back")
+        #expect(try restored.prLanding(itemId: later.id)?.state == .pushed)
+        #expect(try restored.prLanding(itemId: same.id)?.state == .checksFailed)
+        #expect(try restored.openPRLandings(companyId: acme.id).map(\.itemId).sorted() == [later.id, same.id].sorted())
+        for line in ["Acme: the PR landing of brahma/\(abandoned.key) stays abandoned (the snapshot had open)",
+                     "Acme: the PR landing of brahma/\(gone.key), gone after the snapshot, is not resumed"] {
+            #expect(outcome.warnings.contains { $0.contains(line) }, "\(line): \(outcome.warnings)")
+        }
+    }
+
+    /// An unreadable live database leaves no landing state to keep: none of the snapshot's landings is resumed.
+    @Test func unreadableLiveDatabaseResumesNoPRLanding() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        let item = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(type: .task, title: "t"))
+        try env.store.upsertPRLanding(PRLanding(itemId: item.id, companyId: acme.id, branch: "brahma/\(item.key)",
+                                                pushedSHA: String(repeating: "b", count: 40), state: .open, updatedAt: Self.now))
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try env.store.close()
+        for suffix in ["-wal", "-shm"] where FileManager.default.fileExists(atPath: env.paths.database.path + suffix) {
+            try FileManager.default.removeItem(atPath: env.paths.database.path + suffix)
+        }
+        try Data(repeating: 0x5a, count: 8192).write(to: env.paths.database)
+        _ = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        #expect(try restored.openPRLandings(companyId: acme.id).isEmpty)
+    }
 }

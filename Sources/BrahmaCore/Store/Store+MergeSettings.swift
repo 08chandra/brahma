@@ -62,6 +62,7 @@ extension Store {
     static func liftsItself(_ hold: String?) -> Bool {
         guard let hold else { return false }
         return hold == redMainHold || (hold.contains(unrecordedLandingMarker) && !hold.hasPrefix(rootBehindHoldPrefix))
+            || isPRUnavailableHold(hold)
     }
 
     private static func requireOwnerOrSystem(_ sender: Sender) throws {

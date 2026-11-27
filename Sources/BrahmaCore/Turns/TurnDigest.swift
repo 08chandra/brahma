@@ -474,6 +474,7 @@ public enum TurnDigest {
         switch request.status {
         case .queued: return ["Merge: \(request.ref) queued (position \(merge.position ?? 1))"]
         case .running, .landing: return ["Merge: \(request.ref) merging"]
+        case .handedToPR: return ["Merge: \(request.ref) in a pull request, waiting for GitHub"]
         case .bounced, .failed:
             var out = ["Merge: \(request.ref) not merged — \(ReviewDigest.flat(request.detail ?? "the merge did not complete", max: 300))"]
             if request.failure == .itemCheckFailed || request.failure == .mainCheckFailed, let output = request.outputTail, !output.isEmpty {

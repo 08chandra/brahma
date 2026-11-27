@@ -21,7 +21,7 @@ extension Orchestrator {
             mergeTasks[company.id] = Task.detached { [self] in
                 await asEngine {
                     // (A request the owner's stop put back is no fault: it merges right after the resume.)
-                    if let outcome = await queue.runNextBatch(company: company), outcome.merged.isEmpty,
+                    if let outcome = await queue.runNextBatch(company: company), outcome.merged.isEmpty, outcome.handedToPR.isEmpty,
                        !outcome.requeued.isEmpty || outcome.held != nil, (try? store.engineStopped()) == nil {
                         await holdMerges(companyId: company.id, until: clock().addingTimeInterval(Self.mergeRetry))
                     }

@@ -43,7 +43,7 @@ extension CompanyGroup {
             let grants = status.grantedActions.isEmpty ? "none" : status.grantedActions.sorted().joined(separator: ", ")
             for line in ["landing: \(mode.rawValue)", "engine-merge: \(engineMerge ? "on" : "off")",
                          "github channel: \(status.channelConnected ? "connected" : "not connected")", "grants: \(grants)",
-                         "token: \(status.tokenPresent ? "present" : "missing") (\(LandingSwitch.tokenSecretName))"] {
+                         "token: \(status.tokenPresent ? (status.tokenEngineOnly ? "present" : "present but a test key, not usable") : "missing") (\(LandingSwitch.tokenSecretName))"] {
                 print(safe(line))
             }
             if mode == .local, let why = LandingSwitch.refusal(mode: .pr, engineMerge: false, status: status) { print(safe("pr: \(why)")) }

@@ -190,6 +190,8 @@ struct RestoreCarry {
                 try db.execute(sql: "DELETE FROM trustedLogin")
                 try db.execute(sql: "UPDATE workItem SET originTrusted = 0 WHERE originTrusted = 1")
             }
+            // Plan X8: no live landing state to keep, so no snapshot landing is resumed (none is active again by a restore).
+            if try db.tableExists("prLanding") { try db.execute(sql: "DELETE FROM prLanding") }
             try markEveryOpenItemsCommits(db, now: now)
             try recordRestoreEpochs(db, now: now, gitTempRoot: gitTempRoot)
             notes.append("the current database could not be read (\(Store.flat(why, max: 160))): every grant was revoked and every "
@@ -327,6 +329,7 @@ struct RestoreCarry {
     /// Ruling X8-20: deletes every trusted login the live database no longer lists (and marks that login's imported items
     /// untrusted), and keeps each issue link at the stricter of the live and the restored one.
     static func keepNarrowerTrust(_ live: Settings, into db: Database) throws {
+        try keepLivePRLandings(live, into: db)
         if try db.tableExists("trustedLogin") {
             for key in Set(try Settings.readTrustedLogins(db)).subtracting(live.trustedLogins).sorted() {
                 let (companyId, login) = Settings.split(key)
@@ -348,6 +351,25 @@ struct RestoreCarry {
                     try db.execute(sql: "DELETE FROM issueLink WHERE companyId = ? AND provider = ?", arguments: [companyId, provider])
                 }
             }
+        }
+    }
+
+    /// Plan X8 (Ruling 22's rule for `prLanding`): live state wins, snapshot-only rows are dropped. A landing the owner
+    /// abandoned (or GitHub closed) after the snapshot stays so; one the snapshot alone has is not resumed; a landing that
+    /// started after the snapshot is kept when the snapshot has its item, so the engine keeps watching the PR it opened.
+    static func keepLivePRLandings(_ live: Settings, into db: Database) throws {
+        guard try db.tableExists("prLanding") else { return }
+        for restored in try PRLanding.fetchAll(db) {
+            if let current = live.prLandings[restored.itemId] {
+                if current != restored { try current.save(db) }
+            } else {
+                try restored.delete(db)
+            }
+        }
+        for (itemId, current) in live.prLandings.sorted(by: { $0.key < $1.key }) where try PRLanding.fetchOne(db, key: itemId) == nil {
+            let itemHere = try Bool.fetchOne(db, sql: "SELECT EXISTS (SELECT 1 FROM workItem WHERE id = ? AND companyId = ?)",
+                                             arguments: [itemId, current.companyId]) == true
+            if itemHere { try current.insert(db) }
         }
     }
 
@@ -564,6 +586,8 @@ extension RestoreCarry {
         var trustedLogins: Set<String> = []
         /// Ruling X8-20: `companyId|provider` → the issue link's target and label filter.
         var issueLinks: [String: IssueLinkSetting] = [:]
+        /// Plan X8: item id → its PR landing (`keepLivePRLandings`: live state wins).
+        var prLandings: [String: PRLanding] = [:]
 
         /// What a restore compares of an issue link (`IssueLink` without its poll state).
         struct IssueLinkSetting: Equatable {
@@ -636,6 +660,9 @@ extension RestoreCarry {
             }
             if try db.tableExists("trustedLogin") { s.trustedLogins = Set(try readTrustedLogins(db)) }
             if try db.tableExists("issueLink") { s.issueLinks = try readIssueLinks(db) }
+            if try db.tableExists("prLanding") {
+                s.prLandings = Dictionary(try PRLanding.fetchAll(db).map { ($0.itemId, $0) }, uniquingKeysWith: { a, _ in a })
+            }
             if try db.tableExists("ownerSettings"), try db.columns(in: "ownerSettings").contains(where: { $0.name == "autoMerge" }) {
                 s.ownerAutoMerge = try Bool.fetchOne(db, sql: "SELECT autoMerge FROM ownerSettings WHERE id = 1")
                 s.ownerAutoMergePaths = try String.fetchOne(db, sql: "SELECT autoMergePaths FROM ownerSettings WHERE id = 1")
@@ -688,6 +715,16 @@ extension RestoreCarry {
                 guard kept != link else { continue }
                 out.append(kept.map { "\(companyName(company)): \(provider) issue link kept at \(showLink($0)) (the snapshot had \(showLink(link)))" }
                            ?? "\(companyName(company)): \(provider) issue link \(link.target), cleared after the snapshot, stays cleared")
+            }
+            // Plan X8: a PR landing keeps its live state; one only the snapshot has is dropped.
+            for (itemId, landing) in restored.prLandings.sorted(by: { $0.key < $1.key }) {
+                guard let now = live.prLandings[itemId] else {
+                    out.append("\(companyName(landing.companyId)): the PR landing of \(landing.branch), gone after the snapshot, is not resumed")
+                    continue
+                }
+                if now.state != landing.state {
+                    out.append("\(companyName(landing.companyId)): the PR landing of \(now.branch) stays \(now.state.rawValue) (the snapshot had \(landing.state.rawValue))")
+                }
             }
             if restored.ownerAutoMerge != false, live.ownerAutoMerge == false { out.append("owner-wide auto-merge kept off (the snapshot had it on)") }
             let paths = narrowerAutoMergePaths(live: live.ownerAutoMergePaths, restored: restored.ownerAutoMergePaths)
