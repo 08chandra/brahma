@@ -451,4 +451,50 @@ final class PassthroughRecordingRunner: GitProcessRunning, @unchecked Sendable {
         #expect(try f.fx.resolve(.owner, try f.fx.ref("ENG-1:changes")).tainted)
         #expect(try f.store.refTaint(try f.fx.ref("diff:\(f.r1)..\(f.r2)"), companyId: f.c.id).tainted)
     }
+
+    // MARK: Fix round 4
+
+    /// Opens a restore epoch whose own `main` is `main` (the restored database can place nothing after it).
+    static func openEpoch(_ f: ChangesFixture, id: String, main: String?) throws {
+        let cId = f.c.id
+        try f.store.writer.write { db in
+            try RestoreEpoch(id: id, companyId: cId, mainCommit: main, listed: true, source: "a restored backup", createdAt: Date(),
+                             clearedBy: nil, clearedAt: nil).insert(db)
+        }
+    }
+    static let epochReason = "from a session that read a restored backup"
+
+    /// R3-1: the key-less `diff:a..b` applies the restore-epoch rule `commit:<sha>` and `ENG-n:diff` apply: an open epoch
+    /// whose `main` doesn't hold a displayed commit marks the range, even with no tainted-commit rows at all.
+    @Test func restoreEpochTaintsKeylessRange() throws {
+        let f = try ChangesFixture(edits: false)
+        let main = try f.fx.head("main")
+        #expect(try f.store.refTaint(try f.fx.ref("diff:\(main)..\(f.r2)"), companyId: f.c.id) == (false, nil))
+        try Self.openEpoch(f, id: "epoch-r4", main: main)
+        // r2 is a post-restore commit: every ref that shows it reads tainted, and alike.
+        #expect(try f.store.refTaint(try f.fx.ref("commit:\(f.r2)"), companyId: f.c.id) == (true, Self.epochReason))
+        #expect(try f.store.refTaint(try f.fx.ref("ENG-1:diff"), companyId: f.c.id) == (true, Self.epochReason))
+        for s in ["diff:\(main)..\(f.r2)", "diff:\(f.r2)..\(main)", "diff:\(f.r1)..\(f.r2)", "diff:\(f.r2)..\(f.r1)"] {
+            #expect(try f.store.refTaint(try f.fx.ref(s), companyId: f.c.id) == (true, Self.epochReason), "\(s)")
+        }
+        #expect(try f.fx.resolve(.owner, try f.fx.ref("diff:\(main)..\(f.r2)")).tainted)
+        // A pair the epoch's own main holds both sides of stays clean.
+        let parent = try f.fx.git.git(["rev-parse", "\(main)~1"])
+        #expect(try f.store.refTaint(try f.fx.ref("commit:\(parent)"), companyId: f.c.id) == (false, nil))
+        #expect(try f.store.refTaint(try f.fx.ref("diff:\(parent)..\(main)"), companyId: f.c.id) == (false, nil))
+    }
+
+    /// R3-1: an epoch whose range can't be judged (no `main` recorded, or one git can't read) reads as tainted for
+    /// `diff:a..b`, as it does for `commit:<sha>`.
+    @Test(arguments: [nil, String(repeating: "e", count: 40)])
+    func restoreEpochLookupFailureTaintsKeylessRange(_ epochMain: String?) throws {
+        let f = try ChangesFixture(edits: false)
+        let main = try f.fx.head("main")
+        let parent = try f.fx.git.git(["rev-parse", "\(main)~1"])
+        try Self.openEpoch(f, id: "epoch-r4", main: epochMain)
+        #expect(try f.store.refTaint(try f.fx.ref("commit:\(parent)"), companyId: f.c.id) == (true, Self.epochReason))
+        for s in ["diff:\(parent)..\(main)", "diff:\(main)..\(f.r2)"] {
+            #expect(try f.store.refTaint(try f.fx.ref(s), companyId: f.c.id) == (true, Self.epochReason), "\(s)")
+        }
+    }
 }

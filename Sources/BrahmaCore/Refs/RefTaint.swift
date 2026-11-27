@@ -488,21 +488,40 @@ extension Store {
         }
     }
 
-    /// C5b: the source of the first uncleared tainted commit in `from..to` (full or abbreviated shas, verified by git), or the
-    /// generic reason when the range can't be listed (fail closed). Nil when the range is clean or there are no rows.
+    /// C5b: the taint of a key-less `diff:<from>..<to>` (full or abbreviated shas, verified by git). Fix round 4 (R3-1): never
+    /// narrower than `commitSource` — the displayed set (`displayedRangeSource`: the rows and every orphaned item's commits),
+    /// then the open restore epochs over both displayed sides (each epoch's own `main` to `from` and to `to`, Ruling 25). Nil
+    /// only when nothing marks it; any failed lookup (rows, epochs, repository, revs, orphans) reads as tainted, through the
+    /// same fallback `commitSource` uses.
     private func rangeSource(companyId: String, from: String, to: String) throws -> String? {
-        let rows = try unclearedCommits(companyId: companyId)
-        guard !rows.isEmpty else { return nil }
-        guard let company = try company(id: companyId) else { return "outside content" }
-        let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
+        let rows: [TaintedCommit], epochs: [RestoreEpoch]
         do {
-            let refs = try reachabilityRefs(companyId: companyId)
-            let orphans = Array(try orphanedItems(companyId: companyId, rows: rows).values)
-            return try Self.displayedRangeSource(git, try git.verifyRev(from, reachableFrom: refs), try git.verifyRev(to, reachableFrom: refs),
-                                                 rows: rows, orphans: orphans)
+            rows = try unclearedCommits(companyId: companyId)
+            epochs = try openRestoreEpochs(companyId: companyId)
         } catch {
-            return "outside content"
+            return Self.taintCheckFailedSource
         }
+        guard !rows.isEmpty || !epochs.isEmpty else { return nil }
+        do {
+            guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
+            let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
+            let refs = try reachabilityRefs(companyId: companyId)
+            let (a, b) = (try git.verifyRev(from, reachableFrom: refs), try git.verifyRev(to, reachableFrom: refs))
+            let orphans = Array(try orphanedItems(companyId: companyId, rows: rows).values)
+            if let source = try Self.displayedRangeSource(git, a, b, rows: rows, orphans: orphans) { return source }
+            for side in Set([a, b]) {
+                if let source = restoreEpochSource(epochs, tip: side, path: nil, git: git) { return source }
+            }
+            return nil
+        } catch {
+            return Self.failClosedSource(itemRows: [], rows: rows, epochs: epochs)
+        }
+    }
+
+    /// The source a taint check that failed reads as (ruling 11): the item's own newest uncleared row, else the company's
+    /// newest, else an open restore epoch's, else the generic reason. Never nil.
+    static func failClosedSource(itemRows: [TaintedCommit], rows: [TaintedCommit], epochs: [RestoreEpoch]) -> String {
+        itemRows.first?.source ?? rows.first?.source ?? epochs.first?.source ?? taintCheckFailedSource
     }
 
     /// Fix round 1 (C5b-3): a diff between two commits shows both sides, so the taint of `a...b` (both directions) counts; a
@@ -765,7 +784,7 @@ extension Store {
             // The history can't be read (this item's branch is gone, git failed on it or on any orphan candidate's branch, e.g.
             // one reset onto an unrelated root): fail closed for the whole query (ruling 11). The item's own newest source,
             // else the company's newest uncleared one, else an epoch's (one of them is non-empty here).
-            return itemRows.first?.source ?? rows.first?.source ?? epochs.first?.source ?? Self.taintCheckFailedSource
+            return Self.failClosedSource(itemRows: itemRows, rows: rows, epochs: epochs)
         }
     }
 
