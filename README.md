@@ -1036,8 +1036,9 @@ Context folds can't appear yet, because the engine's patches carry git's default
 ### What protects shared content
 
 - **The secret gate on every read.** Everything an agent reads through Brahma (`open_ref`, a share, search snippets,
-  fact answers, the concierge's reads) and everything rendered for you, exported or copied passes the secret gate with
-  the company's stored secret values. A stored value of 8 or more characters refuses the read or share, naming the line,
+  fact answers, the concierge's reads), every ref the preview and chat cards render for you, and everything exported or
+  copied passes the secret gate with the company's stored secret values. (Some older owner surfaces still show ask titles
+  as stored; gating those is final-wave work.) A stored value of 8 or more characters refuses the read or share, naming the line,
   never the value (shorter stored values are not matched yet; see below); a
   secret pattern is redacted in what is shown and copied; an archive, Office file or PDF is scanned by a sandboxed helper
   the engine runs, never inside a turn, and one that can't be scanned is refused. If the stored values can't be read,
@@ -1064,7 +1065,7 @@ Context folds can't appear yet, because the engine's patches carry git's default
 - **Save As.** Exports go only to a folder you choose outside the data home, the vault, the workspaces and every `.brahma`
   folder. The bytes pass the gate again (a vouched PDF as its flattened copy), the file is marked downloaded
   (`com.apple.quarantine`, so Gatekeeper asks before opening anything), and the export is recorded.
-- **Purge.** Purge… on a ref (`brahma resource <co> purge F-<n>` for a resource) removes the content from the vault,
+- **Purge.** Purge… on a ref (`brahma resource <co> purge F-<n> --yes` for a resource) removes the content from the vault,
   its share refs and pinned git objects (never while a turn of the company runs), and turns every card that carried it
   into a PURGED tombstone. You get a notice for each backup, transcript or exported copy that may still hold it, and for
   content that is still in the company's git history. A purge that couldn't remove everything says so and can be run
