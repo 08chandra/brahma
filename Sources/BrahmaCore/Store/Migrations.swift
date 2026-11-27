@@ -2051,6 +2051,17 @@ enum Migrations {
                 t.primaryKey(["companyId", "name", "day"])
             }
         }
+        m.registerMigration("vX6a-measure-epoch") { db in
+            // Plan X6a Task 4. When link history began: the date the item links above came into existence, so a measure window
+            // that starts earlier can say so (`basis: links since <date>`). Owner-wide (one database, one migration), like
+            // `sandboxCanary`. On every database that takes the X6a migrations in one pass this is the `vX6a-measure` date; on
+            // one that ran `vX6a-measure` earlier it is later than that (a later start is stated, never an earlier one).
+            try db.create(table: "measureEpoch") { t in
+                t.column("name", .text).primaryKey()               // "links"
+                t.column("at", .datetime).notNull()
+            }
+            try db.execute(sql: "INSERT INTO measureEpoch (name, at) VALUES ('links', ?)", arguments: [Store.now()])
+        }
     }
 }
 

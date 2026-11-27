@@ -195,3 +195,56 @@ enum MeasureFixtures {
         return company
     }
 }
+
+// MARK: Task 4 — item events, audits, links, link history
+
+extension MeasureFixtures {
+    /// One `workItemEvent` of `kind` on `item` at `at` (`changesRequested` is written by the reviewer, `submitted` by the holder).
+    @discardableResult
+    static func event(_ store: Store, item: WorkItem, kind: WorkEventKind, at: Date, actor: String = "agent-fixture") throws -> WorkItemEvent {
+        var e = WorkItemEvent(id: nil, companyId: item.companyId, itemId: item.id, actorId: actor, kind: kind, text: kind.rawValue,
+                              createdAt: at, createdActive: 0)
+        try store.writer.write { db in try e.insert(db) }
+        return e
+    }
+
+    /// A finished `reviewAudit` of `item` (`verdict` is the stored value, `ok` or `failed`), with the follow-up the failed audit
+    /// opened, if any.
+    @discardableResult
+    static func audit(_ store: Store, item: WorkItem, verdict: String, auditedAt: Date, followUp: WorkItem? = nil) throws -> ReviewAudit {
+        var a = ReviewAudit(itemId: item.id, companyId: item.companyId, sampledActive: 0)
+        a.auditedAt = auditedAt
+        a.verdict = verdict
+        a.followUpId = followUp?.id
+        let row = a
+        try store.writer.write { db in try row.insert(db) }
+        return row
+    }
+
+    /// `item` is a `kind` of `target`, written as the engine writes its own link (`Store.insertLink`: no landed check).
+    static func link(_ store: Store, item: WorkItem, kind: ItemLinkKind, target: WorkItem, at: Date, by: String = "owner") throws {
+        try store.writer.write { db in
+            try Store.insertLink(db, ItemLink(companyId: item.companyId, itemId: item.id, kind: kind, targetId: target.id, createdBy: by,
+                                              createdAt: at))
+        }
+    }
+
+    /// Moves the recorded start of link history (`measureEpoch`, written when `vX6a-measure-epoch` ran) to `date`.
+    static func setLinksSince(_ store: Store, _ date: Date) throws {
+        try store.writer.write { db in
+            try db.execute(sql: "UPDATE measureEpoch SET at = ? WHERE name = 'links'", arguments: [date])
+        }
+    }
+
+    /// One landing per item, numbered from `firstNumber`, item `i` landed at `at[i]` (enqueued ten minutes earlier).
+    @discardableResult
+    static func landEach(_ store: Store, company: Company, items: [WorkItem], at: [Date], firstNumber: Int = 1)
+        throws -> [(batch: MergeBatch, request: MergeRequest, item: WorkItem)] {
+        precondition(items.count == at.count)
+        return try items.enumerated().map { i, item in
+            let (batch, requests) = try land(store, company: company, items: [item], number: firstNumber + i,
+                                             enqueuedAt: at[i].addingTimeInterval(-600), landedAt: at[i])
+            return (batch, requests[0], item)
+        }
+    }
+}

@@ -153,9 +153,10 @@ public enum Measure {
     /// A metric not built yet maps to `notBuilt`; a task wires its functions here.
     static let functions: [MetricId: MetricFunction] = [
         .greenMain: { try LandingMetrics.greenMain($0) },
-        .revertRate: notBuilt(.revertRate),
-        .reviewCatch: notBuilt(.reviewCatch),
-        .escapeRate: notBuilt(.escapeRate),
+        // One detector per run: its patch-id cache lives for this report only.
+        .revertRate: { try ReviewMetrics.revertRate($0, detector: RevertDetector(git: $0.git)) },
+        .reviewCatch: { try ReviewMetrics.reviewCatch($0) },
+        .escapeRate: { try ReviewMetrics.escapeRate($0) },
         .usagePerLanded: notBuilt(.usagePerLanded),
         .ownerTouches: notBuilt(.ownerTouches),
         .firstPass: { try LandingMetrics.firstPass($0) },

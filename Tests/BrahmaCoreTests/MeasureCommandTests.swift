@@ -47,12 +47,15 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let md = try brahma(["measure", "Acme"], home: rig.home)
         #expect(md.status == 0, "\(md.stderr)")
         #expect(md.stdout.hasPrefix("# measure Acme — "), "\(md.stdout)")
-        // Task 3's landing metrics are built: with nothing landed they say so; every other metric is not built yet.
-        let built: Set<MetricId> = [.greenMain, .firstPass, .queueHealth]
+        // Tasks 3 and 4's metrics are built: with nothing landed they say so; every other metric is not built yet.
+        let built: Set<MetricId> = [.greenMain, .firstPass, .queueHealth, .revertRate, .reviewCatch, .escapeRate]
         for id in MetricId.all where !built.contains(id) { #expect(md.stdout.contains("| \(id.label) | not applicable: not built yet |"), "\(id.rawValue)") }
         #expect(md.stdout.contains("| \(MetricId.greenMain.label) | not measured: no landings in the window |"), "\(md.stdout)")
         #expect(md.stdout.contains("| \(MetricId.firstPass.label) | not measured: no landings in the window |"), "\(md.stdout)")
         #expect(md.stdout.contains("| \(MetricId.queueHealth.label) | 0 |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.revertRate.label) | not measured: no landings in the window |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.reviewCatch.label) | insufficient data (n=0) |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.escapeRate.label) | not measured: no landings in the window |"), "\(md.stdout)")
         #expect(md.stdout.contains("docs/measure/metrics.md"))
         #expect(md.stdout.split(separator: "\n").count > 15, "the table is printed line by line, not flattened")
 
@@ -65,6 +68,9 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(report.metrics.filter { !built.contains($0.id) }.allSatisfy { $0.status == .notApplicable(reason: "not built yet") })
         #expect(report.metrics.first { $0.id == .greenMain }?.status == .notMeasured(reason: "no landings in the window"))
         #expect(report.metrics.first { $0.id == .queueHealth }?.status == .ok)
+        #expect(report.metrics.first { $0.id == .revertRate }?.status == .notMeasured(reason: "no landings in the window"))
+        #expect(report.metrics.first { $0.id == .reviewCatch }?.status == .insufficient(n: 0))
+        #expect(report.metrics.first { $0.id == .escapeRate }?.status == .notMeasured(reason: "no landings in the window"))
         #expect(["UTC", "GMT"].contains(report.timeZone), "Foundation names the UTC zone GMT: \(report.timeZone)")
         // The JSON decodes back to the same report: re-encoding it gives the same bytes, and decoding those the same value.
         let again = try report.json()
