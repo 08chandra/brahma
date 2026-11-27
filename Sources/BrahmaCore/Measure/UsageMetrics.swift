@@ -74,9 +74,10 @@ public enum UsageMetrics {
             let messages = try count(db, """
                 SELECT COUNT(*) FROM message WHERE companyId = ? AND senderId = 'owner' AND kind <> 'system' AND createdAt >= ? AND createdAt < ?
                 """, [ctx.companyId, w.since, w.until])
+            // `commented` only: a review comment also writes a `commented` beside its `reviewComment` (C5b), one comment.
             let comments = try count(db, """
                 SELECT COUNT(*) FROM workItemEvent
-                WHERE companyId = ? AND actorId = 'owner' AND kind IN ('commented', 'reviewComment') AND createdAt >= ? AND createdAt < ?
+                WHERE companyId = ? AND actorId = 'owner' AND kind = 'commented' AND createdAt >= ? AND createdAt < ?
                 """, [ctx.companyId, w.since, w.until])
             let detail: [MetricValue] = [
                 .count(.ownerTouches, label: "inbox decisions", Double(asks),
@@ -102,9 +103,7 @@ public enum UsageMetrics {
         let tz = ctx.store.ownerTimeZone()
         return try ctx.store.writer.read { db in
             let (id, w) = (MetricId.safety, ctx.window)
-            let taint = try count(db, """
-                SELECT COUNT(*) FROM turn WHERE companyId = ? AND freshSessionReason = 'tainted' AND startedAt >= ? AND startedAt < ?
-                """, [ctx.companyId, w.since, w.until])
+            let (taint, trusted) = try taintRefusals(db, companyId: ctx.companyId, window: w)
             let access = try count(db, "SELECT COUNT(*) FROM accessRefusal WHERE companyId = ? AND createdAt >= ? AND createdAt < ?",
                                    [ctx.companyId, w.since, w.until])
             let dlp = try count(db, """
@@ -132,7 +131,8 @@ public enum UsageMetrics {
             }
             let detail: [MetricValue] = [
                 .count(id, label: "taint refusals", Double(taint),
-                       basis: "turns started fresh after a refused high-risk call under taint (freshSessionReason = tainted); one per refused turn, not per call"),
+                       basis: "turns started fresh after a refused high-risk call under taint (freshSessionReason = tainted); one per refused turn, not per call"
+                        + (trusted > 0 ? "; \(LandingMetrics.plural(trusted, "fresh session")) after the owner's trust-import excluded" : "")),
                 .count(id, label: "access refusals", Double(access), basis: "refused request_access calls (accessRefusal)"),
                 .count(id, label: "DLP hits", Double(dlp), basis: "merge requests bounced for a secret (failure = secretFound)"),
                 .count(id, label: "canary passes", Double(canary),
@@ -151,6 +151,30 @@ public enum UsageMetrics {
             basis += "; cap overruns not applicable; the other rows are counts without a target"
             return .count(id, Double(wasted) + (breachCount ?? 0), basis: basis, target: 0, detail: detail)
         }
+    }
+
+    /// Turns in the window that started fresh with `freshSessionReason = tainted`, less those the owner's `trust-import` caused: it
+    /// ends every tainted session of the company with the same reason. Such a turn is the agent's first after a trust-import (the
+    /// engine's own activity line, kind `approval`) that came after its previous turn; a refusal needs a turn before it.
+    static func taintRefusals(_ db: Database, companyId: String, window: MeasureWindow) throws -> (refusals: Int, trusted: Int) {
+        let trusts = try Date.fetchAll(db, sql: """
+            SELECT createdAt FROM activityEvent WHERE companyId = ? AND kind = 'approval' AND text LIKE 'The owner trusted the imported repo%'
+            """, arguments: [companyId])
+        var refusals = 0, trusted = 0
+        for row in try Row.fetchAll(db, sql: """
+            SELECT t.startedAt AS startedAt,
+                   (SELECT MAX(p.startedAt) FROM turn p WHERE p.companyId = t.companyId AND p.agentId = t.agentId AND p.startedAt < t.startedAt) AS previousAt
+            FROM turn t WHERE t.companyId = ? AND t.freshSessionReason = 'tainted' AND t.startedAt >= ? AND t.startedAt < ?
+            """, arguments: [companyId, window.since, window.until]) {
+            let startedAt: Date = row["startedAt"], previousAt: Date? = row["previousAt"]
+            let afterTrust = trusts.contains { at in
+                guard at <= startedAt else { return false }
+                guard let previousAt else { return true }
+                return at > previousAt
+            }
+            if afterTrust { trusted += 1 } else { refusals += 1 }
+        }
+        return (refusals, trusted)
     }
 
     // MARK: Non-code acceptance
@@ -202,7 +226,7 @@ public enum UsageMetrics {
             let idle = try seconds(MeasureCounter.idleActionableSeconds)
             var basis = "company-active seconds with no running turn while an agent waited on usage (blocked by the five-hour gate, or "
                 + "ready but held by the weekly pace or the owner reserve) ÷ company-active seconds, from the recorder's daily counters "
-                + "(\(LandingMetrics.plural(active.rows, "day"))); cap closures (X1) absent"
+                + "; n = days with active-seconds records (\(active.rows)); cap closures (X1) absent"
             basis += try recordedSince(db, companyId: ctx.companyId, window: ctx.window, tz: tz)
             let detail: [MetricValue] = [
                 .seconds(.idleActionable, label: "five-hour gate", try seconds(MeasureCounter.idleUsageLimitSeconds),
@@ -212,7 +236,8 @@ public enum UsageMetrics {
                 .seconds(.idleActionable, label: "owner reserve", try seconds(MeasureCounter.idleReserveSeconds),
                          basis: "a ready agent held because the owner reserve is reached (paceStrict)"),
             ]
-            return .rate(.idleActionable, numerator: idle, denominator: active.sum, unit: .ratio, basis: basis, detail: detail)
+            // Ruling R32: the events are the recorded days, not the seconds.
+            return .rate(.idleActionable, numerator: idle, denominator: active.sum, unit: .ratio, basis: basis, detail: detail, events: active.rows)
         }
     }
 
@@ -304,6 +329,7 @@ public enum UsageMetrics {
         var reviewerId: String?
         var firstPass: Bool
         var reworkRounds: Int
+        var reviewRejections: Int
         var turnsUsed: Int
         var tokensUsed: Int
         var cycleActiveSeconds: Int?
@@ -317,11 +343,12 @@ public enum UsageMetrics {
         for chunk in LandingMetrics.chunks(itemIds.sorted()) {
             let marks = chunk.map { _ in "?" }.joined(separator: ", ")
             for row in try Row.fetchAll(db, sql: """
-                SELECT itemId, ownerId, reviewerId, firstPass, reworkRounds, turnsUsed, tokensUsed, cycleActiveSeconds, costLE, reviewCostLE
+                SELECT itemId, ownerId, reviewerId, firstPass, reworkRounds, reviewRejections, turnsUsed, tokensUsed, cycleActiveSeconds,
+                       costLE, reviewCostLE
                 FROM itemFact WHERE companyId = ? AND itemId IN (\(marks))
                 """, arguments: StatementArguments([companyId]) + StatementArguments(chunk)) {
                 let f = Fact(itemId: row["itemId"], ownerId: row["ownerId"], reviewerId: row["reviewerId"], firstPass: row["firstPass"],
-                             reworkRounds: row["reworkRounds"], turnsUsed: row["turnsUsed"], tokensUsed: row["tokensUsed"],
+                             reworkRounds: row["reworkRounds"], reviewRejections: row["reviewRejections"], turnsUsed: row["turnsUsed"], tokensUsed: row["tokensUsed"],
                              cycleActiveSeconds: row["cycleActiveSeconds"], costLE: row["costLE"], reviewCostLE: row["reviewCostLE"])
                 facts[f.itemId] = f
             }

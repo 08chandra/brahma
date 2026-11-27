@@ -118,6 +118,8 @@ import GRDB
         try MeasureFixtures.message(store, company: zeta, senderId: "owner", at: inWindow)
         let landed = try store.workItems(companyId: acme.id)[0]
         try MeasureFixtures.event(store, item: landed, kind: .commented, at: inWindow, actor: "owner")
+        // C5b writes a `reviewComment` beside every `commented`: one comment, not two.
+        try MeasureFixtures.event(store, item: landed, kind: .reviewComment, at: inWindow, actor: "owner")
 
         let m = try UsageMetrics.ownerTouches(try ctx(store, acme, since: t0.addingTimeInterval(-10 * day)))
         #expect(m.unit == .perItem && m.status == .ok, "\(m.display)")
@@ -226,7 +228,7 @@ import GRDB
         let acme = try MeasureFixtures.company(store, name: "Acme", createdAt: t0.addingTimeInterval(-30 * day))
         let eng = try MeasureFixtures.agent(store, company: acme, name: "eng", role: "engineer", model: "sonnet")
         let rev = try MeasureFixtures.agent(store, company: acme, name: "rev", role: "reviewer", model: "opus")
-        let items = try MeasureFixtures.items(store, company: acme, count: 4, now: t0.addingTimeInterval(-10 * day))
+        let items = try MeasureFixtures.items(store, company: acme, count: 5, now: t0.addingTimeInterval(-10 * day))
         let at = t0.addingTimeInterval(-5 * day)
         // 1: two opus turns, one sonnet → opus.
         for m in ["claude-opus-5-5", "claude-opus-5-5,claude-haiku-5-5", "claude-sonnet-5-5"] {
@@ -239,9 +241,16 @@ import GRDB
         // 4: one opus, one sonnet → no majority.
         try MeasureFixtures.turn(store, agent: eng, item: items[3], modelsUsed: "claude-opus-5-5", at: at)
         try MeasureFixtures.turn(store, agent: eng, item: items[3], modelsUsed: "claude-sonnet-5-5", at: at)
-        try MeasureFixtures.landEach(store, company: acme, items: items, at: Array(repeating: t0.addingTimeInterval(-4 * day), count: 4))
+        // 5: its only turn names two families (cumulative over a resume): ambiguous, excluded — never the agent's current model.
+        try MeasureFixtures.turn(store, agent: eng, item: items[4], modelsUsed: "claude-opus-5-5,claude-sonnet-5-5", at: at)
+        // Item 2's second sonnet turn runs after its first submit (below); a rate-limited opus turn is not a counted turn.
+        try MeasureFixtures.turn(store, agent: eng, item: items[1], modelsUsed: "claude-sonnet-5-5", at: at.addingTimeInterval(250))
+        try MeasureFixtures.turn(store, agent: eng, item: items[1], outcome: .usageLimited, modelsUsed: "claude-opus-5-5", at: at.addingTimeInterval(260))
+        try MeasureFixtures.turn(store, agent: eng, item: items[1], outcome: .usageLimited, modelsUsed: "claude-opus-5-5", at: at.addingTimeInterval(270))
+        try MeasureFixtures.landEach(store, company: acme, items: items, at: Array(repeating: t0.addingTimeInterval(-4 * day), count: 5))
         for (i, item) in items.enumerated() {
-            try MeasureFixtures.fact(store, item: item, firstPass: i != 1, costLE: 2, ownerId: eng.id, reviewerId: rev.id, reworkRounds: i)
+            try MeasureFixtures.fact(store, item: item, firstPass: i != 1, costLE: 2, reviewRejections: i, ownerId: eng.id, reviewerId: rev.id,
+                                     reworkRounds: i)
         }
         // Item 2 was caught in review and confirmed: the reviewer's catch.
         try MeasureFixtures.event(store, item: items[1], kind: .changesRequested, at: at.addingTimeInterval(100), actor: rev.id)
@@ -251,7 +260,7 @@ import GRDB
         let m = try UsageMetrics.modelRanking(try ctx(store, acme))
         #expect(m.status == .ok, "\(m.display)")
         #expect(m.numerator == 3, "three items attributed")
-        #expect(m.basis.contains("1 landed item with no majority model excluded"), "\(m.basis)")
+        #expect(m.basis.contains("2 landed items with no majority model excluded"), "\(m.basis)")
         #expect(m.basis.contains("1 by the agent's model"), "\(m.basis)")
         let opus = try row(m, "engineer · opus")
         #expect(opus.numerator == 1)
@@ -263,12 +272,75 @@ import GRDB
         #expect(rework.numerator == 3 && rework.denominator == 2 && rework.unit == .perItem)   // items 2 (1) and 3 (2)
         let cost = try #require(sonnet.detail.first { $0.label == "$LE (subscription)" })
         #expect(cost.numerator == 4 && cost.denominator == 2 && cost.unit == .usd)
+        let rejections = try #require(sonnet.detail.first { $0.label == "review rejections" })
+        #expect(rejections.numerator == 3 && rejections.denominator == 2 && rejections.unit == .perItem)  // items 2 (1) and 3 (2)
+        let after = try #require(sonnet.detail.first { $0.label == "turns after first submit" })
+        #expect(after.numerator == 1 && after.denominator == 2 && after.unit == .perItem, "\(after)")
         // The reviewer's row: its catches over the items it reviewed (caught + escaped).
         let reviewer = try row(m, "reviewer · opus")
         let catchRate = try #require(reviewer.detail.first { $0.label == "review catch (as reviewer)" })
         #expect(catchRate.numerator == 1 && catchRate.denominator == 1 && catchRate.status == .insufficient(n: 1))
         // Labels are roles and model families only.
         #expect(m.detail.allSatisfy { !$0.label.contains("Item ") })
+    }
+
+    /// An agent whose model is not one of the three families is ranked under that model (as a safe token); an `auto` agent with no
+    /// turn naming a model is excluded with that reason, never "no model recorded".
+    @Test func modelRankingUnknownAndAutoModels() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme", createdAt: t0.addingTimeInterval(-30 * day))
+        let odd = try MeasureFixtures.agent(store, company: acme, name: "odd", role: "engineer", model: "mystery-1")
+        let auto = try MeasureFixtures.agent(store, company: acme, name: "auto", role: "engineer", model: "auto")
+        let items = try MeasureFixtures.items(store, company: acme, count: 2, now: t0.addingTimeInterval(-10 * day))
+        try MeasureFixtures.landEach(store, company: acme, items: items, at: [t0.addingTimeInterval(-4 * day), t0.addingTimeInterval(-4 * day)])
+        try MeasureFixtures.fact(store, item: items[0], ownerId: odd.id)
+        try MeasureFixtures.fact(store, item: items[1], ownerId: auto.id)
+        let m = try UsageMetrics.modelRanking(try ctx(store, acme))
+        #expect(try row(m, "engineer · mystery-1").numerator == 1)
+        #expect(m.basis.contains("1 landed item whose agent's model is auto and no turn named a model excluded"), "\(m.basis)")
+        #expect(!m.basis.contains("no model recorded"), "\(m.basis)")
+    }
+
+    /// `brahma company trust-import` also ends sessions with `freshSessionReason = tainted`; those fresh sessions are the owner's
+    /// decision, not refusals, and are excluded with the basis saying how many.
+    @Test func taintRefusalsExcludeTrustImport() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme", createdAt: t0.addingTimeInterval(-30 * day))
+        let eng = try MeasureFixtures.agent(store, company: acme, name: "eng")
+        let base = t0.addingTimeInterval(-5 * day)
+        try MeasureFixtures.turn(store, agent: eng, at: base)
+        try store.writer.write { db in try Store.markImported(db, companyId: acme.id, source: "import: example.com", now: base) }
+        #expect(try store.trustImport(companyId: acme.id, now: base.addingTimeInterval(600)) != nil)
+        try MeasureFixtures.turn(store, agent: eng, freshSessionReason: "tainted", at: base.addingTimeInterval(1200))   // after the trust
+        try MeasureFixtures.turn(store, agent: eng, at: base.addingTimeInterval(1800))
+        try MeasureFixtures.turn(store, agent: eng, freshSessionReason: "tainted", at: base.addingTimeInterval(2400))   // a refusal
+        let taint = try row(try UsageMetrics.safety(try ctx(store, acme)), "taint refusals")
+        #expect(taint.numerator == 1)
+        #expect(taint.basis.contains("1 fresh session after the owner's trust-import excluded"), "\(taint.basis)")
+    }
+
+    /// Owner minutes are the owner's alone (ruling R32): an agent process holding no principal can't log them, and the generic
+    /// counter write refuses the owner's counter.
+    @Test func ownerMinutesNeedTheOwner() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme")
+        let owner = try OwnerPrincipal.mint()
+        #expect(throws: WorkError.self) {
+            try OwnerPrincipal.simulatingAgentProcess {
+                try store.logOwnerMinutes(companyId: acme.id, minutes: 10, day: "2026-11-01", owner: owner)
+            }
+        }
+        #expect(throws: WorkError.self) {
+            try store.addCounter(companyId: acme.id, name: MeasureCounter.ownerInterventionSeconds, day: "2026-11-01", delta: 600)
+        }
+        #expect(throws: WorkError.self) {
+            try store.writer.write { db in
+                try Store.addCounter(db, companyId: acme.id, name: MeasureCounter.ownerInterventionSeconds, day: "2026-11-01", delta: 600)
+            }
+        }
+        #expect(try MeasureFixtures.counter(store, companyId: acme.id, MeasureCounter.ownerInterventionSeconds) == 0)
+        try store.logOwnerMinutes(companyId: acme.id, minutes: 10, day: "2026-11-01", owner: owner)
+        #expect(try MeasureFixtures.counter(store, companyId: acme.id, MeasureCounter.ownerInterventionSeconds) == 600)
     }
 
     // MARK: Idle while actionable, items per $LE and per plan-hour
@@ -290,11 +362,22 @@ import GRDB
         try store.addCounter(companyId: acme.id, name: MeasureCounter.activeSeconds,
                              day: Store.measureDay(t0.addingTimeInterval(-20 * day), in: Self.utc), delta: 9999)
         let idle = try UsageMetrics.idleActionable(c)
-        #expect(idle.status == .ok && idle.numerator == 250 && idle.denominator == 1000 && idle.unit == .ratio)
-        #expect(idle.display == "25.0% (250/1000)")
+        // Ruling R32: n is the days with an active-seconds record, not seconds.
+        #expect(idle.status == .insufficient(n: 1) && idle.numerator == 250 && idle.denominator == 1000 && idle.unit == .ratio)
+        #expect(idle.basis.contains("n = days with active-seconds records (1)"), "\(idle.basis)")
         #expect(try row(idle, "five-hour gate").numerator == 200)
         #expect(try row(idle, "weekly pace").numerator == 50)
         #expect(try row(idle, "owner reserve").numerator == 0)
+        // Twenty recorded days: measured.
+        let long = try MeasureFixtures.company(store, name: "Long", createdAt: t0.addingTimeInterval(-30 * day))
+        for n in 1...20 {
+            try store.addCounter(companyId: long.id, name: MeasureCounter.activeSeconds,
+                                 day: Store.measureDay(t0.addingTimeInterval(-Double(n) * day), in: Self.utc), delta: 50)
+        }
+        try store.addCounter(companyId: long.id, name: MeasureCounter.idleActionableSeconds, day: d, delta: 250)
+        let longer = try UsageMetrics.idleActionable(try ctx(store, long, since: t0.addingTimeInterval(-25 * day)))
+        #expect(longer.status == .ok, "\(longer.display) \(longer.basis)")
+        #expect(longer.display == "25.0% (250/1000)")
     }
 
     /// Landed items ÷ Σ itemFact.costLE ($LE, subscription) and ÷ company-active hours. An item without a fact has no cost and is
@@ -345,8 +428,8 @@ import GRDB
         let acme = try MeasureFixtures.seed(store, name: "Acme", landed: 20, now: t0)
         let zeta = try MeasureFixtures.seed(store, name: "Zeta", landed: 1, now: t0)
         // Another company's log and a log before the window are not this window's records.
-        try store.logOwnerMinutes(companyId: zeta.id, minutes: 30, day: Store.measureDay(t0.addingTimeInterval(-day), in: Self.utc))
-        try store.logOwnerMinutes(companyId: acme.id, minutes: 30, day: Store.measureDay(t0.addingTimeInterval(-20 * day), in: Self.utc))
+        try store.logOwnerMinutes(companyId: zeta.id, minutes: 30, day: Store.measureDay(t0.addingTimeInterval(-day), in: Self.utc), owner: try OwnerPrincipal.mint())
+        try store.logOwnerMinutes(companyId: acme.id, minutes: 30, day: Store.measureDay(t0.addingTimeInterval(-20 * day), in: Self.utc), owner: try OwnerPrincipal.mint())
         let m = try UsageMetrics.ownerMinutes(try ctx(store, acme, since: t0.addingTimeInterval(-10 * day)))
         #expect(m.status == .notMeasured(reason: "no owner-time records"))
         #expect(m.display == "not measured: no owner-time records")
@@ -356,9 +439,9 @@ import GRDB
     @Test func ownerMinutesPerItemFromLog() throws {
         let store = try Store.inMemory()
         let acme = try MeasureFixtures.seed(store, name: "Acme", landed: 30, now: t0)
-        try store.logOwnerMinutes(companyId: acme.id, minutes: 30, day: Store.measureDay(t0.addingTimeInterval(-2 * day), in: Self.utc))
-        try store.logOwnerMinutes(companyId: acme.id, minutes: 15, day: Store.measureDay(t0.addingTimeInterval(-3 * day), in: Self.utc))
-        try store.logOwnerMinutes(companyId: acme.id, minutes: 100, day: Store.measureDay(t0.addingTimeInterval(-20 * day), in: Self.utc))
+        try store.logOwnerMinutes(companyId: acme.id, minutes: 30, day: Store.measureDay(t0.addingTimeInterval(-2 * day), in: Self.utc), owner: try OwnerPrincipal.mint())
+        try store.logOwnerMinutes(companyId: acme.id, minutes: 15, day: Store.measureDay(t0.addingTimeInterval(-3 * day), in: Self.utc), owner: try OwnerPrincipal.mint())
+        try store.logOwnerMinutes(companyId: acme.id, minutes: 100, day: Store.measureDay(t0.addingTimeInterval(-20 * day), in: Self.utc), owner: try OwnerPrincipal.mint())
         #expect(try MeasureFixtures.counter(store, companyId: acme.id, MeasureCounter.ownerInterventionSeconds) == 145 * 60)
         let m = try UsageMetrics.ownerMinutes(try ctx(store, acme, since: t0.addingTimeInterval(-10 * day)))
         #expect(m.status == .ok && m.unit == .perItem)
@@ -367,17 +450,17 @@ import GRDB
         #expect(m.basis.contains("owner-logged"), "\(m.basis)")
 
         let small = try MeasureFixtures.seed(store, name: "Small", landed: 5, now: t0)
-        try store.logOwnerMinutes(companyId: small.id, minutes: 10, day: Store.measureDay(t0.addingTimeInterval(-day), in: Self.utc))
+        try store.logOwnerMinutes(companyId: small.id, minutes: 10, day: Store.measureDay(t0.addingTimeInterval(-day), in: Self.utc), owner: try OwnerPrincipal.mint())
         let few = try UsageMetrics.ownerMinutes(try ctx(store, small, since: t0.addingTimeInterval(-10 * day)))
         #expect(few.status == .ok && few.display == "2.00 per landed item (10/5)")
         // Logged minutes with no landing: not measured, the minutes shown in the detail.
         let idle = try MeasureFixtures.company(store, name: "Idle", createdAt: t0.addingTimeInterval(-30 * day))
-        try store.logOwnerMinutes(companyId: idle.id, minutes: 20, day: Store.measureDay(t0.addingTimeInterval(-day), in: Self.utc))
+        try store.logOwnerMinutes(companyId: idle.id, minutes: 20, day: Store.measureDay(t0.addingTimeInterval(-day), in: Self.utc), owner: try OwnerPrincipal.mint())
         let none = try UsageMetrics.ownerMinutes(try ctx(store, idle))
         #expect(none.status == .notMeasured(reason: "no landings in the window"))
         #expect(try row(none, "owner minutes logged").numerator == 20)
         // A log is a positive number of minutes on a real day.
-        #expect(throws: MeasureError.self) { try store.logOwnerMinutes(companyId: idle.id, minutes: 0, day: "2026-11-01") }
-        #expect(throws: MeasureError.self) { try store.logOwnerMinutes(companyId: idle.id, minutes: 10, day: "2026-13-01") }
+        #expect(throws: MeasureError.self) { try store.logOwnerMinutes(companyId: idle.id, minutes: 0, day: "2026-11-01", owner: try OwnerPrincipal.mint()) }
+        #expect(throws: MeasureError.self) { try store.logOwnerMinutes(companyId: idle.id, minutes: 10, day: "2026-13-01", owner: try OwnerPrincipal.mint()) }
     }
 }

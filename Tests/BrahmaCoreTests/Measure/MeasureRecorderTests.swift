@@ -38,17 +38,22 @@ import GRDB
         try MeasureFixtures.agent(s, company: reserved, name: "eng", state: .ready)
         let pausedOnly = try MeasureFixtures.company(s, name: "PausedOnly")
         try MeasureFixtures.agent(s, company: pausedOnly, name: "eng", state: .ready, paused: true)
+        // The gate closed this tick, and the agent is still ready (not yet moved to blocked): it waits on usage.
+        let gateReady = try MeasureFixtures.company(s, name: "GateReady")
+        try MeasureFixtures.agent(s, company: gateReady, name: "eng", state: .ready)
 
-        let all = [blocked, nobody, busy, paced, reserved, pausedOnly]
+        let all = [blocked, nobody, busy, paced, reserved, pausedOnly, gateReady]
         let closed = UsageDecision.closed(until: t0.addingTimeInterval(600))
         let tick = MeasureRecorder.Tick(
-            decisions: [blocked.id: closed, nobody.id: closed, busy.id: closed],
+            decisions: [blocked.id: closed, nobody.id: closed, busy.id: closed, gateReady.id: closed],
             paceClosed: [paced.id, reserved.id, pausedOnly.id], paceStrict: [reserved.id],
             runningByCompany: [busy.id: 1],
             activeDelta: Dictionary(uniqueKeysWithValues: all.map { ($0.id, 30.0) }), ownerReserve: 0.3)
         try MeasureRecorder.record(store: s, companies: all, tick: tick, now: t0)
 
-        for c in all { #expect(try count(s, c, MeasureCounter.activeSeconds) == 30, "\(c.name)") }
+        // Active seconds are the clock's own write (`accrueActiveTime`), never the recorder's.
+        for c in all { #expect(try count(s, c, MeasureCounter.activeSeconds) == 0, "\(c.name)") }
+        #expect(try count(s, gateReady, MeasureCounter.idleUsageLimitSeconds) == 30)
         #expect(try count(s, blocked, MeasureCounter.idleActionableSeconds) == 30)
         #expect(try count(s, blocked, MeasureCounter.idleUsageLimitSeconds) == 30)
         #expect(try count(s, nobody, MeasureCounter.idleActionableSeconds) == 0, "a closed gate with nobody waiting is not actionable")
@@ -118,22 +123,33 @@ import GRDB
         #expect(rows == 0)
     }
 
-    /// Each tick adds what the company clock accrued for the company this tick to that day's `activeSeconds` (owner's calendar);
-    /// a tick after midnight goes to the new day.
+    /// The company clock writes each tick's accrued seconds to that day's `activeSeconds` (owner's calendar) in its own
+    /// transaction, so the counter always equals what `companyActivity` gained, whatever happens later in the tick; a tick after
+    /// midnight goes to the new day; a paused company gains nothing.
     @Test func activeSecondsAccruedPerTick() throws {
         let s = try store()
         let acme = try MeasureFixtures.company(s, name: "Acme")
+        var paused = try MeasureFixtures.company(s, name: "Paused")
+        paused.status = .paused
+        try s.updateCompany(paused)
         let midnight = Date(timeIntervalSince1970: 1_700_006_400)   // 2023-11-15T00:00:00Z
-        for (delta, at) in [(60.0, -120.0), (60, -60), (15, -1), (20, 19)] {
-            try MeasureRecorder.record(store: s, companies: [acme], tick: MeasureRecorder.Tick(activeDelta: [acme.id: delta], ownerReserve: 0.3),
-                                       now: midnight.addingTimeInterval(at))
+        var gained: [Double] = []
+        for at in [-121.0, -61, -1, 19] {
+            let delta = try s.accrueActiveTime(now: midnight.addingTimeInterval(at))
+            gained.append(delta[acme.id] ?? -1)
+            #expect(delta[paused.id] == 0)
         }
+        #expect(gained == [0, 60, 60, 20])
         let day1 = MeasureWindow(since: midnight.addingTimeInterval(-86_400), until: midnight)
         let day2 = MeasureWindow(since: midnight, until: midnight.addingTimeInterval(86_400))
-        #expect(try s.counters(companyId: acme.id, name: MeasureCounter.activeSeconds, in: day1, tz: Self.utc) == 135)
+        #expect(try s.counters(companyId: acme.id, name: MeasureCounter.activeSeconds, in: day1, tz: Self.utc) == 120)
         #expect(try s.counters(companyId: acme.id, name: MeasureCounter.activeSeconds, in: day2, tz: Self.utc) == 20)
-        // No running turn, nobody waiting: no idle seconds.
-        #expect(try count(s, acme, MeasureCounter.idleActionableSeconds) == 0)
+        #expect(try MeasureFixtures.counter(s, companyId: acme.id, MeasureCounter.activeSeconds) == s.activeNow(companyId: acme.id))
+        #expect(try MeasureFixtures.counter(s, companyId: paused.id, MeasureCounter.activeSeconds) == 0)
+        // The recorder adds no active seconds of its own.
+        try MeasureRecorder.record(store: s, companies: [acme], tick: MeasureRecorder.Tick(activeDelta: [acme.id: 20], ownerReserve: 0.3),
+                                   now: midnight.addingTimeInterval(19))
+        #expect(try MeasureFixtures.counter(s, companyId: acme.id, MeasureCounter.activeSeconds) == 140)
     }
 
     /// The engine calls the recorder once per tick, after dispatch, with the seconds the company clock accrued that tick.
@@ -148,5 +164,69 @@ import GRDB
         await w.orchestrator.tick()
         #expect(try MeasureFixtures.counter(w.store, companyId: c.id, MeasureCounter.activeSeconds) == 90)
         #expect(abs(w.store.activeNow(companyId: c.id) - 90) < 1e-9, "the counter is what the clock accrued, never more")
+    }
+
+    /// The recorder runs after dispatch: a company held by the weekly pace whose critical-path agent was admitted this tick has a
+    /// running turn, so the tick is not idle.
+    @Test func launchTickIsNotIdle() async throws {
+        let w = try World()
+        try w.store.setOwnerTimeZone("UTC")
+        let c = try w.company("Acme")
+        let eng = try w.hire(c, "eng")
+        let waiter = try w.hire(c, "waiter")
+        try await w.store.writer.write { db in
+            guard var a = try Agent.fetchOne(db, key: waiter.id) else { throw FakeError(description: "no agent") }
+            a.state = .blocked
+            a.blocker = .agent(eng.id)
+            try a.update(db)
+        }
+        // Weekly pace closed (half the week used at its start), the reserve untouched: only the critical path runs.
+        try w.store.saveRateLimit(RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
+                                                fiveHourUtilization: 0.1, sevenDayUtilization: 0.5, observedAt: w.clock.now,
+                                                fiveHourResetsAt: w.clock.now.addingTimeInterval(3600),
+                                                sevenDayResetsAt: w.clock.now.addingTimeInterval(7 * 86_400)))
+        await w.orchestrator.tick()
+        w.clock.advance(30)
+        try w.dm(c, eng)
+        try await w.cycle()
+        #expect(try w.turns(eng).count == 1, "the critical-path agent was admitted under the closed pace")
+        #expect(try MeasureFixtures.counter(w.store, companyId: c.id, MeasureCounter.activeSeconds) == 30)
+        #expect(try MeasureFixtures.counter(w.store, companyId: c.id, MeasureCounter.idleActionableSeconds) == 0)
+    }
+
+    /// The tick's log line for the recorder: the first failure, a changed failure, and one recovery line; never once per tick.
+    @Test func failureLoggedOnChangeOnly() {
+        var log = MeasureRecorder.FailureLog()
+        #expect(log.note(nil) == nil)
+        #expect(log.note("disk I/O error")?.contains("disk I/O error") == true)
+        #expect(log.note("disk I/O error") == nil)
+        #expect(log.note("database is locked")?.contains("database is locked") == true)
+        #expect(log.note(nil) == "measure recorder recovered; this tick's measure counters were recorded")
+        #expect(log.note(nil) == nil)
+    }
+
+    /// `vX6a-measure-owner-counters` rebuilds `measureCounter` without the company reference: rows are copied, an owner-wide row
+    /// (company id "") is allowed, and deleting a company removes its rows while the owner-wide rows stay.
+    @Test func ownerCountersMigrationKeepsRowsAndCascade() throws {
+        let db = try DatabaseQueue()
+        let migrator = Migrations.migrator()
+        try migrator.migrate(db, upTo: "vX6a-measure-epoch")
+        let acme = Company(id: "c-acme", name: "Acme", slug: "acme", goal: "g", workspacePath: "/nonexistent", status: .running,
+                           usageMode: .balanced, priorityWeight: 1, createdAt: t0)
+        try db.write { db in
+            try acme.insert(db)
+            try db.execute(sql: "INSERT INTO measureCounter (companyId, name, day, value) VALUES ('c-acme', 'activeSeconds', '2026-11-01', 42)")
+            #expect(throws: (any Error).self) {
+                try db.execute(sql: "INSERT INTO measureCounter (companyId, name, day, value) VALUES ('', 'reserveBreaches', '2026-11-01', 1)")
+            }
+        }
+        try migrator.migrate(db)
+        try db.write { db in
+            #expect(try Double.fetchOne(db, sql: "SELECT value FROM measureCounter WHERE companyId = 'c-acme'") == 42)
+            try Store.addCounter(db, companyId: MeasureCounter.ownerWide, name: MeasureCounter.reserveBreaches, day: "2026-11-01", delta: 1)
+            try db.execute(sql: "DELETE FROM company WHERE id = 'c-acme'")
+            #expect(try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM measureCounter WHERE companyId = 'c-acme'") == 0)
+            #expect(try Double.fetchOne(db, sql: "SELECT value FROM measureCounter WHERE companyId = ''") == 1)
+        }
     }
 }

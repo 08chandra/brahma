@@ -17,7 +17,7 @@ struct MeasureCommand: ParsableCommand {
     @Argument(help: "Company name or slug.") var company: String
     @Option(help: "Start of the window: a date (YYYY-MM-DD, midnight in the owner's time zone) or 'all' (since the company was created). Default: the last \(MeasureWindow.defaultDays) days.")
     var since: String?
-    @Option(help: "md (a table) or json.") var format: Format = .md
+    @Option(help: "md (a table, the default) or json.") var format: Format?
     @Option(name: .customLong("log-owner-minutes"),
             help: "Log minutes of your own time spent on this company (1-\(MeasureRecorder.maxOwnerMinutesPerLog)), added to the day's total; prints no report.")
     var logOwnerMinutes: Int?
@@ -25,17 +25,18 @@ struct MeasureCommand: ParsableCommand {
     var day: String?
 
     func run() throws {
-        try requireOwnerShell(quietly: false)
+        let owner = try requireOwnerShell(quietly: false)
         let (store, _) = try openStore()
         let c = try resolveCompanyOrExplain(store, company)
         let now = Date()
         if let minutes = logOwnerMinutes {
-            guard since == nil else { throw fail("--log-owner-minutes takes --day, not --since") }
+            // A log is a write, not a report: the report's flags are refused, never silently ignored.
+            guard since == nil, format == nil else { throw fail("--log-owner-minutes takes only --day; it prints no report (no --since or --format)") }
             do {
                 let dayKey = try MeasureRecorder.ownerLogDay(day, now: now, tz: store.ownerTimeZone())
-                try store.logOwnerMinutes(companyId: c.id, minutes: minutes, day: dayKey)
+                try store.logOwnerMinutes(companyId: c.id, minutes: minutes, day: dayKey, owner: owner)
                 print(safe("Logged \(minutes) owner minute\(minutes == 1 ? "" : "s") for \(c.name) on \(dayKey)."))
-            } catch let error as MeasureError { throw fail("\(error)") }
+            } catch let error as MeasureError { throw fail("\(error)") } catch let error as WorkError { throw fail("\(error)") }
             return
         }
         guard day == nil else { throw fail("--day is only for --log-owner-minutes") }
@@ -46,7 +47,7 @@ struct MeasureCommand: ParsableCommand {
         let git = GitWorkspace(root: URL(fileURLWithPath: c.workspacePath, isDirectory: true))
         let report: MeasureReport
         do { report = try Measure.report(store: store, git: git, companyId: c.id, window: window, now: now) } catch { throw fail("\(error)") }
-        switch format {
+        switch format ?? .md {
         case .md:
             // Line by line: `safe()` turns newlines into spaces, and the company name is in the header.
             print(safeLines(report.markdown()), terminator: "")

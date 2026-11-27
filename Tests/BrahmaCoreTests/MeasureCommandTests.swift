@@ -159,7 +159,9 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let agent = try brahma(["measure", "Acme", "--log-owner-minutes", "5"], home: rig.home, env: ["BRAHMA_AGENT_ID": "a1"])
         #expect(agent.status == 1 && agent.stderr.contains("owner commands can't run inside an agent turn"), "\(agent.stderr)")
         for bad in [["--log-owner-minutes", "0"], ["--log-owner-minutes", "-3"], ["--log-owner-minutes", "5", "--day", "2026-13-01"],
-                    ["--log-owner-minutes", "5", "--day", "2999-01-01"], ["--day", today]] {
+                    ["--log-owner-minutes", "5", "--day", "2999-01-01"], ["--day", today],
+                    ["--log-owner-minutes", "5", "--format", "json"], ["--log-owner-minutes", "5", "--format", "md"],
+                    ["--log-owner-minutes", "5", "--since", "all"]] {
             let r = try brahma(["measure", "Acme"] + bad, home: rig.home)
             #expect(r.status != 0, "\(bad)")
             #expect(r.stdout.isEmpty, "\(bad): \(r.stdout)")

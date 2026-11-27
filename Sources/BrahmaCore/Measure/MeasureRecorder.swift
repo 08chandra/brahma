@@ -1,10 +1,12 @@
 import Foundation
 import GRDB
 
-/// The daily counters of `measureCounter` (`docs/measure/metrics.md`). The recorder writes the first six; the owner writes
+/// The daily counters of `measureCounter` (`docs/measure/metrics.md`). The clock writes `activeSeconds`, the recorder the next
+/// five; the owner writes
 /// `ownerInterventionSeconds` (`brahma measure <co> --log-owner-minutes`), and nothing else does.
 public enum MeasureCounter {
-    /// Company-active seconds per day: exactly what the company clock accrued each tick (ruling R15).
+    /// Company-active seconds per day: written by the company clock (`Store.accrueActiveTime`) in the transaction that accrues
+    /// them, so the counter and `companyActivity` never disagree (ruling R15).
     public static let activeSeconds = "activeSeconds"
     /// Company-active seconds with no running turn while an agent waited on usage (metrics.md §12), and the same seconds by cause.
     public static let idleActionableSeconds = "idleActionableSeconds"
@@ -20,9 +22,9 @@ public enum MeasureCounter {
 }
 
 /// The measure recorder (Plan X6a Task 5; ruling R5: a pure function over the store, called once per tick from
-/// `Orchestrator.schedule(now:)` after dispatch). For every running company it adds the seconds the company clock accrued this
-/// tick to that day's `activeSeconds`, and, when the company had no running turn while an agent waited on usage, the same seconds
-/// to `idleActionableSeconds` and to the counter of the cause. Once per new usage snapshot it judges the owner reserve. Nothing
+/// `Orchestrator.schedule(now:)` after dispatch). For every running company that had no running turn while an agent waited on
+/// usage, it adds the seconds the company clock accrued this tick (the clock itself wrote them to `activeSeconds`, in its own
+/// transaction) to `idleActionableSeconds` and to the counter of the cause. Once per new usage snapshot it judges the owner reserve. Nothing
 /// here estimates: a tick the recorder did not see is not recorded, and the metrics say so.
 public enum MeasureRecorder {
     /// What the tick decided, as `schedule(now:)` holds it after dispatch.
@@ -78,9 +80,10 @@ public enum MeasureRecorder {
             // observed before it is history the recorder never saw.
             try db.execute(sql: "INSERT OR IGNORE INTO measureEpoch (name, at) VALUES (?, ?)", arguments: [recorderEpoch, now])
             for company in companies where company.status == .running {
+                // `activeSeconds` itself is written by the clock in its own transaction (`accrueActiveTime`); here only the
+                // idle share of the same seconds.
                 let delta = tick.activeDelta[company.id] ?? 0
                 guard delta.isFinite, delta > 0 else { continue }
-                try Store.addCounter(db, companyId: company.id, name: MeasureCounter.activeSeconds, day: day, delta: delta)
                 guard let cause = try idleCause(db, companyId: company.id, tick: tick) else { continue }
                 try Store.addCounter(db, companyId: company.id, name: MeasureCounter.idleActionableSeconds, day: day, delta: delta)
                 try Store.addCounter(db, companyId: company.id, name: cause.counter, day: day, delta: delta)
@@ -128,6 +131,24 @@ public enum MeasureRecorder {
                              day: Store.measureDay(info.observedAt, in: tz), delta: 1)
     }
 
+    /// What the tick logs about the recorder: the first failure, a failure that differs from the last, and one line when it
+    /// recovers; nothing while it keeps failing the same way or keeps working (no line per tick).
+    public struct FailureLog: Sendable {
+        private var last: String?
+        public init() {}
+
+        /// `error`: this tick's failure, nil on success. Returns the line to log, if any.
+        public mutating func note(_ error: String?) -> String? {
+            defer { last = error }
+            switch (last, error) {
+            case (nil, nil): return nil
+            case (_, let now?) where now == last: return nil
+            case (_, let now?): return "measure recorder failed; this tick's measure counters were not recorded (logged again only if the error changes): \(now)"
+            case (.some, nil): return "measure recorder recovered; this tick's measure counters were recorded"
+            }
+        }
+    }
+
     /// When the recorder first ran, nil if it never has (owner-wide metadata).
     static func recorderStart(_ db: Database) throws -> Date? {
         try Date.fetchOne(db, sql: "SELECT at FROM measureEpoch WHERE name = ?", arguments: [recorderEpoch])
@@ -164,13 +185,18 @@ public enum MeasureRecorder {
 
 extension Store {
     /// Adds the owner's own `minutes` (1…1440) to the company's `ownerInterventionSeconds` for `day` (`YYYY-MM-DD`). The only
-    /// source of the owner-minutes metric; Brahma never records or estimates owner time itself.
-    public func logOwnerMinutes(companyId: String, minutes: Int, day: String) throws {
+    /// source of the owner-minutes metric; Brahma never records or estimates owner time itself. Owner-only (ruling R32, the C6
+    /// pattern): it takes the owner's principal, which only the owner CLI and the app can mint, and refuses in an agent process
+    /// before anything else.
+    public func logOwnerMinutes(companyId: String, minutes: Int, day: String, owner: OwnerPrincipal) throws {
+        try ProcessRole.refuseInAgentProcess()
+        _ = try requireOwner(owner)
         guard minutes > 0, minutes <= MeasureRecorder.maxOwnerMinutesPerLog else { throw MeasureError.badMinutes(minutes) }
         guard MeasureRecorder.isDay(day) else { throw MeasureError.badDay(day) }
         try writer.write { db in
             guard try Company.fetchOne(db, key: companyId) != nil else { throw MeasureError.unknownCompany(companyId) }
-            try Self.addCounter(db, companyId: companyId, name: MeasureCounter.ownerInterventionSeconds, day: day, delta: Double(minutes) * 60)
+            try Self.upsertCounter(db, companyId: companyId, name: MeasureCounter.ownerInterventionSeconds, day: day,
+                                   delta: Double(minutes) * 60)
         }
     }
 }

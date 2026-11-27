@@ -69,6 +69,8 @@ public actor Orchestrator {
 
     /// In-memory: turns this orchestrator has in flight, per company. The DB `running` state is the durable record.
     var runningByCompany: [String: Int] = [:]
+    /// The measure recorder's failure state, so a failing recorder is logged on change and on recovery, not every tick (X6a).
+    var measureFailures = MeasureRecorder.FailureLog()
     /// Agent id → its turn task.
     var tasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
     /// Health work that must never block a tick (doctor re-probe, `claude --version`, HTTPS probe, disk checks).

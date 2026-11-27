@@ -18,9 +18,10 @@ extension UsageMetrics {
     enum Attribution: Equatable {
         /// The family, and whether it came from the agent's model because no turn named one.
         case family(String, byAgent: Bool)
-        /// Two families ran the same number of turns: no majority, not attributed.
+        /// Two families ran the same number of turns, or every turn that named a model named several (cumulative over a resume):
+        /// no majority, not attributed — never the agent's current model.
         case noMajority
-        /// No turn named a model and the agent's model is not a family (`auto`).
+        /// No turn named a model and the agent's model is `auto` (it has no model of its own).
         case unknown
     }
 
@@ -39,6 +40,7 @@ extension UsageMetrics {
             let agents = Dictionary(uniqueKeysWithValues: try Agent.fetchAll(db, sql: "SELECT * FROM agent WHERE companyId = ?",
                                                                              arguments: [ctx.companyId]).map { ($0.id, $0) })
             let work = try turnModels(db, companyId: ctx.companyId, itemIds: itemIds, kind: .work)
+            let firstSubmit = try firstSubmits(db, companyId: ctx.companyId, itemIds: itemIds)
             let reviews = try turnModels(db, companyId: ctx.companyId, itemIds: itemIds, kind: .review)
             let reviewers = try reviewerFallback(db, companyId: ctx.companyId, itemIds: itemIds, agents: agents)
             let caught = try confirmedCatches(db, companyId: ctx.companyId, itemIds: itemIds, until: ctx.window.until)
@@ -83,6 +85,14 @@ extension UsageMetrics {
                                       basis: "itemFact.firstPass over the pair's landed items"))
                     rows.append(.rate(id, label: "rework rounds", numerator: Double(items.reduce(0) { $0 + $1.reworkRounds }), denominator: n,
                                       unit: .perItem, basis: "Σ itemFact.reworkRounds ÷ the pair's landed items"))
+                    rows.append(.rate(id, label: "review rejections", numerator: Double(items.reduce(0) { $0 + $1.reviewRejections }),
+                                      denominator: n, unit: .perItem, basis: "Σ itemFact.reviewRejections ÷ the pair's landed items"))
+                    let after = items.reduce(0) { total, fact in
+                        guard let submitted = firstSubmit[fact.itemId] else { return total }
+                        return total + work[fact.itemId, default: []].filter { $0.startedAt > submitted }.count
+                    }
+                    rows.append(.rate(id, label: "turns after first submit", numerator: Double(after), denominator: n, unit: .perItem,
+                                      basis: "counted work turns started after the item's first submitted event ÷ the pair's landed items"))
                     rows.append(.rate(id, label: "$LE (subscription)", numerator: items.reduce(0) { $0 + $1.costLE }, denominator: n,
                                       unit: .usd, basis: "Σ itemFact.costLE ÷ the pair's landed items"))
                 }
@@ -103,23 +113,33 @@ extension UsageMetrics {
             basis += excludedWithoutFact(landed.count - facts.count)
             if noOwner > 0 { basis += "; \(LandingMetrics.plural(noOwner, "landed item")) with no assignee recorded excluded" }
             if noMajority > 0 { basis += "; \(LandingMetrics.plural(noMajority, "landed item")) with no majority model excluded" }
-            if unknown > 0 { basis += "; \(LandingMetrics.plural(unknown, "landed item")) with no model recorded excluded" }
+            if unknown > 0 {
+                basis += "; \(LandingMetrics.plural(unknown, "landed item")) whose agent's model is auto and no turn named a model excluded"
+            }
             if reviewNoMajority > 0 { basis += "; \(LandingMetrics.plural(reviewNoMajority, "review")) with no majority model left out of the reviewer rows" }
             return .count(id, Double(attributed), basis: basis, detail: detail)
         }
     }
 
-    /// The majority family of `turns` (each a `modelsUsed` value), else the agent's model when no turn names one.
+    /// The majority family of `turns` (each a `modelsUsed` value). Only when no turn names any model, the agent's model (a known
+    /// family, or any other model as its safe token); an `auto` agent then has none.
     static func attribute(_ turns: [String?], agentModel: String) -> Attribution {
         var tally: [String: Int] = [:]
-        for models in turns { if let family = turnFamily(models) { tally[family, default: 0] += 1 } }
+        var named = false
+        for models in turns {
+            if let models, !models.trimmingCharacters(in: .whitespaces).isEmpty { named = true }
+            if let family = turnFamily(models) { tally[family, default: 0] += 1 }
+        }
         if let top = tally.values.max() {
             let leaders = tally.filter { $0.value == top }.keys.sorted()
             guard leaders.count == 1, let family = leaders.first else { return .noMajority }
             return .family(family, byAgent: false)
         }
-        let family = ModelAllowlist.family(agentModel)
-        return ["haiku", "sonnet", "opus"].contains(family) ? .family(family, byAgent: true) : .unknown
+        // Turns named models but none a single family: ambiguous, not the agent's (perhaps since changed) model.
+        if named { return .noMajority }
+        let family = ModelAllowlist.family(agentModel.trimmingCharacters(in: .whitespaces))
+        guard !family.isEmpty, family != "auto" else { return .unknown }
+        return .family(token(family), byAgent: true)
     }
 
     /// The one family a turn ran on: its `modelsUsed` families, less a background `haiku` beside another family; nil when the turn
@@ -139,18 +159,35 @@ extension UsageMetrics {
         return kept.isEmpty ? "unnamed" : kept
     }
 
-    /// The `modelsUsed` of the company's counted turns of `kind` about each item (infra failures and session resets excluded).
+    /// The company's counted turns of `kind` about each item — the turns `itemFact.turnsUsed` counts: outcome succeeded or failed,
+    /// no infra failure, no session reset — with their agent, `modelsUsed` and start.
     static func turnModels(_ db: Database, companyId: String, itemIds: [String], kind: TurnKind)
-        throws -> [String: [(agentId: String, models: String?)]] {
-        var out: [String: [(agentId: String, models: String?)]] = [:]
+        throws -> [String: [(agentId: String, models: String?, startedAt: Date)]] {
+        var out: [String: [(agentId: String, models: String?, startedAt: Date)]] = [:]
         for chunk in LandingMetrics.chunks(itemIds) {
             let marks = chunk.map { _ in "?" }.joined(separator: ", ")
             for row in try Row.fetchAll(db, sql: """
-                SELECT itemId, agentId, modelsUsed FROM turn
-                WHERE companyId = ? AND kind = ? AND infra = 0 AND sessionResetReason IS NULL AND itemId IN (\(marks))
+                SELECT itemId, agentId, modelsUsed, startedAt FROM turn
+                WHERE companyId = ? AND kind = ? AND infra = 0 AND sessionResetReason IS NULL
+                  AND (stopReason IS NULL OR stopReason <> 'sessionReset') AND outcome IN ('succeeded', 'failed') AND itemId IN (\(marks))
                 ORDER BY startedAt, id
                 """, arguments: StatementArguments([companyId, kind.rawValue]) + StatementArguments(chunk)) {
-                out[row["itemId"] as String, default: []].append((agentId: row["agentId"], models: row["modelsUsed"]))
+                out[row["itemId"] as String, default: []].append((agentId: row["agentId"], models: row["modelsUsed"], startedAt: row["startedAt"]))
+            }
+        }
+        return out
+    }
+
+    /// The time of each item's first `submitted` event.
+    static func firstSubmits(_ db: Database, companyId: String, itemIds: [String]) throws -> [String: Date] {
+        var out: [String: Date] = [:]
+        for chunk in LandingMetrics.chunks(itemIds) {
+            let marks = chunk.map { _ in "?" }.joined(separator: ", ")
+            for row in try Row.fetchAll(db, sql: """
+                SELECT itemId, MIN(createdAt) AS firstAt FROM workItemEvent
+                WHERE companyId = ? AND kind = 'submitted' AND itemId IN (\(marks)) GROUP BY itemId
+                """, arguments: StatementArguments([companyId]) + StatementArguments(chunk)) {
+                out[row["itemId"] as String] = row["firstAt"] as Date
             }
         }
         return out

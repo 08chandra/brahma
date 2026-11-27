@@ -74,13 +74,18 @@ extension Store {
 
     /// Called first in every tick. Each company that is `running` while no hold is active gains the time since its
     /// last accrual, at most `CompanyClock.maxGap`; every company's `lastAccruedAt` moves to `now` regardless, so a
-    /// pause or a hold is never counted afterwards. Returns the seconds each company gained this tick (0 for one that did not
-    /// run): the measure recorder adds exactly these to its daily counter, so the two never disagree (Plan X6a, ruling R15).
+    /// pause or a hold is never counted afterwards. The same seconds go to the company's daily `activeSeconds` measure counter
+    /// (owner's calendar day of `now`) in the same transaction, so the windowed history and `companyActivity` never disagree, whatever
+    /// happens later in the tick (Plan X6a, ruling R15). Returns the seconds each company gained this tick (0 for one that did not
+    /// run), which the measure recorder reads for its idle-while-actionable share.
     @discardableResult
     public func accrueActiveTime(now: Date) throws -> [String: TimeInterval] {
         try writer.write { db in
             // An engine hold or the owner's stop freezes every company's clock.
             let held = try EngineHold.fetchOne(db, key: 1) != nil || Store.engineStopped(db) != nil
+            try Store.ensureOwnerSettings(db)
+            let zoneId = try String.fetchOne(db, sql: "SELECT timeZone FROM ownerSettings WHERE id = 1")
+            let day = Store.measureDay(now, in: zoneId.flatMap { TimeZone(identifier: $0) } ?? .current)
             var gained: [String: TimeInterval] = [:]
             for company in try Company.fetchAll(db) {
                 var row = try CompanyActivity.fetchOne(db, key: company.id)
@@ -90,6 +95,9 @@ extension Store {
                     let gap = now.timeIntervalSince(row.lastAccruedAt ?? now)
                     delta = min(max(gap, 0), CompanyClock.maxGap)
                     row.activeSeconds += delta
+                }
+                if delta > 0 {
+                    try Store.addCounter(db, companyId: company.id, name: MeasureCounter.activeSeconds, day: day, delta: delta)
                 }
                 gained[company.id] = delta
                 row.lastAccruedAt = now

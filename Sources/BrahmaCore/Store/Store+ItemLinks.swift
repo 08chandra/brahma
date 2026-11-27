@@ -127,13 +127,23 @@ extension Store {
 
     // MARK: Daily counters
 
-    /// Adds `delta` to the company's `name` counter for `day` (`YYYY-MM-DD` in the owner's calendar: `measureDay`).
-    public func addCounter(companyId: String, name: String, day: String, delta: Double) throws {
+    /// Adds `delta` to the company's `name` counter for `day` (`YYYY-MM-DD` in the owner's calendar: `measureDay`). Internal: the
+    /// engine's own counters only. The owner's counter (`ownerInterventionSeconds`) is refused here; only
+    /// `logOwnerMinutes(…owner:)` writes it (ruling R32).
+    func addCounter(companyId: String, name: String, day: String, delta: Double) throws {
         try writer.write { db in try Self.addCounter(db, companyId: companyId, name: name, day: day, delta: delta) }
     }
 
-    /// The in-transaction form, for the recorder that counts inside the tick's own write.
+    /// The in-transaction form, for the clock and the recorder that count inside the tick's own writes. Refuses the owner's counter.
     static func addCounter(_ db: Database, companyId: String, name: String, day: String, delta: Double) throws {
+        guard name != MeasureCounter.ownerInterventionSeconds else {
+            throw WorkError.forbidden("owner minutes are written only by the owner's own log (brahma measure --log-owner-minutes)")
+        }
+        try upsertCounter(db, companyId: companyId, name: name, day: day, delta: delta)
+    }
+
+    /// The write itself, unchecked: `addCounter` and `logOwnerMinutes` only.
+    static func upsertCounter(_ db: Database, companyId: String, name: String, day: String, delta: Double) throws {
         try db.execute(sql: """
             INSERT INTO measureCounter (companyId, name, day, value) VALUES (?, ?, ?, ?)
             ON CONFLICT (companyId, name, day) DO UPDATE SET value = value + excluded.value
