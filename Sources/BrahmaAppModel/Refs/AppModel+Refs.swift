@@ -138,6 +138,19 @@ extension AppModel {
         cleanRenderScratch(prefix: "open-tab")
         if selectedPreviewTab == PreviewTabID.ref { selectPreviewTab(nil) }
         saveNav()
+        updateChangesVisibility()
+    }
+
+    /// C6b: the live changes stream runs only while the CHANGES tab, or a live item diff in the OPENED tab, is visible.
+    func updateChangesVisibility() {
+        guard let changes else { return }
+        var liveOpened = false
+        if case .changes? = openedBody?.content, previewNav.opened != nil { liveOpened = true }
+        if selectedPreviewTab == PreviewTabID.changes || (selectedPreviewTab == PreviewTabID.ref && liveOpened) {
+            changes.start()
+        } else {
+            changes.stop()
+        }
     }
 
     /// The owner looked at the OPENED tab: the background badge clears.
@@ -160,12 +173,23 @@ extension AppModel {
         ownerRequestUsage = nil
         if previewNav.selection == PreviewTabID.ref, previewNav.opened != nil { selectedPreviewTab = PreviewTabID.ref }
         wireShowBar(companyId: companyId)
+        wireChanges(companyId: companyId)
         if previewNav.opened != nil {
             Task {
                 await refreshOpenedTitle()
                 await loadOpenedBody()
             }
         }
+    }
+
+    /// C6b: the CHANGES model of the selected company over the live engine; the stored values come from the injected vault on
+    /// every subscription and refresh (a vault that can't be read shows nothing).
+    func wireChanges(companyId: String) {
+        changes?.stop()
+        let store = self.store, vault = self.secretVault
+        changes = ChangesTabModel(store: store, live: liveChanges, companyId: companyId,
+                                  knownValues: { try store.knownSecretValues(companyId: companyId, vault: vault) }, defaults: navDefaults, clock: clock)
+        updateChangesVisibility()
     }
 
     /// M12: the stored navigation keeps canonicals only; the title is resolved and gated again here.
@@ -201,6 +225,9 @@ extension AppModel {
         let body = await renderBody(for: opened, companyId: companyId, via: Store.tabReadVia)
         guard gen == openGeneration, previewNav.opened == opened, companyId == selectedCompanyId else { return }
         openedBody = body
+        // C6b: a live item diff is the changes model's; `at` is the patch hash a show answer showed it at.
+        if case .changes(let key, let compare) = body.content { changes?.show(key: key, compare: compare, shownAt: opened.ref.params["at"]) }
+        updateChangesVisibility()
     }
 
     /// The body of `opened` for the owner: the ref's (`RefBodies`), or, for an answer message opened from its card, the answer

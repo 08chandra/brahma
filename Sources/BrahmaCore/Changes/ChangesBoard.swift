@@ -57,6 +57,22 @@ extension Store {
         }
     }
 
+    /// Plan C Task C6b: the keys of the company's active leases whose worktree is in place (the live worktree rule's subjects), in
+    /// key order. The CHANGES tab shows whenever this is not empty. No diff is computed; a workspace that can't be walked reads
+    /// as none (the tab is presence only, never content).
+    public func worktreeKeys(companyId: String) throws -> [String] {
+        guard let company = try company(id: companyId) else { return [] }
+        let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
+        guard let fs = try? SafeFS(workspace: workspace, ownHandle: nil) else { return [] }
+        var keys: [String] = []
+        for lease in try leases(companyId: companyId) {
+            guard let item = try workItem(id: lease.itemId), item.companyId == companyId else { continue }
+            guard (try? fs.worktreeDirectory(key: item.key)) != nil else { continue }
+            keys.append(item.key)
+        }
+        return keys.sorted()
+    }
+
     /// `passed`, `failed`, `running` or `none`.
     static func boardCheckStatus(_ run: VerificationRun?) -> String {
         guard let run else { return "none" }

@@ -29,6 +29,9 @@ public struct RefHeader: Equatable, Sendable {
 public enum RefContent: Equatable, Sendable {
     case code(lines: [[CodeSpan]], firstLine: Int, highlight: LineRange?, hasHidden: Bool)
     case diff(DiffModel, live: Bool, updated: String?)
+    /// C6b: a live item diff in the OPENED tab — drawn from `AppModel.changes` (`ChangesTabModel`: the engine's live stream, gated per
+    /// yield, with the compare picker, split view, stops and review markers), never a one-shot parse.
+    case changes(key: String, compare: CompareMode)
     case file(FileBody, provenance: Provenance)
     case item(itemId: String)
     case ask(askId: String)
@@ -135,6 +138,12 @@ public enum RefBodies {
                 let r = try render()
                 return try fileBody(r, resolved: resolved, header: header, ctx: ctx, gate: gate)
             case .diff:
+                // C6b: in the OPENED tab a live item diff is the changes model's (one stream, the read recorded here); the inspector
+                // and cards keep a one-shot render.
+                if via == Store.tabReadVia, !ref.id.isEmpty, let compare = CompareMode(ref: ref), compare.isLive {
+                    try read()
+                    return RefBody(header: header(live: true), content: .changes(key: ref.id, compare: compare))
+                }
                 let r = try render()
                 let live = ref.isWorktree && ref.params["snapshot"] == nil
                 let model = DiffModel.parse(patch: redacted(r.text ?? "", knownValues: ctx.knownValues))

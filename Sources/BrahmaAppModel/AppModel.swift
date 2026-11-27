@@ -137,6 +137,12 @@ public final class AppModel {
     @ObservationIgnored public var owner: OwnerPrincipal? = { OwnerPrincipal.enterOwnerProcess(); return try? OwnerPrincipal.mint() }()
     /// Where `PreviewNav` is kept (`.standard` in the app; tests give a suite of their own).
     @ObservationIgnored public var navDefaults: UserDefaults = .standard
+    /// Plan C C6b: the live changes engine over `store` (one loop per observed item and compare; rebuilt with the store).
+    @ObservationIgnored public private(set) var liveChanges: LiveChanges
+    /// Plan C C6b: the CHANGES tab's model for the selected company (nil with none selected). It streams only while the tab or a
+    /// live diff in the OPENED tab is visible (`updateChangesVisibility`).
+    public internal(set) var changes: ChangesTabModel?
+    @ObservationIgnored var ticksSinceChanges = 0
 
     /// The embedded engine, when this app hosts one. Set by the app delegate.
     public var engine: EngineHost?
@@ -157,12 +163,15 @@ public final class AppModel {
     private static let activityCap = 500
     /// Owner notices are planned on every 4th tick (about every 2 s at the default poll).
     static let deliveryEvery = 4
+    /// The changes board and comments reload on every 4th tick while the CHANGES model runs (the diff itself streams).
+    static let changesRefreshEvery = 4
 
     public init(store: Store, paths: BrahmaPaths, secretVault: any SecretVault, clock: @escaping @Sendable () -> Date = { .now }) {
         self.store = store
         self.paths = paths
         self.secretVault = secretVault
         self.clock = clock
+        self.liveChanges = LiveChanges(store: store)
         self.search = SearchModel(store: store)
         self.backups = BackupsModel(store: store, paths: paths)
         self.access = AccessModel(store: store)
@@ -245,6 +254,9 @@ public final class AppModel {
             // Anything built or installed over the closed store while it was away is dropped; the next ensure builds a
             // controller over `reopened`, its cursors at the restored database's maxima.
             storeClosed = false
+            changes?.stop()
+            changes = nil
+            liveChanges = LiveChanges(store: reopened)
             dropLiveMapController()
             search = SearchModel(store: reopened)
             backups = BackupsModel(store: reopened, paths: paths)
@@ -354,6 +366,13 @@ public final class AppModel {
             }
             if turnStreamAgentId != nil { await refreshTurnStream() }
             await refreshCollab()
+            if let changes, changes.isRunning {
+                ticksSinceChanges += 1
+                if ticksSinceChanges >= Self.changesRefreshEvery {
+                    ticksSinceChanges = 0
+                    await changes.refresh()
+                }
+            }
             lastDBError = nil
             ticksSinceDelivery += 1
             if ticksSinceDelivery >= Self.deliveryEvery {
@@ -517,6 +536,11 @@ public final class AppModel {
             openShow(presentation: .overlay)
             showBar.query = query
             Task { await showBar.update(query: query) }
+        case .changes(let key):
+            // The board, or that item's live diff vs main, on the CHANGES tab (the key is selected first, so the stream starts on it).
+            select(.missionControl)
+            if let key { changes?.select(key) }
+            selectPreviewTab(PreviewTabID.changes)
         }
     }
 

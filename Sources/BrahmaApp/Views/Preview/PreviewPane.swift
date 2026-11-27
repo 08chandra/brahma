@@ -275,6 +275,9 @@ private struct PreviewBodyView: View {
             SimulatorFramesView(udid: udid)
         case .window(let pid):
             WindowCaptureView(pid: pid)
+        case .changes:
+            // Plan C C6b: the model is in place (`model.changes`); C7a draws the board, the split view and the review gutter.
+            MonoEmptyState("CHANGES", detail: "Live changes of every leased worktree appear here.")
         default:
             // `.web`, and the cases Collab adds to the open enum (L-1).
             if case .web(let url, let origin, let builtBy) = body_ {

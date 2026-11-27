@@ -15,6 +15,8 @@ struct ChangesFixture {
     let wt: URL
     let r1: String, r2: String, base: String
     let eng7: Agent
+    /// The owner principal of this (owner) test process, for the owner-only review APIs (Ruling C6-3).
+    let owner: OwnerPrincipal
 
     var store: Store { cf.store }
     var c: Company { cf.c }
@@ -29,6 +31,7 @@ struct ChangesFixture {
             try WorkLease(itemId: itemId, companyId: cId, agentId: eng1Id, acquiredAt: now, expiresActive: 1e12).insert(db)
         }
         eng7 = try cf.store.hire(companyId: cId, name: "eng-7", role: "engineer", model: "sonnet", managerId: cf.fx.cto.id)
+        owner = try OwnerPrincipal.mint()
         wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         r1 = try cf.fx.head("item/ENG-1")
         try cf.fx.git.write("src/a.ts", "one\nTWO\nthree\nfour\n", in: wt)

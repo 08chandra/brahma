@@ -12,6 +12,8 @@ extension AppModel {
     /// selected (possibly pinned) artifact, with the list and picker always present (`artifactNotice` is shown beside them, never
     /// in their place); a backend body carries the parsed OpenAPI copy (`previewForBodies`).
     public func previewBody(forTab tabId: String?) -> PreviewBody {
+        // Plan C C6b: the CHANGES tab's content is `changes` (the view reads the model).
+        if tabId == PreviewTabID.changes { return .changes }
         // Plan C: the OPENED tab shows the opened ref's body (or a placeholder while it renders).
         if tabId == PreviewTabID.ref, let opened = previewNav.opened {
             return .ref(openedBody ?? RefBody(header: RefHeader(title: opened.title, subtitle: "", chips: [], actions: []), content: .unavailable("LOADING")))
@@ -27,6 +29,7 @@ extension AppModel {
         selectedPreviewTab = id
         artifactNotice = nil
         artifactSelectionGeneration += 1
+        updateChangesVisibility()
     }
 
     /// Asks the engine to restart a surface (owner).

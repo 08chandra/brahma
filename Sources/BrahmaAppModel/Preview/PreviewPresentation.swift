@@ -25,6 +25,8 @@ public enum PreviewTabID {
     public static let live = "live"
     public static let artifacts = "artifacts"
     public static let ref = "ref"
+    /// Plan C Task C6b: the CHANGES tab (every leased worktree's live diff).
+    public static let changes = "changes"
     static let surfacePrefix = "surface:"
 
     public static func surface(_ id: String) -> String { surfacePrefix + id }
@@ -54,13 +56,16 @@ public struct PreviewTab: Equatable, Identifiable, Sendable {
 }
 
 public enum PreviewTabs {
-    /// The surfaces by position, then ARTIFACTS when any artifact exists (its chip names the newest), then LIVE when a release
-    /// is deployed (4a A7).
+    /// The surfaces by position, then CHANGES whenever any lease has its worktree in place (Plan C C6b; its chip counts them,
+    /// LIVE tone), then ARTIFACTS when any artifact exists (its chip names the newest), then LIVE when a release is deployed (4a A7).
     public static func make(_ p: PreviewSnapshot) -> [PreviewTab] {
         var tabs = p.surfaces.sorted { ($0.position, $0.name) < ($1.position, $1.name) }.map { s -> PreviewTab in
             let status = p.states[s.id]?.status ?? .idle
             return PreviewTab(id: PreviewTabID.surface(s.id), title: s.name.uppercased(), statusTitle: status.title.uppercased(),
                               tone: PreviewTone(status), surfaceId: s.id)
+        }
+        if !p.worktreeKeys.isEmpty {
+            tabs.append(PreviewTab(id: PreviewTabID.changes, title: "CHANGES", statusTitle: "\(p.worktreeKeys.count) LIVE", tone: .busy, surfaceId: nil))
         }
         if let latest = p.artifacts.first {
             // Not a health state: the chip stays neutral.
@@ -119,6 +124,8 @@ public enum PreviewBody: Equatable, Sendable {
     case artifact(Artifact, all: [Artifact])
     /// The OPENED tab (Plan C): a ref's body (`RefBodies`), or the chat inspector's.
     case ref(RefBody)
+    /// The CHANGES tab (Plan C C6b): the view draws `AppModel.changes` (the board, the selected item's live diff, the markers).
+    case changes
 }
 
 public enum PreviewBodies {
@@ -131,6 +138,7 @@ public enum PreviewBodies {
         let tabs = PreviewTabs.make(p)
         guard let id = PreviewTabs.resolve(tabId, tabs) else { return .empty(noPreview) }
         if id == PreviewTabID.live, let live = p.live { return .web(url: live, origin: live, builtBy: p.liveRef ?? "LIVE") }
+        if id == PreviewTabID.changes { return .changes }
         if id == PreviewTabID.artifacts, let latest = p.artifacts.first {
             return .artifact(p.artifacts.first { $0.id == selectedArtifactId } ?? latest, all: p.artifacts)
         }

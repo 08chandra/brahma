@@ -47,6 +47,9 @@ public enum SelectTarget: Equatable, Sendable {
     case ref(companyId: String, canonical: String)
     /// `find:<query>` (Plan C): the Show palette open with the query typed and its results shown, Enter never pressed.
     case find(String)
+    /// `changes` (Plan C C6b): Mission Control's preview pane on the CHANGES tab (the board); `changes:<KEY>` selects that item's
+    /// live diff vs main there.
+    case changes(key: String?)
 
     public init?(_ s: String) {
         switch s {
@@ -71,6 +74,7 @@ public enum SelectTarget: Equatable, Sendable {
         case "hire": self = .sheet(.hire)
         case "new-company": self = .sheet(.newCompany)
         case "map": self = .map
+        case "changes": self = .changes(key: nil)
         default:
             guard let colon = s.firstIndex(of: ":") else { return nil }
             let key = s[..<colon]
@@ -98,6 +102,7 @@ public enum SelectTarget: Equatable, Sendable {
                 guard !companyId.isEmpty, !canonical.isEmpty else { return nil }
                 self = .ref(companyId: companyId, canonical: canonical)
             case "find": self = .find(value)
+            case "changes": self = .changes(key: value.uppercased())
             default: return nil
             }
         }

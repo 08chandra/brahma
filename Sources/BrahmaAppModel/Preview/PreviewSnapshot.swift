@@ -27,6 +27,8 @@ public struct PreviewSnapshot: Equatable, Sendable {
     public var openAPICopies: [String: OpenAPICopy] = [:]
     /// Surface id → that copy parsed (laid over by `AppModel.previewForBodies`; empty straight from `load`).
     public var openAPI: [String: PreviewOpenAPI] = [:]
+    /// Plan C C6b: the keys of the active leases whose worktree is in place (`Store.worktreeKeys`): the CHANGES tab shows when any.
+    public var worktreeKeys: [String] = []
 
     public static let empty = PreviewSnapshot(surfaces: [], states: [:], live: nil, liveRef: nil)
 
@@ -34,6 +36,7 @@ public struct PreviewSnapshot: Equatable, Sendable {
         var p = PreviewSnapshot.empty
         p.surfaces = try store.previewSurfaces(companyId: company.id)
         p.states = try store.previewStates(companyId: company.id)
+        p.worktreeKeys = try store.worktreeKeys(companyId: company.id)
         let names = Dictionary(try store.agents(companyId: company.id).map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
         for s in p.surfaces { p.setBy[s.id] = s.setById == "owner" ? "owner" : names[s.setById] ?? s.setById }
         if let latest = try store.releases(companyId: company.id, limit: 50).first(where: { $0.status == .deployed }),

@@ -35,7 +35,9 @@ import GRDB
         #expect(files.contains("CompanyTools.swift") && files.contains("CollabTools.swift"))
         // Round 3: an implicit `.mint(` and every one of the 12 tokenised APIs, however the call is spelled.
         let apis = ["renderRef(", "ownerShare(", "ownerThreadReply(", "openShowRequests(", "recordOwnerRead(", ".message(companyId", "agentUsageShareToday(",
-                    "agentActivity(", "leasedItemKey(", "viewOriginal(", ".purge(companyId", "vouchItem("]
+                    "agentActivity(", "leasedItemKey(", "viewOriginal(", ".purge(companyId", "vouchItem(",
+                    // C6b: the owner's inline review.
+                    "addDiffComment(", "requestHunkRevert(", "resolveDiffComment("]
         for f in files {
             let text = try String(contentsOf: mcp.appending(path: f), encoding: .utf8)
             #expect(!text.contains("OwnerPrincipal"), "\(f) references OwnerPrincipal")
@@ -104,7 +106,8 @@ import GRDB
         let tools = Set(CompanyToolNames.all + CompanyToolNames.concierge)
         for name in ["purge", "view_original", "viewOriginal", "purge_ref", "export", "export_ref", "renderRef", "render_ref", "ownerShare", "owner_share",
                      "ownerThreadReply", "owner_thread_reply", "openShowRequests", "open_show_requests", "recordOwnerRead", "record_owner_read",
-                     "requireOwner", "establish_owner"] {
+                     "requireOwner", "establish_owner", "addDiffComment", "add_diff_comment", "requestHunkRevert", "request_hunk_revert",
+                     "resolveDiffComment", "resolve_diff_comment"] {
             #expect(!tools.contains(name), "\(name)")
         }
     }

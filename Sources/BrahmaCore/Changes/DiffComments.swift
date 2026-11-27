@@ -92,9 +92,12 @@ extension Store {
     /// (I-1) The path must be one of the diff's files and prints as a JSON literal; the hunk header is regenerated from its
     /// numbers. (I-2) The quote's taint (`snapshot.tainted`) is carried onto the row, the DM and the events. Every text is
     /// redacted, then gated as the final string (a stored value in the owner's own text or in the quote refuses the comment).
+    ///
+    /// Ruling C6-3 (C6b): an owner-only API — it takes the minted `OwnerPrincipal`, so no tool handler or turn can call it.
     @discardableResult
     public func addDiffComment(companyId: String, key: String, compare: CompareMode, anchor: DiffAnchor, text: String,
-                               knownValues: [(name: String, value: String)], now: Date) throws -> DiffComment {
+                               knownValues: [(name: String, value: String)], now: Date, owner: OwnerPrincipal) throws -> DiffComment {
+        _ = try requireOwner(owner)
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { throw WorkError.invalid("the comment is empty") }
         return try writeDiffComment(companyId: companyId, key: key, compare: compare, anchor: anchor, kind: DiffComment.comment, text: body,
@@ -106,7 +109,8 @@ extension Store {
     /// `apply`, `restore`, `reset` or file write is ever issued (the holder does the revert in its turn).
     @discardableResult
     public func requestHunkRevert(companyId: String, key: String, compare: CompareMode, anchor: DiffAnchor, note: String?,
-                                  knownValues: [(name: String, value: String)], now: Date) throws -> DiffComment {
+                                  knownValues: [(name: String, value: String)], now: Date, owner: OwnerPrincipal) throws -> DiffComment {
+        _ = try requireOwner(owner)
         let text = note?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return try writeDiffComment(companyId: companyId, key: key, compare: compare, anchor: anchor, kind: DiffComment.revertRequest, text: text,
                                     knownValues: knownValues, now: now)
@@ -211,8 +215,9 @@ extension Store {
         }
     }
 
-    /// Marks the comment resolved (owner).
-    public func resolveDiffComment(companyId: String, id: String, now: Date) throws {
+    /// Marks the comment resolved (owner; Ruling C6-3: takes the minted principal).
+    public func resolveDiffComment(companyId: String, id: String, now: Date, owner: OwnerPrincipal) throws {
+        _ = try requireOwner(owner)
         try writer.write { db in
             try db.execute(sql: "UPDATE diffComment SET resolvedAt = ? WHERE companyId = ? AND id = ? AND resolvedAt IS NULL",
                            arguments: [now, companyId, id])
