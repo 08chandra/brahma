@@ -363,27 +363,27 @@ private final class HTTPSFixture {
         // The generic lab clear refuses while the import mark stands (final-review I3); the owner's trust ends it and the
         // sessions it tainted.
         #expect(throws: WorkError.invalid("\(company.name) carries an import mark; use brahma company trust-import \(company.slug)")) {
-            _ = try LabProvenance.clearCompanyMark(store: store, paths: paths, companyId: company.id)
+            _ = try LabProvenance.clearCompanyMark(store: store, paths: paths, companyId: company.id, owner: .test)
         }
-        #expect(try RepoImport.trust(store: store, paths: paths, companyId: company.id) == "import: local")
+        #expect(try RepoImport.trust(store: store, paths: paths, companyId: company.id, owner: .test) == "import: local")
         #expect(try store.importTaint(companyId: company.id) == nil)
         let trusted = try #require(try store.agent(id: eng.id))
         #expect(!trusted.sessionTainted && trusted.taintSources.isEmpty, "the tainted session was ended")
         #expect(try TurnContext.load(store: store, paths: paths, agent: eng, company: company).relayedTaint == nil)
         #expect(try store.labTaint(agentId: eng.id) != nil, "labs stay marked until brahma lab clear-taint")
-        #expect(try RepoImport.trust(store: store, paths: paths, companyId: company.id) == nil, "nothing left to trust")
+        #expect(try RepoImport.trust(store: store, paths: paths, companyId: company.id, owner: .test) == nil, "nothing left to trust")
         // Final-review I3: the generic lab clear never ends an import mark (even before any turn ran): only trust-import,
         // which shows the source, the imported commit and the secret scan first, does. Nothing changes.
         let (store2, paths2) = try home()
         let (c2, _, _) = try importCompany(try RepoSource.parse(src.root.path), store: store2, paths: paths2)
         let refusal = "\(c2.name) carries an import mark; use brahma company trust-import \(c2.slug)"
-        #expect(throws: WorkError.invalid(refusal)) { _ = try LabProvenance.clearCompanyMark(store: store2, paths: paths2, companyId: c2.id) }
-        #expect(throws: WorkError.invalid(refusal)) { _ = try store2.clearCompanyLabTaint(companyId: c2.id) }
+        #expect(throws: WorkError.invalid(refusal)) { _ = try LabProvenance.clearCompanyMark(store: store2, paths: paths2, companyId: c2.id, owner: .test) }
+        #expect(throws: WorkError.invalid(refusal)) { _ = try store2.clearCompanyLabTaint(companyId: c2.id, owner: .test) }
         #expect(try store2.importTaint(companyId: c2.id) == "import: local")
         #expect(try store2.companyLabTaint(companyId: c2.id)?.source == "import: local")
         // Once trusted, the remaining (ordinary) company mark clears as any lab mark does.
-        #expect(try RepoImport.trust(store: store2, paths: paths2, companyId: c2.id) == "import: local")
-        #expect(try LabProvenance.clearCompanyMark(store: store2, paths: paths2, companyId: c2.id))
+        #expect(try RepoImport.trust(store: store2, paths: paths2, companyId: c2.id, owner: .test) == "import: local")
+        #expect(try LabProvenance.clearCompanyMark(store: store2, paths: paths2, companyId: c2.id, owner: .test))
         #expect(try store2.companyLabTaint(companyId: c2.id) == nil)
         // A greenfield company carries no mark.
         let green = try store2.createCompany(name: "Green", goal: "g", workspacesRoot: paths2.workspaces)
@@ -658,7 +658,7 @@ private final class HTTPSFixture {
         #expect(mark.source == "import: local" && mark.profile == company.permissionProfile.rawValue)
         try store.writer.write { try $0.execute(sql: "UPDATE companyTaint SET profile = NULL WHERE companyId = ?", arguments: [company.id]) }
         #expect(try store.companyLabTaint(companyId: company.id)?.profile == "unknown")
-        _ = try RepoImport.trust(store: store, paths: paths, companyId: company.id)
+        _ = try RepoImport.trust(store: store, paths: paths, companyId: company.id, owner: .test)
         #expect(try store.companyLabTaint(companyId: company.id) != nil)
     }
 

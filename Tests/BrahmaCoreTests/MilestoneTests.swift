@@ -38,7 +38,7 @@ import GRDB
             let stripe = try store.fileTemplateTask(companyId: c.id, requesterId: "system", template: .stripeTestKeys, now: MilestoneTests.at(20))
             try store.completeHumanTask(companyId: c.id, askId: stripe.id,
                                         values: ["STRIPE_TEST_SECRET_KEY": "sk_test_abc", "STRIPE_TEST_PUBLISHABLE_KEY": "pk_test_abc"],
-                                        vault: vault, now: MilestoneTests.at(40))
+                                        vault: vault, now: MilestoneTests.at(40), owner: .test)
             // The combined gate: one prd ask, approved by the owner at +0:52.
             let prd = try store.propose(companyId: c.id, by: .agent(ceo.id), kind: .prd, title: "Brief", summary: "s", viaOwner: true,
                                         now: MilestoneTests.at(10))
@@ -58,7 +58,7 @@ import GRDB
                 let post = try store.fileTemplateTask(companyId: c.id, requesterId: "system", template: .launchPost,
                                                       args: ["text": "We launched"], now: MilestoneTests.at(250))
                 try store.completeHumanTask(companyId: c.id, askId: post.id, values: ["posted_url": "https://x.com/acme/status/1"],
-                                            vault: vault, now: MilestoneTests.at(300))
+                                            vault: vault, now: MilestoneTests.at(300), owner: .test)
             }
         }
 

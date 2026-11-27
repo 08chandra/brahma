@@ -148,7 +148,8 @@ extension Store {
     /// the app call it; no agent path does.
     @discardableResult
     public func completeHumanTask(companyId: String, askId: String, values raw: [String: String], vault: any SecretVault,
-                                  now: Date = Store.now()) throws -> Ask {
+                                  now: Date = Store.now(), owner: OwnerPrincipal) throws -> Ask {
+        try ProcessRole.refuseInAgentProcess()  // FW-B1 re-review I-1: the owner principal, never from an agent process
         guard let seen = try ask(id: askId), seen.companyId == companyId else { throw WorkError.notFound("no such ask") }
         guard seen.kind == .humanTask, let task = HumanTask.from(seen) else { throw WorkError.invalid("\(seen.ref) is not a human task") }
         guard seen.status.isPending else { throw WorkError.conflict("\(seen.ref) is already \(seen.status.rawValue)") }
@@ -215,8 +216,10 @@ extension Store {
 
     /// The owner declines the task: `rejected` with the note; the linked item is restored and told (`humanTaskDeclined`).
     @discardableResult
-    public func declineHumanTask(companyId: String, askId: String, note: String, now: Date = Store.now()) throws -> Ask {
-        try writer.write { db in
+    public func declineHumanTask(companyId: String, askId: String, note: String, now: Date = Store.now(),
+                                 owner: OwnerPrincipal) throws -> Ask {
+        try ProcessRole.refuseInAgentProcess()  // FW-B1 re-review I-1: the owner principal, never from an agent process
+        return try writer.write { db in
             guard var ask = try Ask.fetchOne(db, key: askId), ask.companyId == companyId else { throw WorkError.notFound("no such ask") }
             guard ask.kind == .humanTask else { throw WorkError.invalid("\(ask.ref) is not a human task") }
             guard ask.status.isPending else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }

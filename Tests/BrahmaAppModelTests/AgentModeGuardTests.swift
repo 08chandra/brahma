@@ -18,7 +18,10 @@ import GRDB
                                           "createShowRequest", "cancelShowRequest", "addResources", "addLink", "setPreset",
                                           "clearTaintHolds", "vouchItem", "extensionApprove", "extensionRemove", "extensionRollback",
                                           // Fix round 1: the autonomy preset.
-                                          "setAutonomy"]
+                                          "setAutonomy",
+                                          // Re-review I-1.
+                                          "trustImport", "clearCompanyLabTaint", "clearLabTaint", "clearMachineLabTaint", "acceptMainCommit",
+                                          "adoptMain", "completeHumanTask", "declineHumanTask"]
 
     @Test func mintRefusesInAgentModeWhateverTheArguments() throws {
         // The simulation exists only in debug builds (round 5, R4-1): a release test build (`swift test -c release -Xswiftc
@@ -124,6 +127,14 @@ import GRDB
             case "clearTaintHolds": _ = try s.clearTaintHolds(companyId: "nope", now: now, owner: owner)
             case "vouchItem": try s.vouchItem(itemId: "nope", now: now, owner: owner)
             case "setAutonomy": try s.setAutonomy(companyId: "nope", .auto, owner: owner)
+            case "trustImport": _ = try s.trustImport(companyId: "nope", now: now, owner: owner)
+            case "clearCompanyLabTaint": _ = try s.clearCompanyLabTaint(companyId: "nope", now: now, owner: owner)
+            case "clearLabTaint": _ = try s.clearLabTaint(companyId: cId, agentId: "nope", now: now, owner: owner)
+            case "clearMachineLabTaint": _ = try s.clearMachineLabTaint(now: now, owner: owner)
+            case "acceptMainCommit": _ = try s.acceptMainCommit(companyId: "nope", ref: "nope", owner: owner)
+            case "adoptMain": _ = try s.adoptMain(companyId: "nope", now: now, owner: owner)
+            case "completeHumanTask": _ = try s.completeHumanTask(companyId: cId, askId: "nope", values: [:], vault: MemoryVault(), now: now, owner: owner)
+            case "declineHumanTask": _ = try s.declineHumanTask(companyId: cId, askId: "nope", note: "", now: now, owner: owner)
             case "extensionApprove": try ExtensionLibrary.approve(askId: "nope", roles: nil, store: s, paths: paths, now: now, owner: owner)
             case "extensionRemove": try ExtensionLibrary.remove(companyId: cId, id: "nope", store: s, paths: paths, now: now, owner: owner)
             case "extensionRollback": try ExtensionLibrary.rollback(companyId: cId, id: "nope", store: s, paths: paths, now: now, owner: owner)

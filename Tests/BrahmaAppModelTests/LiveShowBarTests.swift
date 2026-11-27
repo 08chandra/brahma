@@ -52,7 +52,7 @@ struct LiveShowBarTests {
             try git(["add", "src/index.html"], in: ws)
             try git(["-c", "user.name=Brahma", "-c", "user.email=engine@brahma.local", "-c", "commit.gpgsign=false",
                      "commit", "-q", "-m", "Habit tracker landing page"], in: ws)
-            _ = try store.acceptMainCommit(companyId: company.id)
+            _ = try store.acceptMainCommit(companyId: company.id, owner: .test)
             _ = try store.upsertPreviewSurface(companyId: company.id, by: .owner, PreviewDraft(
                 name: "web", run: "python3 -m http.server {port} --bind 127.0.0.1", url: "http://127.0.0.1:{port}/"))
             let item = try store.createWorkItem(companyId: company.id, by: .owner, draft: WorkItemDraft(

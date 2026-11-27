@@ -80,7 +80,7 @@ struct EngineShutdownTests {
         try f.write("README.md", "one")
         try f.git(["add", "-A"])
         try f.git(["commit", "-q", "-m", "change"])
-        _ = try store.acceptMainCommit(companyId: company.id)
+        _ = try store.acceptMainCommit(companyId: company.id, owner: .test)
         let tools = CompanyTools(store: store, companyId: company.id, agentId: devops.id)
         _ = try tools.call(name: "set_preview_command", arguments: ["name": .string("tool"), "kind": .string("cli"), "demo": .string("./demo.sh")])
         // The tool stamps the wall clock; the engine's clock moves past it so the start sees the surface.

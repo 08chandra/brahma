@@ -101,12 +101,16 @@ import GRDB
         let (store, engId, wt) = (h.store, h.eng.id, h.worktree(h.item))
         let shas = ShaBox()
         store.refHooks.setFailTaintRecords(true)
-        defer { store.refHooks.setFailTaintRecords(false) }
+        defer { store.refHooks.setFailTaintRecords(false); store.refHooks.setAfterTurnTaintRecord(nil) }
+        // Re-review M-2: held the instant the record fails, before the turn's end awaits anything.
+        let latched = ShaBox(), orchestrator = h.world.orchestrator
+        store.refHooks.setAfterTurnTaintRecord { for c in orchestrator.taintHoldLatch.companies { latched.append(c) } }
         try await h.turn {
             try store.markTainted(agentId: engId, source: "docs.swift.org")
             shas.append(try Holder.commit(wt, "src/a.ts", "a\n"))
         }
         let cId = h.company.id
+        #expect(latched.all == [cId], "the company was not held the instant its taint record failed")
         #expect(try h.rows().isEmpty, "nothing could be recorded")
         #expect(try store.taintHeldCompanies() == [cId])
         func alerts() throws -> [Ask] {

@@ -14,11 +14,11 @@ struct MainGroup: ParsableCommand {
         @Argument(help: "A quarantine ref (refs/brahma/quarantine/<yyyyMMdd-HHmmss>) Brahma asked you about: the commit it recorded on that ask is merged into main (refused if the ref has moved).") var ref: String?
 
         func run() throws {
-            try requireOwnerShell()
+            let owner = try requireOwnerShell()
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
             let accepted: MainAcceptance
-            do { accepted = try store.acceptMainCommit(companyId: c.id, ref: ref) } catch let e as WorkError { throw fail(e.message) }
+            do { accepted = try store.acceptMainCommit(companyId: c.id, ref: ref, owner: owner) } catch let e as WorkError { throw fail(e.message) }
             let head = accepted.head.prefix(7)
             if let ref {
                 // How Brahma's quarantine ask stands (A2): merged before, decided earlier, or settled by this accept.

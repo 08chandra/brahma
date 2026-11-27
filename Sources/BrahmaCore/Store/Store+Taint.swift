@@ -298,8 +298,9 @@ extension Store {
     /// the clear time is kept (commits authored before it are never recorded clean), and every company logs it. Per-company
     /// clears never touch it. Returns whether a mark stood.
     @discardableResult
-    public func clearMachineLabTaint(now: Date = Store.now()) throws -> Bool {
-        try writer.write { db in
+    public func clearMachineLabTaint(now: Date = Store.now(), owner: OwnerPrincipal) throws -> Bool {
+        try ProcessRole.refuseInAgentProcess()  // FW-B1 re-review I-1 (with the company clear): the owner principal
+        return try writer.write { db in
             let source: String? = try Row.fetchOne(db, sql: "SELECT source FROM machineTaint WHERE id = 1")?["source"]
             try db.execute(sql: """
                 INSERT INTO machineTaint (id, source, markedAt, clearedAt) VALUES (1, NULL, NULL, ?)
@@ -389,8 +390,9 @@ extension Store {
     /// as an activity event. Returns the import mark's source, or nil when none stood. The caller holds the engine lock with no
     /// turn in progress (`RepoImport.trust`).
     @discardableResult
-    public func trustImport(companyId: String, now: Date = Store.now()) throws -> String? {
-        try writer.write { db in
+    public func trustImport(companyId: String, now: Date = Store.now(), owner: OwnerPrincipal) throws -> String? {
+        try ProcessRole.refuseInAgentProcess()  // FW-B1 re-review I-1: the owner principal, never from an agent process
+        return try writer.write { db in
             guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
             guard let source = try String.fetchOne(db, sql: "SELECT source FROM companyTaint WHERE companyId = ? AND source LIKE 'import: %'",
                                                     arguments: [companyId]) else { return nil }
@@ -434,8 +436,9 @@ extension Store {
     /// marked. Refused, changing nothing, while the company carries an import mark (final-review I3): that mark ends only
     /// through `trustImport`, which the owner reaches after seeing the source, the imported commit and the secret scan.
     @discardableResult
-    public func clearCompanyLabTaint(companyId: String, now: Date = Store.now()) throws -> Bool {
-        try writer.write { db in
+    public func clearCompanyLabTaint(companyId: String, now: Date = Store.now(), owner: OwnerPrincipal) throws -> Bool {
+        try ProcessRole.refuseInAgentProcess()  // FW-B1 re-review I-1: the owner principal, never from an agent process
+        return try writer.write { db in
             guard let found = try Company.fetchOne(db, key: companyId) else { throw WorkError.notFound("no such company") }
             try Self.refuseImportMark(db, company: found)
             let company = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM companyTaint WHERE companyId = ? AND source IS NOT NULL",
@@ -468,8 +471,9 @@ extension Store {
     /// The owner clears an agent's lab mark (`brahma lab clear-taint`, owner shell only; never a company tool). Recorded as an
     /// activity event. Returns whether there was a mark.
     @discardableResult
-    public func clearLabTaint(companyId: String, agentId: String, now: Date = Store.now()) throws -> Bool {
-        try writer.write { db in
+    public func clearLabTaint(companyId: String, agentId: String, now: Date = Store.now(), owner: OwnerPrincipal) throws -> Bool {
+        try ProcessRole.refuseInAgentProcess()  // FW-B1 re-review I-1: the owner principal, never from an agent process
+        return try writer.write { db in
             guard let agent = try Agent.fetchOne(db, key: agentId), agent.companyId == companyId else {
                 throw WorkError.forbidden("not in your company")
             }
@@ -660,7 +664,8 @@ public enum LabProvenance {
     /// its commits marked tainted first; then the mark goes, its clear time kept. Blocking (git).
     @discardableResult
     public static func clearCompanyMark(store: Store, paths: BrahmaPaths, companyId: String, now: Date = Store.now(),
-                                        walkLimit: Int = workspaceWalkLimit) throws -> Bool {
+                                        walkLimit: Int = workspaceWalkLimit, owner: OwnerPrincipal) throws -> Bool {
+        try ProcessRole.refuseInAgentProcess()
         guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
         // Final-review I3: an import mark ends only through trust-import (refused before anything is snapshotted).
         if try store.importTaint(companyId: companyId) != nil { throw WorkError.invalid(Store.importMarkRefusal(company)) }
@@ -668,13 +673,14 @@ public enum LabProvenance {
         defer { withExtendedLifetime(lock) {} }
         try refuseActiveSessions(store: store, paths: paths, companies: [company])
         try snapshotTainted(store: store, company: company, now: now, walkLimit: walkLimit)
-        return try store.clearCompanyLabTaint(companyId: companyId, now: now)
+        return try store.clearCompanyLabTaint(companyId: companyId, now: now, owner: owner)
     }
 
     /// The owner's machine-wide clear (S32, S33), the same critical section over every company.
     @discardableResult
     public static func clearMachineMark(store: Store, paths: BrahmaPaths, now: Date = Store.now(),
-                                        walkLimit: Int = workspaceWalkLimit) throws -> Bool {
+                                        walkLimit: Int = workspaceWalkLimit, owner: OwnerPrincipal) throws -> Bool {
+        try ProcessRole.refuseInAgentProcess()
         let lock = try engineLock(paths)
         defer { withExtendedLifetime(lock) {} }
         let companies = try store.companies()
@@ -682,7 +688,7 @@ public enum LabProvenance {
         // Every workspace is checked whole before any snapshot is written.
         for company in companies { _ = try labLikeRepos(workspace: URL(fileURLWithPath: company.workspacePath, isDirectory: true), walkLimit: walkLimit) }
         for company in companies { try snapshotTainted(store: store, company: company, now: now, walkLimit: walkLimit) }
-        return try store.clearMachineLabTaint(now: now)
+        return try store.clearMachineLabTaint(now: now, owner: owner)
     }
 
     static func engineLock(_ paths: BrahmaPaths) throws -> OrchestratorLock {

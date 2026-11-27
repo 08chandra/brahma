@@ -48,7 +48,7 @@ struct LiveCollabTests {
             try Self.git(["add", "index.html"], in: ws)
             try Self.git(["-c", "user.name=Brahma", "-c", "user.email=engine@brahma.local", "-c", "commit.gpgsign=false",
                           "commit", "-q", "-m", "Habit tracker landing page"], in: ws)
-            _ = try store.acceptMainCommit(companyId: company.id)
+            _ = try store.acceptMainCommit(companyId: company.id, owner: .test)
             let mcp = Bundle.module.bundleURL.deletingLastPathComponent().appending(path: "brahma")
             try #require(FileManager.default.isExecutableFile(atPath: mcp.path), "build the brahma product first")
             orchestrator = Orchestrator(store: store, runner: ClaudeProcessRunner(maxTurnDuration: .seconds(150)), paths: paths,

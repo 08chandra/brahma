@@ -560,7 +560,7 @@ extension Store {
         if let seen = try ask(id: askId), let ref = Self.quarantineRef(of: seen) {
             guard seen.status.isPending else { throw WorkError.conflict("\(seen.ref) is already \(seen.status.rawValue)") }
             if approve {
-                let accepted = try acceptMainCommit(companyId: seen.companyId, ref: ref, note: note.isEmpty ? nil : note)
+                let accepted = try acceptMainCommit(companyId: seen.companyId, ref: ref, note: note.isEmpty ? nil : note, owner: owner)
                 return accepted.ask ?? seen
             }
         }

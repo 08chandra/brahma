@@ -22,14 +22,14 @@ struct LabClearTaint: ParsableCommand {
           help: "Clear the machine-wide mark a Full-profile session left (it could write any company's labs).") var machineWide = false
 
     func run() throws {
-        try requireOwnerShell()
+        let owner = try requireOwnerShell()
         let (store, paths) = try openStore()
         if machineWide {
             guard company == nil, agent == nil else { throw fail("--machine-wide takes no company or agent") }
             // One critical section under the engine lock: refused while a tainted session is active; every lab-like repository
             // of every workspace is snapshotted tainted before the mark goes.
             let cleared: Bool
-            do { cleared = try LabProvenance.clearMachineMark(store: store, paths: paths) } catch let e as LabProvenance.ClearRefused {
+            do { cleared = try LabProvenance.clearMachineMark(store: store, paths: paths, owner: owner) } catch let e as LabProvenance.ClearRefused {
                 throw fail("refused: \(e.message)")
             }
             print(safe(cleared
@@ -42,7 +42,7 @@ struct LabClearTaint: ParsableCommand {
         let c = try resolveCompany(store, company)
         guard let agent else {
             let cleared: Bool
-            do { cleared = try LabProvenance.clearCompanyMark(store: store, paths: paths, companyId: c.id) }
+            do { cleared = try LabProvenance.clearCompanyMark(store: store, paths: paths, companyId: c.id, owner: owner) }
             catch let e as LabProvenance.ClearRefused { throw fail("refused: \(e.message)") }
             catch let e as WorkError { throw fail(e.message) }
             print(safe(cleared ? "cleared \(c.name)'s lab marks" : "\(c.name) carries no lab mark"))
@@ -53,7 +53,7 @@ struct LabClearTaint: ParsableCommand {
         }
         let a = try resolveAgent(store, company: c, handle: agent)
         let cleared: Bool
-        do { cleared = try store.clearLabTaint(companyId: c.id, agentId: a.id) } catch let e as WorkError { throw fail(e.message) }
+        do { cleared = try store.clearLabTaint(companyId: c.id, agentId: a.id, owner: owner) } catch let e as WorkError { throw fail(e.message) }
         print(safe(cleared ? "cleared @\(a.name)'s lab mark" : "@\(a.name)'s lab carries no mark"))
         if try store.companyLabTaint(companyId: c.id) != nil {
             print(safe("\(c.name)'s company mark still applies to every lab: brahma lab clear-taint \(c.slug)"))

@@ -79,7 +79,7 @@ import GRDB
         #expect(try told() == 1)
         #expect(try recorded(m) == nil)
         // The owner accepts: main as it stands then is the record, the alert is closed, the guard is content.
-        #expect(try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) == moved)
+        #expect(try m.store.adoptMain(companyId: m.company.id, now: m.now, owner: .test) == moved)
         #expect(try recorded(m) == moved)
         #expect(try openAlerts(m, reason: Store.mainAlertReason(m.company.id)).isEmpty)
         #expect(try mergeActivity(m).contains("main adopted at \(moved.prefix(7)) by the owner"))
@@ -95,7 +95,7 @@ import GRDB
         try f.git(["branch", "--quiet", "x", before])
         try f.git(["symbolic-ref", "refs/heads/main", "refs/heads/x"])
         #expect(try m.ws.mainIsSymbolic())
-        #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) }
+        #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, now: m.now, owner: .test) }
         #expect(try recorded(m) == before)
         #expect(try check(m) == .skipped)
         #expect(try check(m, now: m.now.addingTimeInterval(60)) == .skipped)
@@ -107,7 +107,7 @@ import GRDB
         // A ref that names no commit: nothing to adopt, nothing to restore to; the owner is told.
         try f.git(["symbolic-ref", "--delete", "refs/heads/main"])
         try m.exec("UPDATE company SET mainCommit = NULL WHERE id = ?", [m.company.id])
-        #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) }
+        #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, now: m.now, owner: .test) }
         #expect(try recorded(m) == nil)
         #expect(try check(m) == .skipped)
         #expect(try recorded(m) == nil)
@@ -118,13 +118,16 @@ import GRDB
         let before = try main(m)
         let owners = try foreignCommit(m, file: "owner.txt", message: "the owner's hand-made commit")
         #expect(owners != before)
-        // An agent never adopts.
-        #expect(throws: WorkError.forbidden("only the owner can adopt main")) {
-            try m.store.adoptMain(companyId: m.company.id, by: .agent(m.eng.id))
+        // An agent never adopts: an agent process can't (FW-B1 re-review I-1: refused even holding a principal).
+        #if DEBUG
+        let owner = try OwnerPrincipal.test
+        OwnerPrincipal.simulatingAgentProcess {
+            #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, owner: owner) }
         }
+        #endif
         #expect(try recorded(m) == before)
         // The owner does: the head is the record now, and the guard has nothing to restore.
-        #expect(try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) == owners)
+        #expect(try m.store.adoptMain(companyId: m.company.id, now: m.now, owner: .test) == owners)
         #expect(try recorded(m) == owners)
         #expect(try mergeActivity(m).contains("main adopted at \(owners.prefix(7)) by the owner"))
         #expect(try check(m) == .ok)
@@ -133,7 +136,7 @@ import GRDB
         try m.store.writer.write { db in
             try MergeBatch(companyId: m.company.id, number: 1, step: .claimed, requestIds: ["r"], startedAt: m.now).insert(db)
         }
-        #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, by: .owner) }
+        #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, owner: .test) }
         try m.exec("UPDATE mergeBatch SET step = 'done' WHERE companyId = ?", [m.company.id])
         // A saved foreign tip can be adopted by name: main is moved to it, the checkout follows, the record is written.
         let later = try foreignCommit(m, file: "later.txt", message: "another hand-made commit")
@@ -141,7 +144,7 @@ import GRDB
         #expect(to == owners); #expect(try main(m) == owners)
         #expect(!FileManager.default.fileExists(atPath: m.root.appending(path: "later.txt").path))
         let savedTip = try #require(try m.ws.head(of: ref))
-        #expect(try m.store.adoptMain(companyId: m.company.id, by: .owner, commit: savedTip, now: m.now) == later)
+        #expect(try m.store.adoptMain(companyId: m.company.id, commit: savedTip, now: m.now, owner: .test) == later)
         #expect(try main(m) == later); #expect(try recorded(m) == later)
         #expect(FileManager.default.fileExists(atPath: m.root.appending(path: "later.txt").path))
         #expect(try check(m) == .ok)
@@ -155,9 +158,9 @@ import GRDB
         let f = fixture(m)
         try f.git(["branch", "--quiet", "x", before])
         try f.git(["symbolic-ref", "refs/heads/main", "refs/heads/x"])
-        do { _ = try m.store.acceptMainCommit(companyId: m.company.id); Issue.record("a symbolic main must be refused") }
+        do { _ = try m.store.acceptMainCommit(companyId: m.company.id, owner: .test); Issue.record("a symbolic main must be refused") }
         catch let e as WorkError { #expect(e.message.contains("symbolic ref") && e.message.contains("will not accept"), "the accept names itself: \(e.message)") }
-        do { _ = try m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000"); Issue.record("the quarantine form must be refused too") }
+        do { _ = try m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000", owner: .test); Issue.record("the quarantine form must be refused too") }
         catch let e as WorkError { #expect(e.message.contains("symbolic ref"), "\(e.message)") }
         #expect(try recorded(m) == before)
         try f.git(["symbolic-ref", "--delete", "refs/heads/main"])
@@ -166,14 +169,14 @@ import GRDB
         let batch = MergeBatch(companyId: m.company.id, number: 1, step: .checked, requestIds: ["r"], startedAt: m.now)
         try m.store.writer.write { db in try batch.insert(db) }
         let owners = try foreignCommit(m, file: "owner.txt", message: "the owner's commit")
-        #expect(throws: WorkError.self) { try m.store.acceptMainCommit(companyId: m.company.id) }
-        let refusal = (try? m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000")).map { _ in "" }
+        #expect(throws: WorkError.self) { try m.store.acceptMainCommit(companyId: m.company.id, owner: .test) }
+        let refusal = (try? m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000", owner: .test)).map { _ in "" }
         #expect(refusal == nil, "the quarantine path refuses too")
-        do { _ = try m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000") }
+        do { _ = try m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000", owner: .test) }
         catch let e as WorkError { #expect(e.message.contains("merge batch") && e.message.contains("then accept main"), "\(e.message)") } catch { Issue.record("\(error)") }
         #expect(try recorded(m) == before)
         try m.exec("UPDATE mergeBatch SET step = 'done' WHERE id = ?", [batch.id])
-        let accepted = try m.store.acceptMainCommit(companyId: m.company.id)
+        let accepted = try m.store.acceptMainCommit(companyId: m.company.id, owner: .test)
         #expect(accepted.head == owners && accepted.ask == nil && !accepted.alreadyMerged)
         #expect(try recorded(m) == owners)
         #expect(try mergeActivity(m).contains("main adopted at \(owners.prefix(7)) by the owner"))
@@ -439,7 +442,7 @@ import GRDB
         let (store, companyId) = (m.store, m.company.id)
         store.mergeRefProbe.set { ref in
             guard ref == "refs/brahma/foreign" else { return }
-            _ = try? store.adoptMain(companyId: companyId, by: .owner)
+            _ = try? store.adoptMain(companyId: companyId, owner: .test)
         }
         defer { store.mergeRefProbe.set(nil) }
         #expect(try check(m) == .skipped)
@@ -493,7 +496,7 @@ import GRDB
         let (store, companyId) = (m.store, m.company.id)
         store.mergeRefProbe.set { label in
             guard label == "refs/brahma/guard-record" else { return }
-            _ = try? store.acceptMainCommit(companyId: companyId, ref: ref)
+            _ = try? store.acceptMainCommit(companyId: companyId, ref: ref, owner: .test)
         }
         defer { store.mergeRefProbe.set(nil) }
         let result = try check(m)
@@ -518,8 +521,8 @@ import GRDB
         try m.store.quarantineRoot(company: m.company, git: git, expectedMain: before, now: m.now)
         let ref = try #require(try fixture(m).git(["for-each-ref", "--format=%(refname)", "refs/brahma/quarantine/"]).split(separator: "\n").first.map(String.init))
         let q = try #require(try m.ws.head(of: ref))
-        #expect(try m.store.adoptMain(companyId: m.company.id, by: .owner, commit: q, now: m.now) == q)
-        let accepted = try m.store.acceptMainCommit(companyId: m.company.id, ref: ref)
+        #expect(try m.store.adoptMain(companyId: m.company.id, commit: q, now: m.now, owner: .test) == q)
+        let accepted = try m.store.acceptMainCommit(companyId: m.company.id, ref: ref, owner: .test)
         #expect(accepted.head == q && !accepted.alreadyMerged)
         #expect(accepted.ask?.status == .approved, "the open ask is settled")
         #expect(try m.activity(.work).map(\.text).contains("the owner accepted \(ref) (\(q.prefix(12))) into main at \(q.prefix(7))"))
@@ -591,7 +594,7 @@ import GRDB
         #expect(try f(m).git(["for-each-ref", "refs/brahma/foreign/"]).isEmpty)
         #expect(FileManager.default.fileExists(atPath: m.root.appending(path: "after-restore.txt").path))
         // Nor does the engine ever swap by itself, even when asked by commit.
-        #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, by: .system, commit: head) }
+        #expect(throws: WorkError.self) { try m.store.adoptMainAsEngine(companyId: m.company.id, commit: head) }
         #expect(try main(m) == moved)
     }
 

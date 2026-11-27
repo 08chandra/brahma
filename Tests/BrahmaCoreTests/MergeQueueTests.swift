@@ -85,8 +85,15 @@ import GRDB
         try await m.cycle()
         m.world.clock.advance(3600)
         try await m.cycle()
+        try await m.cycle()
         #expect(try m.fresh(i).status != .done, "a merge ran while the holds couldn't be read")
         let cId = m.company.id
+        // Re-review M-1: one alert per outage, not one per tick (its activity line once per company).
+        let lines = try await m.store.writer.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM activityEvent WHERE companyId = ? AND text LIKE 'Brahma couldn''t read whether any company is held%'",
+                             arguments: [cId]) ?? 0
+        }
+        #expect(lines == 1, "the unreadable-holds alert repeated every tick (\(lines))")
         let alerts = try await m.store.writer.read { db in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM ask WHERE companyId = ? AND kind = 'engineAlert' AND subjectId = ?",
                              arguments: [cId, Store.engineAlertKey(Orchestrator.taintHoldsUnreadableReason)]) ?? 0
@@ -97,6 +104,12 @@ import GRDB
         m.world.clock.advance(3600)
         try await m.cycle()
         #expect(try m.fresh(i).status == .done)
+        // Readable again: the alert answers itself.
+        let open = try await m.store.writer.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM ask WHERE companyId = ? AND kind = 'engineAlert' AND subjectId = ? AND status = 'pendingOwner'",
+                             arguments: [cId, Store.engineAlertKey(Orchestrator.taintHoldsUnreadableReason)]) ?? 0
+        }
+        #expect(open == 0)
     }
 
     // MARK: Landing

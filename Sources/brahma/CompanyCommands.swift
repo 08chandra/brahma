@@ -116,7 +116,7 @@ struct CompanyGroup: ParsableCommand {
         @Flag(help: "Trust it now (otherwise only show what would be trusted).") var yes = false
 
         func run() throws {
-            try requireOwnerShell()
+            let owner = try requireOwnerShell()
             let (store, paths) = try openStore()
             let c = try resolveCompany(store, company)
             guard let summary = try RepoImport.trustSummary(store: store, companyId: c.id) else {
@@ -128,7 +128,7 @@ struct CompanyGroup: ParsableCommand {
                 return
             }
             let source: String?
-            do { source = try RepoImport.trust(store: store, paths: paths, companyId: c.id) }
+            do { source = try RepoImport.trust(store: store, paths: paths, companyId: c.id, owner: owner) }
             catch let e as LabProvenance.ClearRefused { throw fail("refused: \(e.message)") }
             print(safe(source.map { "\(c.name): trusted the imported repo (\($0)); every agent starts a fresh session" }
                        ?? "\(c.name) carries no import mark"))

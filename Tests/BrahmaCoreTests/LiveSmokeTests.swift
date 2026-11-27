@@ -34,7 +34,7 @@ enum LiveOwnerPolicy {
             _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true, owner: .test)
             return "approve \(ask.ref) (\(ask.kind.rawValue): \(ask.title))"
         case .declineHumanTask:
-            _ = try store.declineHumanTask(companyId: companyId, askId: ask.id, note: "not needed for this test")
+            _ = try store.declineHumanTask(companyId: companyId, askId: ask.id, note: "not needed for this test", owner: .test)
             return "decline \(ask.ref) (human task: \(ask.title))"
         case .answer:
             _ = try store.ownerAnswer(askId: ask.id, text: "Use your recommendation.", owner: .test)
@@ -832,7 +832,7 @@ struct LiveSmokeTests {
         // turns' MCP servers read too; never a Keychain).
         let vault = FileVault(home: paths.home)
         let accountId = hosting.provider == .cloudflarePages ? String(repeating: "0", count: 32) : "team_fake"
-        _ = try store.completeHumanTask(companyId: companyId, askId: hostingTask.id, values: [tokenName: Self.fakeHostToken, "account_id": accountId], vault: vault)
+        _ = try store.completeHumanTask(companyId: companyId, askId: hostingTask.id, values: [tokenName: Self.fakeHostToken, "account_id": accountId], vault: vault, owner: .test)
         try store.reloadRedactorIfNeeded(vault: vault)
         #expect(try store.hosting(companyId: companyId)?.accountId == accountId)
 

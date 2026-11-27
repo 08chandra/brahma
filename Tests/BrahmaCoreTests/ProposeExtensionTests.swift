@@ -290,7 +290,7 @@ private struct LabWorld {
         #expect(try w.store.labTaint(agentId: w.eng.id) != nil)
         // No company tool can clear it; the owner can, and it is recorded.
         #expect(!CompanyToolNames.all.contains { $0.contains("taint") || $0.contains("lab") })
-        #expect(try w.store.clearLabTaint(companyId: w.company.id, agentId: w.eng.id))
+        #expect(try w.store.clearLabTaint(companyId: w.company.id, agentId: w.eng.id, owner: .test))
         #expect(try w.store.labTaint(agentId: w.eng.id) == nil)
         #expect(try w.store.events(afterId: 0, companyId: w.company.id).contains { $0.text.contains("cleared @eng-1's lab mark") })
         // The next clean proposal routes to the reviewer again, with the exact provenance line.
@@ -303,7 +303,7 @@ private struct LabWorld {
         #expect(secondPage.contains("no tainted session has worked in this lab since the owner last cleared it"))
         #expect(secondPage.contains("commit content is not traced beyond object ids"))
         // Another company's owner path cannot clear it.
-        #expect(throws: WorkError.self) { try w.store.clearLabTaint(companyId: "other", agentId: w.eng.id) }
+        #expect(throws: WorkError.self) { try w.store.clearLabTaint(companyId: "other", agentId: w.eng.id, owner: .test) }
     }
 
     /// Taint held only in the flag file (the database write failed, Task 10 M2): at the turn's end the lab is marked and the
@@ -404,15 +404,15 @@ private struct LabWorld {
         #expect(first.status == .pendingOwner); #expect(first.internalApproverId == nil)
         #expect(ExtensionAskPayload.read(first)?.labMark?.contains("company:") == true)
         // Clearing only the agent's own row leaves the company mark in force.
-        _ = try w.store.clearLabTaint(companyId: w.company.id, agentId: late.id)
+        _ = try w.store.clearLabTaint(companyId: w.company.id, agentId: late.id, owner: .test)
         #expect(try w.store.labTaint(agentId: late.id) != nil)
         // The owner clears the company (one critical section; refused while eng's tainted session is active): every mark there
         // goes, recorded; the next clean proposal reaches the cto.
         #expect(throws: LabProvenance.ClearRefused.self) {
-            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id)
+            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id, owner: .test)
         }
         try w.freshSession(w.eng)
-        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id))
+        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id, owner: .test))
         #expect(try w.store.companyLabTaint(companyId: w.company.id) == nil)
         for a in [w.eng, w.cto, late] { #expect(try w.store.labTaint(agentId: a.id) == nil, "\(a.name)") }
         #expect(try w.store.events(afterId: 0, companyId: w.company.id).contains { $0.text.contains("cleared the company's lab mark") })
@@ -452,10 +452,10 @@ private struct LabWorld {
         let s0 = start(); let during = try commit("during"); record(s0)
         #expect(try w.store.labCommitTainted(agentId: bee.id, sha: during), "nothing records clean meanwhile")
         // Refused while a tainted session is active.
-        #expect(throws: LabProvenance.ClearRefused.self) { try LabProvenance.clearMachineMark(store: w.store, paths: w.paths) }
+        #expect(throws: LabProvenance.ClearRefused.self) { try LabProvenance.clearMachineMark(store: w.store, paths: w.paths, owner: .test) }
         try w.freshSession(w.eng)
         // Company A's own clear leaves the machine-wide mark.
-        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id))
+        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id, owner: .test))
         #expect(try w.store.machineLabTaint()?.source != nil); #expect(try w.store.labTaint(agentId: bee.id) != nil)
         // Left before the clear, unrecorded, with forged dates; and a fired agent's leftover lab.
         let future = try commit("future", date: "2099-01-01T00:00:00")
@@ -464,7 +464,7 @@ private struct LabWorld {
         try FileManager.default.createDirectory(at: leftover, withIntermediateDirectories: true)
         try GitFixture.plainGit(["init", "-q", "-b", "main"], in: leftover)
         let fired = try commit("fired", in: leftover)
-        #expect(try LabProvenance.clearMachineMark(store: w.store, paths: w.paths))
+        #expect(try LabProvenance.clearMachineMark(store: w.store, paths: w.paths, owner: .test))
         #expect(try w.store.machineLabTaint()?.source == nil); #expect(try w.store.labTaint(agentId: bee.id) == nil)
         for sha in [future, past] { #expect(try w.store.labCommitTainted(agentId: bee.id, sha: sha)) }
         // Afterwards: forged dates made between turns are never clean; the leftover lab's commit fetched in a clean turn is not
@@ -496,10 +496,10 @@ private struct LabWorld {
         #expect(try w.store.labCommitTainted(agentId: w.eng.id, sha: direct), "the company mark stands")
         try w.store.markTainted(agentId: w.cto.id, source: "WebSearch", now: w.world.clock.now)
         #expect(throws: LabProvenance.ClearRefused.self) {
-            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id)
+            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id, owner: .test)
         }
         try w.freshSession(w.cto)
-        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id))
+        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id, owner: .test))
         let between = try w.commitPlugin(message: "between")
         let start = LabProvenance.commitSet(store: w.store, workspace: w.ws, handle: w.eng.name, companyId: w.company.id)
         let clean = try w.commitPlugin(id: "tone-two", message: "clean")
@@ -518,16 +518,16 @@ private struct LabWorld {
         try FileManager.default.createDirectory(at: odd, withIntermediateDirectories: true)
         try GitFixture.plainGit(["init", "-q", "-b", "main"], in: odd)
         do {
-            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id)
+            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id, owner: .test)
             Issue.record("the clear ran")
         } catch let e as LabProvenance.ClearRefused {
             #expect(e.message.contains(".brahma/labs/") && e.message.contains("odd"), "\(e.message)")
         }
         #expect(try w.store.companyLabTaint(companyId: w.company.id) != nil, "the mark stands")
-        #expect(throws: LabProvenance.ClearRefused.self) { try LabProvenance.clearMachineMark(store: w.store, paths: w.paths) }
+        #expect(throws: LabProvenance.ClearRefused.self) { try LabProvenance.clearMachineMark(store: w.store, paths: w.paths, owner: .test) }
         // Moved aside, the clear runs.
         try FileManager.default.removeItem(at: odd)
-        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id))
+        #expect(try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id, owner: .test))
     }
 
     /// S34: the clear fails closed, with the reason, on a layout it cannot vouch for: a linked `.brahma/labs`, a stray repo
@@ -567,14 +567,14 @@ private struct LabWorld {
             expected = "more than 5 entries"
         }
         do {
-            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id, walkLimit: limit)
+            try LabProvenance.clearCompanyMark(store: w.store, paths: w.paths, companyId: w.company.id, walkLimit: limit, owner: .test)
             Issue.record("\(shape): the clear ran")
         } catch let e as LabProvenance.ClearRefused {
             #expect(e.message.contains(expected), "\(shape): \(e.message)")
         }
         #expect(try w.store.companyLabTaint(companyId: w.company.id) != nil, "\(shape): the mark stands")
         #expect(throws: LabProvenance.ClearRefused.self) {
-            try LabProvenance.clearMachineMark(store: w.store, paths: w.paths, walkLimit: limit)
+            try LabProvenance.clearMachineMark(store: w.store, paths: w.paths, walkLimit: limit, owner: .test)
         }
     }
 
@@ -582,7 +582,7 @@ private struct LabWorld {
     /// started (between turns) does not.
     @Test func cleanTurnCommitRecordsCleanAfterAClear() async throws {
         let w = try LabWorld()
-        #expect(!(try w.store.clearMachineLabTaint(now: w.world.clock.now)), "no mark: only the clear time is kept")
+        #expect(!(try w.store.clearMachineLabTaint(now: w.world.clock.now, owner: .test)), "no mark: only the clear time is kept")
         let before = try w.commitPlugin(message: "between turns")
         w.world.fake.script(w.eng.name, FakeTurnRunner.Script(sideEffect: { r in
             let lab = URL(fileURLWithPath: r.workingDirectory)

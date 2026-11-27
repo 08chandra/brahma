@@ -380,7 +380,7 @@ import GRDB
         #expect(try restored.labCommitTainted(agentId: f.eng.id, sha: taintedAfter))
         #expect(try restored.labCommitTainted(agentId: f.eng.id, sha: unrecorded))
         // After the owner's machine-wide clear, a commit the engine did not see made in a clean turn still is not clean.
-        try restored.clearMachineLabTaint(now: Date())
+        try restored.clearMachineLabTaint(now: Date(), owner: .test)
         let later = String(repeating: "d", count: 40)
         _ = try restored.recordLabCommits(agentId: f.other.id, turnId: nil, shas: [later, taintedAfter], tainted: false)
         #expect(try restored.labCommitTainted(agentId: f.other.id, sha: later))

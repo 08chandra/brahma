@@ -45,8 +45,10 @@ import GRDB
                     "createShowRequest(", "cancelShowRequest(", "clearTaintedCommits(", "addResources(", "addLink(", "setPreset(",
                     "clearTaintHolds(", "ExtensionLibrary.approve(", "ExtensionLibrary.remove(", "ExtensionLibrary.rollback(",
                     "AccessPresets.evaluate(", "DecisionAuthority", "PolicyPrincipal", ".preset(",
-                    // Fix round 1.
-                    "setAutonomy("]
+                    // Fix round 1 (and re-review I-1).
+                    "setAutonomy(", "trustImport(", "clearCompanyLabTaint(", "clearLabTaint(", "clearMachineLabTaint(", "acceptMainCommit(",
+                    "adoptMain(", "adoptMainAsEngine(", "completeHumanTask(", "declineHumanTask(", "clearCompanyMark(", "clearMachineMark(",
+                    "RepoImport.trust("]
         for f in files {
             let text = try String(contentsOf: mcp.appending(path: f), encoding: .utf8)
             #expect(!text.contains("OwnerPrincipal"), "\(f) references OwnerPrincipal")

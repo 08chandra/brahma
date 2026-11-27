@@ -135,6 +135,11 @@ public actor Orchestrator {
     /// owner clears the hold; kept here too so a hold whose row could not be written still holds while the engine runs.
     /// `alerted`: the owner's alert for it went out (fix round 1 (3): a hold whose row can't be written alerts on its own).
     var taintHoldMemory: [String: (hold: TaintHold, persisted: Bool, alerted: Bool)] = [:]
+    /// FW-B1 re-review M-2: the holds a turn's end latched the instant its taint record failed, from off the actor, before any
+    /// `await` (the actor drains them into `taintHoldMemory` at the top of every tick). Nonisolated and lock-guarded.
+    nonisolated let taintHoldLatch = TaintHoldLatch()
+    /// M-1: whether the "holds unreadable" alert is raised (once per outage; resolved when the holds read again).
+    var taintHoldsUnreadableAlerted = false
     /// The retry pass of the held turns' taint records (`taintHoldTick`), off the actor; never overlaps itself.
     var taintRetryTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
     /// The companies whose system timers have been ensured; a change re-runs `SystemTimers.ensure`.
@@ -266,7 +271,7 @@ public actor Orchestrator {
         let blocking = self.blocking
         restoreHooks.register(afterRestore: { event in
             guard let head = event.mainHead, try store.company(id: event.companyId)?.mainCommit == head else { return }
-            _ = try await blocking.tryRun { try store.adoptMain(companyId: event.companyId, by: .system) }
+            _ = try await blocking.tryRun { try store.adoptMainAsEngine(companyId: event.companyId) }
         })
     }
 
@@ -1724,13 +1729,22 @@ public actor Orchestrator {
         if launched {
             let (store, paths, turnId, started, leasedItem) = (self.store, self.paths, turn.id, heldAtStart, leaseHead?.item.id)
             let held = Array(heldItemsAtStart)
+            let (latch, markItems) = (taintHoldLatch, !isReview)
             (taintSource, taintRecorded) = await blocking.run { () -> (String?, Bool) in
                 let source: String?
                 do { source = try store.currentTaint(agentId: agent.id, paths: paths) } catch { source = "session" }
                 guard let source else { return (nil, true) }
-                return (source, store.recordTurnTaints(companyId: agent.companyId, agentId: agent.id, turnId: turnId, heldAtStart: started,
-                                                       heldItemsAtStart: held, leasedItemId: leasedItem, source: source, now: now))
+                let complete = store.recordTurnTaints(companyId: agent.companyId, agentId: agent.id, turnId: turnId, heldAtStart: started,
+                                                      heldItemsAtStart: held, leasedItemId: leasedItem, source: source, now: now)
+                // M-2: held the instant the record failed, before any `await` could let the actor start another turn.
+                if !complete {
+                    latch.insert(TaintHold(turnId: turnId, companyId: agent.companyId, agentId: agent.id, heldAtStart: started,
+                                           heldItemsAtStart: held, leasedItemId: leasedItem, source: source, markItems: markItems,
+                                           createdAt: now))
+                }
+                return (source, complete)
             }
+            store.refHooks.afterTurnTaintRecord?()
         }
 
         // Plan C4b (controller ruling): every launched turn records the commits it made on the item branches it held or claimed
@@ -1793,6 +1807,10 @@ public actor Orchestrator {
                 try store.markHeldItemsIfTainted(agentId: agent.id, turnId: turn.id, heldAtStart: Array(heldItemsAtStart), home: paths.home)
             } catch {
                 itemsMarked = false
+                // M-2: latched at once (no `await` before it).
+                taintHoldLatch.insert(TaintHold(turnId: turn.id, companyId: agent.companyId, agentId: agent.id, heldAtStart: heldAtStart,
+                                                heldItemsAtStart: Array(heldItemsAtStart), leasedItemId: leaseHead?.item.id,
+                                                source: taintRecorded ? nil : (taintSource ?? "session"), markItems: true, createdAt: now))
                 log("@\(agent.name)'s held items could not be marked after its turn (\(error)); the company is held")
             }
         }
@@ -1992,16 +2010,31 @@ public actor Orchestrator {
     /// the held companies, and whether the database's holds could be read (unreadable: the caller starts nothing that ships,
     /// and the owner is alerted once).
     func taintHoldTick(now: Date) -> (held: Set<String>, readable: Bool) {
+        // M-2: what turn ends latched off the actor joins the in-memory holds first (not yet written, not yet alerted).
+        for hold in taintHoldLatch.drain() where taintHoldMemory[hold.turnId] == nil {
+            taintHoldMemory[hold.turnId] = (hold, false, false)
+        }
         var readable = true
         do {
             let rows = try store.taintHolds()
             let ids = Set(rows.map(\.turnId))
             taintHoldMemory = taintHoldMemory.filter { !$0.value.persisted || ids.contains($0.key) }
             for row in rows { taintHoldMemory[row.turnId] = (row, true, taintHoldMemory[row.turnId]?.alerted ?? true) }
+            // M-1: the outage is over: its alert answers itself "resolved".
+            if taintHoldsUnreadableAlerted {
+                do {
+                    try store.writer.write { db in try store.resolveEngineAlerts(db, reasons: [Self.taintHoldsUnreadableReason], now: now) }
+                    taintHoldsUnreadableAlerted = false
+                } catch { log("the taint-holds alert could not be resolved (\(error)); retried next tick") }
+            }
         } catch {
             readable = false
             log("the taint holds could not be read (\(error)); no turn, merge or release starts this tick")
-            try? EngineAlerts.raise(store: store, text: Self.taintHoldsUnreadableText, now: now, reason: Self.taintHoldsUnreadableReason)
+            // M-1: one alert per outage (its DMs and activity lines once), not one per tick.
+            if !taintHoldsUnreadableAlerted,
+               (try? EngineAlerts.raise(store: store, text: Self.taintHoldsUnreadableText, now: now, reason: Self.taintHoldsUnreadableReason)) != nil {
+                taintHoldsUnreadableAlerted = true
+            }
         }
         // Fix round 1 (3): every tick, a hold whose row isn't written is written again (and alerted, if that failed too).
         for (turnId, entry) in taintHoldMemory where !entry.persisted {
@@ -2032,6 +2065,7 @@ public actor Orchestrator {
         + "release starts until it can. Check the database (brahma doctor)."
 
     private func taintRetryDone(_ lifted: [String]) {
+        taintHoldLatch.remove(lifted)
         for turnId in lifted {
             if taintHoldMemory.removeValue(forKey: turnId) != nil { log("the taint of turn \(turnId) was recorded; its hold is lifted") }
         }

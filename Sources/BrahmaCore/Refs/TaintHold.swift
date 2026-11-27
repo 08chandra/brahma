@@ -127,3 +127,18 @@ extension Store {
         if left == 0 { try store.resolveEngineAlerts(db, reasons: [taintHoldReason(companyId)], now: now) }
     }
 }
+
+/// FW-B1 re-review M-2: the holds a turn's end latches from off the orchestrator's actor the instant its taint record fails,
+/// before any `await`; the actor drains them into its in-memory holds at the top of every tick (`Orchestrator.taintHoldTick`).
+/// `companies` is what is latched now (read by the scheduler's hold check too).
+public final class TaintHoldLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var holds: [String: TaintHold] = [:]
+
+    public init() {}
+
+    func insert(_ hold: TaintHold) { lock.withLock { holds[hold.turnId] = hold } }
+    func drain() -> [TaintHold] { lock.withLock { let all = Array(holds.values); holds = [:]; return all } }
+    func remove(_ turnIds: [String]) { lock.withLock { for id in turnIds { holds.removeValue(forKey: id) } } }
+    public var companies: Set<String> { lock.withLock { Set(holds.values.map(\.companyId)) } }
+}

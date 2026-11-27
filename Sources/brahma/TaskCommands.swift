@@ -97,7 +97,7 @@ struct HumanTaskGroup: ParsableCommand {
         var secrets: [String] = []
 
         func run() throws {
-            try requireOwnerShell()
+            let owner = try requireOwnerShell()
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
             let (ask, task) = try HumanTaskGroup.task(store, c, ref)
@@ -118,7 +118,7 @@ struct HumanTaskGroup: ParsableCommand {
             }
             let done: Ask
             do {
-                done = try store.completeHumanTask(companyId: c.id, askId: ask.id, values: values, vault: try cliSecretVault(interactive: true))
+                done = try store.completeHumanTask(companyId: c.id, askId: ask.id, values: values, vault: try cliSecretVault(interactive: true), owner: owner)
             } catch let e as WorkError { throw fail(e.message) } catch let e as SecretError { throw fail(e.message) }
             print(safe("\(done.ref) done: \(done.title)"))
             let saved = task.fields.filter { $0.isSecret && values[$0.name] != nil }.map(\.name)
@@ -144,11 +144,11 @@ struct HumanTaskGroup: ParsableCommand {
         @Option(help: "Why (the requester sees it).") var note: String
 
         func run() throws {
-            try requireOwnerShell()
+            let owner = try requireOwnerShell()
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
             let (ask, _) = try HumanTaskGroup.task(store, c, ref)
-            do { _ = try store.declineHumanTask(companyId: c.id, askId: ask.id, note: note) } catch let e as WorkError { throw fail(e.message) }
+            do { _ = try store.declineHumanTask(companyId: c.id, askId: ask.id, note: note, owner: owner) } catch let e as WorkError { throw fail(e.message) }
             print(safe("\(ask.ref) declined: \(ask.title)"))
         }
     }

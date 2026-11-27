@@ -151,7 +151,7 @@ import Foundation
         func merge(_ text: String) throws {
             try f.write("README.md", text)
             try f.git(["add", "-A"]); try f.git(["commit", "-q", "-m", "change"])
-            _ = try store.acceptMainCommit(companyId: company.id)
+            _ = try store.acceptMainCommit(companyId: company.id, owner: .test)
         }
         try merge("one")
         let paths = w.paths

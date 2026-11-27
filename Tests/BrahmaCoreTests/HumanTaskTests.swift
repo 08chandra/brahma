@@ -226,7 +226,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(task.fields.map(\.kind) == [.url])
         // Completing it: a key is not a URL.
         #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: try h.humanTasks()[0].id,
-                                                             values: ["STRIPE_SECRET_KEY": "sk_test_abc"], vault: h.vault) }
+                                                             values: ["STRIPE_SECRET_KEY": "sk_test_abc"], vault: h.vault, owner: .test) }
                 == "Key must start with https://")
     }
 
@@ -247,9 +247,9 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(task.links.map(\.host) == ["github.com"])
         #expect(HumanTaskPolicy.customFieldCaption == "Values you enter here are shown to agents. Never paste a key or password.")
         // A url field takes https only, and its value is what the agent is told.
-        #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: ["site_url": "http://acme.dev"], vault: h.vault) }
+        #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: ["site_url": "http://acme.dev"], vault: h.vault, owner: .test) }
                 == "Site URL must start with https://")
-        try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: ["site_url": " https://acme.github.io/site "], vault: h.vault)
+        try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: ["site_url": " https://acme.github.io/site "], vault: h.vault, owner: .test)
         #expect(try h.fresh(ask).ownerAnswer == #"{"site_url":"https://acme.github.io/site"}"#)
         // Fix round 1, I1: the @system DM carries refs only, never the agent's title or an owner-entered value.
         let doneDM = try #require(try h.dms(h.eng).first { $0.hasPrefix("\(ask.ref) is done") })
@@ -301,7 +301,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(blocked.statusBeforeBlock == .inProgress)
         #expect(try h.store.lease(itemId: item.id)?.agentId == h.eng.id, "the lease stays")
 
-        try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: Self.stripeValues, vault: h.vault)
+        try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: Self.stripeValues, vault: h.vault, owner: .test)
         let done = try h.fresh(ask)
         #expect(done.status == .answered); #expect(done.ownerDecidedAt != nil); #expect(done.decidedBy == "owner")
         #expect(done.ownerAnswer == #"{"STRIPE_TEST_PUBLISHABLE_KEY":"saved","STRIPE_TEST_SECRET_KEY":"saved"}"#)
@@ -319,7 +319,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(dm == "\(ask.ref) is done (\(item.key)). See the Inbox.")
         #expect(!dm.contains("Create Stripe")); #expect(!dm.contains("sk_test_51")); #expect(!dm.contains("pk_test_51"))
         // Done once.
-        #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: Self.stripeValues, vault: h.vault) }
+        #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: Self.stripeValues, vault: h.vault, owner: .test) }
                 == "\(ask.ref) is already answered")
     }
 
@@ -330,7 +330,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         // The lease went while the item waited.
         try h.store.writer.write { db in try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [held.id]) }
         let ask = try #require(try h.humanTasks().first)
-        try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: Self.stripeValues, vault: h.vault)
+        try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: Self.stripeValues, vault: h.vault, owner: .test)
         #expect(try h.fresh(held).status == .ready)
         // An assigned (not held) ready item goes back to ready; another agent's item is never blocked.
         let assigned = try h.item(owner: h.eng)
@@ -339,7 +339,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(try h.fresh(assigned).status == .blocked); #expect(try h.fresh(assigned).statusBeforeBlock == .ready)
         let (_, deduped) = try h.store.requestHumanTask(companyId: h.acme.id, by: h.eng.id, template: .domain, itemId: others.id, reason: "r")
         #expect(deduped); #expect(try h.fresh(others).status == .ready, "not the requester's item")
-        try h.store.completeHumanTask(companyId: h.acme.id, askId: domain.id, values: ["domain": "lumen.app"], vault: h.vault)
+        try h.store.completeHumanTask(companyId: h.acme.id, askId: domain.id, values: ["domain": "lumen.app"], vault: h.vault, owner: .test)
         #expect(try h.fresh(assigned).status == .ready)
         #expect(try h.store.hosting(companyId: h.acme.id)?.customDomain == "lumen.app", "done sets the custom domain")
     }
@@ -355,7 +355,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         let blocked = try h.fresh(item)
         #expect(blocked.status == .blocked); #expect(blocked.blockedAskId == task.id); #expect(blocked.statusBeforeBlock == .inProgress)
         try h.store.completeHumanTask(companyId: h.acme.id, askId: task.id,
-                                      values: ["CLOUDFLARE_API_TOKEN": "tok-abcdef123456", "account_id": Self.accountId], vault: h.vault)
+                                      values: ["CLOUDFLARE_API_TOKEN": "tok-abcdef123456", "account_id": Self.accountId], vault: h.vault, owner: .test)
         let back = try h.fresh(item)
         #expect(back.status == .inProgress); #expect(try h.store.lease(itemId: item.id)?.agentId == h.eng.id)
         #expect(back.statusBeforeBlock == nil)
@@ -367,7 +367,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
             try db.execute(sql: "UPDATE workItem SET status = 'blocked', blockedAskId = ?, statusBeforeBlock = NULL WHERE id = ?",
                            arguments: [stripe.id, other.id])
         }
-        try h2.store.declineHumanTask(companyId: h2.acme.id, askId: stripe.id, note: "")
+        try h2.store.declineHumanTask(companyId: h2.acme.id, askId: stripe.id, note: "", owner: .test)
         #expect(try h2.fresh(other).status == .inProgress)
         // A human-task block cleared another way (the holder unblocks it) leaves no stale status behind.
         let third = try h.store.fileTemplateTask(companyId: h.acme.id, requesterId: "system", template: .domain)
@@ -385,7 +385,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         let ask = try h.store.fileTemplateTask(companyId: h.acme.id, requesterId: "system", template: .hostingAccount)
         #expect(ask.requesterId == "system"); #expect(ask.status == .pendingOwner)
         try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id,
-                                      values: ["CLOUDFLARE_API_TOKEN": token + "\n", "account_id": "  \(Self.accountId) "], vault: h.vault)
+                                      values: ["CLOUDFLARE_API_TOKEN": token + "\n", "account_id": "  \(Self.accountId) "], vault: h.vault, owner: .test)
         #expect(try h.vault.value(companyId: h.acme.id, name: "CLOUDFLARE_API_TOKEN") == token)
         #expect(try h.store.secrets(companyId: h.acme.id).map(\.name) == ["CLOUDFLARE_API_TOKEN"])
         #expect(try h.store.secrets(companyId: h.acme.id).first?.isTest == false, "engine-held")
@@ -403,7 +403,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         let stripe = try h.store.fileTemplateTask(companyId: h.acme.id, requesterId: "system", template: .stripeTestKeys)
         #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: stripe.id,
                                                              values: ["STRIPE_TEST_SECRET_KEY": "sk_test_ab cd", "STRIPE_TEST_PUBLISHABLE_KEY": "pk_test_x"],
-                                                             vault: h.vault) } == "Test secret key doesn't look right")
+                                                             vault: h.vault, owner: .test) } == "Test secret key doesn't look right")
     }
 
     @Test func liveStripeKeyRefused() throws {
@@ -411,10 +411,10 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         let ask = try h.store.fileTemplateTask(companyId: h.acme.id, requesterId: "system", template: .stripeTestKeys)
         #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id,
                                                              values: ["STRIPE_TEST_SECRET_KEY": "sk_live_51abcdef", "STRIPE_TEST_PUBLISHABLE_KEY": "pk_test_1"],
-                                                             vault: h.vault) } == "that's a live Stripe key; paste the test key (sk_test_…)")
+                                                             vault: h.vault, owner: .test) } == "that's a live Stripe key; paste the test key (sk_test_…)")
         #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id,
                                                              values: ["STRIPE_TEST_SECRET_KEY": "sk_test_1", "STRIPE_TEST_PUBLISHABLE_KEY": "pk_live_1"],
-                                                             vault: h.vault) } == "Test publishable key must start with pk_test_")
+                                                             vault: h.vault, owner: .test) } == "Test publishable key must start with pk_test_")
         #expect(try h.fresh(ask).status == .pendingOwner)
         #expect(try h.vault.value(companyId: h.acme.id, name: "STRIPE_TEST_SECRET_KEY") == nil)
         #expect(try h.store.secrets(companyId: h.acme.id).isEmpty)
@@ -424,7 +424,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         let h = try H()
         let ask = try h.store.fileTemplateTask(companyId: h.acme.id, requesterId: "system", template: .hostingAccount)
         func complete(_ v: [String: String]) -> String? {
-            Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: v, vault: h.vault) }
+            Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: v, vault: h.vault, owner: .test) }
         }
         #expect(complete(["account_id": Self.accountId]) == "Cloudflare API token is required")
         #expect(complete(["CLOUDFLARE_API_TOKEN": "tok-abcdef123", "account_id": "  "]) == "Account ID is required")
@@ -435,7 +435,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(try h.vault.value(companyId: h.acme.id, name: "CLOUDFLARE_API_TOKEN") == nil, "nothing saved on a refusal")
         #expect(try h.store.hosting(companyId: h.acme.id)?.accountId == nil)
         // Another company's ask is not found.
-        #expect(Self.message { try h.store.completeHumanTask(companyId: h.globex.id, askId: ask.id, values: [:], vault: h.vault) } == "no such ask")
+        #expect(Self.message { try h.store.completeHumanTask(companyId: h.globex.id, askId: ask.id, values: [:], vault: h.vault, owner: .test) } == "no such ask")
     }
 
     @Test func declineRestoresItemWithNote() throws {
@@ -444,7 +444,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         let (ask, _) = try h.store.requestHumanTask(companyId: h.acme.id, by: h.eng.id, template: .domain, args: ["domain": "lumen.app"],
                                                     itemId: item.id, reason: "a real domain")
         #expect(try h.fresh(item).status == .blocked)
-        try h.store.declineHumanTask(companyId: h.acme.id, askId: ask.id, note: "use the pages.dev address for now")
+        try h.store.declineHumanTask(companyId: h.acme.id, askId: ask.id, note: "use the pages.dev address for now", owner: .test)
         let declined = try h.fresh(ask)
         #expect(declined.status == .rejected); #expect(declined.ownerNote == "use the pages.dev address for now")
         let back = try h.fresh(item)
@@ -454,7 +454,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(event.text == "\(ask.ref) declined by the owner: Buy or connect the domain lumen.app — use the pages.dev address for now")
         #expect(try h.store.pendingNotices(agentId: h.eng.id).contains { $0.event.kind == .humanTaskDeclined && $0.notice.wakes })
         #expect(try h.dms(h.eng).contains { $0.contains("\(ask.ref) rejected by the owner: use the pages.dev address for now") })
-        #expect(Self.message { try h.store.declineHumanTask(companyId: h.acme.id, askId: ask.id, note: "") } == "\(ask.ref) is already rejected")
+        #expect(Self.message { try h.store.declineHumanTask(companyId: h.acme.id, askId: ask.id, note: "", owner: .test) } == "\(ask.ref) is already rejected")
     }
 
     // MARK: Filing rules
@@ -569,8 +569,8 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(try h.fresh(theirs).status == .ready)
         // The owner paths take the company the ask belongs to.
         let ask = try h.store.fileTemplateTask(companyId: h.globex.id, requesterId: "system", template: .stripeTestKeys)
-        #expect(Self.message { try h.store.declineHumanTask(companyId: h.acme.id, askId: ask.id, note: "") } == "no such ask")
-        #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: Self.stripeValues, vault: h.vault) } == "no such ask")
+        #expect(Self.message { try h.store.declineHumanTask(companyId: h.acme.id, askId: ask.id, note: "", owner: .test) } == "no such ask")
+        #expect(Self.message { try h.store.completeHumanTask(companyId: h.acme.id, askId: ask.id, values: Self.stripeValues, vault: h.vault, owner: .test) } == "no such ask")
     }
 
     /// Task 13 (controller ruling, carried from Task 9): the requester sees its own answered human tasks in the turn digest —
@@ -600,11 +600,11 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(!TurnDigest.render(ctx, agent: h.eng, company: h.acme).contains("Done human tasks"))
 
         let secret = "sk_test_51HyperSecretValue0000000000", publishable = "pk_test_51PublicValue00000000000000"
-        try h.store.completeHumanTask(companyId: h.acme.id, askId: siteAsk.id, values: ["site_url": "https://status.acme.dev/"], vault: h.vault)
+        try h.store.completeHumanTask(companyId: h.acme.id, askId: siteAsk.id, values: ["site_url": "https://status.acme.dev/"], vault: h.vault, owner: .test)
         try h.store.completeHumanTask(companyId: h.acme.id, askId: stripeAsk.id,
-                                      values: ["STRIPE_TEST_SECRET_KEY": secret, "STRIPE_TEST_PUBLISHABLE_KEY": publishable], vault: h.vault)
-        try h.store.completeHumanTask(companyId: h.acme.id, askId: deckAsk.id, values: ["deck_url": "https://docs.acme.dev/deck"], vault: h.vault)
-        try h.store.completeHumanTask(companyId: h.globex.id, askId: globex.id, values: Self.stripeValues, vault: h.vault)
+                                      values: ["STRIPE_TEST_SECRET_KEY": secret, "STRIPE_TEST_PUBLISHABLE_KEY": publishable], vault: h.vault, owner: .test)
+        try h.store.completeHumanTask(companyId: h.acme.id, askId: deckAsk.id, values: ["deck_url": "https://docs.acme.dev/deck"], vault: h.vault, owner: .test)
+        try h.store.completeHumanTask(companyId: h.globex.id, askId: globex.id, values: Self.stripeValues, vault: h.vault, owner: .test)
 
         ctx = try TurnContext.load(store: h.store, paths: paths, agent: h.eng, company: h.acme)
         #expect(ctx.answeredTasks.map(\.id) == [stripeAsk.id, siteAsk.id], "the requester's own, newest first")
@@ -621,7 +621,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(globexCtx.answeredTasks.map(\.id) == [globex.id])
         // A declined task is not an answer; the store query refuses another company's requester.
         let declined = try h.store.requestHumanTask(companyId: h.acme.id, by: h.eng.id, template: .domain, reason: "r").ask
-        try h.store.declineHumanTask(companyId: h.acme.id, askId: declined.id, note: "later")
+        try h.store.declineHumanTask(companyId: h.acme.id, askId: declined.id, note: "later", owner: .test)
         #expect(try h.store.answeredHumanTasks(companyId: h.acme.id, requesterId: h.eng.id, limit: 10).map(\.id) == [stripeAsk.id, siteAsk.id])
         #expect(try h.store.answeredHumanTasks(companyId: h.acme.id, requesterId: h.globexEng.id, limit: 10).isEmpty)
         // The secret never reached the database in clear.

@@ -270,6 +270,10 @@ final class RefHooks: @unchecked Sendable {
     /// `markHeldItemsIfTainted`), as a database that refuses writes would.
     var failTaintRecords: Bool { lock.withLock { taintRecordFails } }
     func setFailTaintRecords(_ fails: Bool) { lock.withLock { taintRecordFails = fails } }
+    private var afterTaintRecord: (@Sendable () -> Void)?
+    /// FW-B1 re-review M-2: runs on a turn's end right after its taint record, before any further `await`.
+    var afterTurnTaintRecord: (@Sendable () -> Void)? { lock.withLock { afterTaintRecord } }
+    func setAfterTurnTaintRecord(_ body: (@Sendable () -> Void)?) { lock.withLock { afterTaintRecord = body } }
     private var taintHoldWriteFails = false
     /// FW-B1 fix round 1 (3): writing a taint hold's row fails (the hold stays in memory; the row is written again every tick).
     var failTaintHoldWrite: Bool { lock.withLock { taintHoldWriteFails } }

@@ -297,7 +297,9 @@ public enum RepoImport {
     /// The owner's end of the import mark (`brahma company trust-import`): under the engine lock (the engine stopped) and with
     /// no turn of the company recorded as running, `Store.trustImport`. Returns the mark's source, or nil when none stood.
     @discardableResult
-    public static func trust(store: Store, paths: BrahmaPaths, companyId: String, now: Date = Store.now()) throws -> String? {
+    public static func trust(store: Store, paths: BrahmaPaths, companyId: String, now: Date = Store.now(),
+                             owner: OwnerPrincipal) throws -> String? {
+        try ProcessRole.refuseInAgentProcess()
         guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
         let lock = try LabProvenance.engineLock(paths)
         defer { withExtendedLifetime(lock) {} }
@@ -308,7 +310,7 @@ public enum RepoImport {
         if running > 0 {
             throw LabProvenance.ClearRefused(message: "a turn in \(company.name) is still recorded as running: let the engine recover it first")
         }
-        return try store.trustImport(companyId: company.id, now: now)
+        return try store.trustImport(companyId: company.id, now: now, owner: owner)
     }
 
     // MARK: Helpers

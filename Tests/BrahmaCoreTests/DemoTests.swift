@@ -238,7 +238,7 @@ import GRDB
         let g = GitFixture(existing: URL(fileURLWithPath: beta.workspacePath, isDirectory: true))
         func land(_ text: String) throws -> String {
             try g.write("README.md", text); try g.git(["add", "-A"]); try g.git(["commit", "-q", "-m", "change"])
-            return try f.store.acceptMainCommit(companyId: beta.id).head
+            return try f.store.acceptMainCommit(companyId: beta.id, owner: .test).head
         }
         let first = try land("one")
         _ = try CompanyTools(store: f.store, companyId: beta.id, agentId: dev.id).call(

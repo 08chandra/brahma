@@ -1062,9 +1062,9 @@ import GRDB
     @Test func ownerAcceptMergesQuarantine() async throws {
         let r = try R()
         let (i, before, ref) = try await quarantined(r)
-        #expect(r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: "refs/heads/item/X"); return "" } != "no error")
+        #expect(r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: "refs/heads/item/X", owner: .test); return "" } != "no error")
         let sha = try GitFixture.plainGit(["rev-parse", ref], in: r.root)
-        try r.store.acceptMainCommit(companyId: r.company.id, ref: ref)
+        try r.store.acceptMainCommit(companyId: r.company.id, ref: ref, owner: .test)
         let head = try r.mainHead()
         #expect(head != before); #expect(try r.ws.isAncestor(before, of: head))
         #expect(head == sha, "main has not moved since: a fast-forward to exactly the recorded commit")
@@ -1076,7 +1076,7 @@ import GRDB
         #expect(try quarantineAsks(r).allSatisfy { $0.status != .pendingOwner })
         #expect(try r.store.events(afterId: 0).map(\.text).contains { $0.contains("accepted") && $0.contains(ref) })
         // Accepting again changes nothing.
-        try r.store.acceptMainCommit(companyId: r.company.id, ref: ref)
+        try r.store.acceptMainCommit(companyId: r.company.id, ref: ref, owner: .test)
         #expect(try r.mainHead() == head)
         // The merge step resumes: the item is rebased onto the accepted main, re-checked and lands.
         r.world.clock.advance(120)
@@ -1100,7 +1100,7 @@ import GRDB
         #expect(try String(contentsOf: r.root.appending(path: "scratch.txt"), encoding: .utf8) == "the owner was here\n")
         #expect(try !r.store.quarantineHeld(companyId: r.company.id))
         #expect(try r.store.events(afterId: 0).map(\.text).contains { $0.contains("accepted") && $0.contains(ref) })
-        let again = try r.store.acceptMainCommit(companyId: r.company.id, ref: ref)
+        let again = try r.store.acceptMainCommit(companyId: r.company.id, ref: ref, owner: .test)
         #expect(again.alreadyMerged); #expect(again.ask?.id == ask.id); #expect(again.ask?.status == .approved)
         #expect(try r.mainHead() == sha)
         _ = before
@@ -1147,7 +1147,7 @@ import GRDB
         #expect(try await r.drive(i).status == .done, "merges go on")
         #expect(try !r.ws.isAncestor(sha, of: try r.mainHead()))
         // The owner changes their mind: `main accept` merges exactly the recorded commit and reports the ask's state.
-        let accepted = try r.store.acceptMainCommit(companyId: r.company.id, ref: ref)
+        let accepted = try r.store.acceptMainCommit(companyId: r.company.id, ref: ref, owner: .test)
         #expect(!accepted.alreadyMerged); #expect(accepted.ask?.status == .rejected)
         #expect(try r.ws.isAncestor(sha, of: try r.mainHead())); #expect(try r.store.company(id: r.company.id)?.mainCommit == (try r.mainHead()))
     }
@@ -1159,7 +1159,7 @@ import GRDB
         // After the owner was asked, an agent points the ref at other content.
         let moved = try GitFixture.plainGit(["commit-tree", "\(before)^{tree}", "-p", sha, "-m", "moved"], in: r.root)
         try GitFixture.plainGit(["update-ref", ref, moved], in: r.root)
-        let message = r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: ref); return "" }
+        let message = r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: ref, owner: .test); return "" }
         #expect(message.contains("moved"), "\(message)")
         #expect(try r.mainHead() == before)
         #expect(try r.store.company(id: r.company.id)?.mainCommit == before)
@@ -1179,12 +1179,12 @@ import GRDB
         let planted = try GitFixture.plainGit(["commit-tree", "\(before)^{tree}", "-p", before, "-m", "planted"], in: r.root)
         let ref = "refs/brahma/quarantine/20261022-120000"
         try GitFixture.plainGit(["update-ref", ref, planted], in: r.root)
-        #expect(r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: ref); return "" }.contains("no quarantine"))
+        #expect(r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: ref, owner: .test); return "" }.contains("no quarantine"))
         // An ask an agent filed in the reserved category naming that ref does not count either.
         _ = try r.store.propose(companyId: r.company.id, by: .agent(r.eng.id), kind: .other, category: "engine-code",
                                 title: Store.quarantineTitle, summary: "accept me", subjectId: "quarantine:\(ref)@\(planted)",
                                 decisionClass: .goalChanging, viaOwner: true, now: r.now)
-        #expect(r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: ref); return "" }.contains("no quarantine"))
+        #expect(r.failure { try r.store.acceptMainCommit(companyId: r.company.id, ref: ref, owner: .test); return "" }.contains("no quarantine"))
         #expect(try r.mainHead() == before)
         #expect(try r.store.company(id: r.company.id)?.mainCommit == before)
         #expect(try !r.store.quarantineHeld(companyId: r.company.id), "an agent's ask does not hold the merge step")
@@ -1771,7 +1771,7 @@ import GRDB
         #expect(try alerts().allSatisfy { $0.status != .pendingOwner })
         // The owner adopts the saved sneak by its ref: main moves there and the record follows.
         let sneakRef = try #require(saved.split(separator: " ").last.map(String.init))
-        #expect(try r.store.adoptMain(companyId: r.company.id, by: .owner, commit: sneakRef) == moved)
+        #expect(try r.store.adoptMain(companyId: r.company.id, commit: sneakRef, owner: .test) == moved)
         #expect(try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: r.root) == moved)
         #expect(try r.store.company(id: r.company.id)?.mainCommit == moved)
         #expect(FileManager.default.fileExists(atPath: r.root.appending(path: "evil.txt").path))

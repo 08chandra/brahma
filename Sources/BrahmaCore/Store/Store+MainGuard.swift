@@ -75,9 +75,20 @@ extension Store {
     /// head, `main` is first moved there by compare-and-swap with the root checkout following (refused while the root has
     /// uncommitted edits). Writes activity `main adopted at <sha7> by the owner|the engine`, closes 3a's "main changed
     /// outside Brahma" alert, and returns the recorded commit. Runs git: call it off the actor.
+    /// FW-B1 re-review I-1: the owner's adoption takes the owner principal (never from an agent process); the engine's own
+    /// re-affirmation is `adoptMainAsEngine` (internal, the orchestrator's alone).
     @discardableResult
-    public func adoptMain(companyId: String, by sender: Sender, commit: String? = nil, now: Date = Store.now()) throws -> String {
-        try adoptMain(companyId: companyId, by: sender, commit: commit, now: now, command: "adopt")
+    public func adoptMain(companyId: String, commit: String? = nil, now: Date = Store.now(), owner: OwnerPrincipal) throws -> String {
+        try ProcessRole.refuseInAgentProcess()
+        return try adoptMain(companyId: companyId, by: .owner, commit: commit, now: now, command: "adopt")
+    }
+
+    /// The engine's re-affirmation of the live head (`by: .system`: never a move; see `adoptMain`). Internal: the orchestrator's
+    /// main-guard pass calls it; refused in an agent process.
+    @discardableResult
+    func adoptMainAsEngine(companyId: String, commit: String? = nil, now: Date = Store.now()) throws -> String {
+        try ProcessRole.refuseInAgentProcess()
+        return try adoptMain(companyId: companyId, by: .system, commit: commit, now: now, command: "adopt")
     }
 
     /// `adoptMain`, its refusals worded for the command the owner ran (`adopt` for `brahma merge adopt-main`, `accept` for
@@ -198,7 +209,8 @@ extension Store {
     ///   refused and flagged to the owner (an engine alert): what the owner was shown is not what the ref holds. Accepting a
     ///   quarantine that is already merged changes nothing (`alreadyMerged`).
     @discardableResult
-    public func acceptMainCommit(companyId: String, ref: String? = nil, note: String? = nil) throws -> MainAcceptance {
+    public func acceptMainCommit(companyId: String, ref: String? = nil, note: String? = nil, owner: OwnerPrincipal) throws -> MainAcceptance {
+        try ProcessRole.refuseInAgentProcess()  // FW-B1 re-review I-1: the owner principal (it bypasses ownerDecide otherwise)
         guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
         let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
         guard let ref else {

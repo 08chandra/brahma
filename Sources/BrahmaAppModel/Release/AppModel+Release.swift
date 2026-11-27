@@ -59,13 +59,13 @@ extension AppModel {
             return
         }
         let values = form.values
-        await ownerWrite("complete the task") { store in
-            try store.completeHumanTask(companyId: companyId, askId: askId, values: values, vault: vault)
+        await ownerAct("complete the task") { store, owner in
+            try store.completeHumanTask(companyId: companyId, askId: askId, values: values, vault: vault, owner: owner)
         }
     }
 
     public func declineHumanTask(askId: String, note: String) async {
         guard let companyId = selectedCompanyId else { return }
-        await ownerWrite("decline the task") { store in try store.declineHumanTask(companyId: companyId, askId: askId, note: note) }
+        await ownerAct("decline the task") { store, owner in try store.declineHumanTask(companyId: companyId, askId: askId, note: note, owner: owner) }
     }
 }

@@ -99,7 +99,7 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
             for (path, text) in files { try f.write(path, text) }
             try f.git(["add", "-A"])
             try f.git(["commit", "-q", "-m", "change"])
-            return try store.acceptMainCommit(companyId: company.id).head
+            return try store.acceptMainCommit(companyId: company.id, owner: .test).head
         }
 
         func tools() -> CompanyTools { CompanyTools(store: store, companyId: company.id, agentId: devops.id) }

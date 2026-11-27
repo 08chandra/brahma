@@ -119,11 +119,11 @@ struct MergeGroup: ParsableCommand {
         @Argument(help: "A commit, or a ref the main guard saved (refs/brahma/foreign/<yyyyMMdd-HHmmss>-<n>). Without it, main's current head.") var commit: String?
 
         func run() throws {
-            try requireOwnerShell()
+            let owner = try requireOwnerShell()
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
             let adopted: String
-            do { adopted = try store.adoptMain(companyId: c.id, by: .owner, commit: commit) } catch let e as WorkError { throw fail(e.message) }
+            do { adopted = try store.adoptMain(companyId: c.id, commit: commit, owner: owner) } catch let e as WorkError { throw fail(e.message) }
             print(safe("\(c.name): main adopted at \(adopted.prefix(7)) (\(adopted))"))
         }
     }
