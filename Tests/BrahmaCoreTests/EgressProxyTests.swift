@@ -313,6 +313,78 @@ import Glibc
         #expect(count.lock.withLock { count.n } == 1)
     }
 
+    /// Ruling 22: the gateway's proxy lets exactly its one pinned host through — a vendor root the sandbox refuses included —
+    /// with the sandbox's other rules (port 443, vetted addresses resolved once); an agent sandbox's proxy keeps refusing
+    /// Anthropic's hosts. A refused host is never resolved, so the resolver's calls show what was let past the name check.
+    @Test func gatewayHostPinsExactlyOneHostIncludingAVendorRoot() throws {
+        final class Asked: @unchecked Sendable { let lock = NSLock(); var hosts: [String] = [] }
+        let asked = Asked()
+        let resolver: EgressProxy.Resolver = { host in asked.lock.withLock { asked.hosts.append(host) }; return nil }
+        let gateway = try EgressProxy(gatewayHost: "api.anthropic.com", resolver: resolver)
+        defer { gateway.stop() }
+        #expect(gateway.allow == ["api.anthropic.com"])
+        for refused in ["claude.ai:443", "anthropic.com:443", "evil.api.anthropic.com:443", "api.anthropic.com.evil.net:443",
+                        "example.com:443", "API.ANTHROPIC.COM:80", "93.184.215.14:443"] {
+            #expect(try Self.ask(gateway.port, "CONNECT \(refused) HTTP/1.1\r\n\r\n").hasPrefix("HTTP/1.1 403"), "\(refused)")
+        }
+        #expect(asked.lock.withLock { asked.hosts }.isEmpty)
+        // The pinned host passes the name check (and is then refused here only because the test resolver answers nothing).
+        #expect(try Self.ask(gateway.port, "CONNECT API.Anthropic.com.:443 HTTP/1.1\r\n\r\n").hasPrefix("HTTP/1.1 403"))
+        #expect(asked.lock.withLock { asked.hosts } == ["api.anthropic.com"])
+
+        // A sandbox proxy listing the same host never even resolves it.
+        let sandbox = try EgressProxy(allow: ["api.anthropic.com", "example.com"], resolver: resolver)
+        defer { sandbox.stop() }
+        #expect(try Self.ask(sandbox.port, "CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n").hasPrefix("HTTP/1.1 403"))
+        #expect(asked.lock.withLock { asked.hosts } == ["api.anthropic.com"])
+
+        // Only one plain host name can be pinned.
+        for bad in ["*.anthropic.com", "127.0.0.1", "localhost", "api.anthropic.com\n", "", "anthropic", "a b.com", "api.anthropic.com:443"] {
+            #expect(throws: EgressProxyError.invalidGatewayHost, "\(bad)") { try EgressProxy(gatewayHost: bad, resolver: resolver) }
+        }
+    }
+
+    /// The pinned host, vetted, is dialled and piped (a loopback echo stands in for the provider; vetting swapped for the test).
+    @Test func gatewayHostPipesItsPinnedHost() throws {
+        let server = socket(AF_INET, Int32(SOCK_STREAM), 0)
+        let echoDone = DispatchSemaphore(value: 0)
+        defer { _ = echoDone.wait(timeout: .now() + 15) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        _ = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(server, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        listen(server, 4)
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(server, $0, &len) } }
+        let echoPort = UInt16(bigEndian: addr.sin_port)
+        Thread.detachNewThread {                                                // scope-escape: an echo server, no scratch dirs
+            defer { close(server); echoDone.signal() }
+            let c = accept(server, nil, nil)
+            guard c >= 0 else { return }
+            var buffer = [UInt8](repeating: 0, count: 1024)
+            let n = read(c, &buffer, buffer.count)
+            if n > 0 { _ = write(c, buffer, n) }
+            close(c)
+        }
+        let loopback = Self.v4("127.0.0.1")
+        let proxy = try EgressProxy(gatewayHost: "api.anthropic.com", resolver: { _ in [loopback] }, vet: { _ in true }, dialPort: echoPort)
+        defer { proxy.stop() }
+        let fd = try Self.open(proxy.port)
+        defer { close(fd) }
+        let request = "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\nPING-43"
+        _ = request.withCString { write(fd, $0, strlen($0)) }
+        var got = [UInt8]()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        while !String(decoding: got, as: UTF8.self).contains("PING-43") {
+            let n = read(fd, &buffer, buffer.count)
+            if n <= 0 { break }
+            got += buffer[0..<n]
+        }
+        #expect(String(decoding: got, as: UTF8.self) == "HTTP/1.1 200 Connection established\r\n\r\nPING-43")
+        #expect(proxy.allowedHosts == ["api.anthropic.com"])
+    }
+
     /// A-M1/A-M8: the request may take its time (up to the 10 s budget), and an oversized head is refused.
     @Test func requestReadWaitsAndOversizedHeadRefused() throws {
         let proxy = try EgressProxy(allow: ["example.com"])

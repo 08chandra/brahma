@@ -197,9 +197,14 @@ public enum AddressPolicy {
 
 // MARK: Proxy
 
+public enum EgressProxyError: Error, Equatable, Sendable {
+    /// `EgressProxy(gatewayHost:)` was given something other than one plain host name.
+    case invalidGatewayHost
+}
+
 /// A CONNECT-only HTTP proxy on `127.0.0.1:<port>` (POSIX sockets, one thread per connection). For `CONNECT host:port`:
 /// 1. `port` must be 443;
-/// 2. `DomainMatcher.matches(host, allow)`;
+/// 2. `DomainMatcher.matches(host, allow)` (for the gateway's proxy, `init(gatewayHost:)`: exactly its one pinned host);
 /// 3. the host is resolved once (`getaddrinfo`) and every address must pass `AddressPolicy.isPublic`;
 /// 4. it dials those vetted addresses (in order, never resolving again: DNS rebinding cannot swap one in);
 /// 5. it answers `200 Connection established` and pipes bytes both ways.
@@ -271,6 +276,9 @@ public final class EgressProxy: @unchecked Sendable {
 
     public let port: UInt16
     public let allow: [String]
+    /// Set only by the gateway constructor (`init(gatewayHost:)`, Ruling 22): the one host this proxy lets through, compared
+    /// exactly, in place of `DomainMatcher.matches` (which refuses Anthropic's hosts for every agent sandbox).
+    private let pinnedHost: String?
 
     typealias Resolver = @Sendable (String) -> [sockaddr_storage]?
     private let resolver: Resolver
@@ -294,9 +302,36 @@ public final class EgressProxy: @unchecked Sendable {
 
     /// `resolver`, `vet` and `dialPort` are for tests. `maxConnections` caps this proxy; `budget`, when given, is a ceiling
     /// shared with other proxies (the pool's).
-    init(allow: [String], resolver: @escaping Resolver, vet: @escaping @Sendable (sockaddr_storage) -> Bool = AddressPolicy.isPublic,
-         dialPort: UInt16 = EgressProxy.allowedPort, maxConnections: Int = EgressProxy.perProxyLimit, budget: Budget? = nil) throws {
-        self.allow = allow; self.resolver = resolver; self.vet = vet; self.dialPort = dialPort
+    convenience init(allow: [String], resolver: @escaping Resolver, vet: @escaping @Sendable (sockaddr_storage) -> Bool = AddressPolicy.isPublic,
+                     dialPort: UInt16 = EgressProxy.allowedPort, maxConnections: Int = EgressProxy.perProxyLimit, budget: Budget? = nil) throws {
+        try self.init(allow: allow, pinnedHost: nil, resolver: resolver, vet: vet, dialPort: dialPort, maxConnections: maxConnections,
+                      budget: budget)
+    }
+
+    /// The model gateway's upstream proxy (Plan X1 Ruling 22) — **its only caller is `Gateway/Upstream.swift`**, which
+    /// `GatewayEgressLintTests` enforces. It lets exactly one host through: `host`, compared exactly (no wildcard, no other
+    /// name), which may be a vendor root such as `api.anthropic.com` that `DomainMatcher` refuses for every agent sandbox.
+    /// Everything else is the sandbox policy unchanged: CONNECT only, port 443, every resolved address public, resolved once.
+    /// Throws `EgressProxyError.invalidGatewayHost` for anything but one valid host name (no `*.`, no IP literal, no
+    /// `localhost`). The engine holds the provider key; agents never reach this proxy (it is not in any sandbox's allow-list).
+    convenience init(gatewayHost host: String) throws {
+        try self.init(gatewayHost: host, resolver: EgressProxy.systemResolve)
+    }
+
+    /// `init(gatewayHost:)` with the test seams of `init(allow:resolver:vet:dialPort:)`.
+    convenience init(gatewayHost host: String, resolver: @escaping Resolver,
+                     vet: @escaping @Sendable (sockaddr_storage) -> Bool = AddressPolicy.isPublic,
+                     dialPort: UInt16 = EgressProxy.allowedPort) throws {
+        let pinned = DomainMatcher.normalize(host)
+        guard pinned == host.lowercased(), !pinned.hasPrefix("*."), DomainMatcher.isValidPattern(pinned), DomainMatcher.isHostName(pinned)
+        else { throw EgressProxyError.invalidGatewayHost }
+        try self.init(allow: [pinned], pinnedHost: pinned, resolver: resolver, vet: vet, dialPort: dialPort,
+                      maxConnections: EgressProxy.perProxyLimit, budget: nil)
+    }
+
+    private init(allow: [String], pinnedHost: String?, resolver: @escaping Resolver, vet: @escaping @Sendable (sockaddr_storage) -> Bool,
+                 dialPort: UInt16, maxConnections: Int, budget: Budget?) throws {
+        self.allow = allow; self.pinnedHost = pinnedHost; self.resolver = resolver; self.vet = vet; self.dialPort = dialPort
         self.maxConnections = maxConnections; self.budget = budget
         let fd = socket(AF_INET, Self.streamType, 0)
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
@@ -462,7 +497,8 @@ public final class EgressProxy: @unchecked Sendable {
             return
         }
         let host = DomainMatcher.normalize(String(target[..<colon]))
-        guard DomainMatcher.matches(host: host, allow: allow),
+        let permitted = pinnedHost.map { DomainMatcher.isHostName(host) && host == $0 } ?? DomainMatcher.matches(host: host, allow: allow)
+        guard permitted,
               let addresses = resolve(host, deadline: deadline), !addresses.isEmpty, addresses.allSatisfy(vet),
               let upstream = dial(addresses, deadline: deadline) else {
             deny(host)
