@@ -272,6 +272,9 @@ public enum DiffAnchoring {
 
     struct Hunk {
         var header: String
+        /// N3-1: the numbers its first old and new lines take (`starts(header)`).
+        var oldStart: Int
+        var newStart: Int
         /// The raw hunk body lines (with their `+`/`-`/space markers).
         var lines: [String]
         var numbered: [Numbered]
@@ -290,15 +293,15 @@ public enum DiffAnchoring {
         return hunks(of: sections[index])
     }
 
-    /// C6b R2-1: the line counts of every hunk of every section of `patch` (`ChangesSnapshot.sectionHunks`).
+    /// C6b R2-1: the start lines and line counts of every hunk of every section of `patch` (`ChangesSnapshot.sectionHunks`).
     static func spans(in patch: String) -> [[HunkSpan]] {
         ChangesPatch.parse(patch).map(spans(of:))
     }
 
-    /// The line counts of each hunk of `section`, from the same numbering relocation and quoting use.
+    /// The start lines and line counts of each hunk of `section`, from the same numbering relocation and quoting use.
     static func spans(of section: ChangesPatch.Section) -> [HunkSpan] {
         hunks(of: section).map { h in
-            HunkSpan(old: h.numbered.filter { $0.old != nil }.count, new: h.numbered.filter { $0.new != nil }.count,
+            HunkSpan(oldStart: h.oldStart, newStart: h.newStart, old: h.numbered.filter { $0.old != nil }.count, new: h.numbered.filter { $0.new != nil }.count,
                      shown: h.numbered.filter { $0.old != nil || $0.new != nil }.count)
         }
     }
@@ -312,7 +315,7 @@ public enum DiffAnchoring {
                 if let h = current { out.append(h) }
                 let (o, n) = starts(line)
                 old = o; new = n
-                current = Hunk(header: line, lines: [], numbered: [])
+                current = Hunk(header: line, oldStart: o, newStart: n, lines: [], numbered: [])
                 continue
             }
             guard var h = current else { continue }
@@ -340,27 +343,42 @@ public enum DiffAnchoring {
         return hunks(in: patch, path: path).first { headerRange($0.header) == wanted }
     }
 
-    /// `@@ -a,b +c,d @@` → (a, c); 0 when unreadable.
-    static func starts(_ header: String) -> (Int, Int) {
-        let parts = header.split(separator: " ")
-        func start(_ s: Substring) -> Int { Int(s.dropFirst().split(separator: ",").first ?? "") ?? 0 }
-        guard parts.count >= 3 else { return (0, 0) }
-        return (start(parts[1]), start(parts[2]))
+    /// N3-1: the ONE reading of a hunk header, the engine's and the app's `DiffModel`: `@@ -a[,b] +c[,d] @@` read from the start of
+    /// the line, by unicode scalar — `@@ `, the old range, one space, the new range, ` @@`, then the end of the line or a space —
+    /// and nothing after the closing ` @@`: git appends the hunk's function context there, a line of the agent's file, which may
+    /// itself spell `-1 +11` or `@@`. Each number is 1–9 ASCII digits. nil when the line is not such a header.
+    static func readHeader(_ header: String) -> (old: String, oldStart: Int, new: String, newStart: Int)? {
+        var scalars = header.unicodeScalars[...]
+        func take(_ s: String) -> Bool {
+            guard scalars.starts(with: s.unicodeScalars) else { return false }
+            scalars = scalars.dropFirst(s.unicodeScalars.count)
+            return true
+        }
+        func range(_ sign: Unicode.Scalar) -> (text: String, start: Int)? {
+            guard scalars.first == sign else { return nil }
+            let body = scalars.dropFirst().prefix { $0 != " " }
+            scalars = scalars.dropFirst(1 + body.count)
+            let nums = String(Substring(body)).split(separator: ",", omittingEmptySubsequences: false)
+            guard (1...2).contains(nums.count),
+                  nums.allSatisfy({ !$0.isEmpty && $0.unicodeScalars.count <= 9 && $0.unicodeScalars.allSatisfy { ("0"..."9").contains($0) } }),
+                  let start = Int(nums[0]) else { return nil }
+            return (String(sign) + nums.joined(separator: ","), start)
+        }
+        guard take("@@ "), let old = range("-"), take(" "), let new = range("+"), take(" @@"), scalars.isEmpty || scalars.first == " " else { return nil }
+        return (old.text, old.start, new.text, new.start)
     }
 
-    /// The header's range alone, `@@ -a[,b] +c[,d] @@`, regenerated from its numbers (never the function context git appends,
-    /// which is a line of the file); nil when the text is not a hunk header.
+    /// N3-1: the numbers a hunk's first old and new lines take, by `readHeader` — `@@ -a[,b] +c[,d] @@ …` → (a, c); (0, 0) when
+    /// unreadable. The engine's numbering (relocation, the holder's quote, `sectionHunks`) and the app's `DiffModel` both call it.
+    public static func starts(_ header: String) -> (old: Int, new: Int) {
+        guard let h = readHeader(header) else { return (0, 0) }
+        return (h.oldStart, h.newStart)
+    }
+
+    /// The header's range alone, `@@ -a[,b] +c[,d] @@`, regenerated from its numbers by `readHeader` (never the function context
+    /// git appends, which is a line of the file); nil when the text is not a hunk header.
     public static func headerRange(_ header: String) -> String? {
-        let parts = header.split(separator: " ", omittingEmptySubsequences: false)
-        guard parts.count >= 4, parts[0] == "@@", parts[3] == "@@" else { return nil }
-        func range(_ s: Substring, _ sign: Character) -> String? {
-            guard s.first == sign else { return nil }
-            let nums = s.dropFirst().split(separator: ",", omittingEmptySubsequences: false)
-            guard (1...2).contains(nums.count), nums.allSatisfy({ !$0.isEmpty && $0.count <= 9 && $0.allSatisfy { $0.isASCII && $0.isNumber } }) else { return nil }
-            return String(sign) + nums.joined(separator: ",")
-        }
-        guard let old = range(parts[1], "-"), let new = range(parts[2], "+") else { return nil }
-        return "@@ \(old) \(new) @@"
+        readHeader(header).map { "@@ \($0.old) \($0.new) @@" }
     }
 
     /// The line the comment shows at in `patch` now, or nil when it is outdated. With `sectionIndex` (the snapshot file's

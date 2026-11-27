@@ -17,9 +17,15 @@ public struct DiffLine: Equatable, Sendable {
 public struct DiffHunk: Equatable, Sendable {
     /// The `@@ … @@` line as written (agent-controlled).
     public var header: String
+    /// N3-1: the numbers the hunk's first old and new lines take, read from `header` by the engine's one reading
+    /// (`DiffAnchoring.starts`); `ChangesTabModel.verify` checks them against the engine's.
+    public var oldStart: Int
+    public var newStart: Int
     public var lines: [DiffLine]
 
-    public init(header: String, lines: [DiffLine]) { self.header = header; self.lines = lines }
+    public init(header: String, oldStart: Int, newStart: Int, lines: [DiffLine]) {
+        self.header = header; self.oldStart = oldStart; self.newStart = newStart; self.lines = lines
+    }
 }
 
 public struct DiffFile: Equatable, Sendable {
@@ -137,10 +143,11 @@ public struct DiffModel: Equatable, Sendable {
             }
             if ChangesPatch.marker(line) == .hunkHeader {
                 closeHunk()
-                let (o, n) = Self.hunkStarts(line)
+                // N3-1: the engine's one header reading (`DiffAnchoring.starts`): never the function context after ` @@`.
+                let (o, n) = DiffAnchoring.starts(line)
                 oldNo = o
                 newNo = n
-                hunk = DiffHunk(header: line, lines: [])
+                hunk = DiffHunk(header: line, oldStart: o, newStart: n, lines: [])
                 noteHidden(line)
                 continue
             }
@@ -182,16 +189,6 @@ public struct DiffModel: Equatable, Sendable {
         ChangesPatch.prefixedPath(s, "") ?? s
     }
 
-    /// The old and new start lines of an `@@ -a,b +c,d @@` header (1 when it can't be read).
-    static func hunkStarts(_ line: String) -> (Int, Int) {
-        let parts = line.split(separator: " ")
-        var old = 1, new = 1
-        for p in parts {
-            if p.hasPrefix("-"), let n = Int(p.dropFirst().split(separator: ",").first ?? "") { old = n }
-            if p.hasPrefix("+"), let n = Int(p.dropFirst().split(separator: ",").first ?? "") { new = n }
-        }
-        return (old, new)
-    }
 }
 
 // MARK: - Presentation (Plan C Task C6b)

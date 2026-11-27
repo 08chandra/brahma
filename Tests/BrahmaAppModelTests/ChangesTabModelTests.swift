@@ -747,7 +747,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         }
         // The engine's per-hunk spans agree with the app's parse; a forced divergence (count or classification) is refused.
         let spans = DiffAnchoring.spans(in: patch)
-        #expect(spans == [[HunkSpan(old: 7, new: 8, shown: 11)]] && ChangesTabModel.spans(app) == spans)
+        #expect(spans == [[HunkSpan(oldStart: 10, newStart: 10, old: 7, new: 8, shown: 11)]] && ChangesTabModel.spans(app) == spans)
         let snapshot = ChangesSnapshot(key: "ENG-1", compare: .main, base: "b", target: "worktree",
                                        files: [ChangedFile(path: "src/m.ts", status: "M", added: 4, removed: 3, patchIndex: 0)],
                                        added: 4, removed: 3, patch: patch, truncated: false, tainted: false, taintReason: nil, lastEdit: nil,
@@ -756,13 +756,13 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         var diverged = app
         diverged.files[0].hunks[0].lines[1] = DiffLine(kind: .ctx, text: "\u{301}x", oldNo: 11, newNo: 11)   // the old Character reading
         #expect(ChangesTabModel.verify(diverged, against: snapshot) == ChangesTabModel.unverifiedText)
-        for forged in [[[HunkSpan(old: 7, new: 8, shown: 12)]], [[HunkSpan(old: 8, new: 9, shown: 11)]], [spans[0] + spans[0]], []] {
+        for forged in [[[HunkSpan(oldStart: 10, newStart: 10, old: 7, new: 8, shown: 12)]], [[HunkSpan(oldStart: 10, newStart: 10, old: 8, new: 9, shown: 11)]], [spans[0] + spans[0]], []] {
             var s = snapshot
             s.sectionHunks = forged
             #expect(ChangesTabModel.verify(app, against: s) == ChangesTabModel.unverifiedText, "\(forged)")
         }
         // {add, del} and {ctx, unnumbered} have the same old/new counts; the shown count tells them apart.
-        #expect(HunkSpan(old: 1, new: 1, shown: 2) != HunkSpan(old: 1, new: 1, shown: 1))
+        #expect(HunkSpan(oldStart: 1, newStart: 1, old: 1, new: 1, shown: 2) != HunkSpan(oldStart: 1, newStart: 1, old: 1, new: 1, shown: 1))
     }
 
     /// R2-2: the board loop holds the model only around its reload, never across its sleep: a running model dropped without
@@ -778,5 +778,101 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         }
         #expect(ChangesTabModel.boardInterval >= .seconds(10))
         try await eventually(timeout: .seconds(4)) { dropped == nil }
+    }
+
+    // MARK: Fix round 4 (N3-1)
+
+    /// N3-1: a hunk's START lines are read by ONE parser on both sides (`DiffAnchoring.starts`: the first `-a[,b]` and `+c[,d]`
+    /// right after `@@ `, up to the closing ` @@`), never from the function context git appends after it (a line of the agent's
+    /// file); the snapshot's spans carry the engine's starts, so a parse that numbers a hunk from anywhere else is refused.
+    @Test func hunkStartsAgree() throws {
+        // Real git: the agent's first line `fn -1 +11` becomes the function context of the hunk around line 15.
+        let cw = try ChangesWorld()
+        let original = ["fn -1 +11"] + (2...20).map { "    line \($0)" }
+        _ = try RefWorld.write("src/fn.ts", original.joined(separator: "\n") + "\n", in: cw.wt)
+        _ = try RefWorld.git(["add", "-A"], in: cw.wt)
+        _ = try RefWorld.git(["commit", "-q", "-m", "fn"], in: cw.wt)
+        var edited = original
+        edited[14] = "    line 15 changed"
+        _ = try RefWorld.write("src/fn.ts", edited.joined(separator: "\n") + "\n", in: cw.wt)
+        let snapshot = Store.finishChanges(try cw.w.store.changesRaw(companyId: cw.w.company.id, key: cw.key, compare: .head), knownValues: [], now: cw.w.now)
+        let index = try #require(snapshot.sectionPaths.firstIndex(of: "src/fn.ts"))
+        let engineHunks = DiffAnchoring.hunks(in: snapshot.patch, sectionIndex: index)
+        try #require(engineHunks.count == 1)
+        #expect(engineHunks[0].header == "@@ -12,7 +12,7 @@ fn -1 +11", "\(engineHunks[0].header)")
+        let app = DiffModel.parse(patch: snapshot.patch)
+        try #require(app.files.count == snapshot.sectionPaths.count && app.files[index].hunks.count == 1)
+        func agrees(_ engine: DiffAnchoring.Hunk, _ file: DiffFile, patch: String, section: Int, _ label: String) {
+            let hunk = file.hunks[0]
+            let shown = engine.numbered.filter { $0.old != nil || $0.new != nil }
+            #expect(shown.map { [$0.old, $0.new] } == hunk.lines.map { [$0.oldNo, $0.newNo] }, "\(label)")
+            #expect(hunk.lines.first.map { [$0.oldNo, $0.newNo] } == [12, 12], "\(label)")
+            #expect([hunk.oldStart, hunk.newStart] == [12, 12] && [engine.oldStart, engine.newStart] == [12, 12], "\(label)")
+            #expect(hunk.lines.first { $0.kind == .add }?.newNo == 15 && hunk.lines.first { $0.kind == .del }?.oldNo == 15, "\(label)")
+            // The holder's quote row (`DiffQuote`) for new line 15 is the edited line; the marker lands on the same text.
+            let row = engine.numbered.firstIndex { $0.new == 15 }
+            #expect(row.map { engine.lines[$0] } == "+    line 15 changed", "\(label)")
+            let comment = DiffComment(id: UUID().uuidString, companyId: "c", itemId: "i", kind: DiffComment.comment, path: "src/fn.ts", side: "new",
+                                      line: 15, lineHash: StableHash.fnv1a64("    line 15 changed"), hunkHeader: engine.header,
+                                      compare: "ENG-1:diff@worktree", baseSha: nil, text: "look", eventId: nil, createdAt: .now, resolvedAt: nil)
+            let relocated = DiffAnchoring.relocate(comment, in: patch, sectionIndex: section)
+            #expect(relocated == 15, "\(label)")
+            #expect(relocated.flatMap { ChangesTabModel.anchor(in: file, path: "src/fn.ts", side: "new", line: $0)?.lineText } == "    line 15 changed",
+                    "\(label)")
+        }
+        agrees(engineHunks[0], app.files[index], patch: snapshot.patch, section: index, "git")
+        #expect(ChangesTabModel.spans(app) == snapshot.sectionHunks && snapshot.sectionHunks[index] == [HunkSpan(oldStart: 12, newStart: 12, old: 7, new: 7, shown: 8)])
+        #expect(ChangesTabModel.verify(app, against: snapshot) == nil)
+
+        // The same hunk under function contexts holding `-N`, `+N`, `@@` and `,`: the same starts on both sides, the same rows.
+        let body = (12...14).map { "     line \($0)" } + ["-    line 15", "+    line 15 changed"] + (16...18).map { "     line \($0)" }
+        let contexts = ["fn -1 +11", "-1 +11", "+11 -1", "@@ -1,2 +3,4 @@", "x @@ -99 +98 @@", "a,-1,+2, -3, +4,5", "-1,2", "@@", ",", "@@@ -1 +1 @@@"]
+        for context in contexts {
+            let header = "@@ -12,7 +12,7 @@ " + context
+            let starts = DiffAnchoring.starts(header)
+            #expect(starts.old == 12 && starts.new == 12, "\(context)")
+            let patch = DiffPresentationTests.file("src/fn.ts", body, header: header)
+            let engine = DiffAnchoring.hunks(in: patch, sectionIndex: 0), parsed = DiffModel.parse(patch: patch)
+            try #require(engine.count == 1 && parsed.files.count == 1 && parsed.files[0].hunks.count == 1)
+            agrees(engine[0], parsed.files[0], patch: patch, section: 0, context)
+            #expect(ChangesTabModel.spans(parsed) == DiffAnchoring.spans(in: patch), "\(context)")
+        }
+        // Plain headers, and unreadable ones (git never writes them): one reading, 0 when unreadable, on both sides.
+        for (header, want) in [("@@ -0,0 +1 @@", [0, 1]), ("@@ -1 +1 @@", [1, 1]), ("@@ -3,0 +4,2 @@ -9 +9", [3, 4]), ("@@ x @@", [0, 0]),
+                               ("@@  -1 +1 @@", [0, 0]), ("@@ +1 -1 @@", [0, 0]), ("@@ -1 +1", [0, 0]), ("@@ -1 +1 @@x", [0, 0]), ("@@ -1x +2 @@", [0, 0]),
+                               ("@@ -1234567890 +1 @@", [0, 0]), ("@@ -\u{661} +1 @@", [0, 0])] {
+            let s = DiffAnchoring.starts(header)
+            #expect([s.old, s.new] == want, "\(header)")
+            let patch = DiffPresentationTests.file("src/x.ts", ["+a", " b"], header: header)
+            let parsed = DiffModel.parse(patch: patch)
+            #expect(parsed.files.first?.hunks.first.map { [$0.oldStart, $0.newStart] } == want, "\(header)")
+            #expect(ChangesTabModel.spans(parsed) == DiffAnchoring.spans(in: patch), "\(header)")
+            // The anchor's header range is the same reading: nil exactly when the starts are unreadable.
+            #expect((DiffAnchoring.headerRange(header) == nil) == (want == [0, 0]), "\(header)")
+        }
+
+        // A forced start mismatch is refused: the pre-fix app reading (the last `-N`/`+N` of the line: 1 and 11), a start off by
+        // one on either side, and a snapshot whose spans carry other starts.
+        var oldReading = app
+        oldReading.files[index].hunks[0].oldStart = 1
+        oldReading.files[index].hunks[0].newStart = 11
+        var o = 1, n = 11
+        for i in oldReading.files[index].hunks[0].lines.indices {
+            let line = oldReading.files[index].hunks[0].lines[i]
+            if line.oldNo != nil { oldReading.files[index].hunks[0].lines[i].oldNo = o; o += 1 }
+            if line.newNo != nil { oldReading.files[index].hunks[0].lines[i].newNo = n; n += 1 }
+        }
+        #expect(ChangesTabModel.verify(oldReading, against: snapshot) == ChangesTabModel.unverifiedText)
+        for (dOld, dNew) in [(1, 0), (0, 1), (-1, 0), (0, -1)] {
+            var shifted = app
+            shifted.files[index].hunks[0].oldStart += dOld
+            shifted.files[index].hunks[0].newStart += dNew
+            #expect(ChangesTabModel.verify(shifted, against: snapshot) == ChangesTabModel.unverifiedText, "\(dOld) \(dNew)")
+            var forged = snapshot
+            forged.sectionHunks[index][0].oldStart += dOld
+            forged.sectionHunks[index][0].newStart += dNew
+            #expect(ChangesTabModel.verify(app, against: forged) == ChangesTabModel.unverifiedText, "\(dOld) \(dNew)")
+        }
+        #expect(HunkSpan(oldStart: 1, newStart: 11, old: 7, new: 7, shown: 8) != HunkSpan(oldStart: 12, newStart: 12, old: 7, new: 7, shown: 8))
     }
 }

@@ -338,18 +338,18 @@ import BrahmaCore
     }
 
     /// Ruling C6b-2: nil when `diff`'s sections are the engine's (`sectionPaths`: the same count, the same path at every index) and
-    /// (R2-1) every hunk of every section has the engine's line counts (`sectionHunks`), else `unverifiedText`: a parse that reads
-    /// any line differently from the engine never has its markers or numbers drawn.
+    /// (R2-1) every hunk of every section has the engine's line counts and (N3-1) start lines (`sectionHunks`), else
+    /// `unverifiedText`: a parse that reads any line or hunk header differently from the engine never has its markers or numbers drawn.
     public static func verify(_ diff: DiffModel, against snapshot: ChangesSnapshot) -> String? {
         guard diff.files.map(\.path) == snapshot.sectionPaths, spans(diff) == snapshot.sectionHunks else { return unverifiedText }
         return nil
     }
 
-    /// R2-1: the app parse's line counts per file and hunk, in the engine's `HunkSpan` terms.
+    /// R2-1: the app parse's start lines (N3-1) and line counts per file and hunk, in the engine's `HunkSpan` terms.
     public static func spans(_ diff: DiffModel) -> [[HunkSpan]] {
         diff.files.map { file in
             file.hunks.map { h in
-                HunkSpan(old: h.lines.filter { $0.oldNo != nil }.count, new: h.lines.filter { $0.newNo != nil }.count,
+                HunkSpan(oldStart: h.oldStart, newStart: h.newStart, old: h.lines.filter { $0.oldNo != nil }.count, new: h.lines.filter { $0.newNo != nil }.count,
                          shown: h.lines.filter { $0.oldNo != nil || $0.newNo != nil }.count)
             }
         }

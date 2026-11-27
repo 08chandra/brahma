@@ -114,22 +114,27 @@ public struct ChangesSnapshot: Equatable, Sendable {
     /// Ruling C6b-2: the path of every `diff --git` section of `patch`, in order (`ChangesPatch.parse` over the shown patch). A diff
     /// parser's result must agree with it, section for section, before anything is drawn; `ChangedFile.patchIndex` indexes it.
     public var sectionPaths: [String] = []
-    /// C6b R2-1: per section, per hunk, the engine's line counts (`DiffAnchoring.spans`: its own classification of the shown patch).
+    /// C6b R2-1: per section, per hunk, the engine's start lines and line counts (`DiffAnchoring.spans`: its own reading of the shown patch).
     /// A parser that reads any line differently disagrees with it, and the app refuses to render (`ChangesTabModel.verify`).
     public var sectionHunks: [[HunkSpan]] = []
 }
 
 /// C6b R2-1: one hunk's lines as the engine numbers them: `old` lines (context and removed), `new` lines (context and added) and
 /// `shown` lines (every numbered line). The three fix the count of added, removed and context lines, so two readings that
-/// classify any line differently never agree on all three.
+/// classify any line differently never agree on all three. N3-1: `oldStart`/`newStart` are the numbers the hunk's first old and
+/// new lines take (`DiffAnchoring.starts` of its header), so two readings that number a hunk from different lines never agree.
 public struct HunkSpan: Equatable, Hashable, Sendable, CustomStringConvertible {
+    public var oldStart: Int
+    public var newStart: Int
     public var old: Int
     public var new: Int
     public var shown: Int
 
-    public init(old: Int, new: Int, shown: Int) { self.old = old; self.new = new; self.shown = shown }
+    public init(oldStart: Int, newStart: Int, old: Int, new: Int, shown: Int) {
+        self.oldStart = oldStart; self.newStart = newStart; self.old = old; self.new = new; self.shown = shown
+    }
 
-    public var description: String { "(-\(old) +\(new) =\(shown))" }
+    public var description: String { "(@\(oldStart),\(newStart) -\(old) +\(new) =\(shown))" }
 }
 
 /// A revision of an item: `base` (the merge base with `main`), `r<n>` (the commit of its n-th check run, oldest first),
