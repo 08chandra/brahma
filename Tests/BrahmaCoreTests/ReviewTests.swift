@@ -1486,9 +1486,9 @@ import GRDB
     @Test func theGitVersionIsRecordedAtStartUp() async throws {
         let r = try R()
         try r.store.recoverMerges()
-        // "git version 2.52.0" (Apple's git appends a parenthesised build).
-        let words = try GitFixture.plainGit(["--version"], in: r.root).split(separator: " ").map(String.init)
-        let version = try #require(words.dropFirst(2).first)
+        // The engine's own git (Plan S S5, B9: `ToolPaths.git`, resolved from the safe PATH directories), which need not be the
+        // first `git` on the owner's PATH.
+        let version = try ToolPaths.engine().get().gitVersion
         let lines = try r.store.events(afterId: 0, companyId: r.company.id).map(\.text)
         #expect(lines.contains { $0.contains("git \(version)") && $0.contains("2.43") }, "\(lines)")
     }

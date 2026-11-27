@@ -81,7 +81,8 @@ extension TurnError: CustomStringConvertible {
 
 /// Runs `claude -p` as a child process: prompt on stdin, stream-json on stdout.
 public struct ClaudeProcessRunner: TurnRunning {
-    /// Command name looked up via `/usr/bin/env`, or an absolute path launched directly.
+    /// An absolute path launched directly, or a bare name (`claude`) resolved once per engine to its absolute path in the safe
+    /// `PATH` directories (`ToolPaths`, B9). Never started through `/usr/bin/env`.
     public var claudePath: String
     /// The wall clock of a turn whose request names none (`TurnProfile.wallClock`): the Plan 1 fallback.
     public var maxTurnDuration: Duration
@@ -169,47 +170,76 @@ public struct ClaudeProcessRunner: TurnRunning {
         let env = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment, engineClaudeVars: profile.environment,
                                         purpose: .claude, allowBuiltinAgentsSwitch: profile.builtinAgentsDisabled)
         let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
+        let cwd = URL(fileURLWithPath: request.workingDirectory, isDirectory: true)
         return await Task.detached { () -> ControlTranscript? in
-            let process = Process()
-            if claude.hasPrefix("/") {
-                process.executableURL = URL(fileURLWithPath: claude); process.arguments = args
-            } else {
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/env"); process.arguments = [claude] + args
-            }
-            process.environment = env
-            process.currentDirectoryURL = URL(fileURLWithPath: request.workingDirectory, isDirectory: true)
-            let stdin = Pipe(), stdout = Pipe()
-            process.standardInput = stdin
-            process.standardOutput = stdout
-            process.standardError = FileHandle.nullDevice
-            let collected = ControlLines(waitingFor: ids)
-            stdout.fileHandleForReading.readabilityHandler = { h in
-                let data = h.availableData
-                if data.isEmpty { h.readabilityHandler = nil } else { collected.append(data) }
-            }
-            do { try process.run() } catch {
-                stdout.fileHandleForReading.readabilityHandler = nil
+            // `claude` by its absolute path (a bare name: `ToolPaths.claude`), as argv[0], through `Spawn`; it leads its own
+            // process group, as Foundation's `Process` made it too. No `claude` to start: a failed session (it was `env`'s
+            // exit 127 before), never a skipped one.
+            let executable: String
+            do { executable = try Self.executable(claude) } catch { return ControlTranscript(exitStatus: nil, lines: []) }
+            let stdin: (read: Int32, write: Int32), stdout: (read: Int32, write: Int32), child: Spawn.Child
+            do {
+                stdin = try Spawn.pipePair()
+                do { stdout = try Spawn.pipePair() } catch { close(stdin.read); close(stdin.write); throw error }
+                do {
+                    child = try Spawn.start(executable, args, cwd: cwd, env: env, stdin: .descriptor(stdin.read),
+                                            stdout: .descriptor(stdout.write), stderr: .null)
+                } catch {
+                    for fd in [stdin.read, stdin.write, stdout.read, stdout.write] { close(fd) }
+                    throw error
+                }
+            } catch {
                 return nil
             }
-            #if canImport(Darwin)
-            _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
-            #endif
-            try? stdin.fileHandleForWriting.write(contentsOf: Data(input.utf8))
-            let deadline = AwakeTime.uptime() + seconds
-            while AwakeTime.uptime() < deadline, process.isRunning, !collected.done { usleep(20_000) }
-            let exitedByItself = !process.isRunning
-            try? stdin.fileHandleForWriting.close()
-            if process.isRunning {
-                process.terminate()
-                let killAt = AwakeTime.uptime() + Self.killGrace
-                while process.isRunning, AwakeTime.uptime() < killAt { usleep(20_000) }
-                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            close(stdin.read); close(stdout.write)
+            let collected = ControlLines(waitingFor: ids)
+            let reader = Thread {
+                var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+                while true {
+                    let n = buffer.withUnsafeMutableBytes { read(stdout.read, $0.baseAddress, $0.count) }
+                    if n < 0, errno == EINTR { continue }
+                    if n <= 0 { break }
+                    collected.append(Data(buffer[0..<n]))
+                }
+                close(stdout.read)
             }
-            process.waitUntilExit()
+            reader.start()
+            #if canImport(Darwin)
+            _ = fcntl(stdin.write, F_SETNOSIGPIPE, 1)
+            #endif
+            let input = Data(input.utf8)
+            input.withUnsafeBytes { raw in
+                var offset = 0
+                while offset < raw.count {
+                    let n = write(stdin.write, raw.baseAddress! + offset, raw.count - offset)
+                    if n < 0 { if errno == EINTR || errno == EAGAIN { continue }; break }
+                    offset += n
+                }
+            }
+            let deadline = AwakeTime.uptime() + seconds
+            while AwakeTime.uptime() < deadline, child.isAlive(), !collected.done { usleep(20_000) }
+            let exitedByItself = !child.isAlive()
+            close(stdin.write)
+            // SIGTERM, `killGrace`, SIGKILL; then swept and reaped.
+            child.stop(grace: Self.killGrace)
             usleep(50_000)
-            stdout.fileHandleForReading.readabilityHandler = nil
-            return ControlTranscript(exitStatus: exitedByItself ? process.terminationStatus : nil, lines: collected.lines)
+            // Foundation's convention, as before: the exit code, or the number of the signal that ended it.
+            let raw = child.waitStatus()
+            let status: Int32 = raw & 0x7f == 0 ? (raw >> 8) & 0xff : raw & 0x7f
+            return ControlTranscript(exitStatus: exitedByItself && !child.lostTrack ? status : nil, lines: collected.lines)
         }.value
+    }
+
+    /// The executable a configured `claudePath` names: an absolute path as is; a bare name (`claude`) the engine's
+    /// `ToolPaths.claude` (B9: resolved once at engine start from the safe absolute PATH directories); anything else is
+    /// refused (`Spawn.validate`). Never `/usr/bin/env`.
+    static func executable(_ claudePath: String) throws -> String {
+        if claudePath.hasPrefix("/") { return claudePath }
+        if claudePath.isEmpty || claudePath.contains("/"), case .deny(let why) = Spawn.validate(claudePath) {
+            throw Spawn.Failure(message: why)
+        }
+        guard let found = ToolPaths.engineTool(named: claudePath) else { throw ToolPathsError.claudeMissing }
+        return found
     }
 
     private func execute(_ request: TurnRequest, yield: (StreamEvent) -> Void) async throws {
@@ -248,14 +278,9 @@ public struct ClaudeProcessRunner: TurnRunning {
             }
         }
         let args = TurnProfileCompiler.arguments(profile)
-        let executable: String, argv: [String]
-        if claudePath.hasPrefix("/") {
-            executable = claudePath
-            argv = [claudePath] + leadingArguments + args
-        } else {
-            executable = "/usr/bin/env"
-            argv = ["env", claudePath] + leadingArguments + args
-        }
+        // `claude` by its absolute path, as argv[0] (B9; a bare name is `ToolPaths.claude`), never `/usr/bin/env`.
+        let executable = try Self.executable(claudePath)
+        let argv = [executable] + leadingArguments + args
         let environment = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment,
                                                 engineClaudeVars: profile.environment, purpose: .claude, secrets: request.secrets,
                                                 allowBuiltinAgentsSwitch: profile.builtinAgentsDisabled)

@@ -180,46 +180,35 @@ struct GitCommand: Sendable {
         return numbers[0] > 2 || numbers[0] == 2 && numbers[1] >= 43
     }
 
-    /// A `git --version` process, not yet run: the executable resolved in the engine from the ABSOLUTE entries of the
-    /// child's PATH (`resolveGit`) and exec'd by absolute path, the child's PATH stripped of empty and relative entries, as
-    /// every other git the engine starts (never `/usr/bin/env git`). Nil when no git is found.
-    static func versionProbe(base: [String: String] = ProcessInfo.processInfo.environment) -> (Process, executable: String)? {
-        var environment = ChildEnvironment.make(base: base, purpose: .general)
-        environment["PATH"] = GitCommand.absoluteEntries(of: environment["PATH"])
-        guard let executable = GitCommand.resolveGit(path: environment["PATH"]) else { return nil }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = ["--version"]
-        process.environment = environment
-        return (process, executable)
+    /// The engine's git (`ToolPaths.git`, B9): resolved once per process from the safe absolute `PATH` directories, by
+    /// absolute path, at least 2.43, never `/usr/bin/env git` and never a lookup in the child's working directory.
+    static func tools() -> Result<ToolPaths, ToolPathsError> {
+        if !ToolPaths.isResolved { EngineGitGuard.willRunGit("git --version (tool paths)") }
+        return ToolPaths.engine()
     }
 
-    /// Asked once per process.
-    static let installedSupportsAttrSource: Bool = {
-        EngineGitGuard.willRunGit("git --version (attr-source probe)")
-        guard let (process, _) = versionProbe() else { return false }
-        let out = Pipe()
-        process.standardOutput = out; process.standardError = FileHandle.nullDevice; process.standardInput = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return false }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return process.terminationStatus == 0 && supportsAttrSource(versionLine: String(decoding: data, as: UTF8.self))
-    }()
+    /// The absolute git every engine call starts, or the reason there is none (as a `GitError` of `command`).
+    static func executable(command: String) throws -> String {
+        switch tools() {
+        case .success(let tools): return tools.git
+        case .failure(let problem): throw GitError.failed(command: command, status: -1, stderr: "\(problem)")
+        }
+    }
 
-    /// The installed git's version as `git --version` prints it (`2.52.0`), read once; nil when it cannot be read.
-    static let gitVersionText: String? = {
-        EngineGitGuard.willRunGit("git --version")
-        guard let (process, _) = versionProbe() else { return nil }
-        let pipe = Pipe()
-        process.standardOutput = pipe; process.standardError = FileHandle.nullDevice; process.standardInput = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        let text = String(decoding: data, as: UTF8.self)
-        guard process.terminationStatus == 0, let match = text.range(of: "[0-9]+\\.[0-9]+(\\.[0-9]+)?", options: .regularExpression)
-        else { return nil }
-        return String(text[match])
-    }()
+    /// Whether the engine's git takes `--attr-source` (`ToolPaths` resolves only a git of at least 2.43).
+    static var installedSupportsAttrSource: Bool {
+        if case .success(let tools) = tools() { return supportsAttrSource(versionLine: "git version \(tools.gitVersion)") }
+        return false
+    }
+
+    /// The engine's git version as `git --version` prints it (`2.52.0`); nil when it cannot be read.
+    static var gitVersionText: String? {
+        switch tools() {
+        case .success(let tools): return tools.gitVersion
+        case .failure(.gitTooOld(let version)): return version == "unknown" ? nil : version
+        case .failure: return nil
+        }
+    }
 
     /// The engine's merge work materializes trees: it is refused, not run with the repository's attributes, on a git
     /// without `--attr-source` (`installedSupportsAttrSource`).
@@ -277,9 +266,10 @@ struct GitCommand: Sendable {
         return env
     }
 
-    /// `attrSource`: the tree attributes are read from (the empty tree of the repository's hash), nil on an older git.
+    /// git's arguments after argv[0] (the absolute `ToolPaths.git`). `attrSource`: the tree attributes are read from (the
+    /// empty tree of the repository's hash), nil on an older git.
     func arguments(_ args: [String], attrSource: String?) -> [String] {
-        ["git", "-C", workTreeDescriptor == nil ? workTree.path : "."] + (attrSource.map { ["--attr-source=\($0)"] } ?? []) + extraConfig + Self.configFlags
+        ["-C", workTreeDescriptor == nil ? workTree.path : "."] + (attrSource.map { ["--attr-source=\($0)"] } ?? []) + extraConfig + Self.configFlags
             + (allowsLocalFetch ? ["-c", "protocol.file.allow=always"] : [])
             + (allowsHTTPSFetch ? ["-c", "protocol.https.allow=always"] : []) + args
     }
@@ -289,12 +279,12 @@ struct GitCommand: Sendable {
     /// records what git would have been given; `LiveGitRunner` hands it to `runPrepared`.
     func commandLine(_ args: [String]) throws -> (args: [String], environment: [String: String]) {
         let attrSource = try prepare(args)
-        return (Array(arguments(args, attrSource: attrSource).dropFirst()), environment())
+        return (arguments(args, attrSource: attrSource), environment())
     }
 
     /// Runs the command line `commandLine` built (one attempt, no `index.lock` retry; `SafeGit` never takes the index lock).
     func runPrepared(args: [String], environment: [String: String], maxOutput: Int, stdin: Stdin) throws -> Output {
-        try runOnce(["git"] + args, environment: environment, label: args.joined(separator: " "), maxOutput: maxOutput, stdin: stdin)
+        try runOnce(args, environment: environment, label: args.joined(separator: " "), maxOutput: maxOutput, stdin: stdin)
     }
 
     /// Before each attempt: an older git may only run tree-free plumbing; the repository's config must hold only allowed
@@ -340,7 +330,7 @@ struct GitCommand: Sendable {
         env["GIT_CONFIG_NOSYSTEM"] = "1"
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_CEILING_DIRECTORIES"] = "/"
-        return try runOnce(["git", "-C", "/", "config", "--file", file.path, "--no-includes", "--null", "--list"],
+        return try runOnce(["-C", "/", "config", "--file", file.path, "--no-includes", "--null", "--list"],
                            environment: env, label: "config --list", maxOutput: 1 << 20)
     }
 
@@ -415,37 +405,28 @@ struct GitCommand: Sendable {
         (path ?? "").split(separator: ":", omittingEmptySubsequences: true).filter { $0.hasPrefix("/") }.joined(separator: ":")
     }
 
-    /// `git` as an absolute path: the first `<dir>/git` that is a regular executable file in the ABSOLUTE entries of `path`.
-    /// Resolved in the engine, before the spawn, so the child never searches its working directory (an agent's worktree,
-    /// when anchored) for a planted `git`; nil when there is none.
-    static func resolveGit(path: String?) -> String? {
-        for dir in (path ?? "").split(separator: ":", omittingEmptySubsequences: true) where dir.hasPrefix("/") {
-            let candidate = String(dir) + "/git"
-            var st = stat()
-            if stat(candidate, &st) == 0, st.st_mode & S_IFMT == S_IFREG, access(candidate, X_OK) == 0 { return candidate }
-        }
-        return nil
+    /// The directory every engine git starts in (B9, spec §6.5): an engine-owned one, the repository's common dir (its git
+    /// dir for the workspace itself), never an agent's worktree; `/` while that directory does not exist yet (`init`). git
+    /// still works on the work tree it is told (`-C`, `GIT_WORK_TREE`) and reads nothing from where it starts.
+    var engineDirectory: URL {
+        let dir = commonDir ?? gitDir
+        var st = stat()
+        if stat(dir.path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR { return dir }
+        return URL(fileURLWithPath: "/", isDirectory: true)
     }
 
-    private func runOnce(_ argv: [String], environment: [String: String], label: String, maxOutput: Int, stdin: Stdin = .none) throws -> Output {
+    /// `args` are git's arguments after argv[0].
+    private func runOnce(_ args: [String], environment: [String: String], label: String, maxOutput: Int, stdin: Stdin = .none) throws -> Output {
         EngineGitGuard.willRunGit("git \(label)")
-        // The executable is resolved here and exec'd directly: never `/usr/bin/env git` with the child's directory on PATH.
-        guard let executable = Self.resolveGit(path: environment["PATH"]) else {
-            throw GitError.failed(command: label, status: -1, stderr: "no git executable on an absolute PATH entry")
-        }
-        let argv = [executable] + argv.dropFirst()
+        // The executable is the engine's `ToolPaths.git`, exec'd directly as argv[0]: never `/usr/bin/env git`, never a
+        // lookup on the child's PATH or in its working directory.
+        let executable = try Self.executable(command: label)
+        let argv = [executable] + args
         spawnObserver?(executable, argv)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = Array(argv.dropFirst())
-        process.environment = environment
         var feed: (pipe: Pipe, result: FeedResult)?
         switch stdin {
-        case .none: process.standardInput = FileHandle.nullDevice
-        case .data, .stream:
-            let pipe = Pipe()
-            process.standardInput = pipe.fileHandleForReading
-            feed = (pipe, FeedResult())
+        case .none: break
+        case .data, .stream: feed = (Pipe(), FeedResult())
         }
         // Output goes to files, not pipes: concurrent children cannot hold each other's pipe ends open, and a grandchild
         // that outlives git cannot keep us waiting for end of file.
@@ -462,22 +443,15 @@ struct GitCommand: Sendable {
             try? outHandle.close(); try? errHandle.close()
             _ = try? EngineFiles.removeNoFollow(outURL, under: tempRoot); _ = try? EngineFiles.removeNoFollow(errURL, under: tempRoot)
         }
-        process.standardOutput = outHandle
-        process.standardError = errHandle
-        // A merge's git leads its own group, recorded for the owner's stop until it is reaped (`childGroups`); a git anchored
-        // to a work tree descriptor (`workTreeDescriptor`) is spawned the same way, `fchdir`ed into it before exec.
-        let grouped: ProcessGroupChild?
+        // Every git leads its own process group (as Foundation's `Process` made it too) and starts in `engineDirectory`
+        // (`Spawn`); a merge's git is also recorded for the owner's stop until it is reaped (`childGroups`); a git anchored to
+        // a work tree descriptor (`workTreeDescriptor`, `SafeGit`) is `fchdir`ed into it before exec.
+        let grouped: ProcessGroupChild
         do {
-            if childGroups != nil || workTreeDescriptor != nil {
-                let input = feed.map { $0.pipe.fileHandleForReading.fileDescriptor } ?? -1
-                grouped = try ProcessGroupChild.spawn(
-                    executable: executable, arguments: argv, environment: environment,
-                    workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
-                    output: outHandle.fileDescriptor, stdin: input, stderr: errHandle.fileDescriptor, workingDirectoryFD: workTreeDescriptor)
-            } else {
-                try process.run()
-                grouped = nil
-            }
+            let input = feed.map { $0.pipe.fileHandleForReading.fileDescriptor } ?? -1
+            grouped = try ProcessGroupChild.spawn(
+                executable: executable, arguments: argv, environment: environment, workingDirectory: engineDirectory,
+                output: outHandle.fileDescriptor, stdin: input, stderr: errHandle.fileDescriptor, workingDirectoryFD: workTreeDescriptor)
         } catch {
             if let feed { try? feed.pipe.fileHandleForReading.close(); try? feed.pipe.fileHandleForWriting.close() }
             throw GitError.failed(command: label, status: -1, stderr: "\(error)")
@@ -499,15 +473,15 @@ struct GitCommand: Sendable {
                 } catch { result.error = error }
             }.start()
         }
-        let record = grouped.flatMap { childGroups?.record($0.pid) }
+        let record = childGroups?.record(grouped.pid)
         let timedOut = TimeoutFlag()
-        let timer = DispatchWorkItem { timedOut.mark(); if let grouped { grouped.signalGroup(SIGTERM) } else { process.terminate() } }
+        let timer = DispatchWorkItem { timedOut.mark(); grouped.signalGroup(SIGTERM) }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: timer)
         // The size watch polls on a thread of its own: a busy shared dispatch pool must never let git outgrow the cap.
         let oversize = TimeoutFlag(), flooded = TimeoutFlag(), watchDone = TimeoutFlag()
         let unmeasurable = PathFlag()
         if let sizeWatch {
-            let stop = GitStopper(process: process, grouped: grouped)
+            let stop = GitStopper(grouped: grouped)
             let outputCap = Int64(maxOutput) + Self.maxWatchedStderr
             @Sendable func bytes(_ url: URL) -> Int64 {
                 var st = stat()
@@ -534,16 +508,11 @@ struct GitCommand: Sendable {
                 }
             }.start()
         }
-        var groupedStatus: Int32 = 0
-        if let grouped {
-            // Foundation's convention: the exit code, or the number of the signal that ended it.
-            let raw = grouped.finish()
-            groupedStatus = raw & 0x7f == 0 ? (raw >> 8) & 0xff : raw & 0x7f
-            if grouped.lostTrack { groupedStatus = -1 }
-            childGroups?.forget(record, pid: grouped.pid)
-        } else {
-            process.waitUntilExit()
-        }
+        // Foundation's convention: the exit code, or the number of the signal that ended it.
+        let raw = grouped.finish()
+        var groupedStatus: Int32 = raw & 0x7f == 0 ? (raw >> 8) & 0xff : raw & 0x7f
+        if grouped.lostTrack { groupedStatus = -1 }
+        childGroups?.forget(record, pid: grouped.pid)
         timer.cancel()
         watchDone.mark()
         // Git has exited, so the feeder's next write fails and it finishes; nothing waits on a live pipe.
@@ -561,7 +530,7 @@ struct GitCommand: Sendable {
         if oversize.cut, let sizeWatch { stderr = "stopped: the repository grew past \(sizeWatch.limit) bytes" + (stderr.isEmpty ? "" : ": \(stderr)") }
         if flooded.cut { stderr = "stopped: git's output passed \(Self.maxWatchedStderr) bytes" + (stderr.isEmpty ? "" : ": \(stderr)") }
         if let dir = unmeasurable.path { stderr = "stopped: \(dir) could not be measured" + (stderr.isEmpty ? "" : ": \(stderr)") }
-        var status = grouped == nil ? process.terminationStatus : groupedStatus
+        var status = groupedStatus
         if let error = feed?.result.error {
             // The input ended early: whatever git made of the part it got does not count as success.
             if status == 0 { status = -1 }
@@ -698,10 +667,9 @@ enum RepoConfigGuard {
 
 /// Stops one git run from the size watch's thread (the process objects are only signalled, never otherwise touched there).
 private final class GitStopper: @unchecked Sendable {
-    let process: Process
-    let grouped: ProcessGroupChild?
-    init(process: Process, grouped: ProcessGroupChild?) { self.process = process; self.grouped = grouped }
-    func stop() { if let grouped { grouped.signalGroup(SIGTERM) } else { process.terminate() } }
+    let grouped: ProcessGroupChild
+    init(grouped: ProcessGroupChild) { self.grouped = grouped }
+    func stop() { grouped.signalGroup(SIGTERM) }
 }
 
 /// A flag set from a timer thread.
@@ -2284,39 +2252,23 @@ public struct GitWorkspace: Sendable {
         return try? checkoutsDirectory(command: command)
     }
 
-    /// Unpacks a tar file made by `git archive` (read from `archive`, a descriptor) with `/usr/bin/tar` into `place`. tar is
-    /// spawned with its working directory set from `place`'s descriptor (`posix_spawn_file_actions_addfchdir_np`), so it
-    /// writes relative to that directory wherever its path now leads; `-k` never overwrites a file, and tar refuses
-    /// absolute paths, `..` and extraction through links. Every other descriptor is closed in the child.
+    /// Unpacks a tar file made by `git archive` (read from `archive`, a descriptor) with `ToolPaths.tar` (`/usr/bin/tar`) into
+    /// `place`. tar is spawned (`Spawn`, in the engine's process group as before, waited for without a timeout as before) with
+    /// its working directory set from `place`'s descriptor (`posix_spawn_file_actions_addfchdir_np`), so it writes relative
+    /// to that directory wherever its path now leads; `-k` never overwrites a file, and tar refuses absolute paths, `..` and
+    /// extraction through links. Every other descriptor is closed in the child.
     static func untar(_ archive: Int32, into place: EngineFiles.OpenDirectory) throws {
-        var actions: posix_spawn_file_actions_t? = nil
-        var attr: posix_spawnattr_t? = nil
-        posix_spawn_file_actions_init(&actions); posix_spawnattr_init(&attr)
-        defer { posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attr) }
-        posix_spawn_file_actions_adddup2(&actions, archive, 0)
-        posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
-        posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
-        posix_spawn_file_actions_addfchdir_np(&actions, place.fd)
-        var defaults = sigset_t(), mask = sigset_t()
-        sigfillset(&defaults); sigemptyset(&mask)
-        posix_spawnattr_setsigdefault(&attr, &defaults)
-        posix_spawnattr_setsigmask(&attr, &mask)
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK))
         let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
-        let arguments: [String] = ["/usr/bin/tar", "-x", "-k", "-f", "-"]
-        var argv: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) } + [nil]
-        var envp: [UnsafeMutablePointer<CChar>?] = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
-        defer { for p in argv { free(p) }; for p in envp { free(p) } }
-        var pid: pid_t = 0
-        let spawned = posix_spawn(&pid, "/usr/bin/tar", &actions, &attr, &argv, &envp)
-        guard spawned == 0 else {
-            throw GitError.failed(command: "archive", status: -1, stderr: "could not unpack the export: \(String(cString: strerror(spawned)))")
+        let tar: Spawn.Child
+        do {
+            tar = try Spawn.start(ToolPaths.fixedTar, ["-x", "-k", "-f", "-"], cwd: URL(fileURLWithPath: "/", isDirectory: true),
+                                  cwdDescriptor: place.fd, env: environment, stdin: .descriptor(archive), group: false)
+        } catch {
+            throw GitError.failed(command: "archive", status: -1, stderr: "could not unpack the export: \(error)")
         }
-        var status: Int32 = 0
-        while waitpid(pid, &status, 0) < 0 {
-            guard errno == EINTR else {
-                throw GitError.failed(command: "archive", status: -1, stderr: "could not wait for tar: \(String(cString: strerror(errno)))")
-            }
+        let status = tar.waitStatus()
+        guard !tar.lostTrack else {
+            throw GitError.failed(command: "archive", status: -1, stderr: "could not wait for tar: its exit status was lost")
         }
         // tar ran and refused: what it was given is the commit's tree (a path it or the volume refuses, an over-long name).
         guard status == 0 else {

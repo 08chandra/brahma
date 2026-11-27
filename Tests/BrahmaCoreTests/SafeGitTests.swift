@@ -130,14 +130,16 @@ import Foundation
         #expect(calls.contains { $0.args.contains("--batch-check") && $0.stdin == Data((sha + "\n").utf8) }, "the purge did not verify its objects")
     }
 
-    /// The live runner maps `GitCommand`'s timeout kill to `.timedOut`: a `git` on PATH that only sleeps, a short injected
-    /// timeout, and no bound on how late the kill comes (only that it does).
+    /// The live runner maps `GitCommand`'s timeout kill to `.timedOut`: the engine's git blocked opening a FIFO no one writes
+    /// (Plan S S5: a `git` planted on the child's PATH is never the one started, so the hang is the real git's), a short
+    /// injected timeout, and no bound on how late the kill comes (only that it does).
     @Test func liveRunnerMapsTimeoutKill() throws {
         let r = try Repo()
-        let bin = try FakeTools.bin(["git": "#!/bin/sh\nexec sleep 600\n"])
-        let env = ["PATH": bin.path + ":/usr/bin:/bin", "GIT_DIR": r.root.appending(path: ".git").path, "GIT_WORK_TREE": r.root.path]
+        let fifo = try tempDir().appending(path: "never-written")
+        try #require(mkfifo(fifo.path, 0o600) == 0)
+        let env = ["PATH": "/usr/bin:/bin", "GIT_DIR": r.root.appending(path: ".git").path, "GIT_WORK_TREE": r.root.path]
         #expect(throws: SafeGitError.timedOut) {
-            try LiveGitRunner().run(args: ["status"], env: env, stdin: nil, timeout: .milliseconds(200), outputCap: 1 << 20)
+            try LiveGitRunner().run(args: ["hash-object", fifo.path], env: env, stdin: nil, timeout: .milliseconds(200), outputCap: 1 << 20)
         }
         // An anchored command line without its descriptor is refused, never run in this process's directory.
         #expect(throws: SafeGitError.self) {
@@ -497,7 +499,7 @@ import Foundation
         let top = try g.run(["rev-parse", "--show-toplevel"]).text
         let real = realpath(r.wt.path, nil).map { p in defer { free(p) }; return String(cString: p) } ?? r.wt.path
         #expect(top == real, "\(top)")
-        #expect(g.arguments(["x"], attrSource: nil).prefix(3) == ["git", "-C", "."] && g.environment()["GIT_WORK_TREE"] == ".")
+        #expect(g.arguments(["x"], attrSource: nil).prefix(2) == ["-C", "."] && g.environment()["GIT_WORK_TREE"] == ".")
     }
 
     /// R4: a `git` planted in the worktree never runs, however PATH is shaped: the executable is resolved in the engine from
@@ -527,10 +529,11 @@ import Foundation
         #expect(seen.executable.hasPrefix("/") && seen.executable.hasSuffix("/git") && seen.executable != "/usr/bin/env" && seen.argv.first == seen.executable, "\(seen.executable)")
         #expect(g.environment()["PATH"] == "/usr/bin:/bin")
         #expect(!FileManager.default.fileExists(atPath: marker.path), "the planted git ran (plain)")
-        // The `git --version` probes: resolved the same way (absolute executable, stripped child PATH).
-        let probe = try #require(GitCommand.versionProbe(base: ["PATH": path, "HOME": scratch.path]))
-        #expect(probe.executable.hasPrefix("/") && !probe.executable.hasPrefix(r.wt.path) && probe.0.executableURL?.path == probe.executable)
-        #expect(probe.0.environment?["PATH"] == "/usr/bin:/bin" && probe.0.arguments == ["--version"])
+        // The engine's git (Plan S S5, B9): `ToolPaths.git`, absolute and outside the worktree, resolved once from the safe
+        // PATH directories (never the child's PATH), and at least 2.43; the version probe runs it by that path.
+        let tools = try ToolPaths.engine().get()
+        #expect(tools.git.hasPrefix("/") && !tools.git.hasPrefix(r.wt.path) && seen.executable == tools.git, "\(tools.git)")
+        #expect(ToolPaths.isSupportedGit(tools.gitVersion) && GitCommand.gitVersionText == tools.gitVersion)
         // The worktree diff itself, with the planted git sitting in the worktree (ignored by name: `FakeTools.install` hard-links
         // the shared script, which SafeFS would refuse as a file with another link): every git it starts is an absolute
         // executable outside the worktree, exec'd as argv[0].

@@ -22,6 +22,9 @@ struct Doctor: AsyncParsableCommand {
         for item in report.items {
             print("\(item.status.rawValue.uppercased().padding(toLength: 4, withPad: " ", startingAt: 0))  \(item.name)  \(safe(item.detail))")
         }
+        // B9: the engine's tools by absolute path (resolved when the store was opened, as the engine does at its start).
+        let tools = BrahmaCore.Doctor.toolPathsItem()
+        print("\(tools.status.rawValue.uppercased().padding(toLength: 4, withPad: " ", startingAt: 0))  \(tools.name)  \(safe(tools.detail))")
         if let item = BrahmaCore.Doctor.planTierItem(configured: store.planTier(), reported: report.reportedSubscription) {
             print("\(item.status.rawValue.uppercased().padding(toLength: 4, withPad: " ", startingAt: 0))  \(item.name)  \(safe(item.detail))")
         }
@@ -37,7 +40,7 @@ struct Doctor: AsyncParsableCommand {
         if let item = await BrahmaCore.Doctor.npmItem(store: store) {
             print("\(item.status.rawValue.uppercased().padding(toLength: 4, withPad: " ", startingAt: 0))  \(item.name)  \(safe(item.detail))")
         }
-        if !report.ok { throw ExitCode.failure }
+        if !report.ok || tools.status == .fail { throw ExitCode.failure }
         // A passing doctor is what ends an account or CLI hold (the running engine sees it on its next tick).
         try? store.clearHoldAfterDoctor(now: Date())
     }

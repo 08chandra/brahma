@@ -161,6 +161,9 @@ public actor Orchestrator {
     public nonisolated let releaseExecutor: ReleaseExecutor
     var releaseTasks: [String: Task<Void, Never>] = [:] { didSet { resumeIdleWaitersIfIdle() } }
 
+    /// The engine's tools (B9), resolved once at init (`ToolPaths.installForEngine`); `start` logs them.
+    public nonisolated let tools: Result<ToolPaths, ToolPathsError>
+
     static let usageRetry: TimeInterval = 15 * 60
     static let hour: TimeInterval = 3600
 
@@ -190,6 +193,12 @@ public actor Orchestrator {
                 releaseDeps: ReleaseDependencies? = nil,
                 mcpEnvironment: [String: String] = ProcessInfo.processInfo.environment) {
         self.stopPollSleep = stopPollSleep
+        // B9 (spec §6.5): the engine's tools by absolute path, resolved once here from the safe PATH directories outside
+        // every company workspace and the data home, and installed for every child the engine starts (git, claude, tar …).
+        // A store that cannot list its companies yet still keeps the data home and the workspaces directory out.
+        let workspacePaths: [String]
+        do { workspacePaths = try store.companies().map(\.workspacePath) } catch { workspacePaths = [] }
+        self.tools = ToolPaths.installForEngine(paths: paths, workspacePaths: workspacePaths)
         let engineBlocking = Blocking()
         self.blocking = engineBlocking
         let engineId = UUID().uuidString
@@ -271,6 +280,7 @@ public actor Orchestrator {
         try await EngineGitGuard.$engine.withValue(engineId) {
             // Raise the descriptor limit so the egress proxies' pooled sockets cannot starve the engine's own files (A-I2).
             if let raised = FileLimit.raise() { log("file descriptor limit: \(raised)") }
+            log("tools: \(Doctor.toolPathsItem(tools).detail)")
             // The first load of the secrets, in a Blocking body (vault reads may block; never on the actor).
             let (store, vault) = (self.store, self.vault)
             let failure: String? = await blocking.run {

@@ -129,7 +129,7 @@
     "Sources/BrahmaCore/Extensions/ExtensionLibrary.swift" : 10,
     "Sources/BrahmaCore/Extensions/ExtensionTry.swift" : 10,
     "Sources/BrahmaCore/Extensions/ExtensionValidator.swift" : 10,
-    "Sources/BrahmaCore/Git/GitWorkspace.swift" : 86,
+    "Sources/BrahmaCore/Git/GitWorkspace.swift" : 84,
     "Sources/BrahmaCore/Handbook/Handbook.swift" : 1,
     "Sources/BrahmaCore/Handbook/KBMarkdown.swift" : 1,
     "Sources/BrahmaCore/Hosting/CloudflarePagesAdapter.swift" : 1,
@@ -256,7 +256,7 @@
     "Sources/BrahmaCore/Turns/StreamParser.swift" : 5,
     "Sources/BrahmaCore/Turns/TurnDigest.swift" : 7,
     "Sources/BrahmaCore/Turns/TurnProcess.swift" : 7,
-    "Sources/BrahmaCore/Turns/TurnRunner.swift" : 11,
+    "Sources/BrahmaCore/Turns/TurnRunner.swift" : 9,
     "Sources/BrahmaCore/Util/OwnerKey.swift" : 8,
     "Sources/BrahmaCore/Verify/CheckScripts.swift" : 1,
     "Sources/BrahmaCore/Work/Liveness.swift" : 1,
@@ -299,7 +299,7 @@
     "Sources/BrahmaCore/Extensions/ExtensionTemplates.swift" : 2,
     "Sources/BrahmaCore/Extensions/ExtensionTry.swift" : 3,
     "Sources/BrahmaCore/Extensions/ExtensionValidator.swift" : 18,
-    "Sources/BrahmaCore/Git/GitWorkspace.swift" : 44,
+    "Sources/BrahmaCore/Git/GitWorkspace.swift" : 43,
     "Sources/BrahmaCore/Handbook/HandbookExporter.swift" : 1,
     "Sources/BrahmaCore/Hosting/Hosting.swift" : 1,
     "Sources/BrahmaCore/MCP/ExtensionTools.swift" : 1,
@@ -396,14 +396,8 @@
     "Sources/BrahmaCore/Store/Store+Release.swift" : 1
   },
   "spawn" : {
-    "Sources/BrahmaCore/Collab/Export.swift" : 1,
-    "Sources/BrahmaCore/Engine/Doctor.swift" : 1,
-    "Sources/BrahmaCore/Git/GitWorkspace.swift" : 6,
-    "Sources/BrahmaCore/Preview/AppleAdapters.swift" : 1,
     "Sources/BrahmaCore/Sandbox/ClaudeSettings.swift" : 2,
-    "Sources/BrahmaCore/Turns/TurnRunner.swift" : 3,
-    "Sources/BrahmaSafety/Process/ProcessGroup.swift" : 1,
-    "Sources/brahma/CanaryCommands.swift" : 1
+    "Sources/BrahmaSafety/Process/Spawn.swift" : 1
   },
   "turnScope" : {
     "Sources/BrahmaCore/Access/Grants.swift" : 1,

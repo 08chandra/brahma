@@ -1542,7 +1542,8 @@ import Foundation
         let linked = GitCommand(gitDir: f.root.appending(path: ".git/worktrees/K"), workTree: f.root, commonDir: f.root.appending(path: ".git"))
         #expect(linked.environment()["GIT_COMMON_DIR"] == f.root.appending(path: ".git").path)
         let args = git.arguments(["status"], attrSource: GitCommand.emptyTreeSHA1)
-        #expect(Array(args.suffix(args.count - 4)) == forced.flatMap { ["-c", $0] } + ["status"])
+        // `-C <work tree>`, `--attr-source=…`, then the forced flags (argv[0] is the absolute `ToolPaths.git`, not in `arguments`).
+        #expect(Array(args.suffix(args.count - 3)) == forced.flatMap { ["-c", $0] } + ["status"])
         #expect(args.contains("--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904"))
         #expect(args.contains("core.attributesFile=/dev/null"))
         #expect(args.firstIndex(of: "--attr-source=\(GitCommand.emptyTreeSHA1)")! < args.firstIndex(of: "status")!)
@@ -1552,6 +1553,34 @@ import Foundation
         try f.write(".git/info/attributes", "* filter=evil\n")
         _ = try f.ws.isDirty(in: f.root)
         #expect(try String(contentsOf: f.root.appending(path: ".git/info/attributes"), encoding: .utf8) == GitCommand.attributesOverride)
+    }
+
+    /// Plan S Task S5 (spec §6.5): the engine's own git starts by its absolute `ToolPaths.git`, as argv[0], with its working
+    /// directory an engine-owned one (the repository's common dir), never an agent's worktree under `.brahma/wt/`, across a
+    /// worktree's life: add, commit, status, diff.
+    @Test func engineGitNeverUsesAgentCwd() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        final class Seen: @unchecked Sendable { let lock = NSLock(); var all: [Spawn.Spawned] = [] }
+        let seen = Seen()
+        let tools = try ToolPaths.engine().get()
+        try Spawn.$observer.withValue({ s in seen.lock.withLock { seen.all.append(s) } }) {
+            let wt = try f.ws.addWorktree(key: "ENG-1")
+            try f.write("b.txt", "two", in: wt)
+            #expect(try f.ws.isDirty(in: wt))
+            let commit = try #require(try f.ws.commitAll(in: wt, message: "add b"))
+            #expect(try f.ws.isDirty(in: wt) == false)
+            let base = try #require(try f.ws.head(of: "main"))
+            #expect(try f.ws.diff(base: base, head: commit).text.contains("b.txt"))
+        }
+        let started = seen.lock.withLock { seen.all }
+        #expect(started.count >= 8, "\(started.count) spawns")
+        let agentPlaces = SandboxPath.resolve(f.root.appending(path: ".brahma/wt").path)
+        for s in started {
+            #expect(s.executable == tools.git && s.arguments.first == tools.git, "\(s.executable) \(s.arguments.prefix(1))")
+            let cwd = try #require(s.cwd, "every engine git here starts in a named directory, not a descriptor")
+            #expect(!SandboxPath.isInside(SandboxPath.resolve(cwd), agentPlaces), "git ran in \(cwd)")
+            #expect(!cwd.contains("/.brahma/wt/"), "git ran in \(cwd)")
+        }
     }
 
     @Test func attrSourceNeedsGit243() throws {

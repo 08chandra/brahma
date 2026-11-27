@@ -52,12 +52,14 @@ enum SafetyLint {
         static let policyAndPrincipal = ["Sources/BrahmaSafety/Policy/", "Sources/BrahmaSafety/Principal/", "Sources/BrahmaCore/Principal/"]
 
         /// Repo-relative directory prefixes where the rule must have no hit at all; each lies under a `scanned` root. S3 emptied
-        /// `Verify/` and `Sandbox/` of spawns (the process primitives and the Seatbelt runtime moved to `BrahmaSafety`); S4
+        /// `Verify/` and `Sandbox/` of spawns (the process primitives and the Seatbelt runtime moved to `BrahmaSafety`); S5 the
+        /// whole engine and CLI (every child through `Spawn` with a `ToolPaths` executable; the kernel's own `posix_spawn` in
+        /// `Spawn.launch` stays baseline-bounded); S4
         /// emptied the kernel and `Principal/` of fail-open shapes and every scanned file of unscoped alerts; S7, S9–S12 and S15
         /// fill the rest.
         var zero: [String] {
             switch self {
-            case .spawn: return ["Sources/BrahmaCore/Verify/", "Sources/BrahmaCore/Sandbox/"]
+            case .spawn: return ["Sources/BrahmaCore/", "Sources/brahma/"]
             case .failOpen: return ["Sources/BrahmaSafety/", "Sources/BrahmaCore/Principal/"]
             case .alertScope: return SafetyLint.scanned.map { $0 + "/" }
             case .publicBool: return Self.policyAndPrincipal
@@ -72,7 +74,7 @@ enum SafetyLint {
             switch self {
             case .spawn:
                 return ["Sources/BrahmaCore/Sandbox/ClaudeSettings.swift":
-                            "`ShellPrefix.tools`: the absolute tool paths the agent's shell prefix script runs, as script text; the engine spawns nothing here"]
+                            "script text, not a spawn: `ShellPrefix.tools` names the absolute tools (`/usr/bin/env -i`) the agent's shell prefix script runs; the engine spawns nothing here"]
             case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope, .publicBool:
                 return [:]
             }
@@ -325,7 +327,8 @@ enum SafetyLint {
         #expect(synthetic[.descriptor] == [:], "every rule is present, empty when it has no entry")
     }
 
-    /// A rule's `zero` directories have no hit. S3 set the first (`spawn` in `Verify/` and `Sandbox/`); later tasks fill the rest.
+    /// A rule's `zero` directories have no hit. S3 set the first (`spawn` in `Verify/` and `Sandbox/`, S5: all of `BrahmaCore` and
+    /// the CLI); later tasks fill the rest.
     @Test func zeroScopesAreZero() throws {
         let hits = try SafetyLint.hits(root: Self.root)
         var offenders: [String] = []
@@ -375,7 +378,12 @@ enum SafetyLint {
     /// matching `)`.
     @Test func scanFindsKnownSites() throws {
         let counts = try SafetyLint.scan(root: Self.root)
-        #expect((counts[.spawn]?["Sources/BrahmaCore/Git/GitWorkspace.swift"] ?? 0) > 0, "spawn: GitWorkspace starts git")
+        // S5: the engine and the CLI start nothing themselves; the one `posix_spawn` is the kernel's `Spawn.launch`.
+        #expect(counts[.spawn]?["Sources/BrahmaSafety/Process/Spawn.swift"] == 1, "spawn: the kernel's Spawn is the one posix_spawn")
+        func spawn(_ code: String) -> Int { SafetyLint.regexHits(in: code, pattern: SafetyLint.Rule.spawn.pattern).count }
+        #expect(spawn("let p = Process()\np.executableURL = URL(fileURLWithPath: \"/usr/bin/env\")") == 2)
+        #expect(spawn("posix_spawn(&pid, exe, &a, &b, &argv, &envp)\nlet argv = [ \"git\", \"status\"]") == 2)
+        #expect(spawn("try Spawn.run(tools.git, [\"status\"], cwd: dir, env: env, timeout: .seconds(1), outputCap: 1)") == 0)
         #expect((counts[.sandboxPolicy]?["Sources/BrahmaCore/Sandbox/SandboxedCheckRunner.swift"] ?? 0) > 0,
                 "sandboxPolicy: the check runner builds a policy")
         #expect((counts[.descriptor]?["Sources/BrahmaSafety/Path/EngineFiles.swift"] ?? 0) > 0, "descriptor: the kernel is scanned")

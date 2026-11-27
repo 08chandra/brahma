@@ -46,6 +46,23 @@ private let t0 = Date(timeIntervalSince1970: 1_000_000)
 private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.first { $0.name == name } }
 
 @Suite(.scratch) struct DoctorTests {
+    /// Plan S Task S5 (B9): `brahma doctor`'s `tools` line names the engine's tools by absolute path; git missing or older
+    /// than 2.43 fails it, a missing `claude` warns.
+    @Test func toolsItemNamesTheEnginesTools() {
+        let tools = ToolPaths(git: "/opt/x/bin/git", claude: "/opt/x/bin/claude", gitVersion: "2.52.0")
+        let item = Doctor.toolPathsItem(.success(tools))
+        #expect(item.name == "tools" && item.status == .pass)
+        #expect(item.detail == "git /opt/x/bin/git 2.52.0 · claude /opt/x/bin/claude · unzip /usr/bin/unzip · tar /usr/bin/tar")
+        let noClaude = Doctor.toolPathsItem(.success(ToolPaths(git: "/opt/x/bin/git", claude: nil, gitVersion: "2.52.0")))
+        #expect(noClaude.status == .warn && noClaude.detail.contains("claude not found"))
+        #expect(Doctor.toolPathsItem(.failure(.gitMissing)).status == .fail)
+        let old = Doctor.toolPathsItem(.failure(.gitTooOld("2.39.5")))
+        #expect(old.status == .fail && old.detail.contains("2.39.5") && old.detail.contains("2.43"))
+        // The engine's own resolution on this machine: git found, by absolute path, at least 2.43.
+        let live = Doctor.toolPathsItem()
+        #expect(live.status != .fail && live.detail.hasPrefix("git /"), "\(live.detail)")
+    }
+
     @Test func allPass() async {
         let runner = ProbeRunner(good())
         let r = await Doctor.run(claudePath: "claude", runner: runner, exec: exec(), now: t0)

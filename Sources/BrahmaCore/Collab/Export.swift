@@ -333,20 +333,13 @@ extension Store {
             }
         }
         let zip = stage.appending(path: "export.zip")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        process.arguments = ["-c", "-k", "--norsrc", "--noextattr", "--noacl", "--keepParent", root.path, zip.path]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        let deadline = AwakeTime.deadline(after: .seconds(ExportLimits.zipTimeout))
-        while process.isRunning, AwakeTime.now < deadline { usleep(20_000) }
-        if process.isRunning {
-            process.terminate()
-            process.waitUntilExit()
-            throw WorkError.invalid("zipping \(a.ref) took too long; try again")
-        }
-        guard process.terminationStatus == 0 else { throw WorkError.invalid("\(a.ref) couldn't be zipped for export") }
+        // `/usr/bin/ditto` by absolute path through `Spawn` (its own process group, the engine's environment as before),
+        // started in `/`; output discarded; past the timeout (awake time) it is stopped.
+        let zipped = try Spawn.run("/usr/bin/ditto", ["-c", "-k", "--norsrc", "--noextattr", "--noacl", "--keepParent", root.path, zip.path],
+                                   cwd: URL(fileURLWithPath: "/", isDirectory: true), env: ProcessInfo.processInfo.environment,
+                                   timeout: .seconds(ExportLimits.zipTimeout), outputCap: 0)
+        if zipped.timedOut { throw WorkError.invalid("zipping \(a.ref) took too long; try again") }
+        guard zipped.status == 0 else { throw WorkError.invalid("\(a.ref) couldn't be zipped for export") }
         return try Data(contentsOf: zip)
         #else
         throw WorkError.invalid("folder export needs macOS")

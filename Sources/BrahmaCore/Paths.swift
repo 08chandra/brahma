@@ -87,3 +87,13 @@ public struct BrahmaPaths: Sendable, Equatable {
         return BrahmaPaths(home: home, workspaces: workspaces)
     }
 }
+
+extension ToolPaths {
+    /// The engine's tools (B9, spec §6.5), resolved once from this process's `PATH` with every company workspace and the data
+    /// home (and the default workspaces directory) as forbidden roots, and installed as `ToolPaths.engine()`: the
+    /// orchestrator at its start, the CLI when it opens the store.
+    @discardableResult
+    public static func installForEngine(paths: BrahmaPaths, workspacePaths: [String]) -> Result<ToolPaths, ToolPathsError> {
+        install(forbiddenRoots: [paths.home, paths.workspaces] + workspacePaths.map { URL(fileURLWithPath: $0, isDirectory: true) })
+    }
+}

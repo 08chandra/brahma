@@ -22,13 +22,19 @@ struct CanaryGroup: ParsableCommand {
             // Checked before the editor opens it: never hand an editor a link or a file that is not the owner's own.
             if case .failure(let error) = CanaryProbes.load(paths: paths), case .refused = error { throw fail(error.description) }
             let editor = ProcessInfo.processInfo.environment["EDITOR"].flatMap { $0.isEmpty ? nil : $0 } ?? "vi"
-            // As git runs an editor: the owner's $EDITOR through the shell, the file as its one argument (never spliced).
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/sh")
-            process.arguments = ["-c", "\(editor) \"$1\"", "brahma-canary-edit", created.url.path]
-            do { try process.run() } catch { throw fail("can't start the editor '\(editor)': \(error)") }
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { throw fail("the editor exited with status \(process.terminationStatus)") }
+            // As git runs an editor: the owner's $EDITOR through the shell (`ToolPaths.sh`, by absolute path through `Spawn`),
+            // the file as its one argument (never spliced), on this terminal, with this command's environment, in its own
+            // process group as before.
+            let editorRun: Spawn.Child
+            do {
+                editorRun = try Spawn.start(ToolPaths.fixedSh, ["-c", "\(editor) \"$1\"", "brahma-canary-edit", created.url.path],
+                                            cwd: URL(fileURLWithPath: ".", isDirectory: true).standardizedFileURL,
+                                            env: ProcessInfo.processInfo.environment, stdin: .inherit, stdout: .inherit, stderr: .inherit)
+            } catch { throw fail("can't start the editor '\(editor)': \(error)") }
+            let raw = editorRun.waitStatus()
+            // Foundation's convention, as before: the exit code, or the number of the signal that ended it.
+            let status: Int32 = editorRun.lostTrack ? -1 : (raw & 0x7f == 0 ? (raw >> 8) & 0xff : raw & 0x7f)
+            guard status == 0 else { throw fail("the editor exited with status \(status)") }
             // Checked again after the edit: an editor may have replaced the file (another mode, a link).
             switch CanaryProbes.load(paths: paths) {
             case .success(let file):

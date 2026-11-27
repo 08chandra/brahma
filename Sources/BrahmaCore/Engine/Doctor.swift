@@ -115,6 +115,21 @@ public enum Doctor {
         return report
     }
 
+    /// `tools` (Plan S, B9): the engine's tools by absolute path, resolved once at engine start (a `PATH` change takes effect
+    /// at the next start): `git <path> <version> · claude <path> · unzip <path> · tar <path>`. Fails when git cannot be
+    /// resolved (missing, or older than 2.43); warns when no `claude` is found.
+    public static func toolPathsItem(_ resolved: Result<ToolPaths, ToolPathsError> = ToolPaths.engine()) -> DoctorItem {
+        switch resolved {
+        case .failure(let problem):
+            return DoctorItem(name: "tools", status: .fail, detail: "\(problem)")
+        case .success(let tools):
+            let line = "git \(tools.git) \(tools.gitVersion) · claude \(tools.claude ?? "not found") · unzip \(tools.unzip) · tar \(tools.tar)"
+            return tools.claude == nil
+                ? DoctorItem(name: "tools", status: .warn, detail: line + " (\(ToolPathsError.claudeMissing))")
+                : DoctorItem(name: "tools", status: .pass, detail: line)
+        }
+    }
+
     /// Plan C Task C4c: what Collab's tools add to every turn's prompt (`CollabToolBudget`), against its budget.
     public static func collabToolsItem(tokens: Int = CollabToolBudget.addedTokens()) -> DoctorItem {
         tokens <= CollabToolBudget.maxTokens
@@ -390,14 +405,15 @@ public enum Doctor {
         try await execProcess(executable: executable, arguments: arguments, timeout: execTimeout)
     }
 
-    /// Runs the process on a `Blocking` thread (never a cooperative worker), as its own process group (`GroupExec`). Past
-    /// `timeout` awake seconds the group is SIGTERMed, then SIGKILLed, and `ExecTimedOut` is thrown; the output is never
-    /// waited on after a kill, so a process holding the pipe cannot hang us.
+    /// Runs the process on a `Blocking` thread (never a cooperative worker), as its own process group (`GroupExec`, through
+    /// `Spawn`). A bare name (`claude`, `npm`) is the engine's absolute path for it (`ToolPaths`, B9), never `/usr/bin/env`;
+    /// one that is not found cannot run (nil). Past `timeout` awake seconds the group is SIGTERMed, then SIGKILLed, and
+    /// `ExecTimedOut` is thrown; the output is never waited on after a kill, so a process holding the pipe cannot hang us.
     static func execProcess(executable: String, arguments: [String], timeout: TimeInterval,
                             blocking: Blocking = Doctor.execBlocking) async throws -> String? {
         let outcome: Result<String?, ExecTimedOut> = await blocking.run {
-            let (path, args) = executable.hasPrefix("/") ? (executable, arguments) : ("/usr/bin/env", [executable] + arguments)
-            let r = GroupExec.run(executable: path, arguments: args,
+            guard let path = executable.hasPrefix("/") ? executable : ToolPaths.engineTool(named: executable) else { return .success(nil) }
+            let r = GroupExec.run(executable: path, arguments: arguments,
                                   environment: ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .claude),
                                   output: .capture(cap: 4 << 20, stderr: false), timeout: timeout, killGrace: execKillGrace)
             guard r.launched else { return .success(nil) }

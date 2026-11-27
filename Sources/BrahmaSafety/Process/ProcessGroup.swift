@@ -62,78 +62,31 @@ public final class ProcessGroupChild: @unchecked Sendable {
 
     /// Spawns `executable` with `arguments` (argv, `arguments[0]` included) as the leader of a new process group: stdin
     /// `/dev/null`, stdout and stderr to `output` (`-1`: `/dev/null`), working directory `workingDirectory`, exactly
-    /// `environment`, default signal dispositions, an empty signal mask, and (Darwin) no descriptor inherited but those.
-    /// `stdin` (`-1`: `/dev/null`) and `stderr` (nil: `output`) override those two; `newSession` makes it the leader of a new
-    /// session as well (`setsid`: a turn's `claude`), which is also its own process group.
+    /// `environment` (its `PATH` sanitized, `Spawn.sanitized`), default signal dispositions, an empty signal mask, and
+    /// (Darwin) no descriptor inherited but those. `stdin` (`-1`: `/dev/null`) and `stderr` (nil: `output`) override those
+    /// two; `newSession` makes it the leader of a new session as well (`setsid`: a turn's `claude`), which is also its own
+    /// process group. Started through `Spawn.launch` (the one `posix_spawn`): `executable` must be absolute.
     /// Throws a message when it cannot be started.
     /// `workingDirectoryFD`: an open directory descriptor the child `fchdir`s into instead of `workingDirectory`'s path
     /// (`SafeGit`: an item worktree held `O_NOFOLLOW`, so no path an agent can retarget is ever resolved for it).
     public static func spawn(executable: String, arguments: [String], environment: [String: String], workingDirectory: URL,
                       output: Int32, stdin: Int32 = -1, stderr: Int32? = nil, newSession: Bool = false,
                       workingDirectoryFD: Int32? = nil, observer: Observer? = nil) throws -> ProcessGroupChild {
-        #if canImport(Darwin)
-        var actions: posix_spawn_file_actions_t? = nil
-        var attr: posix_spawnattr_t? = nil
-        #else
-        var actions = posix_spawn_file_actions_t()
-        var attr = posix_spawnattr_t()
-        #endif
-        posix_spawn_file_actions_init(&actions); posix_spawnattr_init(&attr)
-        defer { posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attr) }
-        if stdin >= 0 {
-            posix_spawn_file_actions_adddup2(&actions, stdin, 0)
-        } else {
-            posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
-        }
-        if output >= 0 {
-            posix_spawn_file_actions_adddup2(&actions, output, 1)
-        } else {
-            posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
-        }
-        if let stderr, stderr >= 0 {
-            posix_spawn_file_actions_adddup2(&actions, stderr, 2)
-        } else if stderr == nil, output >= 0 {
-            posix_spawn_file_actions_adddup2(&actions, output, 2)
-        } else {
-            posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
-        }
-        // A chdir action that cannot be queued must never let the child start in this process's directory instead.
-        let chdirStatus: Int32
-        if let workingDirectoryFD {
-            #if canImport(Darwin)
-            chdirStatus = posix_spawn_file_actions_addfchdir_np(&actions, workingDirectoryFD)
-            #else
-            // Before exec (so before close-on-exec), the child's own descriptor table still holds it.
-            chdirStatus = posix_spawn_file_actions_addchdir_np(&actions, "/proc/self/fd/\(workingDirectoryFD)")
-            #endif
-        } else {
-            chdirStatus = posix_spawn_file_actions_addchdir_np(&actions, workingDirectory.path)
-        }
-        guard chdirStatus == 0 else { throw SpawnFailure(message: "cannot set the working directory (\(String(cString: strerror(chdirStatus))))") }
-        var defaults = sigset_t(), mask = sigset_t()
-        sigfillset(&defaults); sigemptyset(&mask)
-        posix_spawnattr_setsigdefault(&attr, &defaults)
-        posix_spawnattr_setsigmask(&attr, &mask)
-        // A new session makes the child its own group's leader too (setpgid would fail on a session leader).
-        var flags = Int32(POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK) | (newSession ? Int32(POSIX_SPAWN_SETSID) : Int32(POSIX_SPAWN_SETPGROUP))
-        #if canImport(Darwin)
-        flags |= Int32(POSIX_SPAWN_CLOEXEC_DEFAULT)
-        #endif
-        posix_spawnattr_setflags(&attr, Int16(flags))
-        if !newSession { posix_spawnattr_setpgroup(&attr, 0) }
-
-        var argv: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) } + [nil]
-        var envp: [UnsafeMutablePointer<CChar>?] = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
-        defer { for p in argv { free(p) }; for p in envp { free(p) } }
-        var pid: pid_t = 0
-        let spawned = posix_spawn(&pid, executable, &actions, &attr, &argv, &envp)
-        guard spawned == 0 else { throw SpawnFailure(message: String(cString: strerror(spawned))) }
-        return ProcessGroupChild(pid: pid, leaderStart: ProcessTable.entry(pid)?.start, observer: observer)
+        let out: Spawn.Stream = output >= 0 ? .fd(output) : .null
+        let err: Spawn.Stream
+        if let stderr { err = stderr >= 0 ? .fd(stderr) : .null } else { err = out }
+        return try start(executable: executable, arguments: arguments, environment: environment, cwd: workingDirectory,
+                         cwdDescriptor: workingDirectoryFD, stdin: stdin >= 0 ? .fd(stdin) : .null, stdout: out, stderr: err,
+                         leadership: newSession ? .session : .group, observer: observer)
     }
 
-    struct SpawnFailure: Error, CustomStringConvertible {
-        let message: String
-        var description: String { message }
+    /// `spawn` with each stream and the group leadership spelled out (`Spawn.start` uses it too).
+    static func start(executable: String, arguments: [String], environment: [String: String], cwd: URL, cwdDescriptor: Int32?,
+                      stdin: Spawn.Stream, stdout: Spawn.Stream, stderr: Spawn.Stream, leadership: Spawn.Leadership,
+                      observer: Observer? = nil) throws -> ProcessGroupChild {
+        let pid = try Spawn.launch(executable: executable, arguments: arguments, environment: environment, cwd: cwd,
+                                   cwdDescriptor: cwdDescriptor, stdin: stdin, stdout: stdout, stderr: stderr, leadership: leadership)
+        return ProcessGroupChild(pid: pid, leaderStart: ProcessTable.entry(pid)?.start, observer: observer)
     }
 
     /// True once the leader has exited. It is not reaped here: it stays a zombie, so the group id stays this child's.

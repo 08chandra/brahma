@@ -416,31 +416,22 @@ public struct SimctlController: SimulatorControlling {
         runProcess("/usr/bin/xcrun", ["simctl"] + argv, timeout: callTimeout) ?? (status: -1, stdout: "", stderr: "could not run xcrun")
     }
 
-    /// Runs `executable` with `arguments` to completion (or `timeout`, then SIGKILL), capturing both streams.
+    /// How many bytes of each stream a simctl call keeps (`Spawn.run`); far above any device or runtime listing.
+    static let runOutputCap = 64 << 20
+
+    /// Runs `executable` (absolute) with `arguments` to completion (or `timeout`, then SIGKILL), capturing both streams,
+    /// through `Spawn` (its own process group, as Foundation's `Process` made it, started in `/`). Nil when it cannot start.
     static func runProcess(_ executable: String, _ arguments: [String], timeout: TimeInterval) -> (status: Int32, stdout: String, stderr: String)? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: executable)
-        p.arguments = arguments
         var env: [String: String] = ["PATH": "/usr/bin:/bin"]
         for key in ["DEVELOPER_DIR", "HOME", "TMPDIR"] { if let v = ProcessInfo.processInfo.environment[key] { env[key] = v } }
-        p.environment = env
-        p.standardInput = FileHandle.nullDevice
-        let out = Pipe(), err = Pipe()
-        p.standardOutput = out; p.standardError = err
-        do { try p.run() } catch { return nil }
-        final class Box: @unchecked Sendable { var out = Data(); var err = Data() }
-        let box = Box()
-        let readers = DispatchGroup()
-        readers.enter(); Thread.detachNewThread { box.out = out.fileHandleForReading.readDataToEndOfFile(); readers.leave() }
-        readers.enter(); Thread.detachNewThread { box.err = err.fileHandleForReading.readDataToEndOfFile(); readers.leave() }
-        let done = DispatchSemaphore(value: 0)
-        p.terminationHandler = { _ in done.signal() }
-        if done.wait(timeout: .now() + timeout) == .timedOut {
-            kill(p.processIdentifier, SIGKILL)
-            done.wait()
+        let out: Spawn.Output
+        do {
+            out = try Spawn.run(executable, arguments, cwd: URL(fileURLWithPath: "/", isDirectory: true), env: env,
+                                timeout: .seconds(timeout), outputCap: runOutputCap, killGrace: .zero)
+        } catch {
+            return nil
         }
-        readers.wait()
-        return (p.terminationStatus, String(decoding: box.out, as: UTF8.self), String(decoding: box.err, as: UTF8.self))
+        return (out.status, String(decoding: out.stdout, as: UTF8.self), String(decoding: out.stderr, as: UTF8.self))
     }
 
     // MARK: Devices

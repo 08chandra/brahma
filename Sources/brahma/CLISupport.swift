@@ -25,9 +25,16 @@ func openStore(lazySecrets: Bool = true) throws -> (Store, BrahmaPaths) {
     let store = try Store(path: paths.database.path, catalog: catalog, backupsDir: paths.backupsDir)
     cliTimeZone = store.ownerTimeZone()
     // The data home must lie outside every workspace, its private directories 0700 (Task 3).
-    do { try DataHomeGuard.validate(paths: paths, workspacePaths: try store.companies().map(\.workspacePath)) } catch {
+    let workspacePaths: [String]
+    do {
+        workspacePaths = try store.companies().map(\.workspacePath)
+        try DataHomeGuard.validate(paths: paths, workspacePaths: workspacePaths)
+    } catch {
         throw fail("\(error)")
     }
+    // B9: the tools this command starts (git, claude, tar …) by absolute path, from the safe PATH directories outside every
+    // workspace and the data home, resolved once (`ToolPaths`).
+    ToolPaths.installForEngine(paths: paths, workspacePaths: workspacePaths)
     // A data-home directory that is not private is fixed; one that cannot be (a link, a file) is reported, never followed.
     do { try DataHomeGuard.lockDown(paths: paths) } catch {
         FileHandle.standardError.write(Data("brahma: \(safe("\(error)"))\n".utf8))
