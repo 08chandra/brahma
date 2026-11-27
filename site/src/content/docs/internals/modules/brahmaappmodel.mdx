@@ -1,0 +1,31 @@
+---
+title: BrahmaAppModel
+description: "The Mac app's state with no AppKit or SwiftUI import: AppModel over a Store, the Snapshot the views render, EngineHost, MapController, launch options and presentation types."
+---
+
+import ModuleFacts from '../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../components/SourceLink.astro';
+
+## Purpose
+
+The Mac app's state, with no AppKit or SwiftUI import. `AppModel` holds a `Store` and polls it on a tick into a value-type `Snapshot` the views render; `WorkSnapshot`, `PreviewSnapshot`, `ReleasesSnapshot` and `HandbookSnapshot` are its parts. `EngineHost` runs the orchestrator inside the app under the per-home `OrchestratorLock`. `MapController` feeds one company's map: snapshots in, traffic in, animations out. `LaunchOptions` parses the app's command-line flags. Presentation types turn store rows into strings and rows; the forms validate owner input. Everything here is testable without a window.
+
+## Key types
+
+- [`AppModel`](/api/brahmaappmodel/documentation/brahmaappmodel/appmodel/) — the one observable root: the store, the selection, the open sheet and the sub-models.
+- [`Snapshot`](/api/brahmaappmodel/documentation/brahmaappmodel/snapshot/) — what the views render, loaded off the main actor on each tick.
+- [`EngineHost`](/api/brahmaappmodel/documentation/brahmaappmodel/enginehost/) — the orchestrator in-process; its `EngineStatus` is `starting`, `embedded`, `external`, `stopping`, `stopped` or `failed`.
+- [`MapController`](/api/brahmaappmodel/documentation/brahmaappmodel/mapcontroller/) — one company's map: `sync`, `poll` and `frame`.
+- [`LaunchOptions`](/api/brahmaappmodel/documentation/brahmaappmodel/launchoptions/) and [`SelectTarget`](/api/brahmaappmodel/documentation/brahmaappmodel/selecttarget/) — the app's command-line flags and what `--select` can open.
+- [`NotificationPosting`](/api/brahmaappmodel/documentation/brahmaappmodel/notificationposting/) — the protocol the app's banner poster implements.
+
+## How it connects
+
+- **Calls BrahmaCore.** `AppModel` owns a `Store` and loads `Snapshot.load(store:)` off the main actor; `EngineHost` acquires the `OrchestratorLock` and builds an `Orchestrator`; a live `MapController` reads a `Store` through `MapSource.live`; `OwnerKeyRotation.rotate` calls `OwnerKey.create` with an `OwnerKeyStore`.
+- **Called by BrahmaApp.** `AppDelegate` parses `LaunchOptions`, builds the `AppModel` and the `EngineHost`; the views read `model.snapshot`; the menu bar renders `MenuBarSummary`; `UNNotificationPoster` is the app's `NotificationPosting`.
+- **Called by BrahmaMapKit.** `OrgScene` plays what `MapController.frame(now:)` returns and lays out with `OrgLayout.make`; `MapPalette` builds its colours from `ThemeHex`; every label is `MapText.clean` output.
+- **BrahmaKeychain.** `Package.swift` lists it as a dependency, but no file in this target imports it: the Keychain reaches the model only as the `SecretVault` and `OwnerKeyStore` values the app passes to `AppModel` and `EngineHost`.
+
+<ModuleFacts module="BrahmaAppModel" />
+
+<SourceLink path="Sources/BrahmaAppModel" />

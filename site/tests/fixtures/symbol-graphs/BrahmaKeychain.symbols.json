@@ -1,0 +1,15 @@
+{
+  "metadata": { "formatVersion": { "major": 0, "minor": 6, "patch": 0 }, "generator": "fixture" },
+  "module": { "name": "BrahmaKeychain", "platform": {} },
+  "symbols": [
+    {
+      "kind": { "identifier": "swift.enum", "displayName": "Enumeration" },
+      "identifier": { "precise": "s:14BrahmaKeychain8KeyStoreO", "interfaceLanguage": "swift" },
+      "pathComponents": ["KeyStore"],
+      "names": { "title": "KeyStore" },
+      "accessLevel": "public",
+      "location": { "uri": "file:///Users/example/repo/Sources/BrahmaKeychain/KeyStore.swift", "position": { "line": 1, "character": 12 } }
+    }
+  ],
+  "relationships": []
+}

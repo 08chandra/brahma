@@ -1,0 +1,6 @@
+{
+  "metadata": { "formatVersion": { "major": 0, "minor": 6, "patch": 0 }, "generator": "fixture: an executable module with no public symbols" },
+  "module": { "name": "BrahmaApp", "platform": {} },
+  "symbols": [],
+  "relationships": []
+}

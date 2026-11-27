@@ -1,0 +1,145 @@
+---
+/**
+ * Button / link-button. `primary` is the one accent-filled control on a page; `ghost` is
+ * a hairline-bordered control for everything else. Renders <a> when `href` is set.
+ * States: hover, focus-visible (2 px accent ring, offset 2 px), active, disabled.
+ * The styleguide simulates states with `.is-hover .is-focus .is-active` classes.
+ */
+interface Props {
+  variant?: 'primary' | 'ghost';
+  size?: 'md' | 'sm';
+  href?: string;
+  type?: 'button' | 'submit';
+  disabled?: boolean;
+  trailing?: string; // a glyph such as "→" or a mono hint like "⌘K"
+  class?: string;
+  'aria-label'?: string;
+}
+const {
+  variant = 'ghost',
+  size = 'md',
+  href,
+  type = 'button',
+  disabled = false,
+  trailing,
+  class: className,
+  ...rest
+} = Astro.props;
+const classes = ['btn', `btn--${variant}`, `btn--${size}`, className];
+---
+
+{
+  href && !disabled ? (
+    <a class:list={classes} href={href} {...rest}>
+      <span class="btn__label"><slot /></span>
+      {trailing && <span class="btn__trailing" aria-hidden="true">{trailing}</span>}
+    </a>
+  ) : (
+    <button class:list={classes} type={type} disabled={disabled} aria-disabled={disabled || undefined} {...rest}>
+      <span class="btn__label"><slot /></span>
+      {trailing && <span class="btn__trailing" aria-hidden="true">{trailing}</span>}
+    </button>
+  )
+}
+
+<style>
+  .btn {
+    --btn-h: 2rem; /* 32 px */
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--s-2);
+    height: var(--btn-h);
+    padding: 0 var(--s-3);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--text0);
+    font-family: var(--font-sans);
+    font-size: 0.8125rem; /* 13 px */
+    font-weight: 500;
+    letter-spacing: 0.005em;
+    line-height: 1;
+    text-decoration: none;
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+    transition:
+      background-color var(--dur-fast) var(--ease),
+      border-color var(--dur-fast) var(--ease),
+      color var(--dur-fast) var(--ease);
+  }
+  .btn--sm {
+    --btn-h: 1.625rem; /* 26 px */
+    padding: 0 var(--s-2);
+    font-size: 0.75rem;
+  }
+  .btn__trailing {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--text1);
+    transition: transform var(--dur-fast) var(--ease);
+  }
+
+  /* ghost */
+  .btn--ghost:hover,
+  .btn--ghost.is-hover {
+    background: var(--bg3);
+    border-color: var(--text2);
+  }
+  .btn--ghost:active,
+  .btn--ghost.is-active {
+    background: var(--bg4);
+  }
+
+  /* primary */
+  .btn--primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--on-accent);
+  }
+  .btn--primary .btn__trailing {
+    color: color-mix(in srgb, var(--on-accent) 80%, transparent);
+  }
+  .btn--primary:hover,
+  .btn--primary.is-hover {
+    background: color-mix(in srgb, var(--accent) 85%, var(--bg0));
+    border-color: color-mix(in srgb, var(--accent) 85%, var(--bg0));
+  }
+  .btn--primary:active,
+  .btn--primary.is-active {
+    background: var(--accent-dim);
+    border-color: var(--accent-dim);
+  }
+
+  .btn:hover .btn__trailing,
+  .btn.is-hover .btn__trailing {
+    transform: translateX(2px);
+  }
+
+  /* focus — never animated */
+  .btn:focus-visible,
+  .btn.is-focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* touch: ≥ 40 px targets on coarse pointers */
+  @media (pointer: coarse) {
+    .btn {
+      --btn-h: 2.75rem;
+    }
+    .btn--sm {
+      --btn-h: 2.5rem;
+    }
+  }
+
+  /* disabled */
+  .btn:disabled,
+  .btn[aria-disabled='true'],
+  .btn.is-disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
+</style>

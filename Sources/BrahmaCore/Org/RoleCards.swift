@@ -7,10 +7,9 @@ public enum RoleCards {
         paths.companyDir(companyId).appending(path: "roles/\(handle).md")
     }
 
-    /// Front matter (id, pack, title, kind, models, tools, skills, connectors, adapted_from) followed by the prompt body.
+    /// Front matter (id, pack, title, kind, models, tools, skills, connectors) followed by the prompt body.
     /// Playbooks are not rendered into the card file.
-    public static func render(template t: RoleTemplate, company: Company, pack: IndustryPack? = nil,
-                              adaptedFrom: String? = nil) -> String {
+    public static func render(template t: RoleTemplate, company: Company, pack: IndustryPack? = nil) -> String {
         let pack = pack ?? PackCatalog.builtin.packs.first { $0.role(t.id) == t }
         let groups: [(String, [String])] = [("base", CompanyToolNames.base), ("work", CompanyToolNames.work),
                                             ("lead", CompanyToolNames.lead), ("executive", CompanyToolNames.executive)]
@@ -21,7 +20,6 @@ public enum RoleCards {
         if let pack { lines.append("pack: \(pack.id)@\(pack.version)") }
         lines += ["title: \(t.title)", "kind: \(t.kind.rawValue)", "models: {\(models)}", "tools: \(list(toolGroups))",
                   "skills: \(list(t.skills))", "connectors: \(list(t.connectors))"]
-        if let from = adaptedFrom ?? SoftwarePack.adaptedFrom[t.id] { lines.append("adapted_from: \(from)") }
         lines += ["---", "", "# \(t.title) at \(company.name)", "", t.prompt]
         return lines.joined(separator: "\n")
     }

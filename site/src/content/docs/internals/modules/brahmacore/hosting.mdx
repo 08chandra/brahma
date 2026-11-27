@@ -1,0 +1,31 @@
+---
+title: Hosting
+description: "The hosting providers a company can deploy to, as adapters over the wrangler and vercel CLIs, plus the placeholder site and the owner-run provider probe."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+A `HostingAdapter` turns hosting settings and a staged build into a `DeployPlan`: install the pinned provider CLI token-free, deploy, roll back. Two adapters exist: Cloudflare Pages through `wrangler pages` (the default) and Vercel through the `vercel` CLI, whose token travels in the step's environment only, never in argv. `Placeholder` is the engine-written page a rollback deploys when there is no previous release. `ProviderProbe` is the hidden, owner-only live test of a provider with the owner's own token. The adapter headers record which parts were checked against the CLI packages' source only, not yet against the real service.
+
+## Key types
+
+- [`HostingAdapter`](/api/brahmacore/documentation/brahmacore/hostingadapter/) and [`HostingAdapters`](/api/brahmacore/documentation/brahmacore/hostingadapters/) — the protocol and the production lookup.
+- [`HostingSettings`](/api/brahmacore/documentation/brahmacore/hostingsettings/) and [`HostingProviderID`](/api/brahmacore/documentation/brahmacore/hostingproviderid/) — a company's provider and configuration.
+- [`DeployPlan`](/api/brahmacore/documentation/brahmacore/deployplan/) and [`DeployStep`](/api/brahmacore/documentation/brahmacore/deploystep/) — the steps a release runs.
+- [`CloudflarePagesAdapter`](/api/brahmacore/documentation/brahmacore/cloudflarepagesadapter/) and [`VercelAdapter`](/api/brahmacore/documentation/brahmacore/verceladapter/) — the two providers.
+- [`Placeholder`](/api/brahmacore/documentation/brahmacore/placeholder/) — the rollback page.
+
+## How it connects
+
+- **Called by Release.** `ReleaseExecutor` looks the adapter up by provider for both deploy and rollback; its default lookup is `HostingAdapters.production`.
+- **Called by Store.** `Store+Hosting` reads the settings and computes `HostingReadiness` through the same lookup.
+- **Called by MCP.** `set_deploy_config` writes the settings through `store.setDeployConfig`.
+- **Calls Release.** A plan is built over a `ReleaseLayout`, and `Placeholder.write` writes into it.
+- **Calls Preview.** Smoke requests are the preview area's `SmokeRequest`.
+
+<ModuleFacts module="BrahmaCore" area="Hosting" />
+
+<SourceLink path="Sources/BrahmaCore/Hosting" />
