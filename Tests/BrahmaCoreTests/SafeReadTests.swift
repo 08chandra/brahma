@@ -51,9 +51,9 @@ import Foundation
     @Test(.timeLimit(.minutes(1))) func fifoDoesNotHang() throws {
         let d = try dir()
         #expect(mkfifo(d.appending(path: "pipe").path, 0o600) == 0)
-        let start = ContinuousClock.now
+        let start = AwakeTime.now
         #expect(throws: SafeReadError.notRegular) { try SafeRead.smallText("pipe", under: d) }
-        #expect(ContinuousClock.now - start < .seconds(1))
+        #expect(AwakeTime.now - start < .seconds(1))
     }
 
     @Test func hardLinkRefused() throws {

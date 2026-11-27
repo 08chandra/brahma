@@ -915,7 +915,9 @@ public struct GitWorkspace: Sendable {
     }
 
     /// Why `refs/heads/item/<KEY>` is not a plain ref, or nil. A symbolic item ref (`git symbolic-ref refs/heads/item/K
-    /// refs/heads/main`) would make every update of the item branch move its target. Packed refs are never symbolic.
+    /// refs/heads/main`) would make every update of the item branch move its target. Packed refs are never symbolic. A ref
+    /// file the bounded no-follow reader refuses (another hard link, padded past the bound, unreadable) is reported too, never
+    /// taken for a plain ref (S2 fix round 1, I1): a genuine loose ref is at most 41 bytes with one link, this user's.
     private func symbolicItemRef(key: String) -> String? {
         let ref = branchRef(key: key)
         let url = gitDir.appending(path: ref)
@@ -924,7 +926,9 @@ public struct GitWorkspace: Sendable {
         switch st.st_mode & S_IFMT {
         case S_IFLNK: return "\(ref) is a symbolic ref (a link)"
         case S_IFREG:
-            guard let text = Self.regularText(ref, under: gitDir), text.hasPrefix("ref:") else { return nil }
+            let text: String
+            do { text = try SafeRead.smallText(ref, under: gitDir) } catch { return "\(ref) is not a plain ref file (\(error))" }
+            guard text.hasPrefix("ref:") else { return nil }
             let target = String(text.dropFirst(4).trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
             return "\(ref) is a symbolic ref to \(Self.shown(target))"
         default: return "\(ref) is not a ref file"

@@ -1187,6 +1187,37 @@ import Foundation
         #expect(try ws.head(of: GitWorkspace.mainRef) == main)
     }
 
+    /// S2 fix round 1 (I1): an item ref file `SafeRead` refuses (a second hard link, padded past the 4 KiB bound) is reported
+    /// and refused, never read as "a plain ref". A loose ref is at most 41 bytes with one link, so a genuine one never trips it.
+    @Test func refusedItemRefFileIsReportedNotPlain() throws {
+        for shape in ["hardlink", "padded"] {
+            let f = try GitFixture(files: ["a.txt": "one"])
+            let (ws, log) = watched(f)
+            let wt = try ws.addWorktree(key: "K-1")
+            let main = try #require(try ws.head(of: GitWorkspace.mainRef))
+            try f.write("b.txt", "two", in: wt)
+            let first = try #require(try ws.commitAll(in: wt, message: "first"))
+            let refFile = f.root.appending(path: ".git/refs/heads/item/K-1")
+            // The item branch is made a symref to main, in a shape the bounded no-follow reader refuses.
+            try f.git(["symbolic-ref", "refs/heads/item/K-1", GitWorkspace.mainRef])
+            switch shape {
+            case "hardlink":
+                #expect(link(refFile.path, f.root.appending(path: ".git/refs/heads/item/K-1.other").path) == 0)
+            default:
+                try ("ref: \(GitWorkspace.mainRef)\n" + String(repeating: "\n", count: 5000)).write(to: refFile, atomically: true, encoding: .utf8)
+            }
+            try f.write("c.txt", "three", in: wt)
+            #expect(throws: GitError.self) { try ws.commitAll(in: wt, message: "evil") }
+            #expect(try ws.head(of: GitWorkspace.mainRef) == main, "\(shape): the commit did not land on main")
+            #expect(log.all.count == 1 && log.all[0].contains("refs/heads/item/K-1 is not a plain ref file"), "\(shape): \(log.all)")
+            // Put back by the owner: work goes on, on the item branch.
+            if shape == "hardlink" { try FileManager.default.removeItem(at: f.root.appending(path: ".git/refs/heads/item/K-1.other")) }
+            try f.git(["update-ref", "--no-deref", "refs/heads/item/K-1", first])
+            #expect(try ws.commitAll(in: wt, message: "after") != nil, "\(shape)")
+            #expect(try ws.head(of: GitWorkspace.mainRef) == main)
+        }
+    }
+
     @Test func itemBranchTurnedSymbolicMidOperationLeavesMainAlone() throws {
         for reset in [false, true] {
             let f = try GitFixture(files: ["a.txt": "one"])
