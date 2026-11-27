@@ -103,7 +103,10 @@ public enum UsageMetrics {
         let tz = ctx.store.ownerTimeZone()
         return try ctx.store.writer.read { db in
             let (id, w) = (MetricId.safety, ctx.window)
-            let (taint, trusted) = try taintRefusals(db, companyId: ctx.companyId, window: w)
+            // Exactly the refusal's own reason (ruling R33): the owner's trust-import writes `trustImport`.
+            let taint = try count(db, """
+                SELECT COUNT(*) FROM turn WHERE companyId = ? AND freshSessionReason = 'tainted' AND startedAt >= ? AND startedAt < ?
+                """, [ctx.companyId, w.since, w.until])
             let access = try count(db, "SELECT COUNT(*) FROM accessRefusal WHERE companyId = ? AND createdAt >= ? AND createdAt < ?",
                                    [ctx.companyId, w.since, w.until])
             let dlp = try count(db, """
@@ -131,8 +134,9 @@ public enum UsageMetrics {
             }
             let detail: [MetricValue] = [
                 .count(id, label: "taint refusals", Double(taint),
-                       basis: "turns started fresh after a refused high-risk call under taint (freshSessionReason = tainted); one per refused turn, not per call"
-                        + (trusted > 0 ? "; \(LandingMetrics.plural(trusted, "fresh session")) after the owner's trust-import excluded" : "")),
+                       basis: "turns started fresh after a refused high-risk call under taint (freshSessionReason = tainted); one per refused turn, "
+                        + "not per call; the owner's trust-import resets carry their own reason (trustImport) and are not counted, but "
+                        + "trust-import resets recorded before vX6a stored 'tainted' and are counted"),
                 .count(id, label: "access refusals", Double(access), basis: "refused request_access calls (accessRefusal)"),
                 .count(id, label: "DLP hits", Double(dlp), basis: "merge requests bounced for a secret (failure = secretFound)"),
                 .count(id, label: "canary passes", Double(canary),
@@ -151,30 +155,6 @@ public enum UsageMetrics {
             basis += "; cap overruns not applicable; the other rows are counts without a target"
             return .count(id, Double(wasted) + (breachCount ?? 0), basis: basis, target: 0, detail: detail)
         }
-    }
-
-    /// Turns in the window that started fresh with `freshSessionReason = tainted`, less those the owner's `trust-import` caused: it
-    /// ends every tainted session of the company with the same reason. Such a turn is the agent's first after a trust-import (the
-    /// engine's own activity line, kind `approval`) that came after its previous turn; a refusal needs a turn before it.
-    static func taintRefusals(_ db: Database, companyId: String, window: MeasureWindow) throws -> (refusals: Int, trusted: Int) {
-        let trusts = try Date.fetchAll(db, sql: """
-            SELECT createdAt FROM activityEvent WHERE companyId = ? AND kind = 'approval' AND text LIKE 'The owner trusted the imported repo%'
-            """, arguments: [companyId])
-        var refusals = 0, trusted = 0
-        for row in try Row.fetchAll(db, sql: """
-            SELECT t.startedAt AS startedAt,
-                   (SELECT MAX(p.startedAt) FROM turn p WHERE p.companyId = t.companyId AND p.agentId = t.agentId AND p.startedAt < t.startedAt) AS previousAt
-            FROM turn t WHERE t.companyId = ? AND t.freshSessionReason = 'tainted' AND t.startedAt >= ? AND t.startedAt < ?
-            """, arguments: [companyId, window.since, window.until]) {
-            let startedAt: Date = row["startedAt"], previousAt: Date? = row["previousAt"]
-            let afterTrust = trusts.contains { at in
-                guard at <= startedAt else { return false }
-                guard let previousAt else { return true }
-                return at > previousAt
-            }
-            if afterTrust { trusted += 1 } else { refusals += 1 }
-        }
-        return (refusals, trusted)
     }
 
     // MARK: Non-code acceptance

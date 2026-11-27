@@ -24,8 +24,8 @@ public struct LandedRange: Equatable, Sendable {
 /// patch-id of R's forward diff (`git diff <base'> <merged'>`). Partial reverts are not claimed here; only a `revertOf` link
 /// finds them.
 ///
-/// Patch-ids come from `git diff <a> <b> | git patch-id --stable`, both through `GitCommand` (the workspace's own hardened git,
-/// its common dir, an absolute git), each call limited to `Limits.gitCallSeconds`. They are cached for the detector's life: one
+/// Patch-ids come from `git diff <a> <b> | git patch-id --stable` through `GitWorkspace.stablePatchId` (the workspace's own
+/// hardened git, its common dir, an absolute git), each call limited to `Limits.gitCallSeconds`. They are cached for the detector's life: one
 /// detector per `measure` run. The scan is bounded: at most `Limits.maxItems` landed items (the oldest first), and it stops at
 /// the first git call over its time limit; either way `Scan.basis` says `revert scan stopped at <bound>`.
 public final class RevertDetector {
@@ -179,44 +179,21 @@ public final class RevertDetector {
     // MARK: Git
 
     /// A commit id as the store records it, optionally with `^1` (R17's base): nothing git could read as an option or a path.
-    static func isRevision(_ s: String) -> Bool {
-        s.range(of: "^[0-9a-f]{7,64}(\\^1)?\\z", options: .regularExpression) != nil
-    }
+    static func isRevision(_ s: String) -> Bool { GitWorkspace.isPatchRevision(s) }
 
-    /// `git diff --no-color --no-ext-diff --no-textconv <from> <to> --`, then that diff on the stdin of `git patch-id --stable`,
-    /// through the workspace's own `GitCommand` (`main`: its git dir is the common dir) with `seconds` per call.
+    /// Patch-ids from the company workspace (`GitWorkspace.stablePatchId`, `seconds` per git call), its failures mapped onto
+    /// `SourceError`: a timeout stops the scan, an unreadable range is that item's, an unavailable workspace stops everything.
     static func gitSource(_ workspace: GitWorkspace, seconds: TimeInterval) -> PatchIdSource {
-        var git = workspace.main
-        git.timeoutSeconds = seconds
-        let command = git
-        let gitDir = workspace.gitDir
-        return { from, to in
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: gitDir.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                throw SourceError.unavailable("the company workspace has no repository")
+        { from, to in
+            do {
+                return try workspace.stablePatchId(from: from, to: to, timeout: seconds)
+            } catch let failure as PatchIdFailure {
+                switch failure {
+                case .timedOut: throw SourceError.timedOut
+                case .unreadable(let why): throw SourceError.unreadable(why)
+                case .unavailable(let why): throw SourceError.unavailable(why)
+                }
             }
-            guard isRevision(from), isRevision(to) else { throw SourceError.unreadable("not a commit id") }
-            let diff = try run(command, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", from, to, "--"], stdin: .none)
-            guard !diff.isEmpty else { return nil }
-            let out = try run(command, ["patch-id", "--stable"], stdin: .data(diff))
-            // `<patch-id> <commit-id>`; the commit is all zeros for a diff with no commit header.
-            return String(decoding: out, as: UTF8.self).split(whereSeparator: \.isWhitespace).first.map(String.init)
         }
-    }
-
-    /// One git call's stdout, or the `SourceError` it amounts to.
-    static func run(_ git: GitCommand, _ args: [String], stdin: GitCommand.Stdin) throws -> Data {
-        let out: GitCommand.Output
-        do {
-            out = try git.run(args, allowFailure: true, stdin: stdin)
-        } catch let error as GitError where error.isRepositoryRefusal {
-            throw SourceError.unavailable("\(error)")
-        } catch {
-            throw SourceError.unreadable("\(error)")
-        }
-        if out.timedOut { throw SourceError.timedOut }
-        guard out.status == 0 else { throw SourceError.unreadable("git \(args[0]) exited \(out.status)") }
-        guard !out.cut else { throw SourceError.unreadable("git \(args[0]) output over the capture limit") }
-        return out.stdout
     }
 }

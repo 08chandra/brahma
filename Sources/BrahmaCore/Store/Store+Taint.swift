@@ -394,7 +394,9 @@ extension Store {
                            arguments: [Store.flat("labs worked in while the import mark stood (\(source))", max: 200), companyId])
             for agent in try Agent.filter(Column("companyId") == companyId).fetchAll(db) where agent.sessionTainted || agent.freshSessionRequested {
                 try Store.markLabTainted(db, agentId: agent.id, source: agent.taintSources.split(separator: "\n").first.map(String.init) ?? source, now: now)
-                try Store.forceFreshSession(db: db, agentId: agent.id, itemId: nil, reason: "tainted", now: now)
+                // Its own reason (Plan X6a ruling R33): the owner's decision, not a refused call under taint. Readers only test
+                // the column for NOT NULL (Store+Taint+Memory); `brahma measure` counts `tainted` alone as a taint refusal.
+                try Store.forceFreshSession(db: db, agentId: agent.id, itemId: nil, reason: "trustImport", now: now)
                 try db.execute(sql: "DELETE FROM agentSession WHERE agentId = ?", arguments: [agent.id])
                 try db.execute(sql: "UPDATE agent SET sessionTainted = 0, freshSessionRequested = 0, taintSources = '' WHERE id = ?",
                                arguments: [agent.id])

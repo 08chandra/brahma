@@ -301,22 +301,35 @@ import GRDB
         #expect(!m.basis.contains("no model recorded"), "\(m.basis)")
     }
 
-    /// `brahma company trust-import` also ends sessions with `freshSessionReason = tainted`; those fresh sessions are the owner's
-    /// decision, not refusals, and are excluded with the basis saying how many.
-    @Test func taintRefusalsExcludeTrustImport() throws {
+    /// `brahma company trust-import` ends the company's tainted sessions with its own reason, `trustImport` (ruling R33), so a
+    /// taint refusal is exactly `freshSessionReason = tainted`. Through the real flow: the pending base-scope reason waits past an
+    /// item-scope turn and lands on the next base-scope turn as `trustImport` — no refusal. A refused call under taint
+    /// (`requestFreshSession`, then the turn's end) lands `tainted` on the agent's next turn — one refusal.
+    @Test func taintRefusalsAreExactNotTrustImport() throws {
         let store = try Store.inMemory()
         let acme = try MeasureFixtures.company(store, name: "Acme", createdAt: t0.addingTimeInterval(-30 * day))
         let eng = try MeasureFixtures.agent(store, company: acme, name: "eng")
+        let item = try MeasureFixtures.items(store, company: acme, count: 1, now: t0.addingTimeInterval(-10 * day))[0]
         let base = t0.addingTimeInterval(-5 * day)
-        try MeasureFixtures.turn(store, agent: eng, at: base)
         try store.writer.write { db in try Store.markImported(db, companyId: acme.id, source: "import: example.com", now: base) }
+        try store.markTainted(agentId: eng.id, source: "import: example.com", now: base)
         #expect(try store.trustImport(companyId: acme.id, now: base.addingTimeInterval(600)) != nil)
-        try MeasureFixtures.turn(store, agent: eng, freshSessionReason: "tainted", at: base.addingTimeInterval(1200))   // after the trust
-        try MeasureFixtures.turn(store, agent: eng, at: base.addingTimeInterval(1800))
-        try MeasureFixtures.turn(store, agent: eng, freshSessionReason: "tainted", at: base.addingTimeInterval(2400))   // a refusal
-        let taint = try row(try UsageMetrics.safety(try ctx(store, acme)), "taint refusals")
-        #expect(taint.numerator == 1)
-        #expect(taint.basis.contains("1 fresh session after the owner's trust-import excluded"), "\(taint.basis)")
+        // An item-scope turn: the base-scope reason stays pending.
+        let itemTurn = try MeasureFixtures.turn(store, agent: eng, item: item, at: base.addingTimeInterval(1200))
+        #expect(try store.applyPendingSessionReset(agentId: eng.id, turnId: itemTurn.id, scope: .item(item.id)) == nil)
+        // The next base-scope turn carries the owner's reset.
+        let baseTurn = try MeasureFixtures.turn(store, agent: eng, at: base.addingTimeInterval(1800))
+        #expect(try store.applyPendingSessionReset(agentId: eng.id, turnId: baseTurn.id, scope: .base) == "trustImport")
+        let afterTrust = try row(try UsageMetrics.safety(try ctx(store, acme)), "taint refusals")
+        #expect(afterTrust.numerator == 0)
+        #expect(afterTrust.basis.contains("trust-import resets recorded before"), "\(afterTrust.basis)")
+
+        // A real refusal: a high-risk call refused under taint, the turn's end forces the fresh session, the next turn carries it.
+        try store.requestFreshSession(agentId: eng.id)
+        #expect(try store.clearTaintIfRequested(agentId: eng.id, scope: .base, now: base.addingTimeInterval(2000)))
+        let refusedNext = try MeasureFixtures.turn(store, agent: eng, at: base.addingTimeInterval(2400))
+        #expect(try store.applyPendingSessionReset(agentId: eng.id, turnId: refusedNext.id, scope: .base) == "tainted")
+        #expect(try row(try UsageMetrics.safety(try ctx(store, acme)), "taint refusals").numerator == 1)
     }
 
     /// Owner minutes are the owner's alone (ruling R32): an agent process holding no principal can't log them, and the generic

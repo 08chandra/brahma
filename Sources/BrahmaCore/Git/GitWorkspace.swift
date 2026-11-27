@@ -3981,3 +3981,64 @@ extension GitWorkspace {
                 "textconv", "driver", "cmd", "program", "packobjectshook", "helper", "uploadpack", "receivepack"].contains(variable)
     }
 }
+
+// MARK: Stable patch-ids (Plan X6a, the revert detector)
+
+/// Why `GitWorkspace.stablePatchId` has no answer.
+public enum PatchIdFailure: Error, Equatable, CustomStringConvertible {
+    /// The git call ran past its time limit.
+    case timedOut
+    /// This one range cannot be read (a missing commit, a malformed revision, a diff over the capture limit).
+    case unreadable(String)
+    /// Nothing in this workspace can be read (no repository; the engine refuses the repository's config).
+    case unavailable(String)
+
+    public var description: String {
+        switch self {
+        case .timedOut: return "a git call timed out"
+        case .unreadable(let why), .unavailable(let why): return why
+        }
+    }
+}
+
+extension GitWorkspace {
+    /// The stable patch-id of the diff `from..to` (`git diff --no-color --no-ext-diff --no-textconv <from> <to> --`, that diff on
+    /// the stdin of `git patch-id --stable`), nil for an empty diff. Through `main` (its git dir is the common dir), each call
+    /// limited to `timeout` seconds. `from`/`to` must be commit ids as the store records them, optionally with `^1`: nothing git
+    /// could read as an option or a path. Throws `PatchIdFailure`.
+    public func stablePatchId(from: String, to: String, timeout: TimeInterval) throws -> String? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: gitDir.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw PatchIdFailure.unavailable("the company workspace has no repository")
+        }
+        guard Self.isPatchRevision(from), Self.isPatchRevision(to) else { throw PatchIdFailure.unreadable("not a commit id") }
+        var git = main
+        git.timeoutSeconds = timeout
+        let diff = try Self.patchIdStep(git, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", from, to, "--"], stdin: .none)
+        guard !diff.isEmpty else { return nil }
+        let out = try Self.patchIdStep(git, ["patch-id", "--stable"], stdin: .data(diff))
+        // `<patch-id> <commit-id>`; the commit is all zeros for a diff with no commit header.
+        return String(decoding: out, as: UTF8.self).split(whereSeparator: \.isWhitespace).first.map(String.init)
+    }
+
+    /// A commit id (7–64 hex), optionally with `^1`, and nothing after it.
+    static func isPatchRevision(_ s: String) -> Bool {
+        s.range(of: "^[0-9a-f]{7,64}(\\^1)?\\z", options: .regularExpression) != nil
+    }
+
+    /// One git call's stdout, or the `PatchIdFailure` it amounts to.
+    private static func patchIdStep(_ git: GitCommand, _ args: [String], stdin: GitCommand.Stdin) throws -> Data {
+        let out: GitCommand.Output
+        do {
+            out = try git.run(args, allowFailure: true, stdin: stdin)
+        } catch let error as GitError where error.isRepositoryRefusal {
+            throw PatchIdFailure.unavailable("\(error)")
+        } catch {
+            throw PatchIdFailure.unreadable("\(error)")
+        }
+        if out.timedOut { throw PatchIdFailure.timedOut }
+        guard out.status == 0 else { throw PatchIdFailure.unreadable("git \(args[0]) exited \(out.status)") }
+        guard !out.cut else { throw PatchIdFailure.unreadable("git \(args[0]) output over the capture limit") }
+        return out.stdout
+    }
+}
