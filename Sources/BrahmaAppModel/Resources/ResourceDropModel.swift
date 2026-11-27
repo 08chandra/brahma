@@ -356,14 +356,15 @@ public final class ResourceDropModel {
                 return
             }
             guard let app, let companyId, !isCommitting else { return }
-            let (store, vault, paths, plan, context) = (app.store, app.secretVault, app.paths, pending[index].plan, self.context)
+            let (store, vault, paths, plan, context, owner) = (app.store, app.secretVault, app.paths, pending[index].plan, self.context, app.owner)
             isCommitting = true
             let stored: Result<Void, any Error> = await Task.detached {
                 Result {
                     let known = try store.knownSecretValues(companyId: companyId, vault: vault)
                     try store.addResources(companyId: companyId, plan: plan,
                                            drop: ResourceDrop(context: context, secretChoice: .storeAsSecret(name: name)),
-                                           contentVault: ContentVault(paths: paths), secretVault: vault, knownValues: known, paths: paths)
+                                           contentVault: ContentVault(paths: paths), secretVault: vault, knownValues: known, paths: paths,
+                                           owner: try store.requireOwner(owner))
                 }
             }.value
             isCommitting = false
@@ -414,7 +415,7 @@ public final class ResourceDropModel {
             return false
         }
         let words = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        let (store, vault, paths, context) = (app.store, app.secretVault, app.paths, self.context)
+        let (store, vault, paths, context, owner) = (app.store, app.secretVault, app.paths, self.context, app.owner)
         let (scope, future) = (self.scope, self.futureHolders)
         let acked = defaults.bool(forKey: Self.advisoryKey(companyId))
         isCommitting = true
@@ -422,7 +423,7 @@ public final class ResourceDropModel {
         let result = await Task.detached {
             Self.commitOffMain(store: store, vault: vault, paths: paths, companyId: companyId, context: context, scope: scope,
                                futureHolders: future, acked: acked, files: merged, fileIds: files.map(\.id), link: links.first,
-                               words: words.isEmpty ? nil : words)
+                               words: words.isEmpty ? nil : words, owner: owner)
         }.value
         isCommitting = false
         if result.needsAdvisory {
@@ -490,7 +491,8 @@ public final class ResourceDropModel {
 
     nonisolated static func commitOffMain(store: Store, vault: any SecretVault, paths: BrahmaPaths, companyId: String,
                                           context: DropContext, scope: ScopeChoice, futureHolders: Bool, acked: Bool,
-                                          files: MergedDrop?, fileIds: [UUID], link: PendingDrop?, words: String?) -> CommitResult {
+                                          files: MergedDrop?, fileIds: [UUID], link: PendingDrop?, words: String?,
+                                          owner: OwnerPrincipal?) -> CommitResult {
         var result = CommitResult()
         do {
             let resolved = try resolve(store: store, companyId: companyId, context: context, choice: scope, futureHolders: futureHolders)
@@ -509,10 +511,12 @@ public final class ResourceDropModel {
                 let known = try store.knownSecretValues(companyId: companyId, vault: vault)
                 // Plan C Task C6: through C5's `ownerDrop` (the same `addResources`, with the file-request rules).
                 try store.ownerDrop(companyId: companyId, context: context, plan: files.plan, drop: drop(trust: files.trust, secret: files.secret),
-                                    contentVault: content, secretVault: vault, knownValues: known, paths: paths)
+                                    contentVault: content, secretVault: vault, knownValues: known, paths: paths,
+                                    owner: try store.requireOwner(owner))
                 result.committed = fileIds
             } else if let link, let url = link.link {
-                try store.addLink(companyId: companyId, url: url, drop: drop(trust: link.trust, secret: .none), contentVault: content)
+                try store.addLink(companyId: companyId, url: url, drop: drop(trust: link.trust, secret: .none), contentVault: content,
+                                  owner: try store.requireOwner(owner))
                 result.committed = [link.id]
             }
         } catch {

@@ -379,12 +379,13 @@ extension AppModel {
         case .concierge: reader = .concierge
         case .agent(let id): reader = .agent(id)
         }
-        let created: ShowRequest? = await ownerWrite("ask") { store in
+        let created: ShowRequest? = await ownerAct("ask") { store, owner in
             let known = try store.knownSecretValues(companyId: companyId, vault: vault)
             let gate = GlobalSearch.TextGate(knownValues: known)
             let candidates = try result.map { try ShowCandidates.lines(result: $0, for: reader, store: store, companyId: companyId, gate: gate).lines } ?? []
             return try store.createShowRequest(companyId: companyId, kind: draft.kind, query: draft.query,
-                                               attachedRef: draft.attachedRef?.canonical, routed: draft.target, candidates: candidates, now: now)
+                                               attachedRef: draft.attachedRef?.canonical, routed: draft.target, candidates: candidates, now: now,
+                                               owner: owner)
         }
         guard created != nil else { return }
         showBar.close()
@@ -395,7 +396,7 @@ extension AppModel {
     public func cancelShowRequest(_ id: String) async {
         guard let companyId = selectedCompanyId else { return }
         let now = clock()
-        _ = await ownerWrite("cancel the request") { store in try store.cancelShowRequest(companyId: companyId, id: id, now: now) }
+        _ = await ownerAct("cancel the request") { store, owner in try store.cancelShowRequest(companyId: companyId, id: id, now: now, owner: owner) }
         waitingChips.removeAll { $0.requestId == id }
         await refreshCollab()
     }
@@ -550,8 +551,8 @@ extension AppModel {
     public func sendFileAsk(to handle: String, description: String, item: String?) async -> Bool {
         guard let companyId = selectedCompanyId else { return false }
         let now = clock()
-        return await ownerWrite("ask for a file") { store in
-            _ = try store.sendFileAsk(companyId: companyId, toHandle: handle, description: description, itemKey: item, now: now)
+        return await ownerAct("ask for a file") { store, owner in
+            _ = try store.sendFileAsk(companyId: companyId, toHandle: handle, description: description, itemKey: item, now: now, owner: owner)
             return true
         } ?? false
     }
@@ -625,10 +626,10 @@ extension AppModel {
     public func export(_ ref: WorkRef, to url: URL) async -> URL? {
         guard let companyId = selectedCompanyId else { return nil }
         let paths = self.paths, vault = self.secretVault, archives: @Sendable (Store, BrahmaPaths, String) -> any ArchiveReader = refArchives, now = clock()
-        return await ownerWrite("save \(ref.canonical.prefix(60))") { store in
+        return await ownerAct("save \(ref.canonical.prefix(60))") { store, owner in
             let known = try store.knownSecretValues(companyId: companyId, vault: vault)
             return try store.exportRef(companyId: companyId, ref: ref, to: url, knownValues: known, paths: paths,
-                                       archives: archives(store, paths, companyId), now: now)
+                                       archives: archives(store, paths, companyId), now: now, owner: owner)
         }
     }
 

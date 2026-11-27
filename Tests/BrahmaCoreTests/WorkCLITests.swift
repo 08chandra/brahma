@@ -337,7 +337,7 @@ private func brahma(_ args: [String], home: URL? = nil, env: [String: String] = 
         let b = try store.createWorkItem(companyId: c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Signup\u{1B}[2J"))
         let (sprint, ask) = try store.planSprint(companyId: c.id, by: .agent(ceo.id), goal: "Accounts\u{07}", itemKeys: [a.key, b.key],
                                                  team: nil, cadence: nil, milestoneKey: nil)
-        _ = try store.ownerDecide(askId: ask.id, approve: true)
+        _ = try store.ownerDecide(askId: ask.id, approve: true, owner: .test)
         try store.writer.write { db in _ = try store.engineSetStatus(db: db, itemId: a.id, to: .done, text: "merged", event: .merged, now: Store.now()) }
         let show = try brahma(["sprint", "Acme"], home: home)
         #expect(show.status == 0, "\(show.stderr)")

@@ -49,8 +49,9 @@ extension Store {
     }
 
     /// Stops the item's tainted commits from tainting what holds them: `by` is `"review"` (merged through the review gate) or
-    /// `"owner"` (the owner vouched for the item).
-    public func clearTaintedCommits(itemId: String, by: String, now: Date) throws {
+    /// `"owner"` (the owner vouched for the item). Final wave B1 (FR I-2): internal, the engine's and tests' only; the owner's
+    /// vouch is `vouchItem` (the principal).
+    func clearTaintedCommits(itemId: String, by: String, now: Date) throws {
         try writer.write { db in
             guard let item = try WorkItem.fetchOne(db, key: itemId) else { throw WorkError.notFound("no such work item") }
             try Self.clearTaintedCommits(db: db, item: item, by: by, now: now)
@@ -66,6 +67,7 @@ extension Store {
     /// The owner vouches for an item's changes: its tainted commits are cleared (`clearedBy = "owner"`) and the activity log
     /// says so. Owner callers only (the app and the owner CLI).
     public func vouchItem(itemId: String, now: Date, owner: OwnerPrincipal) throws {
+        try ProcessRole.refuseInAgentProcess()
         try writer.write { db in
             guard let item = try WorkItem.fetchOne(db, key: itemId) else { throw WorkError.notFound("no such work item") }
             try Self.clearTaintedCommits(db: db, item: item, by: "owner", now: now)

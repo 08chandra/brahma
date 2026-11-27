@@ -109,7 +109,7 @@ struct ResourceCommand: ParsableCommand {
 
     func run() throws {
         let action = try Self.action(words)
-        try requireOwnerShell()
+        let owner = try requireOwnerShell()
         let (store, paths) = try openStore()
         let c = try resolveCompany(store, company)
         let contentVault = ContentVault(paths: paths)
@@ -140,11 +140,11 @@ struct ResourceCommand: ParsableCommand {
                                         trust: untrusted ? .untrusted : vouch ? .vouched : .asDetected,
                                         secretChoice: redact ? .uploadRedacted : anyway ? .uploadAnyway : .none)
                 let rows = try store.addResources(companyId: c.id, plan: plan, drop: drop, contentVault: contentVault,
-                                                  secretVault: secretVault, knownValues: known, paths: paths)
+                                                  secretVault: secretVault, knownValues: known, paths: paths, owner: owner)
                 for r in rows { show("added " + line(r, store: store, company: c)) }
             case .link(let url):
                 let drop = ResourceDrop(context: .cli, scope: try resolvedScope())
-                let r = try store.addLink(companyId: c.id, url: url, drop: drop, contentVault: contentVault)
+                let r = try store.addLink(companyId: c.id, url: url, drop: drop, contentVault: contentVault, owner: owner)
                 show("added " + line(r, store: store, company: c))
             case .list:
                 let rows = try store.resources(companyId: c.id, reader: .owner, includePurged: true)
@@ -156,19 +156,19 @@ struct ResourceCommand: ParsableCommand {
                     show((r.parentId == nil ? "" : "    ") + line(r, store: store, company: c, files: r.kind == .folder ? live[r.id] ?? 0 : nil))
                 }
             case .vouch(let n):
-                let rows = try store.vouchResource(companyId: c.id, number: n, contentVault: contentVault, paths: paths)
+                let rows = try store.vouchResource(companyId: c.id, number: n, contentVault: contentVault, paths: paths, owner: owner)
                 print("vouched for F-\(n)" + (rows.count > 1 ? " and its \(rows.count - 1) files" : ""))
             case .scope(let n, let text):
                 let scope = try resolve(try Self.scopeSpec(text), store: store, company: c)
                 try store.setResourceScope(companyId: c.id, number: n, scope: scope, futureHolders: false,
-                                           contentVault: contentVault, paths: paths)
+                                           contentVault: contentVault, paths: paths, owner: owner)
                 show("F-\(n) is now \(try store.resourceScopeLabel(scope, companyId: c.id))")
             case .purge(let n):
                 // Every snapshot that may still hold it: the database's and the data home's (the vault).
                 let backups = BackupService(paths: paths).list().map { (name: $0.name, takenAt: $0.date) }
                     + HomeSnapshot.list(paths: paths).map { (name: $0.name, takenAt: $0.date) }
                 let report = try store.purgeResource(companyId: c.id, number: n, backups: backups, contentVault: contentVault,
-                                                     paths: paths)
+                                                     paths: paths, owner: owner)
                 print("purged F-\(n); " + Store.purgeHolders(report))
                 for name in report.backups { show("  backup \(name) contains purged content · delete or re-create") }
                 for turn in report.transcripts { show("  transcript of turn \(turn) may contain purged content") }

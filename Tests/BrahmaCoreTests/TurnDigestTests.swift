@@ -344,7 +344,7 @@ import GRDB
             try Data(text.utf8).write(to: url)
             let plan = try ResourceIntake.inspect(urls: [url], knownValues: [], agentAreas: .none)
             return try #require(try d.store.addResources(companyId: d.company.id, plan: plan, drop: drop, contentVault: vault,
-                                                         secretVault: MemoryVault(), knownValues: [], paths: d.world.paths, now: now).first)
+                                                         secretVault: MemoryVault(), knownValues: [], paths: d.world.paths, now: now, owner: .test).first)
         }
         // Added when the agent's previous turn started (its orientation was built then): not new to it.
         let start = Store.now()

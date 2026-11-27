@@ -10,7 +10,7 @@ extension AppModel {
     public func ensureHandbook() -> HandbookModel? {
         guard let companyId = selectedCompanyId else { return nil }
         if let handbook, handbook.companyId == companyId { return handbook }
-        let model = HandbookModel(store: store, companyId: companyId, paths: paths, secretVault: secretVault)
+        let model = HandbookModel(store: store, companyId: companyId, paths: paths, secretVault: secretVault, owner: owner)
         model.afterChange = { [weak self] in await self?.tick(forceSnapshot: true) }
         model.memory.afterChange = { [weak self] in await self?.tick(forceSnapshot: true) }
         handbook = model

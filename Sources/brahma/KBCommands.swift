@@ -64,7 +64,7 @@ struct KBCommand: ParsableCommand {
 
     func run() throws {
         let action = try Self.action(words, to: to)
-        try requireOwnerShell()
+        let owner = try requireOwnerShell()
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
         func show(_ text: String) {
@@ -101,7 +101,7 @@ struct KBCommand: ParsableCommand {
                 let r = try store.kbRollback(companyId: c.id, path: path, to: n)
                 print(safe("rolled kb:\(r.page.path) back to rev \(n) (now rev \(r.revision))"))
             case .vouch(let path):
-                try store.kbVouch(companyId: c.id, path: path)
+                try store.kbVouch(companyId: c.id, path: path, owner: owner)
                 print(safe("vouched for kb:\(try HandbookPath.normalize(path))"))
             case .status(let path, let status):
                 try store.kbSetStatus(companyId: c.id, path: path, status: status)

@@ -165,7 +165,7 @@ extension Store {
                         """, arguments: [companyId, resource.id, resource.id])
                 }
                 let ml = try purgeResource(companyId: companyId, number: resource.number, backups: backups, contentVault: contentVault,
-                                           paths: paths, now: now)
+                                           paths: paths, now: now, owner: owner)
                 report.backupsFlagged = ml.backups
                 report.transcripts = ml.transcripts
                 report.exportedCopies = ml.exports      // listed, with their notices, by ML's purge

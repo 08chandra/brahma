@@ -290,7 +290,7 @@ import GRDB
         #expect(refusal("set_blocked", ["on": .string("@mate"), "reason": .string("r"), "ask": .string(ask.ref)]) != nil)
         #expect(try store.agent(id: eng.id)?.requestedBlocker == .owner(reason: "blocked on \(ask.ref) / askId \(ask.id)"))
         #expect(refusal("update_work_item", ["key": .string(item.key), "blockedReason": .string("x"), "blockedOnAsk": .string("A-99")]) != nil)
-        _ = try store.ownerDecide(askId: ask.id, approve: true)
+        _ = try store.ownerDecide(askId: ask.id, approve: true, owner: .test)
         #expect(refusal("set_blocked", ["on": .string("owner"), "reason": .string("r"), "ask": .string(ask.ref)])?.contains("open") == true)
         // Another company's ask is out of reach, by ref or by id.
         let other = try store.createCompany(name: "Globex", goal: "g", workspacesRoot: try tempDir())
@@ -338,7 +338,7 @@ import GRDB
         let other = CompanyTools(store: store, companyId: company.id, agentId: mgr.id)
         #expect((try? other.call(name: "request_from_owner", arguments: ["title": .string("M"), "question": .string("q")])) != nil)
         let open = try store.asks(companyId: company.id, statuses: [.pendingOwner]).filter { $0.requesterId == eng.id }
-        _ = try store.ownerAnswer(askId: open[0].id, text: "yes")
+        _ = try store.ownerAnswer(askId: open[0].id, text: "yes", owner: .test)
         #expect(ask(9).ok)
         try AskQuota.check(store: store, agentId: mgr.id)
     }

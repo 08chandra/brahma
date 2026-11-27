@@ -203,7 +203,7 @@ import GRDB
                 "kind": .string("network_domain"), "value": .string(domain), "reason": .string("I need it")])
             let ask = try #require(try env.store.asks(companyId: acme.id).last { $0.kind == .grant })
             let grantEnv = SandboxEnvironment(userHome: try tempDir(), darwinUserTemp: nil, shell: "/bin/zsh")
-            return try env.store.approveAccess(askId: ask.id, scope: scope, duration: duration, note: "ok", environment: grantEnv)
+            return try env.store.approveAccess(askId: ask.id, scope: scope, duration: duration, note: "ok", environment: grantEnv, owner: .test)
         }
 
         /// Restores the snapshot (the live store closed first) and opens the restored database as the engine would.

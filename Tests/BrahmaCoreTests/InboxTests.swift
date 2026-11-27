@@ -145,9 +145,9 @@ import GRDB
         #expect(try w.dms("eng-1").contains("A-1 approved by policy (important): ok"))
         #expect(try w.store.hasApproved(companyId: w.company.id, kind: .sprintPlan))
         // The owner can acknowledge an FYI.
-        let ack = try w.store.acknowledge(askId: plan.id, now: w.now)
+        let ack = try w.store.acknowledge(askId: plan.id, now: w.now, owner: .test)
         #expect(ack.acknowledgedAt == w.now)
-        #expect(throws: WorkError.conflict("A-1 is already acknowledged")) { try w.store.acknowledge(askId: plan.id, now: w.now) }
+        #expect(throws: WorkError.conflict("A-1 is already acknowledged")) { try w.store.acknowledge(askId: plan.id, now: w.now, owner: .test) }
         // An architecture ask under important goes to the owner.
         let arch = try w.decide(try w.propose(.architecture), by: w.cto)
         #expect(arch.status == .pendingOwner); #expect(!arch.fyi)
@@ -170,14 +170,14 @@ import GRDB
         #expect(q.createdActive == 100); #expect(q.expiresActive == 7300.0)
         #expect(try w.activity().contains { $0.kind == .approval && $0.text.hasPrefix("Owner approval needed: A-1 Question: Which db?") })
         // A question is answered, not approved.
-        #expect(throws: WorkError.self) { try w.store.ownerDecide(askId: q.id, approve: true, note: "", now: w.now) }
-        let a = try w.store.ownerAnswer(askId: q.id, text: "SQLite", now: w.now)
+        #expect(throws: WorkError.self) { try w.store.ownerDecide(askId: q.id, approve: true, note: "", now: w.now, owner: .test) }
+        let a = try w.store.ownerAnswer(askId: q.id, text: "SQLite", now: w.now, owner: .test)
         #expect(a.status == .answered); #expect(a.ownerAnswer == "SQLite"); #expect(a.decidedBy == "owner"); #expect(a.ownerDecidedAt == w.now)
         #expect(try w.dms("eng-1", "owner").contains("SQLite"))
-        #expect(throws: WorkError.conflict("A-1 is already answered")) { try w.store.ownerAnswer(askId: q.id, text: "x", now: w.now) }
+        #expect(throws: WorkError.conflict("A-1 is already answered")) { try w.store.ownerAnswer(askId: q.id, text: "x", now: w.now, owner: .test) }
         // An answer needs a question.
         let gate = try w.propose(.prd)
-        #expect(throws: WorkError.self) { try w.store.ownerAnswer(askId: gate.id, text: "yes", now: w.now) }
+        #expect(throws: WorkError.self) { try w.store.ownerAnswer(askId: gate.id, text: "yes", now: w.now, owner: .test) }
     }
 
     @Test func onlyApproverDecides() throws {
@@ -221,14 +221,14 @@ import GRDB
     @Test func ownerDecidesAndRequesterIsTold() throws {
         let w = try W()
         let a = try w.decide(try w.propose(.architecture), by: w.cto)
-        let d = try w.store.ownerDecide(askId: a.id, approve: true, note: "go", now: w.now)
+        let d = try w.store.ownerDecide(askId: a.id, approve: true, note: "go", now: w.now, owner: .test)
         #expect(d.status == .approved); #expect(d.decidedBy == "owner"); #expect(d.ownerNote == "go"); #expect(d.ownerDecidedAt == w.now)
         #expect(!d.fyi)
         #expect(try w.dms("eng-1").contains("A-1 approved by the owner: go"))
-        #expect(throws: WorkError.conflict("A-1 is already approved")) { try w.store.ownerDecide(askId: a.id, approve: false, note: "", now: w.now) }
+        #expect(throws: WorkError.conflict("A-1 is already approved")) { try w.store.ownerDecide(askId: a.id, approve: false, note: "", now: w.now, owner: .test) }
         // The owner may decide before the internal approver has.
         let early = try w.propose(.prd)
-        let r = try w.store.ownerDecide(askId: early.id, approve: false, note: "no", now: w.now)
+        let r = try w.store.ownerDecide(askId: early.id, approve: false, note: "no", now: w.now, owner: .test)
         #expect(r.status == .rejected); #expect(try w.dms("eng-1").contains("A-2 rejected by the owner: no"))
         #expect(try w.store.hasApproved(companyId: w.company.id, kind: .architecture))
         #expect(try !w.store.hasApproved(companyId: w.company.id, kind: .prd))
@@ -241,28 +241,28 @@ import GRDB
         #expect(a.detailsHash == StableHash.fnv1a64("# PRD\nversion 1\n"))
         _ = try w.writeDoc("docs/prd.md", "# PRD\nversion 2\n")
         #expect(throws: WorkError.conflict("A-1's document changed since it was proposed; read it again and approve with --ack-changed")) {
-            try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now)
+            try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now, owner: .test)
         }
         #expect(try w.fresh(a).status == .pendingOwner)
         // Rejecting needs no re-read; approving with the acknowledgement works.
-        let d = try w.store.ownerDecide(askId: a.id, approve: true, note: "read it", acknowledgeChange: true, now: w.now)
+        let d = try w.store.ownerDecide(askId: a.id, approve: true, note: "read it", acknowledgeChange: true, now: w.now, owner: .test)
         #expect(d.status == .approved)
         #expect(try w.store.documentChanged(d) == true)
     }
 
     @Test func supersedesMarksOldAsk() throws {
         let w = try W()
-        let old = try w.store.ownerDecide(askId: try w.propose(.architecture).id, approve: true, note: "v1", now: w.now)
-        let rejected = try w.store.ownerDecide(askId: try w.propose(.architecture).id, approve: false, note: "no", now: w.now)
+        let old = try w.store.ownerDecide(askId: try w.propose(.architecture).id, approve: true, note: "v1", now: w.now, owner: .test)
+        let rejected = try w.store.ownerDecide(askId: try w.propose(.architecture).id, approve: false, note: "no", now: w.now, owner: .test)
         let new = try w.propose(.architecture, supersedes: old.id)
         #expect(new.supersedesId == old.id)
         #expect(try w.fresh(old).status == .approved)       // only when the new one is approved
-        _ = try w.store.ownerDecide(askId: new.id, approve: true, note: "v2", now: w.now)
+        _ = try w.store.ownerDecide(askId: new.id, approve: true, note: "v2", now: w.now, owner: .test)
         #expect(try w.fresh(old).status == .superseded)
         #expect(try w.store.hasApproved(companyId: w.company.id, kind: .architecture))   // the new one counts
         // A rejected ask stays rejected when superseded.
         let again = try w.propose(.architecture, supersedes: rejected.id)
-        _ = try w.store.ownerDecide(askId: again.id, approve: true, note: "", now: w.now)
+        _ = try w.store.ownerDecide(askId: again.id, approve: true, note: "", now: w.now, owner: .test)
         #expect(try w.fresh(rejected).status == .rejected)
         // Same kind, same company.
         #expect(throws: WorkError.invalid("supersedes must name an ask of the same kind")) { try w.propose(.prd, supersedes: old.id) }
@@ -276,7 +276,7 @@ import GRDB
         }
         // A superseded ask no longer counts as the gate.
         let only = try W()
-        let first = try only.store.ownerDecide(askId: try only.propose(.release).id, approve: true, note: "", now: w.now)
+        let first = try only.store.ownerDecide(askId: try only.propose(.release).id, approve: true, note: "", now: w.now, owner: .test)
         #expect(try only.store.hasApproved(companyId: only.company.id, kind: .release))
         try only.store.writer.write { db in try db.execute(sql: "UPDATE ask SET status = 'rescinded' WHERE id = ?", arguments: [first.id]) }
         #expect(try !only.store.hasApproved(companyId: only.company.id, kind: .release))
@@ -339,7 +339,7 @@ import GRDB
         let b = try w.decide(try w.propose(.sprintPlan), by: w.cpo)
         #expect(b.status == .approved); #expect(b.fyi); #expect(b.decidedBy == "policy:auto")
         // The owner still decides the old one.
-        #expect(try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now).status == .approved)
+        #expect(try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now, owner: .test).status == .approved)
     }
 
     @Test func documentPathMustStayInWorkspace() throws {
@@ -458,12 +458,12 @@ import GRDB
     @Test func replanAnswer() throws {
         let w = try W()
         let a = try w.decide(try w.propose(.architecture), by: w.cto)
-        let r = try w.store.ownerReplan(askId: a.id, text: "split it into two services", now: w.now)
+        let r = try w.store.ownerReplan(askId: a.id, text: "split it into two services", now: w.now, owner: .test)
         #expect(r.status == .rejected); #expect(r.ownerAnswer == "split it into two services"); #expect(r.decidedBy == "owner")
         #expect(try w.dms("eng-1").contains("A-1 needs a new plan: split it into two services"))
-        #expect(throws: WorkError.conflict("A-1 is already rejected")) { try w.store.ownerReplan(askId: a.id, text: "x", now: w.now) }
+        #expect(throws: WorkError.conflict("A-1 is already rejected")) { try w.store.ownerReplan(askId: a.id, text: "x", now: w.now, owner: .test) }
         let q = try w.store.requestFromOwner(companyId: w.company.id, by: .agent(w.eng.id), title: "q", question: "q?", now: w.now)
-        #expect(throws: WorkError.self) { try w.store.ownerReplan(askId: q.id, text: "x", now: w.now) }
+        #expect(throws: WorkError.self) { try w.store.ownerReplan(askId: q.id, text: "x", now: w.now, owner: .test) }
     }
 
     @Test func smallCompanyCombinedGate() throws {
@@ -473,7 +473,7 @@ import GRDB
         _ = try w.decide(prd, by: w.ceo)
         #expect(try w.activity().contains { $0.kind == .approval && $0.text.contains("Brief & architecture") })
         #expect(try w.store.displayTitle(prd) == "Brief & architecture")
-        _ = try w.store.ownerDecide(askId: prd.id, approve: true, note: "", now: w.now)
+        _ = try w.store.ownerDecide(askId: prd.id, approve: true, note: "", now: w.now, owner: .test)
         #expect(try w.store.hasApproved(companyId: w.company.id, kind: .prd))
         #expect(try w.store.hasApproved(companyId: w.company.id, kind: .architecture))
         // Above eight agents the architecture gate stands alone.
@@ -536,7 +536,7 @@ import GRDB
             try w.store.propose(companyId: w.company.id, by: .system, kind: .architecture, title: "x", summary: "", supersedes: old.id, now: w.now)
         }
         // The owner-approved one cannot be replaced by someone else's ask either.
-        let approved = try w.store.ownerDecide(askId: old.id, approve: true, note: "", now: w.now)
+        let approved = try w.store.ownerDecide(askId: old.id, approve: true, note: "", now: w.now, owner: .test)
         #expect(throws: WorkError.forbidden("only the requester of A-1 can supersede it")) {
             try w.propose(.architecture, by: w.cto, supersedes: approved.id)
         }
@@ -548,11 +548,11 @@ import GRDB
     @Test func supersedingOwnerApprovedAskRequiresOwner() throws {
         let w = try W(preset: .auto)
         // Owner-decided old ask: the replacement is never an FYI, even under auto.
-        let old = try w.store.ownerDecide(askId: try w.propose(.sprintPlan).id, approve: true, note: "", now: w.now)
+        let old = try w.store.ownerDecide(askId: try w.propose(.sprintPlan).id, approve: true, note: "", now: w.now, owner: .test)
         let new = try w.decide(try w.propose(.sprintPlan, supersedes: old.id), by: w.cpo)
         #expect(new.status == .pendingOwner); #expect(!new.fyi)
         #expect(try w.fresh(old).status == .approved)
-        _ = try w.store.ownerDecide(askId: new.id, approve: true, note: "", now: w.now)
+        _ = try w.store.ownerDecide(askId: new.id, approve: true, note: "", now: w.now, owner: .test)
         #expect(try w.fresh(old).status == .superseded)
         // Replacing a policy-approved ask stays an FYI.
         let policy = try w.decide(try w.propose(.sprintPlan), by: w.cpo)
@@ -585,7 +585,7 @@ import GRDB
         let path = ws.appending(path: rel).path
         try FileManager.default.removeItem(atPath: path)
         #expect(mkfifo(path, 0o644) == 0)
-        #expect(throws: WorkError.self) { try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now) }
+        #expect(throws: WorkError.self) { try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now, owner: .test) }
         #expect(try w.store.documentChanged(a))
         #expect(AwakeTime.now - started < .seconds(60), "hang guard")
         // A device file is not a regular file either. With /dev as the workspace, /dev/null passes containment and reaches
@@ -623,7 +623,7 @@ import GRDB
         #expect(clean(d.internalNote))
         let q = try w.store.requestFromOwner(companyId: w.company.id, by: .agent(w.eng.id), title: "Q\(esc)", question: "why\(bel)?", now: w.now)
         #expect(clean(q.title)); #expect(clean(q.payload?.question))
-        #expect(clean(try w.store.ownerAnswer(askId: q.id, text: "a\(esc)b\r\nc", now: w.now).ownerAnswer, newlines: true))
+        #expect(clean(try w.store.ownerAnswer(askId: q.id, text: "a\(esc)b\r\nc", now: w.now, owner: .test).ownerAnswer, newlines: true))
     }
 
     @Test func dedupeHitDescribesExistingAsk() throws {
@@ -772,7 +772,7 @@ import GRDB
             #expect(a.risk == .high); #expect(a.itemId == item.id); #expect(!a.fyi)
             // One unresolved boost per item.
             #expect(try w.store.fileFailurePathBoost(companyId: w.company.id, itemId: item.id, reason: "again", now: w.now).id == a.id)
-            #expect(try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now).status == .approved)
+            #expect(try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now, owner: .test).status == .approved)
             #expect(try w.dms("owner").contains { $0.contains(a.ref) })
         }
     }
@@ -808,7 +808,7 @@ import GRDB
         #expect(try w.store.sweepAsks(now: w.now) == 0)
         #expect(try w.dms("owner").filter { $0.hasPrefix("Reminder:") }.count == 2)
         // A decided ask is not reminded.
-        _ = try w.store.ownerAnswer(askId: q.id, text: "SQLite", now: w.now)
+        _ = try w.store.ownerAnswer(askId: q.id, text: "SQLite", now: w.now, owner: .test)
         try w.store.advanceActive(companyId: w.company.id, by: 10 * Self.day)
         #expect(try w.store.sweepAsks(now: w.now) == 0)
     }
@@ -889,7 +889,7 @@ import GRDB
         let e = try w.fresh(q)
         #expect(e.status == .expired)
         #expect(try w.dms("eng-1").contains("A-1 expired (not approved)"))
-        #expect(throws: WorkError.conflict("A-1 is already expired")) { try w.store.ownerAnswer(askId: q.id, text: "late", now: w.now) }
+        #expect(throws: WorkError.conflict("A-1 is already expired")) { try w.store.ownerAnswer(askId: q.id, text: "late", now: w.now, owner: .test) }
         #expect(try w.store.sweepAsks(now: w.now) == 0)
         // An expired gate never counts as approved.
         let g = try w.propose(.architecture)
@@ -952,38 +952,38 @@ import GRDB
         let again = try w.store.asks(companyId: w.company.id).filter { $0.kind == .engineAlert }
         #expect(again.count == 2); #expect(again.last?.status == .pendingOwner)
         // The owner acknowledging it also closes it.
-        let ack = try w.store.acknowledge(askId: try #require(again.last).id, now: w.now)
+        let ack = try w.store.acknowledge(askId: try #require(again.last).id, now: w.now, owner: .test)
         #expect(ack.status == .answered)
     }
 
     @Test func rescindOtherNotifiesRequester() throws {
         let w = try W()
         let a = try w.decide(try w.propose(.other, category: "pricing"), by: w.ceo)
-        #expect(throws: WorkError.self) { try w.store.ownerRescind(askId: a.id, note: "too early", now: w.now) }   // still pending
-        let ok = try w.store.ownerDecide(askId: a.id, approve: true, note: "go", now: w.now)
+        #expect(throws: WorkError.self) { try w.store.ownerRescind(askId: a.id, note: "too early", now: w.now, owner: .test) }   // still pending
+        let ok = try w.store.ownerDecide(askId: a.id, approve: true, note: "go", now: w.now, owner: .test)
         #expect(ok.status == .approved)
-        let r = try w.store.ownerRescind(askId: a.id, note: "changed my mind", now: w.now)
+        let r = try w.store.ownerRescind(askId: a.id, note: "changed my mind", now: w.now, owner: .test)
         #expect(r.status == .rescinded); #expect(r.rescindedAt == w.now)
         #expect(try w.dms("eng-1").contains("A-1 was rescinded by the owner: changed my mind"))
         #expect(try w.dms("ceo").contains("A-1 was rescinded by the owner: changed my mind"))
-        #expect(throws: WorkError.conflict("A-1 is already rescinded")) { try w.store.ownerRescind(askId: a.id, note: "", now: w.now) }
+        #expect(throws: WorkError.conflict("A-1 is already rescinded")) { try w.store.ownerRescind(askId: a.id, note: "", now: w.now, owner: .test) }
         #expect(try w.activity().contains { $0.kind == .approval && $0.text.contains("A-1") && $0.text.contains("rescinded") })
         // FYIs (policy-approved) can be rescinded too.
         let fyi = try w.decide(try w.propose(.other, category: "tooling"), by: w.ceo)
         #expect(fyi.status == .approved && fyi.fyi)
-        #expect(try w.store.ownerRescind(askId: fyi.id, note: "no", now: w.now).status == .rescinded)
+        #expect(try w.store.ownerRescind(askId: fyi.id, note: "no", now: w.now, owner: .test).status == .rescinded)
     }
 
     @Test func rescindGateRegatesPendingSprintPlans() throws {
         let w = try W()
-        let arch = try w.store.ownerDecide(askId: try w.propose(.architecture).id, approve: true, note: "", now: w.now)
-        let prd = try w.store.ownerDecide(askId: try w.propose(.prd).id, approve: true, note: "", now: w.now)
+        let arch = try w.store.ownerDecide(askId: try w.propose(.architecture).id, approve: true, note: "", now: w.now, owner: .test)
+        let prd = try w.store.ownerDecide(askId: try w.propose(.prd).id, approve: true, note: "", now: w.now, owner: .test)
         let plan = try w.propose(.sprintPlan)
         #expect(plan.status == .pendingInternal)
         // The PRD still stands in a small company, so rescinding only the architecture keeps the gate satisfied.
-        _ = try w.store.ownerRescind(askId: arch.id, note: "redo", now: w.now)
+        _ = try w.store.ownerRescind(askId: arch.id, note: "redo", now: w.now, owner: .test)
         #expect(try w.fresh(plan).status == .pendingInternal)
-        _ = try w.store.ownerRescind(askId: prd.id, note: "redo", now: w.now)
+        _ = try w.store.ownerRescind(askId: prd.id, note: "redo", now: w.now, owner: .test)
         let rejected = try w.fresh(plan)
         #expect(rejected.status == .rejected)
         #expect(try w.dms("eng-1").contains { $0.contains("A-3") && $0.contains("gate A-2 was rescinded") })
@@ -992,8 +992,8 @@ import GRDB
 
     @Test func rescindReleaseTellsRollBack() throws {
         let w = try W()
-        let rel = try w.store.ownerDecide(askId: try w.propose(.release).id, approve: true, note: "", now: w.now)
-        _ = try w.store.ownerRescind(askId: rel.id, note: "bad build", now: w.now)
+        let rel = try w.store.ownerDecide(askId: try w.propose(.release).id, approve: true, note: "", now: w.now, owner: .test)
+        _ = try w.store.ownerRescind(askId: rel.id, note: "bad build", now: w.now, owner: .test)
         for who in ["eng-1", "cto"] {
             #expect(try w.dms(who).contains("Release A-1 was rescinded; roll back the release."), "\(who)")
         }

@@ -171,20 +171,20 @@ extension AppModel {
 
     @discardableResult
     public func decide(askId: String, approve: Bool, note: String = "", acknowledgeChange: Bool = false) async -> Ask? {
-        await ownerWrite(approve ? "approve" : "reject") { store in
-            try store.ownerDecide(askId: askId, approve: approve, note: note, acknowledgeChange: acknowledgeChange)
+        await ownerAct(approve ? "approve" : "reject") { store, owner in
+            try store.ownerDecide(askId: askId, approve: approve, note: note, acknowledgeChange: acknowledgeChange, owner: owner)
         }
     }
 
     @discardableResult
     public func answer(askId: String, text: String) async -> Ask? {
-        await ownerWrite("send the answer") { store in try store.ownerAnswer(askId: askId, text: text) }
+        await ownerAct("send the answer") { store, owner in try store.ownerAnswer(askId: askId, text: text, owner: owner) }
     }
 
     /// Acknowledges an FYI or an engine alert.
     @discardableResult
     public func acknowledge(askId: String) async -> Ask? {
-        await ownerWrite("acknowledge") { store in try store.acknowledge(askId: askId) }
+        await ownerAct("acknowledge") { store, owner in try store.acknowledge(askId: askId, owner: owner) }
     }
 
     /// The restore alert's action (Plan C P2, Ruling 26): the owner vouches for the commits a restore over an unreadable
@@ -207,20 +207,20 @@ extension AppModel {
     /// (the row's `fileVouchSides`, shown side by side) vouches only with `acknowledgeAmbiguity`, the owner's explicit
     /// confirmation; without it the vouch is refused and nothing is vouched.
     public func vouchFile(askId: String, acknowledgeAmbiguity: Bool = false) async {
-        _ = await ownerWrite("vouch for the file") { store in
-            try store.vouchFile(alertAskId: askId, acknowledgeAmbiguity: acknowledgeAmbiguity, now: Date())
+        _ = await ownerAct("vouch for the file") { store, owner in
+            try store.vouchFile(alertAskId: askId, acknowledgeAmbiguity: acknowledgeAmbiguity, now: Date(), owner: owner)
         }
     }
 
     @discardableResult
     public func rescind(askId: String, note: String = "") async -> Ask? {
-        await ownerWrite("take it back") { store in try store.ownerRescind(askId: askId, note: note) }
+        await ownerAct("take it back") { store, owner in try store.ownerRescind(askId: askId, note: note, owner: owner) }
     }
 
     /// Sends a decision back with a new direction.
     @discardableResult
     public func replan(askId: String, text: String) async -> Ask? {
-        await ownerWrite("send it back") { store in try store.ownerReplan(askId: askId, text: text) }
+        await ownerAct("send it back") { store, owner in try store.ownerReplan(askId: askId, text: text, owner: owner) }
     }
 
     // MARK: Company

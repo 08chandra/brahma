@@ -267,7 +267,7 @@ struct UnverifiedPDFReader: ArchiveReader {
         let n1 = Data("%PDF-1.7 notes, version one".utf8), n2 = Data("%PDF-1.7 notes, version two".utf8)
         _ = outcome { try check(cf, n1, canonical: "notes.pdf", archives: reader) }
         let alert = try #require(try fileAlerts(cf).first { $0.summary.contains("notes.pdf") })
-        #expect(try cf.store.vouchFile(alertAskId: alert.id, now: cf.now).sha256 == SHA256.hex(n1))
+        #expect(try cf.store.vouchFile(alertAskId: alert.id, now: cf.now, owner: .test).sha256 == SHA256.hex(n1))
         #expect(outcome { try check(cf, n2, canonical: "notes.pdf", archives: reader) } == structure + Self.command(cf.c, "notes.pdf", n2))
         let pasted = vouchRefusal { try cf.store.vouchFile(companyId: cId, canonical: "notes.pdf", sha256: Self.full(n1), now: cf.now) }
         #expect(pasted?.contains("--sha256 \(Self.full(n2))") == true, "\(pasted ?? "vouched")")
@@ -306,34 +306,34 @@ struct UnverifiedPDFReader: ArchiveReader {
             try vouchRows(cf, cId).contains { ($0["sha256"] as String?) == SHA256.hex(data) && ($0["vouchedAt"] as Date?) != nil }
         }
         let (idA, idB) = (Store.canonicalHash(nameA), Store.canonicalHash(nameB))
-        let ambiguous = vouchRefusal { try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(a), name: shownA, now: cf.now) }
+        let ambiguous = vouchRefusal { try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(a), name: shownA, now: cf.now, owner: .test) }
         #expect(ambiguous?.contains("could be taken for one another") == true && ambiguous?.contains(String(SHA256.hex(a).prefix(12))) == true
                 && ambiguous?.contains(String(SHA256.hex(b).prefix(12))) == true && ambiguous?.contains(idA) == true
                 && ambiguous?.contains(idB) == true, "\(ambiguous ?? "vouched")")
         // (Even without a typed name: the shown names collide.)
-        #expect(vouchRefusal { try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(a), now: cf.now) }?
+        #expect(vouchRefusal { try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(a), now: cf.now, owner: .test) }?
                     .contains("could be taken for one another") == true)
         #expect(try !vouched(a) && !vouched(b))
         // A's id with B's bytes: nothing (B is not a version of A), even acknowledged.
-        #expect(vouchRefusal { try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(b), acknowledgeAmbiguity: true, now: cf.now) } != nil)
+        #expect(vouchRefusal { try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(b), acknowledgeAmbiguity: true, now: cf.now, owner: .test) } != nil)
         // A's id with a name that is neither A's shown nor canonical name: nothing.
         #expect(vouchRefusal { try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(a), name: nameB, acknowledgeAmbiguity: true,
-                                                      now: cf.now) } != nil)
+                                                      now: cf.now, owner: .test) } != nil)
         #expect(try !vouched(a) && !vouched(b))
         // B's alert: ambiguous too until the owner confirms; then it vouches B, exactly.
         let alertB = try #require(try fileAlerts(cf).first { $0.summary.contains(SHA256.hex(b)) })
         let choice = try #require(try cf.store.fileVouchChoice(alertAskId: alertB.id))
         #expect(choice.file.canonicalHash == idB && choice.colliding.map(\.canonicalHash) == [idA])
-        #expect(vouchRefusal { try cf.store.vouchFile(alertAskId: alertB.id, now: cf.now) }?.contains("confirm in the Inbox") == true)
+        #expect(vouchRefusal { try cf.store.vouchFile(alertAskId: alertB.id, now: cf.now, owner: .test) }?.contains("confirm in the Inbox") == true)
         #expect(try !vouched(a) && !vouched(b))
-        let rowB = try cf.store.vouchFile(alertAskId: alertB.id, acknowledgeAmbiguity: true, now: cf.now)
+        let rowB = try cf.store.vouchFile(alertAskId: alertB.id, acknowledgeAmbiguity: true, now: cf.now, owner: .test)
         #expect(rowB.sha256 == SHA256.hex(b) && rowB.canonicalHash == idB)
         #expect(try vouched(b) && !vouched(a))
         #expect(outcome { try check(cf, b, canonical: nameB, archives: reader) } == "clean")
         #expect(outcome { try check(cf, a, canonical: nameA, archives: reader) }.hasPrefix(structure))
         // A by its id, full hash and acknowledgement.
         #expect(try cf.store.vouchFile(companyId: cId, fileId: idA, sha256: Self.full(a), name: shownA, acknowledgeAmbiguity: true,
-                                       now: cf.now).canonicalHash == idA)
+                                       now: cf.now, owner: .test).canonicalHash == idA)
         #expect(outcome { try check(cf, a, canonical: nameA, archives: reader) } == "clean")
         // B's vouch is B's name's: B's bytes under A's name are refused.
         #expect(outcome { try check(cf, b, canonical: nameA, archives: reader) }.hasPrefix(structure))
@@ -577,6 +577,6 @@ extension Store {
     /// command gives them (C2b-carry (b): the id and the hash bind the vouch).
     @discardableResult
     func vouchFile(companyId: String, canonical: String, sha256: String, now: Date) throws -> FileVouch {
-        try vouchFile(companyId: companyId, fileId: Store.canonicalHash(canonical), sha256: sha256, now: now)
+        try vouchFile(companyId: companyId, fileId: Store.canonicalHash(canonical), sha256: sha256, now: now, owner: .test)
     }
 }

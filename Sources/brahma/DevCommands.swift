@@ -4,11 +4,12 @@ import BrahmaCore
 
 /// Hidden test hooks that act as an agent. They need `BRAHMA_DEV=1` and the owner key, and never run in an agent turn
 /// (the engine sets `BRAHMA_AGENT_ID` and never `BRAHMA_DEV` there).
-private func requireDev() throws {
+@discardableResult
+private func requireDev() throws -> OwnerPrincipal {
     guard ProcessInfo.processInfo.environment["BRAHMA_DEV"] == "1" else {
         throw fail("dev commands need BRAHMA_DEV=1")
     }
-    try requireOwnerShell()
+    return try requireOwnerShell()
 }
 
 private func refusing<T>(_ body: () throws -> T) throws -> T {
@@ -62,14 +63,14 @@ struct DevGroup: AsyncParsableCommand {
         @Option(name: .customLong("expect-text"), help: "Text the deployed page's / must contain.") var expectText: String?
 
         func run() async throws {
-            try requireDev()
+            let owner = try requireDev()
             let (store, paths) = try openStore()
             let c = try resolveCompany(store, company)
             let summary: DevReleaseScenario.Summary
             do {
                 summary = try await DevReleaseScenario.run(store: store, paths: paths, companyId: c.id,
                                                            vault: try cliSecretVault(interactive: false), itemKey: item,
-                                                           expectText: expectText)
+                                                           expectText: expectText, owner: owner)
             } catch let e as WorkError { throw fail(e.message) }
             print(safe("smoke \(summary.smoke.status.rawValue) at \(summary.smoke.commit.prefix(7))"))
             print(safe("\(summary.deployed.ref) \(summary.deployed.status.rawValue) \(summary.deployed.productionURL ?? "-")"))
@@ -260,7 +261,7 @@ struct DevGroup: AsyncParsableCommand {
         @Argument(help: "Files to drop.") var files: [String]
 
         func run() throws {
-            try requireDev()
+            let owner = try requireDev()
             let (store, paths) = try openStore()
             let c = try resolveCompany(store, company)
             let agent = try resolveAgent(store, company: c, handle: dm)
@@ -276,7 +277,7 @@ struct DevGroup: AsyncParsableCommand {
                 let (scope, readers) = try store.defaultScope(for: context, companyId: c.id)
                 let drop = ResourceDrop(context: context, scope: scope, readerSet: readers, message: message)
                 let rows = try store.addResources(companyId: c.id, plan: plan, drop: drop, contentVault: ContentVault(paths: paths),
-                                                  secretVault: secretVault, knownValues: known, paths: paths)
+                                                  secretVault: secretVault, knownValues: known, paths: paths, owner: owner)
                 for r in rows { print("F-\(r.number)") }
             } catch let e as ResourceError {
                 throw fail(e.message)
@@ -296,10 +297,10 @@ struct DevGroup: AsyncParsableCommand {
         @Argument(help: "What file the owner needs.") var description: String
 
         func run() throws {
-            try requireDev()
+            let owner = try requireDev()
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
-            let message = try refusing { try store.sendFileAsk(companyId: c.id, toHandle: to, description: description, itemKey: item) }
+            let message = try refusing { try store.sendFileAsk(companyId: c.id, toHandle: to, description: description, itemKey: item, owner: owner) }
             print("msg:\(message.id)")
         }
     }

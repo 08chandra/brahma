@@ -499,7 +499,7 @@ import GRDB
         try w.taint("Research/Market")
         _ = try w.mirror()
         #expect(w.mirrored("Research/Market.md") == nil)
-        try w.store.kbVouch(companyId: w.company.id, path: "Research/Market")
+        try w.store.kbVouch(companyId: w.company.id, path: "Research/Market", owner: .test)
         let r = try w.mirror()
         #expect(r.written >= 1)
         #expect(w.mirrored("Research/Market.md")?.contains("market notes from the web") == true)

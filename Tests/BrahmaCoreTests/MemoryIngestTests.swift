@@ -154,7 +154,7 @@ import GRDB
         let w = try W()
         let ask = try w.store.requestFromOwner(companyId: w.company.id, by: .agent(w.eng1.id), title: "Vendor code",
                                                question: "Which vendor code do we use?", now: w.at(0))
-        _ = try w.store.ownerAnswer(askId: ask.id, text: "ORCHID", now: w.at(60))
+        _ = try w.store.ownerAnswer(askId: ask.id, text: "ORCHID", now: w.at(60), owner: .test)
         try w.run()
 
         #expect(try w.search(w.agent(w.eng2), "ORCHID").isEmpty)

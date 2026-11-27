@@ -214,7 +214,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         }
         _ = try MessageRouter(store: rig.store).post(companyId: c.id, channel: "general", from: .owner, text: "go", now: at(1))
         let prd = try rig.store.propose(companyId: c.id, by: .agent(rig.agent.id), kind: .prd, title: "Brief", summary: "s", viaOwner: true, now: at(10))
-        try rig.store.ownerDecide(askId: prd.id, approve: true, now: at(52))
+        try rig.store.ownerDecide(askId: prd.id, approve: true, now: at(52), owner: .test)
         try rig.release(1, status: .deployed) { $0.deployedAt = at(190) }
 
         let out = try brahma(["milestones", "Acme"], home: rig.home)

@@ -104,7 +104,7 @@ struct ExtWorld {
     @discardableResult
     func install(_ fixture: PluginFixture, roles: [String] = ["engineer"]) async throws -> CompanyExtension {
         let ask = try await propose(fixture, roles: roles)
-        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: store, paths: paths, now: world.clock.now)
+        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: store, paths: paths, now: world.clock.now, owner: .test)
         return try #require(try store.installedExtensions(companyId: company.id).first { $0.id == fixture.root.lastPathComponent })
     }
 

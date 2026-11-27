@@ -11,7 +11,12 @@ import GRDB
 @MainActor @Suite(.scratch) struct AgentModeGuardTests {
     nonisolated static let entryPoints = ["ownerDecide", "ownerAnswer", "ownerRescind", "acknowledge", "vouchFile(companyId)", "vouchFile(alertAskId)",
                                           "vouchResource", "purgeResource", "setResourceScope", "approveAccess", "provideSecret",
-                                          "declineFileRequest", "answerFileRequest"]
+                                          "declineFileRequest", "answerFileRequest",
+                                          // Final wave B1 (C6-4 + FR I-2 + C7b m-7): every owner API takes the principal, and refuses in
+                                          // agent mode even when handed one.
+                                          "ownerReplan", "kbVouch", "vouchRestoredCommits", "exportRef", "sendFileAsk", "ownerDrop",
+                                          "createShowRequest", "cancelShowRequest", "addResources", "addLink", "setPreset",
+                                          "clearTaintHolds", "vouchItem", "extensionApprove", "extensionRemove", "extensionRollback"]
 
     @Test func mintRefusesInAgentModeWhateverTheArguments() throws {
         // The simulation exists only in debug builds (round 5, R4-1): a release test build (`swift test -c release -Xswiftc
@@ -75,23 +80,50 @@ import GRDB
         let w = try RefWorld()
         let s = w.store, cId = w.company.id, paths = w.paths, now = w.now
         let vault = ContentVault(paths: paths)
+        // Minted in owner mode, before the simulation: a principal that leaked into an agent process still refuses there.
+        let owner = try OwnerPrincipal.mint()
+        let drop = ResourceDrop(context: .cli, scope: .company)
         func call() throws {
             switch api {
-            case "ownerDecide": _ = try s.ownerDecide(askId: "nope", approve: true, now: now)
-            case "ownerAnswer": _ = try s.ownerAnswer(askId: "nope", text: "x", now: now)
-            case "ownerRescind": _ = try s.ownerRescind(askId: "nope", now: now)
-            case "acknowledge": _ = try s.acknowledge(askId: "nope", now: now)
-            case "vouchFile(companyId)": _ = try s.vouchFile(companyId: cId, fileId: "nope", sha256: "00", now: now)
-            case "vouchFile(alertAskId)": _ = try s.vouchFile(alertAskId: "nope", now: now)
-            case "vouchResource": _ = try s.vouchResource(companyId: cId, number: 999, contentVault: vault, paths: paths, now: now)
-            case "purgeResource": _ = try s.purgeResource(companyId: cId, number: 999, backups: [], contentVault: vault, paths: paths, now: now)
-            case "setResourceScope": try s.setResourceScope(companyId: cId, number: 999, scope: .company, futureHolders: false, contentVault: vault, paths: paths)
-            case "approveAccess": _ = try s.approveAccess(askId: "nope", scope: .once, duration: .turn, now: now)
-            case "provideSecret": _ = try s.provideSecret(askId: "nope", value: "v", isTest: true, vault: MemoryVault(), now: now)
-            case "declineFileRequest": _ = try s.declineFileRequest(companyId: cId, askId: "nope", note: "", now: now)
+            case "ownerDecide": _ = try s.ownerDecide(askId: "nope", approve: true, now: now, owner: owner)
+            case "ownerAnswer": _ = try s.ownerAnswer(askId: "nope", text: "x", now: now, owner: owner)
+            case "ownerRescind": _ = try s.ownerRescind(askId: "nope", now: now, owner: owner)
+            case "acknowledge": _ = try s.acknowledge(askId: "nope", now: now, owner: owner)
+            case "vouchFile(companyId)": _ = try s.vouchFile(companyId: cId, fileId: "nope", sha256: "00", now: now, owner: owner)
+            case "vouchFile(alertAskId)": _ = try s.vouchFile(alertAskId: "nope", now: now, owner: owner)
+            case "vouchResource": _ = try s.vouchResource(companyId: cId, number: 999, contentVault: vault, paths: paths, now: now, owner: owner)
+            case "purgeResource": _ = try s.purgeResource(companyId: cId, number: 999, backups: [], contentVault: vault, paths: paths, now: now, owner: owner)
+            case "setResourceScope": try s.setResourceScope(companyId: cId, number: 999, scope: .company, futureHolders: false, contentVault: vault, paths: paths, owner: owner)
+            case "approveAccess": _ = try s.approveAccess(askId: "nope", scope: .once, duration: .turn, now: now, owner: owner)
+            case "provideSecret": _ = try s.provideSecret(askId: "nope", value: "v", isTest: true, vault: MemoryVault(), now: now, owner: owner)
+            case "declineFileRequest": _ = try s.declineFileRequest(companyId: cId, askId: "nope", note: "", now: now, owner: owner)
             case "answerFileRequest":
                 _ = try s.answerFileRequest(companyId: cId, askId: "nope", plan: DropPlan(), contentVault: vault, secretVault: MemoryVault(),
-                                            knownValues: [], paths: paths, now: now)
+                                            knownValues: [], paths: paths, now: now, owner: owner)
+            case "ownerReplan": _ = try s.ownerReplan(askId: "nope", text: "x", now: now, owner: owner)
+            case "kbVouch": try s.kbVouch(companyId: cId, path: "Nope/Page", now: now, owner: owner)
+            case "vouchRestoredCommits": _ = try s.vouchRestoredCommits(companyId: cId, epochIds: ["nope"], now: now, owner: owner)
+            case "exportRef":
+                _ = try s.exportRef(companyId: cId, ref: WorkRef(kind: .resource, id: "999"), to: paths.home, knownValues: [], paths: paths,
+                                    now: now, owner: owner)
+            case "sendFileAsk": _ = try s.sendFileAsk(companyId: cId, toHandle: "@nope", description: "x", itemKey: nil, now: now, owner: owner)
+            case "ownerDrop":
+                _ = try s.ownerDrop(companyId: cId, context: .cli, plan: DropPlan(), drop: drop, contentVault: vault, secretVault: MemoryVault(),
+                                    knownValues: [], paths: paths, now: now, owner: owner)
+            case "createShowRequest":
+                _ = try s.createShowRequest(companyId: cId, kind: .show, query: "x", attachedRef: nil,
+                                            routed: RoutedTarget(target: .concierge, reason: "x", busy: false), candidates: [], now: now, owner: owner)
+            case "cancelShowRequest": try s.cancelShowRequest(companyId: cId, id: "nope", now: now, owner: owner)
+            case "addResources":
+                _ = try s.addResources(companyId: cId, plan: DropPlan(), drop: drop, contentVault: vault, secretVault: MemoryVault(),
+                                       knownValues: [], paths: paths, now: now, owner: owner)
+            case "addLink": _ = try s.addLink(companyId: cId, url: "https://example.com", drop: drop, contentVault: vault, now: now, owner: owner)
+            case "setPreset": try s.setPreset(companyId: "nope", .autoModeLowRisk, enabled: true, owner: owner)
+            case "clearTaintHolds": _ = try s.clearTaintHolds(companyId: "nope", now: now, owner: owner)
+            case "vouchItem": try s.vouchItem(itemId: "nope", now: now, owner: owner)
+            case "extensionApprove": try ExtensionLibrary.approve(askId: "nope", roles: nil, store: s, paths: paths, now: now, owner: owner)
+            case "extensionRemove": try ExtensionLibrary.remove(companyId: cId, id: "nope", store: s, paths: paths, now: now, owner: owner)
+            case "extensionRollback": try ExtensionLibrary.rollback(companyId: cId, id: "nope", store: s, paths: paths, now: now, owner: owner)
             default: Issue.record("unknown entry point \(api)")
             }
         }
@@ -109,7 +141,8 @@ import GRDB
             }
         }
         #endif
-        // Owner mode: the guard is silent; the call fails on its bogus id (never with the generic refusal) or works.
-        do { try call() } catch let e as WorkError { #expect(e.message != Store.refUnavailable, "\(api)") } catch {}
+        // Owner mode: the guard is silent; the call fails on its bogus id (never with the generic refusal) or works. (`exportRef`
+        // answers a ref that doesn't exist with the generic text itself, as every ref read does.)
+        do { try call() } catch let e as WorkError { if api != "exportRef" { #expect(e.message != Store.refUnavailable, "\(api)") } } catch {}
     }
 }

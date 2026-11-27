@@ -40,7 +40,7 @@ struct GrantWorld {
                duration: GrantDuration) throws -> Grant {
         _ = try request(kind, value, by: agent, item: item)
         let ask = try #require(try store.asks(companyId: company.id).last { $0.kind == .grant })
-        return try store.approveAccess(askId: ask.id, scope: scope, duration: duration, note: "ok", environment: env)
+        return try store.approveAccess(askId: ask.id, scope: scope, duration: duration, note: "ok", environment: env, owner: .test)
     }
 
     /// The scope of the agent's next sandboxed turn.
@@ -156,7 +156,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         #expect(refusal { try g.request("web_domain", "a.example.com") } == AskQuota.refusal)
         #expect(try g.store.asks(companyId: g.company.id).count == 3)
         // Rejected asks free the quota and the dedupe.
-        _ = try g.store.ownerDecide(askId: try g.ask("A-1").id, approve: false)
+        _ = try g.store.ownerDecide(askId: try g.ask("A-1").id, approve: false, owner: .test)
         #expect(try g.request("web_domain", "a.example.com").hasPrefix("Requested A-4"))
     }
 
@@ -181,7 +181,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         // Another company's ask cannot be approved as a grant in this one, nor its grant revoked from here.
         _ = try g.request("web_domain", "x.example.com")
         let ask = try g.ask("A-1")
-        let granted = try g.store.approveAccess(askId: ask.id, scope: .agent, duration: .always, note: "", environment: g.env)
+        let granted = try g.store.approveAccess(askId: ask.id, scope: .agent, duration: .always, note: "", environment: g.env, owner: .test)
         #expect(throws: WorkError.self) { try g.store.revokeGrant(companyId: bolt.id, number: granted.number, by: "owner") }
         #expect(try g.store.asks(companyId: bolt.id).isEmpty)
     }
@@ -193,9 +193,9 @@ func refusal(_ body: () throws -> Any) -> String? {
         _ = try g.request("web_domain", "docs.example.com")
         #expect(!(try await g.nextScope()).network.allowedDomains.contains("api.example.com"), "not before the owner decides")
         let net = try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .sprint, note: "fine",
-                                            environment: g.env)
+                                            environment: g.env, owner: .test)
         let web = try g.store.approveAccess(askId: try g.ask("A-2").id, scope: .agent, duration: .sprint, note: "",
-                                            environment: g.env)
+                                            environment: g.env, owner: .test)
         #expect(net.ref == "G-1"); #expect(web.ref == "G-2")
         #expect(net.kind == .networkDomain); #expect(net.value == "api.example.com"); #expect(net.scope == .agent)
         #expect(net.scopeRef == g.eng.id); #expect(net.requesterId == g.eng.id); #expect(net.duration == .sprint)
@@ -214,7 +214,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         #expect(used.useCount >= 1); #expect(used.lastUsedAt != nil)
         // Approving again is refused; a non-grant ask is not approved as one.
         #expect(throws: WorkError.self) {
-            try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .sprint, note: "", environment: g.env)
+            try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .sprint, note: "", environment: g.env, owner: .test)
         }
     }
 
@@ -222,16 +222,16 @@ func refusal(_ body: () throws -> Any) -> String? {
         let g = try GrantWorld()
         _ = try g.request("web_domain", "docs.example.com", scope: "company", duration: "always")
         // The agent's proposal is never applied silently: the owner names the scope and duration.
-        let message = refusal { try g.store.ownerDecide(askId: try g.ask("A-1").id, approve: true, note: "yes") }
+        let message = refusal { try g.store.ownerDecide(askId: try g.ask("A-1").id, approve: true, note: "yes", owner: .test) }
         #expect(message == "approve access with: brahma access approve \(g.company.slug) A-1 --scope … --duration …")
         #expect(try g.ask("A-1").status == .pendingOwner)
         #expect(try g.store.grants(companyId: g.company.id, includeInactive: true).isEmpty)
         // Rejecting stays a plain decision.
-        _ = try g.store.ownerDecide(askId: try g.ask("A-1").id, approve: false)
+        _ = try g.store.ownerDecide(askId: try g.ask("A-1").id, approve: false, owner: .test)
         #expect(try g.ask("A-1").status == .rejected)
         // Rescinding an approval takes the grant with it, and the ledger says so.
         let grant = try g.grant("web_domain", "other.example.com", scope: .agent, duration: .always)
-        _ = try g.store.ownerRescind(askId: try #require(grant.askId))
+        _ = try g.store.ownerRescind(askId: try #require(grant.askId), owner: .test)
         #expect(try g.store.grants(companyId: g.company.id).isEmpty)
         #expect(try g.store.grants(companyId: g.company.id, includeInactive: true).first { $0.id == grant.id }?.revokedBy == "owner")
         #expect(try g.store.events(afterId: 0, companyId: g.company.id).contains { $0.text.contains("\(grant.ref) revoked") })
@@ -261,7 +261,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         try FileManager.default.removeItem(at: data)
         try FileManager.default.createSymbolicLink(at: data, withDestinationURL: secret)
         #expect(throws: (any Error).self) {
-            try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env)
+            try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env, owner: .test)
         }
         #expect(try g.ask("A-1").status == .pendingOwner)
         #expect(try g.store.grants(companyId: g.company.id, includeInactive: true).isEmpty)
@@ -425,7 +425,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         for d in [data, secret] { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
         _ = try g.store.requestAccess(companyId: g.company.id, agentId: g.eng.id, kind: .readPath, value: data.path, reason: "r",
                                       environment: g.env)
-        let grant = try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env)
+        let grant = try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env, owner: .test)
         let agent = try #require(try g.store.agent(id: g.eng.id))
         let prepared = try await g.world.orchestrator.prepareSandbox(agent: agent, company: g.company, kind: .work, item: nil,
                                                                      turnId: "t-1")
@@ -443,7 +443,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         _ = try g.store.requestAccess(companyId: g.company.id, agentId: g.eng.id, kind: .readPath, value: dir.path, reason: "r",
                                       environment: g.env)
-        let grant = try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env)
+        let grant = try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env, owner: .test)
         try FileManager.default.removeItem(at: dir)
         #expect(!(try await g.nextScope()).readOnlyDirs.map(\.path).contains(grant.value))
         #expect(try g.store.grants(companyId: g.company.id).first?.revokedAt == nil, "a missing directory is not a swap")
@@ -469,7 +469,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         for d in [data, secret] { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
         _ = try g.store.requestAccess(companyId: g.company.id, agentId: g.eng.id, kind: .readPath, value: data.path, reason: "r",
                                       environment: g.env)
-        let grant = try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env)
+        let grant = try g.store.approveAccess(askId: try g.ask("A-1").id, scope: .agent, duration: .always, note: "", environment: g.env, owner: .test)
         #expect((try await g.nextScope()).readOnlyDirs.map(\.path).contains(grant.value))
         try FileManager.default.removeItem(at: data)
         try FileManager.default.createSymbolicLink(at: data, withDestinationURL: secret)
@@ -557,7 +557,7 @@ func refusal(_ body: () throws -> Any) -> String? {
         // An item scope needs an item on the ask.
         _ = try g.request("network_domain", "noitem.example.com")
         #expect(throws: WorkError.self) {
-            try g.store.approveAccess(askId: try g.ask("A-2").id, scope: .item, duration: .always, note: "", environment: g.env)
+            try g.store.approveAccess(askId: try g.ask("A-2").id, scope: .item, duration: .always, note: "", environment: g.env, owner: .test)
         }
     }
 
@@ -638,7 +638,7 @@ func refusal(_ body: () throws -> Any) -> String? {
                                       environment: g.env)
         let ask = try g.ask("A-1")
         #expect(ask.risk == .medium)
-        let grant = try g.store.approveAccess(askId: ask.id, scope: .agent, duration: .always, note: "", environment: g.env)
+        let grant = try g.store.approveAccess(askId: ask.id, scope: .agent, duration: .always, note: "", environment: g.env, owner: .test)
         #expect(grant.value == dir.resolvedForSandbox.path)
         let scope = try await g.nextScope()
         let resolved = dir.resolvedForSandbox.path

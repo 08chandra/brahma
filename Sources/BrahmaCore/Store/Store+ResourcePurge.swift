@@ -39,8 +39,8 @@ extension Store {
     /// `.invalid("F-<n> was purged")`. Returns the folder (or file) first, then its files.
     @discardableResult
     public func vouchResource(companyId: String, number: Int, contentVault: ContentVault, paths: BrahmaPaths,
-                              now: Date = Store.now()) throws -> [Resource] {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+                              now: Date = Store.now(), owner: OwnerPrincipal) throws -> [Resource] {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
         guard contentVault.paths == paths else { throw ResourceError.invalid("the vault belongs to another data home") }
         let ids = try writer.write { db -> [String] in
             var rows = try Self.ownerTarget(db: db, companyId: companyId, number: number, allowPurged: false)
@@ -74,8 +74,9 @@ extension Store {
     /// otherwise). A folder's file and a purged resource are refused as in `vouchResource`.
     @discardableResult
     public func setResourceScope(companyId: String, number: Int, scope: AccessClass, futureHolders: Bool,
-                                 contentVault: ContentVault, paths: BrahmaPaths, now: Date = Store.now()) throws -> [Resource] {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+                                 contentVault: ContentVault, paths: BrahmaPaths, now: Date = Store.now(),
+                                 owner: OwnerPrincipal) throws -> [Resource] {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
         guard contentVault.paths == paths else { throw ResourceError.invalid("the vault belongs to another data home") }
         let ids = try writer.write { db -> [String] in
             var rows = try Self.ownerTarget(db: db, companyId: companyId, number: number, allowPurged: false)
@@ -182,8 +183,9 @@ extension Store {
     /// its own report, and the folder's size counts only its live files. A later purge of the folder keeps that report. A
     /// purged link keeps only its ref and kind: its URL (its content), the host and the name shown are blanked.
     public func purgeResource(companyId: String, number: Int, backups: [(name: String, takenAt: Date)],
-                              contentVault: ContentVault, paths: BrahmaPaths, now: Date = Store.now()) throws -> PurgeReport {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+                              contentVault: ContentVault, paths: BrahmaPaths, now: Date = Store.now(),
+                              owner: OwnerPrincipal) throws -> PurgeReport {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
         guard contentVault.paths == paths else { throw ResourceError.invalid("the vault belongs to another data home") }
         guard let company = try company(id: companyId) else { throw ResourceError.notFound("no such company") }
         let (rows, transcripts) = try writer.read { db -> ([Resource], [String]) in

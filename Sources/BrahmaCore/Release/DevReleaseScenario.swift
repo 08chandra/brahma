@@ -36,7 +36,7 @@ public enum DevReleaseScenario {
     /// check environment built from it (`ChildEnvironment`, which never passes `BRAHMA_DEV` on).
     public static func run(store: Store, paths: BrahmaPaths, companyId: String, vault: any SecretVault, itemKey: String? = nil,
                            expectText: String? = nil,
-                           environment: [String: String] = ProcessInfo.processInfo.environment) async throws -> Summary {
+                           environment: [String: String] = ProcessInfo.processInfo.environment, owner: OwnerPrincipal) async throws -> Summary {
         guard environment["BRAHMA_DEV"] == "1", environment["BRAHMA_AGENT_ID"] == nil else { throw WorkError.forbidden(refusal) }
         let lock: OrchestratorLock
         do { lock = try OrchestratorLock.acquire(paths: paths) } catch OrchestratorLockError.alreadyRunning {
@@ -44,11 +44,11 @@ public enum DevReleaseScenario {
         }
         defer { withExtendedLifetime(lock) {} }
         return try await carryOut(store: store, paths: paths, companyId: companyId, vault: vault, itemKey: itemKey,
-                                  expectText: expectText, environment: environment)
+                                  expectText: expectText, environment: environment, owner: owner)
     }
 
     private static func carryOut(store: Store, paths: BrahmaPaths, companyId: String, vault: any SecretVault, itemKey: String?,
-                                 expectText: String?, environment: [String: String]) async throws -> Summary {
+                                 expectText: String?, environment: [String: String], owner: OwnerPrincipal) async throws -> Summary {
         guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
         guard let hosting = try store.hosting(companyId: companyId), hosting.accountId != nil else {
             throw WorkError.invalid("set the company's hosting first: brahma hosting set \(company.name) --provider … --project … --account-id …")
@@ -107,7 +107,7 @@ public enum DevReleaseScenario {
                                                       adapters: lookup, npmPresent: true)
         _ = try EngineFiles.removeNoFollow(hostDir.appending(path: proposed.ref, directoryHint: .isDirectory), under: hostDir)
         server.serve(folder: proposed.ref)
-        _ = try store.ownerDecide(askId: ask.id, approve: true, note: "dev release scenario")
+        _ = try store.ownerDecide(askId: ask.id, approve: true, note: "dev release scenario", owner: owner)
         let executor = ReleaseExecutor(
             store: store, paths: paths, sandbox: DevHostSandbox(base: sandbox, hostDir: hostDir), vault: vault,
             http: URLSessionHTTPProbe(),

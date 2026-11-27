@@ -37,7 +37,14 @@ import GRDB
         let apis = ["renderRef(", "ownerShare(", "ownerThreadReply(", "openShowRequests(", "recordOwnerRead(", ".message(companyId", "agentUsageShareToday(",
                     "agentActivity(", "leasedItemKey(", "viewOriginal(", ".purge(companyId", "vouchItem(",
                     // C6b: the owner's inline review.
-                    "addDiffComment(", "requestHunkRevert(", "resolveDiffComment("]
+                    "addDiffComment(", "requestHunkRevert(", "resolveDiffComment(",
+                    // Final wave B1 (C6-4, its addition, FR I-2, C7b m-7, Rulings 23 and 28): every other owner API.
+                    "ownerDecide(", "ownerAnswer(", "ownerRescind(", "ownerReplan(", ".acknowledge(", "vouchFile(", "vouchResource(",
+                    "purgeResource(", "setResourceScope(", "approveAccess(", "provideSecret(", "declineFileRequest(",
+                    "answerFileRequest(", "kbVouch(", "vouchRestoredCommits(", "exportRef(", "sendFileAsk(", "ownerDrop(",
+                    "createShowRequest(", "cancelShowRequest(", "clearTaintedCommits(", "addResources(", "addLink(", "setPreset(",
+                    "clearTaintHolds(", "ExtensionLibrary.approve(", "ExtensionLibrary.remove(", "ExtensionLibrary.rollback(",
+                    "AccessPresets.evaluate(", "DecisionAuthority", "PolicyPrincipal", ".preset("]
         for f in files {
             let text = try String(contentsOf: mcp.appending(path: f), encoding: .utf8)
             #expect(!text.contains("OwnerPrincipal"), "\(f) references OwnerPrincipal")
@@ -52,6 +59,28 @@ import GRDB
         #expect(hooks.components(separatedBy: "OwnerPrincipal.enterAgentProcess()").count == 3, "both hook commands enter agent mode")
         #expect(hooks.range(of: "enterAgentProcess()")!.lowerBound < hooks.range(of: "PreToolHook.Context(")!.lowerBound)
         #expect(hooks.range(of: "enterAgentProcess()", options: .backwards)!.lowerBound < hooks.range(of: "PostToolHook.handle(")!.lowerBound)
+    }
+
+    /// Final wave B1 (controller Ruling C6-4 addition): a `PolicyPrincipal` is minted only by the engine's preset evaluator
+    /// (`AccessPresets.evaluate`, from an owner-configured preset row), and only `requestAccess` hands one to `ownerDecide(db:)`.
+    /// The `db:` owner overloads take a `DecisionAuthority` (no free-string `decidedBy`) or the owner principal.
+    @Test func policyPrincipalIsMintedOnlyByThePresetEvaluator() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let sources = root.appending(path: "Sources")
+        let walker = try #require(FileManager.default.enumerator(atPath: sources.path))
+        var minted: [String] = [], presetAuthority: [String] = [], decidedBy: [String] = []
+        for case let rel as String in walker where rel.hasSuffix(".swift") {
+            let text = try String(contentsOf: sources.appending(path: rel), encoding: .utf8)
+            if text.contains("PolicyPrincipal(presetId:") { minted.append(rel) }
+            if text.contains("by: .preset(") { presetAuthority.append(rel) }
+            if text.contains("decidedBy: decision.approvedBy") || text.contains("decidedBy: String = \"owner\"") { decidedBy.append(rel) }
+        }
+        #expect(minted == ["BrahmaCore/Access/Grants.swift"], "\(minted)")
+        #expect(presetAuthority == ["BrahmaCore/Store/Store+Grants.swift"], "\(presetAuthority)")
+        #expect(decidedBy.isEmpty, "\(decidedBy)")
+        let grants = try String(contentsOf: sources.appending(path: "BrahmaCore/Access/Grants.swift"), encoding: .utf8)
+        #expect(grants.contains("fileprivate init(presetId: String, askId: String)"))
+        #expect(grants.components(separatedBy: "PolicyPrincipal(presetId:").count == 2, "minted in one place")
     }
 
     @Test(arguments: apis) func ownerAPIsRequireThePrincipal(_ api: String) async throws {

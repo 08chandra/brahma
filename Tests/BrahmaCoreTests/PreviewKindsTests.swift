@@ -343,7 +343,7 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
         await x.settle()
         // The iOS build needs the owner first.
         let ask = try #require(try x.asks().first)
-        try x.store.ownerDecide(askId: ask.id, approve: true)
+        try x.store.ownerDecide(askId: ask.id, approve: true, owner: .test)
         await x.settle()
         let allow = CompanyNetwork.scope(company: x.company, grantDomains: [], grantWebDomains: []).allowedDomains
         // cli → oneShot: outbound only, reads and writes only its run (no logs, no shared cache), no toolchain.
@@ -458,11 +458,11 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
         let forged = try x.store.propose(companyId: x.company.id, by: .agent(x.devops.id), kind: .other, risk: .high, category: "permissions",
                                          title: "Allow iOS Simulator preview phone", summary: SimulatorApproval.summary,
                                          subjectId: "preview-simulator:" + (try x.surface("phone").id), viaOwner: true)
-        try x.store.ownerDecide(askId: forged.id, approve: true)
+        try x.store.ownerDecide(askId: forged.id, approve: true, owner: .test)
         await x.settle()
         #expect(try x.surface("phone").outsideSandboxApprovedAt == nil && ios.starts.isEmpty)
         // The owner's approval of the engine's ask: the next pass starts it.
-        try x.store.ownerDecide(askId: ask.id, approve: true, now: x.now)
+        try x.store.ownerDecide(askId: ask.id, approve: true, now: x.now, owner: .test)
         #expect(try x.surface("phone").outsideSandboxApprovedAt != nil)
         await x.settle()
         #expect(ios.starts.count == 1)
@@ -488,7 +488,7 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
         #expect(try x.store.ask(id: second.id)?.status == .superseded)
         await x.settle()
         let third = try #require(try x.asks().first { $0.requesterId == "system" && $0.status == .pendingOwner })
-        try x.store.ownerDecide(askId: third.id, approve: false)
+        try x.store.ownerDecide(askId: third.id, approve: false, owner: .test)
         await x.settle()
         #expect(try x.state("phone").message == SimulatorApproval.declinedMessage)
         #expect(ios.starts.count == 1)
@@ -497,12 +497,12 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
         #expect(x.ios(appPath: "build/Fourth.app").ok)
         await x.settle()
         let fourth = try #require(try x.asks().first { $0.requesterId == "system" && $0.status == .pendingOwner })
-        try x.store.ownerDecide(askId: fourth.id, approve: true, now: x.now)
+        try x.store.ownerDecide(askId: fourth.id, approve: true, now: x.now, owner: .test)
         await x.settle()
         let approvedStatus = try x.state("phone").status
         #expect(ios.starts.count == 2 && approvedStatus == .running)
         let stopsBeforeRescind = ios.stops.count
-        try x.store.ownerRescind(askId: fourth.id)
+        try x.store.ownerRescind(askId: fourth.id, owner: .test)
         #expect(try x.surface("phone").outsideSandboxApprovedAt == nil)
         await x.settle()
         state = try x.state("phone")
@@ -521,7 +521,7 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
         await x.settle()
         func systemAsks() throws -> [Ask] { try x.asks().filter { $0.requesterId == "system" } }
         let first = try #require(try systemAsks().first)
-        try x.store.ownerDecide(askId: first.id, approve: false)
+        try x.store.ownerDecide(askId: first.id, approve: false, owner: .test)
         await x.settle()
         #expect(try x.state("phone").message == SimulatorApproval.declinedMessage)
         // The engine alone never asks again.
@@ -544,12 +544,12 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
         #expect(asks.count == 2 && stillAsked == second.id)
         #expect(try x.store.ask(id: second.id)?.status == .pendingOwner)
         // Approved, then rescinded: the same values re-ask once more.
-        try x.store.ownerDecide(askId: second.id, approve: true, now: x.now)
+        try x.store.ownerDecide(askId: second.id, approve: true, now: x.now, owner: .test)
         await x.settle()
         #expect(try x.state("phone").status == .running)
         #expect(x.ios().ok)                                  // unchanged values keep an approval that stands
         #expect(try x.surface("phone").outsideSandboxApprovedAt != nil && x.surface("phone").outsideSandboxAskId == second.id)
-        try x.store.ownerRescind(askId: second.id)
+        try x.store.ownerRescind(askId: second.id, owner: .test)
         await x.settle()
         #expect(x.ios().ok)
         await x.settle()

@@ -44,7 +44,7 @@ import Glibc
             let (scope, readers) = try store.defaultScope(for: context, companyId: c.id)
             return try store.ownerDrop(companyId: c.id, context: context, plan: try plan(urls),
                                        drop: ResourceDrop(context: context, scope: scope, readerSet: readers, message: message),
-                                       contentVault: contentVault, secretVault: secrets, knownValues: [], paths: cf.paths)
+                                       contentVault: contentVault, secretVault: secrets, knownValues: [], paths: cf.paths, owner: .test)
         }
 
         func messages() throws -> [Message] {
@@ -101,7 +101,7 @@ import Glibc
     @Test func ownerFileAskWakesAgent() throws {
         let w = try W()
         let ask = try w.store.sendFileAsk(companyId: w.c.id, toHandle: "@eng-1", description: "the \"Q3\" board deck\nplease",
-                                          itemKey: "ENG-1")
+                                          itemKey: "ENG-1", owner: .test)
         #expect(ask.kind == .fileAsk && ask.senderId == "owner")
         #expect(ask.text == "the \"Q3\" board deck\nplease (for ENG-1)")
         let item = try #require(try w.inbox(w.fx.eng1, ask))
@@ -113,16 +113,16 @@ import Glibc
         let clock = ReviewDigest.clock(ask.createdAt, TimeZone(identifier: "UTC")!)
         #expect(digest == "New since your last turn (1 items):\n- @owner (DM) \(clock) FILE ASK: \"the 'Q3' board deck please (for ENG-1)\" — reply with share(..., reply_to: \"msg:\(ask.id)\")")
         // Refusals: nothing to ask for, too long, an unknown agent or item.
-        #expect(w.refusal { try w.store.sendFileAsk(companyId: w.c.id, toHandle: "eng-1", description: "  ", itemKey: nil) } == "say what file you need")
-        #expect(w.refusal { try w.store.sendFileAsk(companyId: w.c.id, toHandle: "eng-1", description: String(repeating: "x", count: 601), itemKey: nil) }
+        #expect(w.refusal { try w.store.sendFileAsk(companyId: w.c.id, toHandle: "eng-1", description: "  ", itemKey: nil, owner: .test) } == "say what file you need")
+        #expect(w.refusal { try w.store.sendFileAsk(companyId: w.c.id, toHandle: "eng-1", description: String(repeating: "x", count: 601), itemKey: nil, owner: .test) }
             == "the description is at most 600 characters")
-        #expect(w.refusal { try w.store.sendFileAsk(companyId: w.c.id, toHandle: "nobody", description: "x", itemKey: nil) } == "no agent @nobody")
-        #expect(w.refusal { try w.store.sendFileAsk(companyId: w.c.id, toHandle: "eng-1", description: "x", itemKey: "ENG-99") } == "no work item ENG-99")
+        #expect(w.refusal { try w.store.sendFileAsk(companyId: w.c.id, toHandle: "nobody", description: "x", itemKey: nil, owner: .test) } == "no agent @nobody")
+        #expect(w.refusal { try w.store.sendFileAsk(companyId: w.c.id, toHandle: "eng-1", description: "x", itemKey: "ENG-99", owner: .test) } == "no work item ENG-99")
     }
 
     @Test func shareReplyTurnsAskIntoFileCard() throws {
         let w = try W()
-        let ask = try w.store.sendFileAsk(companyId: w.c.id, toHandle: "eng-1", description: "the importer source", itemKey: nil)
+        let ask = try w.store.sendFileAsk(companyId: w.c.id, toHandle: "eng-1", description: "the importer source", itemKey: nil, owner: .test)
         #expect(try w.store.fileAskState(companyId: w.c.id, messageId: ask.id) == .open)
         // A plain DM reply in the thread is not an answer.
         _ = try MessageRouter(store: w.store).sendDM(companyId: w.c.id, from: .agent(w.fx.eng1.id), to: "owner", text: "on it",
@@ -152,11 +152,11 @@ import Glibc
         #expect(FileRequests.requested(ask) == RequestedFile())
         #expect(ask.payload?.question == "Can you send the logo SVG?")
         // A bare approve gives no file: refused.
-        #expect(w.refusal { try w.store.ownerDecide(askId: ask.id, approve: true) } == "\(ask.ref) asks for a file: drop one on it in the Inbox, or decline it")
+        #expect(w.refusal { try w.store.ownerDecide(askId: ask.id, approve: true, owner: .test) } == "\(ask.ref) asks for a file: drop one on it in the Inbox, or decline it")
 
         let before = try w.messages().count
         let refs = try w.store.answerFileRequest(companyId: w.c.id, askId: ask.id, plan: try w.plan([try w.file("logo.svg", "<svg/>")]),
-                                                 contentVault: w.contentVault, secretVault: w.secrets, knownValues: [], paths: w.cf.paths)
+                                                 contentVault: w.contentVault, secretVault: w.secrets, knownValues: [], paths: w.cf.paths, owner: .test)
         #expect(refs.count == 1)
         let r = try w.resource(try #require(refs.first))
         #expect(r.readerSet == [w.fx.eng1.id] && r.scopeKind == "agent" && r.addedVia == "inbox" && r.askId == ask.id)
@@ -173,11 +173,11 @@ import Glibc
         #expect(try w.inbox(w.fx.eng1, answer)?.wakes == true)
         #expect(try w.shareRows(answer).map(\.canonical) == [r.ref])
         // Already answered: nothing more.
-        #expect(w.refusal { try w.store.declineFileRequest(companyId: w.c.id, askId: ask.id, note: "x") } == "\(ask.ref) is already answered")
+        #expect(w.refusal { try w.store.declineFileRequest(companyId: w.c.id, askId: ask.id, note: "x", owner: .test) } == "\(ask.ref) is already answered")
 
         // A second request, declined with a note.
         let second = try w.fileRequest("Fonts", question: "The brand fonts?")
-        let declined = try w.store.declineFileRequest(companyId: w.c.id, askId: second.id, note: "we don't license them")
+        let declined = try w.store.declineFileRequest(companyId: w.c.id, askId: second.id, note: "we don't license them", owner: .test)
         #expect(declined.status == .answered && declined.ownerAnswer == "declined: we don't license them")
         let dm = try #require(try w.messages().last)
         #expect(dm.senderId == "owner" && dm.text == "declined: we don't license them")
@@ -186,7 +186,7 @@ import Glibc
         _ = try w.tools(w.fx.eng1).call(name: "request_from_owner", arguments: ["title": .string("Q"), "question": .string("Which API?")])
         let info = try #require(try w.store.asks(companyId: w.c.id).last)
         #expect(info.kind == .info)
-        #expect(w.refusal { try w.store.declineFileRequest(companyId: w.c.id, askId: info.id, note: "") } == Store.inboxRefusal)
+        #expect(w.refusal { try w.store.declineFileRequest(companyId: w.c.id, askId: info.id, note: "", owner: .test) } == Store.inboxRefusal)
         // The argument is a boolean.
         #expect(throws: ToolError.self) {
             try w.tools(w.fx.eng1).call(name: "request_from_owner", arguments: [
@@ -291,7 +291,7 @@ import Glibc
         let ref = try #require(try w.drop([try w.file("page.html", "<p>hi</p>")], in: .library).first)
         #expect(try w.resource(ref).tainted)
         let n = try #require(Int(ref.id))
-        _ = try w.store.vouchResource(companyId: w.c.id, number: n, contentVault: w.contentVault, paths: w.cf.paths)
+        _ = try w.store.vouchResource(companyId: w.c.id, number: n, contentVault: w.contentVault, paths: w.cf.paths, owner: .test)
         let r = try w.resource(ref)
         #expect(r.provenance == "owner" && !r.tainted && r.vouchedAt != nil)
         #expect(try w.activity(.access) == ["You vouched for F-\(n): agents read it as yours, untainted"])
@@ -338,7 +338,7 @@ import Glibc
         #expect(scope == .agent(w.fx.eng1.id) && readers == [w.fx.eng1.id])
         let added = try w.store.addResources(companyId: w.c.id, plan: try w.plan([try w.file("logo.svg", "<svg/>")]),
                                              drop: ResourceDrop(context: context, scope: scope, readerSet: readers),
-                                             contentVault: w.contentVault, secretVault: w.secrets, knownValues: [], paths: w.cf.paths)
+                                             contentVault: w.contentVault, secretVault: w.secrets, knownValues: [], paths: w.cf.paths, owner: .test)
         #expect(added.count == 1 && added[0].askId == ask.id)
         #expect(try w.store.ask(id: ask.id)?.status == .answered)
         // Other asks are refused: a secret request, a decision, an answered file request.
@@ -349,7 +349,7 @@ import Glibc
             let refused = w.refusal {
                 try w.store.addResources(companyId: w.c.id, plan: try w.plan([try w.file("x.md", "x\n")]),
                                          drop: ResourceDrop(context: .inbox(askId: id), scope: .agent(w.fx.eng1.id), readerSet: [w.fx.eng1.id]),
-                                         contentVault: w.contentVault, secretVault: w.secrets, knownValues: [], paths: w.cf.paths)
+                                         contentVault: w.contentVault, secretVault: w.secrets, knownValues: [], paths: w.cf.paths, owner: .test)
             }
             #expect(refused == "drop files on a question from an agent", "\(id)")
         }

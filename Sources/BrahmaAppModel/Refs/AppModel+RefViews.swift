@@ -43,8 +43,8 @@ extension AppModel {
     public func declineFileRequest(askId: String, note: String) async -> Bool {
         guard let companyId = selectedCompanyId, ownerOrRefuse() != nil else { return false }
         let now = clock()
-        return await ownerWrite("decline the file request") { store in
-            _ = try store.declineFileRequest(companyId: companyId, askId: askId, note: note, now: now)
+        return await ownerAct("decline the file request") { store, owner in
+            _ = try store.declineFileRequest(companyId: companyId, askId: askId, note: note, now: now, owner: owner)
             return true
         } ?? false
     }

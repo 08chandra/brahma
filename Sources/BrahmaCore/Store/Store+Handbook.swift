@@ -493,7 +493,8 @@ extension Store {
     }
 
     /// The owner vouches for a page: its taint is cleared on the page, its current revision and its section docs.
-    public func kbVouch(companyId: String, path: String, now: Date = Store.now()) throws {
+    public func kbVouch(companyId: String, path: String, now: Date = Store.now(), owner: OwnerPrincipal) throws {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1 (C7b m-7): the owner principal, never from an agent process
         let normalized = try HandbookPath.normalize(path)
         try writer.write { db in
             guard var page = try Self.kbPage(db: db, companyId: companyId, path: normalized) else {

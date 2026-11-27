@@ -59,7 +59,7 @@ private struct TryWorld {
         let staged = try await ExtensionImporter.stage(source: .folder(fixture.root), paths: world.paths, sandbox: RecordingRunner())
         let ask = try await ExtensionLibrary.propose(staged: staged, store: store, paths: world.paths, companyId: company.id,
                                                      requester: .system, roles: ["engineer"], now: world.clock.now)
-        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: store, paths: world.paths, now: world.clock.now)
+        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: store, paths: world.paths, now: world.clock.now, owner: .test)
     }
 }
 

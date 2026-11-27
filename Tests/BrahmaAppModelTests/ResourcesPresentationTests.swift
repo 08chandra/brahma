@@ -24,7 +24,7 @@ import BrahmaCore
             try Data(text.utf8).write(to: url)
             let plan = try ResourceIntake.inspect(urls: [url], knownValues: [], agentAreas: .none)
             return try store.addResources(companyId: company.id, plan: plan, drop: drop, contentVault: content, secretVault: vault,
-                                          knownValues: [], paths: paths, now: now)
+                                          knownValues: [], paths: paths, now: now, owner: .test)
         }
     }
 
@@ -34,7 +34,7 @@ import BrahmaCore
         try w.add("report.pdf", "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n")             // F-2 EXTERNAL
         try w.add("aws.txt", "key = AKIAIOSFODNN7EXAMPLE\n", ResourceDrop(secretChoice: .uploadRedacted))  // F-3 REDACTED
         try w.add("keep.txt", "key = AKIAIOSFODNN7EXAMPLE\n", ResourceDrop(scope: .agent(w.eng.id), secretChoice: .uploadAnyway))
-        try w.store.addLink(companyId: w.company.id, url: "https://example.com/docs?q=1", drop: ResourceDrop(), contentVault: w.content)
+        try w.store.addLink(companyId: w.company.id, url: "https://example.com/docs?q=1", drop: ResourceDrop(), contentVault: w.content, owner: .test)
         // Explicit times (the purge flags backups taken in [added, purged]; `Date()` against the store's millisecond-rounded
         // clock could fall either side): one backup before F-6 was added, one between its add and its purge.
         let added = Store.now().addingTimeInterval(60)
@@ -42,7 +42,7 @@ import BrahmaCore
         let report = try w.store.purgeResource(
             companyId: w.company.id, number: 6,
             backups: [(name: "brahma-old", takenAt: added.addingTimeInterval(-30)), (name: "brahma-a", takenAt: added.addingTimeInterval(30))],
-            contentVault: w.content, paths: w.paths, now: added.addingTimeInterval(60))
+            contentVault: w.content, paths: w.paths, now: added.addingTimeInterval(60), owner: .test)
         #expect(report.backups == ["brahma-a"])
 
         let rows = try ResourcesSnapshot.load(store: w.store, companyId: w.company.id)

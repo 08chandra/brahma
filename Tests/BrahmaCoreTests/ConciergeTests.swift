@@ -10,7 +10,7 @@ import GRDB
     /// A concierge request of `cf`'s company with a live run, and the concierge's tools for it.
     static func live(_ cf: CollabFixture, query: String = "where is checkout") throws -> (ShowRequest, CompanyTools) {
         let r = try cf.store.createShowRequest(companyId: cf.c.id, kind: .show, query: query, attachedRef: nil, routed: routed,
-                                               candidates: [cf.fx.item.key], now: cf.now)
+                                               candidates: [cf.fx.item.key], now: cf.now, owner: .test)
         _ = try #require(try cf.store.beginConciergeRun(r, now: cf.now))
         return (r, CompanyTools(store: cf.store, companyId: cf.c.id, agentId: ConciergeCaps.agentId, paths: cf.paths, vault: MemoryVault(),
                                 conciergeRequestId: r.id))
@@ -26,7 +26,7 @@ import GRDB
         let fake = FakeTurnRunner()
         fake.script(ConciergeCaps.agentId, script)
         let r = try cf.store.createShowRequest(companyId: cf.c.id, kind: .show, query: query, attachedRef: nil, routed: routed,
-                                               candidates: [cf.fx.item.key], now: cf.now)
+                                               candidates: [cf.fx.item.key], now: cf.now, owner: .test)
         let outcome = await ConciergeRun.perform(store: cf.store, runner: fake, paths: cf.paths, request: r,
                                                  mcpExecutable: "/usr/local/bin/brahma", knownValues: knownValues)
         return (try #require(try cf.store.showRequest(companyId: cf.c.id, id: r.id)), outcome, fake)
@@ -274,7 +274,7 @@ import GRDB
         await w.orchestrator.tick()
         await started.wait()
         let r = try w.store.createShowRequest(companyId: c.id, kind: .show, query: "where is checkout", attachedRef: nil, routed: Self.routed,
-                                              candidates: [], now: w.clock.now)
+                                              candidates: [], now: w.clock.now, owner: .test)
         await w.orchestrator.tick()
         gate.open()
         try await w.orchestrator.waitUntilIdle(timeout: .seconds(300))
@@ -282,7 +282,7 @@ import GRDB
         #expect(try #require(try w.store.showRequest(companyId: c.id, id: r.id)).status == .answered)
         // With the owner's stop nothing starts in the lane.
         let r2 = try w.store.createShowRequest(companyId: c.id, kind: .show, query: "second", attachedRef: nil, routed: Self.routed,
-                                               candidates: [], now: w.clock.now)
+                                               candidates: [], now: w.clock.now, owner: .test)
         _ = try w.store.emergencyStop(note: nil, by: "owner", now: w.clock.now)
         try await w.cycle()
         #expect(!w.fake.requests.contains { $0.concierge?.requestId == r2.id })
@@ -320,7 +320,7 @@ import GRDB
         // The credential: the live run of exactly this request, in this company.
         let cf = try CollabFixture()
         let r = try cf.store.createShowRequest(companyId: cf.c.id, kind: .show, query: "q", attachedRef: nil, routed: Self.routed,
-                                               candidates: [], now: cf.now)
+                                               candidates: [], now: cf.now, owner: .test)
         let token = try #require(try cf.store.beginConciergeRun(r, now: cf.now))
         #expect(cf.store.conciergeCredentialIsValid(token: token, companyId: cf.c.id, requestId: r.id))
         #expect(!cf.store.conciergeCredentialIsValid(token: token, companyId: cf.fx.d.id, requestId: r.id))

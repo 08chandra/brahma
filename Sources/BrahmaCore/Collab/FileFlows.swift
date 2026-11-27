@@ -84,7 +84,8 @@ extension Store {
     @discardableResult
     public func ownerDrop(companyId: String, context: DropContext, plan: DropPlan, drop: ResourceDrop, contentVault: ContentVault,
                           secretVault: any SecretVault, knownValues: [(name: String, value: String)], paths: BrahmaPaths,
-                          now: Date = Store.now()) throws -> [WorkRef] {
+                          now: Date = Store.now(), owner: OwnerPrincipal) throws -> [WorkRef] {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1 (FR I-2): the owner principal, never from an agent process
         var drop = drop
         drop.context = context
         if case .inbox(let askId) = context, let ask = try ask(id: askId), ask.companyId == companyId, FileRequests.isFileRequest(ask),
@@ -92,8 +93,10 @@ extension Store {
             throw ResourceError.invalid("a file request is answered with a file; store the secret from Secrets instead")
         }
         let added = try addResources(companyId: companyId, plan: plan, drop: drop, contentVault: contentVault, secretVault: secretVault,
-                                     knownValues: knownValues, paths: paths, now: now)
-        if case .inbox(let askId) = context, !added.isEmpty { try settleFileRequest(companyId: companyId, askId: askId, added: added, now: now) }
+                                     knownValues: knownValues, paths: paths, now: now, owner: owner)
+        if case .inbox(let askId) = context, !added.isEmpty {
+            try settleFileRequest(companyId: companyId, askId: askId, added: added, now: now, owner: owner)
+        }
         return added.map { WorkRef(kind: .resource, id: String($0.number)) }
     }
 
@@ -104,7 +107,8 @@ extension Store {
     /// company. The agent answers with `share(..., reply_to: "msg:<id>")` (`fileAskState`).
     @discardableResult
     public func sendFileAsk(companyId: String, toHandle: String, description: String, itemKey: String?,
-                            now: Date = Store.now()) throws -> Message {
+                            now: Date = Store.now(), owner: OwnerPrincipal) throws -> Message {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1 (FR I-2): owner speech, never from an agent process
         let text = description.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw WorkError.invalid("say what file you need") }
         guard text.count <= FileAskLimits.descriptionMax else {
@@ -182,24 +186,26 @@ extension Store {
     public func answerFileRequest(companyId: String, askId: String, plan: DropPlan, contentVault: ContentVault,
                                   secretVault: any SecretVault, knownValues: [(name: String, value: String)], paths: BrahmaPaths,
                                   secretChoice: SecretChoice = .none, trust: TrustChoice = .asDetected, message: String? = nil,
-                                  now: Date = Store.now()) throws -> [WorkRef] {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+                                  now: Date = Store.now(), owner: OwnerPrincipal) throws -> [WorkRef] {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
         _ = try pendingFileRequest(companyId: companyId, askId: askId)
         let context = DropContext.inbox(askId: askId)
         let (scope, readers) = try defaultScope(for: context, companyId: companyId)
         return try ownerDrop(companyId: companyId, context: context, plan: plan,
                              drop: ResourceDrop(context: context, scope: scope, readerSet: readers, trust: trust, secretChoice: secretChoice,
                                                 message: message),
-                             contentVault: contentVault, secretVault: secretVault, knownValues: knownValues, paths: paths, now: now)
+                             contentVault: contentVault, secretVault: secretVault, knownValues: knownValues, paths: paths, now: now,
+                             owner: owner)
     }
 
     /// The owner declines the file request `askId`: answered (`ownerAnswer`) with `declined` or `declined: <note>`, a DM
     /// that wakes the requester. No file is given.
     @discardableResult
-    public func declineFileRequest(companyId: String, askId: String, note: String, now: Date = Store.now()) throws -> Ask {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+    public func declineFileRequest(companyId: String, askId: String, note: String, now: Date = Store.now(),
+                                   owner: OwnerPrincipal) throws -> Ask {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
         _ = try pendingFileRequest(companyId: companyId, askId: askId)
-        return try ownerAnswer(askId: askId, text: FileRequests.declinedText(note), now: now)
+        return try ownerAnswer(askId: askId, text: FileRequests.declinedText(note), now: now, owner: owner)
     }
 
     /// The owner's Inbox card for the file request `askId` (see `FileRequestCard`).
@@ -236,11 +242,11 @@ extension Store {
 
     /// After a drop on the file request `askId`: if the announcement could not answer it (a failure ML traces, never throws),
     /// it is answered now with `provided F-<n>…` (the only message), and the rows point at that answer.
-    private func settleFileRequest(companyId: String, askId: String, added: [Resource], now: Date) throws {
+    private func settleFileRequest(companyId: String, askId: String, added: [Resource], now: Date, owner: OwnerPrincipal) throws {
         guard let ask = try ask(id: askId), ask.companyId == companyId, FileRequests.isFileRequest(ask), ask.status == .pendingOwner else { return }
         let refs = added.filter { $0.parentId == nil }.map(\.ref)
         let posted = try writer.write { db in
-            try ownerAnswer(db: db, askId: askId, text: FileRequests.providedText(refs: refs), now: now).message
+            try ownerAnswer(db: db, askId: askId, text: FileRequests.providedText(refs: refs), owner: owner, now: now).message
         }
         guard let posted else { return }
         try writer.write { db in

@@ -298,7 +298,7 @@ import GRDB
         #expect(before.contains { $0.kind == .resource && $0.ref == "F-1" })
 
         try w.store.purgeResource(companyId: w.company.id, number: 1, backups: [], contentVault: w.contentVault, paths: w.paths,
-                                  now: Self.utc(600))
+                                  now: Self.utc(600), owner: .test)
         #expect(try w.store.resource(companyId: w.company.id, number: 1)?.displayName == "OCELOTNAME-plan.md", "the tombstone keeps it")
         let after = try Self.eng1Day(w)
         let line = try #require(after.first { $0.kind == .resource })
@@ -314,7 +314,7 @@ import GRDB
     @Test func linkShowsOnlyRef() throws {
         let w = try ResourceStoreTests.W()
         try w.store.addLink(companyId: w.company.id, url: "https://hostqzx.example.org/pathtokenqz/a?k=QUERYTOKENQZ",
-                            drop: try w.drop(.dm(handle: "eng-1")), contentVault: w.contentVault, now: Self.utc(0))
+                            drop: try w.drop(.dm(handle: "eng-1")), contentVault: w.contentVault, now: Self.utc(0), owner: .test)
         let entries = try Self.eng1Day(w)
         let line = try #require(entries.first { $0.kind == .resource })
         #expect(line.text == "F-1 link" && line.ref == "F-1")
@@ -324,7 +324,7 @@ import GRDB
         }
         // Purged, it is a ref only too.
         try w.store.purgeResource(companyId: w.company.id, number: 1, backups: [], contentVault: w.contentVault, paths: w.paths,
-                                  now: Self.utc(600))
+                                  now: Self.utc(600), owner: .test)
         #expect(try Self.eng1Day(w).first { $0.kind == .resource }?.text == "[purged F-1]")
     }
 
@@ -385,9 +385,9 @@ import GRDB
         #expect(try Replay.transcriptNotice(store: w.store, companyId: w.company.id, turnId: reader) == nil, "nothing purged yet")
 
         #expect(try w.store.purgeResource(companyId: w.company.id, number: 1, backups: [], contentVault: w.contentVault,
-                                          paths: w.paths).transcripts == [reader])
+                                          paths: w.paths, owner: .test).transcripts == [reader])
         #expect(try Replay.purgesFlagging(store: w.store, companyId: w.company.id, turnId: reader) == ["[purged F-1]"])
-        try w.store.purgeResource(companyId: w.company.id, number: 2, backups: [], contentVault: w.contentVault, paths: w.paths)
+        try w.store.purgeResource(companyId: w.company.id, number: 2, backups: [], contentVault: w.contentVault, paths: w.paths, owner: .test)
         #expect(try Replay.purgesFlagging(store: w.store, companyId: w.company.id, turnId: reader) == ["[purged F-1]", "[purged F-2]"])
         let notice = try #require(try Replay.transcriptNotice(store: w.store, companyId: w.company.id, turnId: reader))
         #expect(notice == "This transcript was captured while a since-purged resource existed; it may still contain that content. "

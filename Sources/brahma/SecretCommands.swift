@@ -104,7 +104,7 @@ struct SecretGroup: ParsableCommand {
         var test = false
 
         func run() throws {
-            try requireOwnerShell()
+            let owner = try requireOwnerShell()
             let (store, _) = try openStore()
             let selected = try resolveCompany(store, company)
             guard let found = try store.ask(companyId: selected.id, ref: ask.uppercased()) else { throw fail("no ask \(safe(ask)) in \(safe(selected.name))") }
@@ -119,7 +119,7 @@ struct SecretGroup: ParsableCommand {
                 } else {
                     value = try SecretInput.read(from: .standardInput)
                 }
-                _ = try store.provideSecret(askId: found.id, value: value, isTest: test, vault: try cliSecretVault(interactive: true))
+                _ = try store.provideSecret(askId: found.id, value: value, isTest: test, vault: try cliSecretVault(interactive: true), owner: owner)
             } catch let e as SecretError {
                 throw fail(e.message)
             } catch let e as WorkError {

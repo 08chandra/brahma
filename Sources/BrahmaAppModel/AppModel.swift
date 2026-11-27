@@ -171,7 +171,7 @@ public final class AppModel {
         self.liveChanges = LiveChanges(store: store)
         self.search = SearchModel(store: store)
         self.backups = BackupsModel(store: store, paths: paths)
-        self.access = AccessModel(store: store)
+        self.access = AccessModel(store: store, owner: owner)
         self.settings = SettingsModel(store: store)
         self.digest = DigestModel(store: store)
         self.showBar = ShowBarModel(backend: .empty)
@@ -257,7 +257,7 @@ public final class AppModel {
             dropLiveMapController()
             search = SearchModel(store: reopened)
             backups = BackupsModel(store: reopened, paths: paths)
-            access = AccessModel(store: reopened)
+            access = AccessModel(store: reopened, owner: owner)
             settings = SettingsModel(store: reopened)
             digest = DigestModel(store: reopened)
             handbook = nil

@@ -28,7 +28,7 @@ import GRDB
 
     private func purge(_ w: W, _ n: Int, now: Date) throws -> PurgeReport {
         try w.store.purgeResource(companyId: w.company.id, number: n, backups: [], contentVault: w.contentVault, paths: w.paths,
-                                  now: now)
+                                  now: now, owner: .test)
     }
 
     @Test func readersTranscriptsWhileItExistedAreListed() throws {
@@ -139,7 +139,7 @@ import GRDB
             try Data("the plan\n".utf8).write(to: file)
             let plan = try ResourceIntake.inspect(urls: [file], knownValues: [], agentAreas: .none)
             _ = try store.addResources(companyId: company.id, plan: plan, drop: ResourceDrop(), contentVault: ContentVault(paths: paths),
-                                       secretVault: MemoryVault(), knownValues: [], paths: paths, now: Store.now().addingTimeInterval(-60))
+                                       secretVault: MemoryVault(), knownValues: [], paths: paths, now: Store.now().addingTimeInterval(-60), owner: .test)
             // A captured turn of a reader, with no tracked read.
             let source = TranscriptSource(configDir: home.url.appending(path: "claude", directoryHint: .isDirectory))
             let capture = TranscriptCapture(paths: paths, source: source, compressor: .gzip)

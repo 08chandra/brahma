@@ -46,7 +46,11 @@ public final class HandbookModel {
     @ObservationIgnored private var pageGeneration = 0
     @ObservationIgnored private var listGeneration = 0
 
-    public init(store: Store, companyId: String, paths: BrahmaPaths, secretVault: any SecretVault) {
+    /// The owner principal the owner-only decisions take (final wave B1: `kbVouch`); nil: they refuse with the generic text.
+    @ObservationIgnored public var owner: OwnerPrincipal?
+
+    public init(store: Store, companyId: String, paths: BrahmaPaths, secretVault: any SecretVault, owner: OwnerPrincipal? = nil) {
+        self.owner = owner
         self.store = store
         self.companyId = companyId
         self.paths = paths
@@ -231,8 +235,8 @@ public final class HandbookModel {
     /// Owner: vouches for the selected page (its taint is cleared).
     public func vouch() async -> Bool {
         guard let path = selection else { return false }
-        let (store, companyId) = (self.store, self.companyId)
-        return await decide("vouch for kb:\(path)") { try store.kbVouch(companyId: companyId, path: path) }
+        let (store, companyId, owner) = (self.store, self.companyId, self.owner)
+        return await decide("vouch for kb:\(path)") { try store.kbVouch(companyId: companyId, path: path, owner: try store.requireOwner(owner)) }
     }
 
     /// Owner: sets the selected page's status (`deprecated` is the owner's alone).

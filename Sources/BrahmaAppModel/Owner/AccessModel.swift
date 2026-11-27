@@ -164,8 +164,12 @@ public final class AccessModel {
     /// Runs after a change that the Inbox must pick up (the app model's snapshot refresh).
     @ObservationIgnored public var afterChange: (@MainActor () async -> Void)?
 
-    public init(store: Store) {
+    /// The owner principal every owner-only call here takes (final wave B1); nil: each refuses with the generic text.
+    @ObservationIgnored public var owner: OwnerPrincipal?
+
+    public init(store: Store, owner: OwnerPrincipal? = nil) {
         self.store = store
+        self.owner = owner
     }
 
     public func revokeConfirmation(_ row: GrantRow) -> String { "Revoke \(row.ref)? It stops at the agent's next turn." }
@@ -209,9 +213,10 @@ public final class AccessModel {
     /// The owner's approval with the scope and duration they chose (`Store.approveAccess`, through `ownerDecide`).
     @discardableResult
     public func approve(askId: String, scope: GrantScope, duration: GrantDuration, note: String = "") async -> Grant? {
-        let (store, env) = (self.store, environment)
+        let (store, env, owner) = (self.store, environment, self.owner)
         let grant = await run("approve", askId: askId) {
-            try store.approveAccess(askId: askId, scope: scope, duration: duration, note: note, environment: env)
+            try store.approveAccess(askId: askId, scope: scope, duration: duration, note: note, environment: env,
+                                    owner: try store.requireOwner(owner))
         }
         await changed()
         return grant
@@ -222,8 +227,10 @@ public final class AccessModel {
     public func deny(askId: String, reason: String) async -> Bool {
         let why = reason.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !why.isEmpty else { cardErrors[askId] = "Say why: the agent reads the reason."; return false }
-        let store = self.store
-        let ask = await run("deny", askId: askId) { try store.ownerDecide(askId: askId, approve: false, note: why) }
+        let (store, owner) = (self.store, self.owner)
+        let ask = await run("deny", askId: askId) {
+            try store.ownerDecide(askId: askId, approve: false, note: why, owner: try store.requireOwner(owner))
+        }
         await changed()
         return ask != nil
     }
@@ -239,8 +246,10 @@ public final class AccessModel {
 
     public func setPreset(_ preset: AccessPreset, enabled: Bool) async {
         guard let companyId else { return }
-        let store = self.store
-        _ = await run("change the preset") { try store.setPreset(companyId: companyId, preset, enabled: enabled) }
+        let (store, owner) = (self.store, self.owner)
+        _ = await run("change the preset") {
+            try store.setPreset(companyId: companyId, preset, enabled: enabled, owner: try store.requireOwner(owner))
+        }
         await reload(keepingError: true)
     }
 

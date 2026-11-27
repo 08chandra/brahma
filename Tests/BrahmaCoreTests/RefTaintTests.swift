@@ -1138,7 +1138,7 @@ import GRDB
         let first = try #require(try alerts().first)
         #expect(try alerts().count == 1 && first.status == .pendingOwner)
         // The owner answers it while the branch is still broken: this break stays answered.
-        _ = try cf.store.acknowledge(askId: first.id)
+        _ = try cf.store.acknowledge(askId: first.id, owner: .test)
         try resolve()
         #expect(try alerts().count == 1)
         func markers() throws -> Int {
@@ -1160,7 +1160,7 @@ import GRDB
         try resolve()
         #expect(try alerts().count == 2 && alerts().filter { $0.status == .pendingOwner }.count == 1)
         // That one answered too: silent until the next clean read, then one more on the next break.
-        _ = try cf.store.acknowledge(askId: try #require(try alerts().last).id)
+        _ = try cf.store.acknowledge(askId: try #require(try alerts().last).id, owner: .test)
         try resolve()
         #expect(try alerts().count == 2)
         try heal()

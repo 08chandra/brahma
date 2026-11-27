@@ -39,7 +39,7 @@ import GRDB
         try f.bin("demo-tool")
         ScratchScope.current?.allowExecutable(named: "demo-tool")
         let ask = try await w.propose(f)
-        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now)
+        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test)
         let installed = try #require(try w.installed("demo"))
         #expect(installed.enabled); #expect(installed.installedAskId == ask.id)
         let hash12 = String(installed.hash.prefix(12))
@@ -85,11 +85,11 @@ import GRDB
         let w = try ExtWorld()
         let ask = try await w.propose(try PluginFixture())
         // The store's plain approve (what `brahma approve` and a naive caller use) is refused; the app's path is the library.
-        #expect(refusal { try w.store.ownerDecide(askId: ask.id, approve: true) } == "approve extensions in the app")
+        #expect(refusal { try w.store.ownerDecide(askId: ask.id, approve: true, owner: .test) } == "approve extensions in the app")
         #expect(try w.store.ask(id: ask.id)?.status == .pendingOwner)
         #expect(try w.installed("demo") == nil)
         // Rejecting works plainly and leaves nothing behind (the staging dir is removed, an event is written).
-        _ = try w.store.ownerDecide(askId: ask.id, approve: false, note: "no")
+        _ = try w.store.ownerDecide(askId: ask.id, approve: false, note: "no", owner: .test)
         #expect(try w.store.ask(id: ask.id)?.status == .rejected)
         #expect(try w.events("declined").count == 1)
         #expect(try FileManager.default.contentsOfDirectory(atPath: w.paths.extensionsDir.staging.path).isEmpty)
@@ -170,7 +170,7 @@ import GRDB
         // Removing an installed extension keeps a "removed by owner" override when the pack still suggests it.
         let w = try ExtWorld()
         _ = try await w.install(try PluginFixture())
-        try ExtensionLibrary.remove(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now)
+        try ExtensionLibrary.remove(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test)
         #expect(try w.installed("demo") == nil)
         #expect(try w.mounts().isEmpty)
         #expect(try w.events("removed").count == 1)
@@ -247,7 +247,7 @@ import GRDB
         let meta = try #require(try w.store.agent(id: w.eng.id)?.sessionMeta)
         #expect(meta.mountSetHash == ExtensionLibrary.mountSetHash(try w.mounts()))
         // Removal changes the set again.
-        try ExtensionLibrary.remove(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now)
+        try ExtensionLibrary.remove(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test)
         let r5 = try await w.nextRequest()
         #expect(r5.mounts.isEmpty); #expect(!r5.agent.sessionStarted)
     }
@@ -296,7 +296,7 @@ import GRDB
         #expect(try w.store.extensionPackage(hash: a.hash)?.publisher == "local")
         #expect(try w.store.grantableExtensions(companyId: w.company.id) == ["local/demo"])
         // B approves: B's row says third-party; A's still says local; on Workspace only A would mount.
-        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now)
+        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test)
         #expect(try w.store.installedExtensions(companyId: b.id).first?.publisher == "third-party:claude-code/official")
         #expect(try w.installed("demo")?.publisher == "local")
         #expect(try w.store.grantableExtensions(companyId: b.id) == ["third-party:claude-code/official/demo"])
@@ -349,12 +349,12 @@ import GRDB
         let w = try ExtWorld()
         let v1 = try await w.install(try PluginFixture())
         let ask = try await w.propose(try PluginFixture(manifest: #"{"name": "demo", "version": "1.1.0", "description": "v2.", "author": {"name": "T"}}"#))
-        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now)
+        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test)
         let old = w.paths.extensionsDir.store.appending(path: "demo/\(v1.hash.prefix(12))/skills/demo/SKILL.md")
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: old.path)
         let text = try String(contentsOf: old, encoding: .utf8)
         try Data(text.replacingOccurrences(of: "\n", with: "\r\n").utf8).write(to: old)
-        #expect(throws: WorkError.self) { try ExtensionLibrary.rollback(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now) }
+        #expect(throws: WorkError.self) { try ExtensionLibrary.rollback(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test) }
         #expect(try w.installed("demo")?.hash != v1.hash)
     }
 
@@ -386,10 +386,10 @@ import GRDB
         let w = try ExtWorld()
         let v1 = try await w.install(try PluginFixture())
         let ask = try await w.propose(try PluginFixture(manifest: #"{"name": "demo", "version": "1.1.0", "description": "v2.", "author": {"name": "T"}}"#))
-        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now)
-        try ExtensionLibrary.rollback(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now)
+        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test)
+        try ExtensionLibrary.rollback(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test)
         #expect(try w.installed("demo")?.hash == v1.hash)
-        #expect(throws: WorkError.self) { try ExtensionLibrary.rollback(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now) }
+        #expect(throws: WorkError.self) { try ExtensionLibrary.rollback(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test) }
         #expect(try w.installed("demo")?.hash == v1.hash)
         #expect(try w.events("rollback").count == 1); #expect(try w.events("installed").count == 2)
     }
@@ -434,7 +434,7 @@ import GRDB
         #expect(reply.hasPrefix("Requested A-"))
         let ask = try #require(try w.store.asks(companyId: w.company.id).last { $0.kind == .grant })
         _ = try w.store.approveAccess(askId: ask.id, scope: .agent, duration: .always, note: "ok",
-                                      environment: SandboxEnvironment(userHome: w.world.userHome, darwinUserTemp: nil, shell: "/bin/zsh"))
+                                      environment: SandboxEnvironment(userHome: w.world.userHome, darwinUserTemp: nil, shell: "/bin/zsh"), owner: .test)
         let grants = try w.store.activeGrants(agent: qa, itemId: nil)
         #expect(GrantResolver.inputs(grants).extensions == ["local/demo"])
         #expect(try w.mounts(qa, grants: GrantResolver.inputs(grants)).map(\.id) == ["demo"])
@@ -447,11 +447,11 @@ import GRDB
         let v1 = try await w.install(try PluginFixture())
         let f2 = try PluginFixture(manifest: #"{"name": "demo", "version": "1.1.0", "description": "A demo skill, v2.", "author": {"name": "T"}}"#)
         let ask = try await w.propose(f2)
-        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now)
+        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test)
         let v2 = try #require(try w.installed("demo"))
         #expect(v2.hash != v1.hash)
         #expect(try w.mounts().first?.url.path.contains(v2.hash.prefix(12)) == true)
-        try ExtensionLibrary.rollback(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now)
+        try ExtensionLibrary.rollback(companyId: w.company.id, id: "demo", store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test)
         #expect(try w.installed("demo")?.hash == v1.hash)
         #expect(try w.mounts().first?.url.path.contains(v1.hash.prefix(12)) == true)
     }

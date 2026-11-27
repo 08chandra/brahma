@@ -96,6 +96,8 @@ public enum InboxRows {
             if section != .pending {
                 var by = a.decidedBy ?? "owner"
                 if by.hasPrefix("@") { by = "@" + (handles[String(by.dropFirst())] ?? String(by.dropFirst())) }
+                // Final wave B1 (Ruling C6-4 addition): a preset's decision reads "decided by preset <id>", never the owner's.
+                if by.hasPrefix("preset:") { by = "preset " + by.dropFirst("preset:".count) }
                 decided = a.fyi ? "Approved by \(by) (FYI)" : "Approved by \(by)"
             }
             let pending = section == .pending

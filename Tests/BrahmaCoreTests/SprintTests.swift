@@ -28,7 +28,7 @@ import GRDB
         func approveGates() throws {
             for kind in [AskKind.prd, .architecture] {
                 let a = try store.propose(companyId: company.id, by: .agent(ceo.id), kind: kind, title: kind.title, summary: "s", now: now)
-                _ = try store.ownerDecide(askId: a.id, approve: true, now: now)
+                _ = try store.ownerDecide(askId: a.id, approve: true, now: now, owner: .test)
             }
         }
 
@@ -95,7 +95,7 @@ import GRDB
         let decided = try w.decide(ask)
         #expect(decided.status == .pendingOwner, "auto would otherwise approve a sprint plan as an FYI")
         #expect(try w.fresh(sprint).status == .pendingApproval)
-        _ = try w.store.ownerDecide(askId: ask.id, approve: true, now: w.now)
+        _ = try w.store.ownerDecide(askId: ask.id, approve: true, now: w.now, owner: .test)
         #expect(try w.fresh(sprint).status == .active)
         // With the gates approved, the same preset lets the C-suite approve it.
         let w2 = try W(preset: .auto)
@@ -158,7 +158,7 @@ import GRDB
         #expect(try w.decide(ask).status == .pendingOwner)
         #expect(try w.fresh(sprint).status == .pendingApproval)
         #expect(try w.fresh(a).status == .backlog)
-        _ = try w.store.ownerDecide(askId: ask.id, approve: true, now: w.now)
+        _ = try w.store.ownerDecide(askId: ask.id, approve: true, now: w.now, owner: .test)
         #expect(try w.fresh(sprint).status == .active)
         #expect(try w.fresh(a).status == .ready)
     }
@@ -476,10 +476,10 @@ import GRDB
         let a = try w.item("A"), b = try w.item("B", status: .ready), c = try w.item("C")
         let (sprint, ask) = try w.plan([a.key, b.key, c.key])
         _ = try w.decide(ask)
-        _ = try w.store.ownerDecide(askId: ask.id, approve: true, now: w.now)
+        _ = try w.store.ownerDecide(askId: ask.id, approve: true, now: w.now, owner: .test)
         #expect(try w.fresh(sprint).status == .active)
         try w.store.writer.write { db in _ = try w.store.engineSetStatus(db: db, itemId: c.id, to: .inProgress, now: w.now) }
-        _ = try w.store.ownerRescind(askId: ask.id, note: "not now", now: w.now)
+        _ = try w.store.ownerRescind(askId: ask.id, note: "not now", now: w.now, owner: .test)
         let closed = try w.fresh(sprint)
         #expect(closed.status == .closed)
         #expect(closed.summary == "cancelled: \(ask.ref) rescinded by the owner")
@@ -501,7 +501,7 @@ import GRDB
         #expect(plan.status == .pendingInternal)
         let arch = try #require(try w.store.asks(companyId: w.company.id).first { $0.kind == .architecture })
         try w.sleep([w.mgr])
-        _ = try w.store.ownerRescind(askId: arch.id, note: "redo", now: w.now)
+        _ = try w.store.ownerRescind(askId: arch.id, note: "redo", now: w.now, owner: .test)
         let rejected = try w.fresh(plan)
         #expect(rejected.status == .rejected && rejected.ownerNote == "gate \(arch.ref) was rescinded")
         #expect(try w.fresh(pending).status == .rejected)

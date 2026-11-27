@@ -4,7 +4,8 @@ import BrahmaCore
 /// Task 4-wire's `Store.provideSecret` behind a seam: the secret `request` card's `Provide…` goes through it. The value goes to
 /// the vault only; the ask is answered through `ownerDecide`.
 public protocol SecretProviding: Sendable {
-    func provideSecret(store: Store, askId: String, name: String, value: String, isTest: Bool, vault: any SecretVault) throws
+    func provideSecret(store: Store, askId: String, name: String, value: String, isTest: Bool, vault: any SecretVault,
+                       owner: OwnerPrincipal) throws
 }
 
 /// The real provider: `Store.provideSecret` (vault write, metadata row and approval as one unit with respect to the pending →
@@ -12,11 +13,12 @@ public protocol SecretProviding: Sendable {
 public struct StoreSecretProvider: SecretProviding {
     public init() {}
 
-    public func provideSecret(store: Store, askId: String, name: String, value: String, isTest: Bool, vault: any SecretVault) throws {
+    public func provideSecret(store: Store, askId: String, name: String, value: String, isTest: Bool, vault: any SecretVault,
+                              owner: OwnerPrincipal) throws {
         guard let ask = try store.ask(id: askId) else { throw WorkError.notFound("no such ask") }
         guard let requested = SecretRequests.requested(ask) else { throw WorkError.invalid("\(ask.ref) is not a secret request") }
         guard requested.name == name else { throw WorkError.invalid("\(ask.ref) asks for \(requested.name), not \(name)") }
-        _ = try store.provideSecret(askId: askId, value: value, isTest: isTest, vault: vault)
+        _ = try store.provideSecret(askId: askId, value: value, isTest: isTest, vault: vault, owner: owner)
     }
 }
 
@@ -53,9 +55,12 @@ extension AppModel {
             return "Providing a secret from the app needs Brahma's secret-request support (Task 4-wire), which this build lacks."
         }
         guard let vault = ownerSecretVault else { return "No secrets vault is available in this app, so nothing was stored." }
-        let (store, name, value, isTest) = (self.store, form.trimmedName, form.value, form.isTest)
+        let (store, name, value, isTest, owner) = (self.store, form.trimmedName, form.value, form.isTest, self.owner)
         do {
-            try await Task.detached { try provider.provideSecret(store: store, askId: askId, name: name, value: value, isTest: isTest, vault: vault) }.value
+            try await Task.detached {
+                try provider.provideSecret(store: store, askId: askId, name: name, value: value, isTest: isTest, vault: vault,
+                                           owner: try store.requireOwner(owner))
+            }.value
             await tick(forceSnapshot: true)
             return nil
         } catch let e as WorkError {

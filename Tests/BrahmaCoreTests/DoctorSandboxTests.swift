@@ -72,7 +72,7 @@ private struct GateWorld {
         _ = try tools.call(name: "request_access", arguments: ["kind": .string("network_domain"), "value": .string(domain),
                                                                "reason": .string("I need it")])
         let ask = try #require(try world.store.asks(companyId: sandboxed.id).last { $0.kind == .grant })
-        return try world.store.approveAccess(askId: ask.id, scope: .once, duration: .always, note: "ok", environment: env)
+        return try world.store.approveAccess(askId: ask.id, scope: .once, duration: .always, note: "ok", environment: env, owner: .test)
     }
 
     func grant(_ g: Grant) throws -> Grant {

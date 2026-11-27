@@ -122,8 +122,8 @@ extension Store {
     /// file`). Vouching the last version again is a no-op that returns the vouch.
     @discardableResult
     public func vouchFile(companyId: String, fileId: String, sha256: String, name: String? = nil, acknowledgeAmbiguity: Bool = false,
-                          now: Date) throws -> FileVouch {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+                          now: Date, owner: OwnerPrincipal) throws -> FileVouch {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
         let hash = sha256.lowercased(), id = fileId.lowercased()
         guard hash.count == 64, hash.allSatisfy(\.isHexDigit) else {
             throw WorkError.invalid("give the file's full sha256 (all 64 hex digits), as the refusal prints it")
@@ -221,8 +221,8 @@ extension Store {
     /// owner's confirmation after the Inbox showed the files side by side. Any other ask is refused. Owner callers only
     /// (the app).
     @discardableResult
-    public func vouchFile(alertAskId: String, acknowledgeAmbiguity: Bool = false, now: Date) throws -> FileVouch {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+    public func vouchFile(alertAskId: String, acknowledgeAmbiguity: Bool = false, now: Date, owner: OwnerPrincipal) throws -> FileVouch {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
         let zone = ownerTimeZone()
         return try writer.write { db in
             guard let ask = try Ask.fetchOne(db, key: alertAskId), Self.isFileVouchAlert(ask), let subject = ask.subjectId else {

@@ -97,7 +97,8 @@ extension Store {
     @discardableResult
     public func addResources(companyId: String, plan: DropPlan, drop: ResourceDrop, contentVault: ContentVault,
                              secretVault: any SecretVault, knownValues: [(name: String, value: String)], paths: BrahmaPaths,
-                             now: Date = Store.now()) throws -> [Resource] {
+                             now: Date = Store.now(), owner: OwnerPrincipal) throws -> [Resource] {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1: an owner drop (it may answer a file request)
         guard !plan.items.isEmpty else { throw ResourceError.invalid("there is nothing to add") }
         guard contentVault.paths == paths else { throw ResourceError.invalid("the vault belongs to another data home") }
         guard let company = try company(id: companyId) else { throw ResourceError.notFound("no such company") }
@@ -284,7 +285,7 @@ extension Store {
         // 8. Announcement, after commit.
         let text = Self.announcement(rows: rows, folder: folder, message: drop.message, refsOnly: refsOnly)
         let posted = announce(text, drop: drop, resolved: resolved, companyId: companyId, refs: rows.map(\.ref),
-                              top: rows.filter { $0.parentId == nil }.map(\.number), now: now)
+                              top: rows.filter { $0.parentId == nil }.map(\.number), now: now, owner: owner)
         if let posted { for i in rows.indices { rows[i].messageId = posted.id; rows[i].channelId = posted.channelId } }
         recordAfterCommit(companyId: companyId, rows: rows, mirrored: mirrored, posted: posted, now: now)
         do {
@@ -305,7 +306,8 @@ extension Store {
     /// is stored, and its host and path are indexed as the title. Trust: owner, unless marked untrusted. Announced like files.
     @discardableResult
     public func addLink(companyId: String, url raw: String, drop: ResourceDrop, contentVault: ContentVault,
-                        now: Date = Store.now()) throws -> Resource {
+                        now: Date = Store.now(), owner: OwnerPrincipal) throws -> Resource {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1: an owner drop (it may answer a file request)
         let url = try ResourceIntake.link(raw)
         guard try company(id: companyId) != nil else { throw ResourceError.notFound("no such company") }
         let shown = Self.linkShown(url)
@@ -341,7 +343,8 @@ extension Store {
                               text: try redact("You added \(Self.linkTag(link.ref)) (\(label))"), createdAt: now).insert(db)
         }
         let text = Self.announcement(rows: [link], folder: nil, message: drop.message, refsOnly: refsOnly)
-        let posted = announce(text, drop: drop, resolved: resolved, companyId: companyId, refs: [link.ref], top: [link.number], now: now)
+        let posted = announce(text, drop: drop, resolved: resolved, companyId: companyId, refs: [link.ref], top: [link.number], now: now,
+                              owner: owner)
         if let posted { link.messageId = posted.id; link.channelId = posted.channelId }
         recordAfterCommit(companyId: companyId, rows: [link], mirrored: [:], posted: posted, now: now)
         do { return try resource(companyId: companyId, number: link.number) ?? link } catch {
@@ -699,7 +702,7 @@ extension Store {
     /// with a `messageRef` row (`inline = 0`) for each top-level ref (`top`, resolved for the owner) in the same transaction,
     /// and the text's other chips after them. No second message is ever posted.
     private func announce(_ text: String, drop: ResourceDrop, resolved: ResolvedDrop, companyId: String, refs: [String],
-                          top: [Int] = [], now: Date) -> Message? {
+                          top: [Int] = [], now: Date, owner: OwnerPrincipal) -> Message? {
         let router = MessageRouter(store: self)
         do {
             // The recipients again, on exactly the text delivered (its sizes and mirror paths are final only now).
@@ -735,13 +738,13 @@ extension Store {
                     let answer = FileRequests.providedText(refs: top.map { "F-\($0)" }) + "\n" + text
                     return try postShare(answer, companyId: companyId, top: top, channelId: nil, now: now) { db, inline, first in
                         guard let message = try ownerAnswer(db: db, askId: askId, text: answer, kind: .share, inline: inline,
-                                                            firstInlinePosition: first, now: now).message else {
+                                                            firstInlinePosition: first, owner: owner, now: now).message else {
                             throw ResourceError.invalid(Self.inboxRefusal)
                         }
                         return message
                     }
                 }
-                _ = try ownerAnswer(askId: askId, text: text, now: now)
+                _ = try ownerAnswer(askId: askId, text: text, now: now, owner: owner)
             case .item(let id):
                 _ = try commentWorkItem(id: id, by: .owner, text: text, now: now)
             case .library, .cli:

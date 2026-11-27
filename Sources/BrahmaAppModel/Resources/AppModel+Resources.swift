@@ -22,8 +22,8 @@ extension AppModel {
     public func vouch(resource ref: String) async {
         guard let companyId = selectedCompanyId, let number = Self.resourceNumber(ref) else { return }
         let paths = self.paths
-        await ownerWrite("vouch for \(ref)") { store in
-            try store.vouchResource(companyId: companyId, number: number, contentVault: ContentVault(paths: paths), paths: paths)
+        await ownerAct("vouch for \(ref)") { store, owner in
+            try store.vouchResource(companyId: companyId, number: number, contentVault: ContentVault(paths: paths), paths: paths, owner: owner)
         }
     }
 
@@ -31,7 +31,7 @@ extension AppModel {
     public func setScope(resource ref: String, _ choice: ScopeChoice, futureHolders: Bool = false) async {
         guard let companyId = selectedCompanyId, let number = Self.resourceNumber(ref) else { return }
         let paths = self.paths
-        await ownerWrite("change the scope of \(ref)") { store in
+        await ownerAct("change the scope of \(ref)") { store, owner in
             let scope: AccessClass
             switch choice {
             case .contextDefault, .company: scope = .company
@@ -43,7 +43,7 @@ extension AppModel {
                 scope = .item(item.id)
             }
             try store.setResourceScope(companyId: companyId, number: number, scope: scope, futureHolders: futureHolders,
-                                       contentVault: ContentVault(paths: paths), paths: paths)
+                                       contentVault: ContentVault(paths: paths), paths: paths, owner: owner)
         }
     }
 
@@ -58,11 +58,11 @@ extension AppModel {
         confirmPurge = nil
         guard let companyId = selectedCompanyId, let number = Self.resourceNumber(ref) else { return nil }
         let paths = self.paths
-        return await ownerWrite("purge \(ref)") { store in
+        return await ownerAct("purge \(ref)") { store, owner in
             let backups = BackupService(paths: paths).list().map { (name: $0.name, takenAt: $0.date) }
                 + HomeSnapshot.list(paths: paths).map { (name: $0.name, takenAt: $0.date) }
             return try store.purgeResource(companyId: companyId, number: number, backups: backups,
-                                           contentVault: ContentVault(paths: paths), paths: paths)
+                                           contentVault: ContentVault(paths: paths), paths: paths, owner: owner)
         }
     }
 

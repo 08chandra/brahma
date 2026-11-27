@@ -166,7 +166,8 @@ extension Store {
     /// tomorrow"`). An agent target also gets the owner's DM (`kind = showRequest`), which wakes it as any owner DM does.
     @discardableResult
     public func createShowRequest(companyId: String, kind: ShowKind, query: String, attachedRef: String?, routed: RoutedTarget,
-                                  candidates: [String], now: Date) throws -> ShowRequest {
+                                  candidates: [String], now: Date, owner: OwnerPrincipal) throws -> ShowRequest {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1 (FR I-2): spends the owner's budget, never from an agent process
         let normalized = ShowQuery.normalize(query).normalized
         let encoded = String(decoding: try JSONEncoder().encode(candidates), as: UTF8.self)
         let tz = ownerTimeZone()
@@ -231,7 +232,8 @@ extension Store {
     }
 
     /// The owner cancels an open request from its waiting chip.
-    public func cancelShowRequest(companyId: String, id: String, now: Date) throws {
+    public func cancelShowRequest(companyId: String, id: String, now: Date, owner: OwnerPrincipal) throws {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1 (FR I-2)
         try writer.write { db in
             try db.execute(sql: "UPDATE showRequest SET status = 'cancelled' WHERE companyId = ? AND id = ? AND status = 'open'",
                            arguments: [companyId, id])

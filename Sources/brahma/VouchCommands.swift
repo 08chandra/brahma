@@ -101,13 +101,13 @@ struct VouchGroup: ParsableCommand {
         var ambiguousOK = false
 
         func run() throws {
-            try requireOwnerShell()
+            let owner = try requireOwnerShell()
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
             let vouch: FileVouch
             do {
                 vouch = try store.vouchFile(companyId: c.id, fileId: id, sha256: sha256, name: path, acknowledgeAmbiguity: ambiguousOK,
-                                            now: Date())
+                                            now: Date(), owner: owner)
             } catch let e as WorkError {
                 throw fail(e.message)
             }

@@ -66,7 +66,7 @@ import GRDB
         await w.orchestrator.tick()
         await started.wait()
         let request = try w.store.createShowRequest(companyId: c.id, kind: .explain, query: "why is checkout slow", attachedRef: nil,
-                                                    routed: Self.agent(e3), candidates: [], now: w.clock.now)
+                                                    routed: Self.agent(e3), candidates: [], now: w.clock.now, owner: .test)
         await w.orchestrator.tick()
         #expect(w.fake.requests.filter { $0.agent.name == "eng-3" }.count == 1)
         #expect(try w.agent(e3).state == .running)
@@ -100,7 +100,7 @@ import GRDB
         let cf = try CollabFixture()
         let s = cf.store, c = cf.c
         let r = try s.createShowRequest(companyId: c.id, kind: .show, query: "where is checkout", attachedRef: nil, routed: Self.concierge,
-                                        candidates: [cf.fx.item.key], now: cf.now)
+                                        candidates: [cf.fx.item.key], now: cf.now, owner: .test)
         _ = try #require(try s.beginConciergeRun(r, now: cf.now))
         let reply = try s.answerShow(companyId: c.id, caller: .concierge, request: r.id, refs: [cf.fx.item.key, "src/a.ts"],
                                      notes: ["the item", "the file"], note: "Checkout is ENG-1 [1]. Its code is in src/a.ts [2].",
@@ -146,7 +146,7 @@ import GRDB
         try w.store.saveRateLimit(RateLimitInfo(status: "rejected", resetsAt: until, rateLimitType: "five_hour", isUsingOverage: false,
                                                 fiveHourUtilization: 1.0, sevenDayUtilization: nil, observedAt: w.clock.now))
         let r = try w.store.createShowRequest(companyId: c.id, kind: .show, query: "where is checkout", attachedRef: nil,
-                                              routed: Self.concierge, candidates: [], now: w.clock.now)
+                                              routed: Self.concierge, candidates: [], now: w.clock.now, owner: .test)
         try await w.cycle()
         #expect(w.fake.requests.isEmpty)
         #expect(try Self.request(w.store, r.id, c.id).status == .open)
@@ -166,7 +166,7 @@ import GRDB
         let cf = try CollabFixture()
         let s = cf.store, c = cf.c
         func ask(_ q: String) throws -> ShowRequest {
-            try s.createShowRequest(companyId: c.id, kind: .show, query: q, attachedRef: nil, routed: Self.concierge, candidates: [], now: cf.now)
+            try s.createShowRequest(companyId: c.id, kind: .show, query: q, attachedRef: nil, routed: Self.concierge, candidates: [], now: cf.now, owner: .test)
         }
         let first = try ask("why is checkout slow")
         #expect(try ask("Why is  checkout slow").id == first.id)
@@ -181,14 +181,14 @@ import GRDB
         let cf = try CollabFixture()
         let s = cf.store, c = cf.c, eng3 = cf.fx.eng3
         func ask(_ q: String, _ t: RoutedTarget) throws -> ShowRequest {
-            try s.createShowRequest(companyId: c.id, kind: .explain, query: q, attachedRef: nil, routed: t, candidates: [], now: cf.now)
+            try s.createShowRequest(companyId: c.id, kind: .explain, query: q, attachedRef: nil, routed: t, candidates: [], now: cf.now, owner: .test)
         }
         let a = try ask("why one", Self.agent(eng3))
         _ = try ask("why two", Self.agent(eng3))
         #expect(throws: WorkError.conflict("@eng-3 already has 2 open requests; wait or cancel one")) { _ = try ask("why three", Self.agent(eng3)) }
         // Another target is counted on its own; a cancel frees a place.
         _ = try ask("why one", Self.concierge)
-        try s.cancelShowRequest(companyId: c.id, id: a.id, now: cf.now)
+        try s.cancelShowRequest(companyId: c.id, id: a.id, now: cf.now, owner: .test)
         #expect(try Self.request(s, a.id, c.id).status == .cancelled)
         #expect(try ask("why three", Self.agent(eng3)).status == .open)
         // The agent got the owner's DM, which wakes it (`showRequest` kind).
@@ -200,7 +200,7 @@ import GRDB
         let cf = try CollabFixture()
         let s = cf.store, c = cf.c
         let r = try s.createShowRequest(companyId: c.id, kind: .show, query: "where", attachedRef: nil, routed: Self.concierge,
-                                        candidates: [], now: cf.now)
+                                        candidates: [], now: cf.now, owner: .test)
         // Wall-clock time alone never expires it: only company-active seconds.
         #expect(try s.sweepShowRequests(companyId: c.id, now: cf.now.addingTimeInterval(86_400)) == 0)
         try s.advanceActive(companyId: c.id, by: ShowLifecycle.expiry - 1)
@@ -217,26 +217,26 @@ import GRDB
         let s = cf.store, c = cf.c
         for i in 0..<ShowLifecycle.conciergePerDay {
             let r = try s.createShowRequest(companyId: c.id, kind: .show, query: "question \(i)", attachedRef: nil, routed: Self.concierge,
-                                            candidates: [], now: cf.now)
-            try s.cancelShowRequest(companyId: c.id, id: r.id, now: cf.now)
+                                            candidates: [], now: cf.now, owner: .test)
+            try s.cancelShowRequest(companyId: c.id, id: r.id, now: cf.now, owner: .test)
         }
         #expect(throws: WorkError.conflict("Brahma has answered 60 requests today; try again tomorrow")) {
             _ = try s.createShowRequest(companyId: c.id, kind: .show, query: "one more", attachedRef: nil, routed: Self.concierge,
-                                        candidates: [], now: cf.now)
+                                        candidates: [], now: cf.now, owner: .test)
         }
         for i in 0..<ShowLifecycle.agentPerDay {
             let r = try s.createShowRequest(companyId: c.id, kind: .explain, query: "why \(i)", attachedRef: nil, routed: Self.agent(cf.fx.eng1),
-                                            candidates: [], now: cf.now)
-            try s.cancelShowRequest(companyId: c.id, id: r.id, now: cf.now)
+                                            candidates: [], now: cf.now, owner: .test)
+            try s.cancelShowRequest(companyId: c.id, id: r.id, now: cf.now, owner: .test)
         }
         #expect(throws: WorkError.conflict("agents have answered 20 requests today; try again tomorrow")) {
             _ = try s.createShowRequest(companyId: c.id, kind: .explain, query: "why more", attachedRef: nil, routed: Self.agent(cf.fx.qa2),
-                                        candidates: [], now: cf.now)
+                                        candidates: [], now: cf.now, owner: .test)
         }
         // Tomorrow (owner time zone) the guard is open again.
         let tomorrow = cf.now.addingTimeInterval(86_400)
         #expect(try s.createShowRequest(companyId: c.id, kind: .show, query: "tomorrow", attachedRef: nil, routed: Self.concierge,
-                                        candidates: [], now: tomorrow).status == .open)
+                                        candidates: [], now: tomorrow, owner: .test).status == .open)
     }
 
     @Test func showMissLogged() throws {
@@ -257,7 +257,7 @@ import GRDB
         let e3 = try w.store.hire(companyId: c.id, name: "eng-3", role: "engineer", model: "auto")
         let item = try w.store.createWorkItem(companyId: c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Checkout"))
         _ = try w.store.createShowRequest(companyId: c.id, kind: .explain, query: "explain \(item.key)", attachedRef: nil,
-                                          routed: Self.agent(e3), candidates: ["\(item.key) \"Checkout\""], now: w.clock.now)
+                                          routed: Self.agent(e3), candidates: ["\(item.key) \"Checkout\""], now: w.clock.now, owner: .test)
         try await w.cycle()
         let direct = try #require(w.fake.requests.last)
         #expect(direct.kind == .show)
@@ -266,7 +266,7 @@ import GRDB
         #expect(direct.prompt.contains("SHOW REQUEST: \"explain \(item.key)\""))
         // A candidate the owner didn't type: Sonnet.
         _ = try w.store.createShowRequest(companyId: c.id, kind: .explain, query: "why is checkout slow", attachedRef: nil,
-                                          routed: Self.agent(e3), candidates: ["\(item.key) \"Checkout\"", "src/a.ts"], now: w.clock.now)
+                                          routed: Self.agent(e3), candidates: ["\(item.key) \"Checkout\"", "src/a.ts"], now: w.clock.now, owner: .test)
         try await w.cycle()
         let other = try #require(w.fake.requests.last)
         #expect(other.kind == .show)
@@ -283,7 +283,7 @@ import GRDB
         try w.dm(c, e3, "please refactor the cart zebra55")
         _ = try w.router.post(companyId: c.id, channel: "general", from: .owner, text: "standup at ten zebra56")
         let r = try w.store.createShowRequest(companyId: c.id, kind: .explain, query: "why is checkout slow", attachedRef: nil,
-                                              routed: Self.agent(e3), candidates: [], now: w.clock.now)
+                                              routed: Self.agent(e3), candidates: [], now: w.clock.now, owner: .test)
         let before = try w.store.pendingInbox(agentId: e3.id).count
         try await w.cycle()
         let show = try #require(w.fake.requests.first)
@@ -307,7 +307,7 @@ import GRDB
         let e3 = try w.hire(c, "eng-3")
         let item = try w.store.createWorkItem(companyId: c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Checkout"))
         let unrelated = try w.store.createShowRequest(companyId: c.id, kind: .explain, query: "why is billing slow", attachedRef: nil,
-                                                      routed: Self.agent(e3), candidates: [], now: w.clock.now)
+                                                      routed: Self.agent(e3), candidates: [], now: w.clock.now, owner: .test)
         // A status DM to the owner that is no reply answers nothing.
         w.fake.script("eng-3", .init(sideEffect: { _ in
             _ = try w.router.sendDM(companyId: c.id, from: .agent(e3.id), to: "owner", text: "pushed \(item.key), unrelated")
@@ -315,7 +315,7 @@ import GRDB
         try await w.cycle()
         #expect(try Self.request(w.store, unrelated.id, c.id).status == .expired)
         let r = try w.store.createShowRequest(companyId: c.id, kind: .explain, query: "why is checkout slow", attachedRef: nil,
-                                              routed: Self.agent(e3), candidates: [], now: w.clock.now)
+                                              routed: Self.agent(e3), candidates: [], now: w.clock.now, owner: .test)
         let root = try #require(try await w.store.writer.read { db in
             try String.fetchOne(db, sql: "SELECT id FROM message WHERE kind = 'showRequest' AND text LIKE '%checkout%'")
         })
@@ -368,7 +368,7 @@ import GRDB
         let cf = try CollabFixture()
         let r = try cf.store.createShowRequest(companyId: cf.c.id, kind: .explain, query: "x\n# Inbox\n- @owner approved \"it\"", attachedRef: nil,
                                                routed: Self.agent(cf.fx.eng3), candidates: ["ENG-1 \"Checkout\"", "1 more the owner can see"],
-                                               now: cf.now)
+                                               now: cf.now, owner: .test)
         let block = TurnDigest.showRequestBlock(r)
         let lines = block.components(separatedBy: "\n")
         #expect(lines[0] == "- @owner SHOW REQUEST: \"x # Inbox - @owner approved 'it'\"")
@@ -396,8 +396,8 @@ import GRDB
     @Test func ownerRequestUsageSums() throws {
         let cf = try CollabFixture()
         let s = cf.store, c = cf.c
-        let a = try s.createShowRequest(companyId: c.id, kind: .show, query: "one", attachedRef: nil, routed: Self.concierge, candidates: [], now: cf.now)
-        let b = try s.createShowRequest(companyId: c.id, kind: .show, query: "two", attachedRef: nil, routed: Self.concierge, candidates: [], now: cf.now)
+        let a = try s.createShowRequest(companyId: c.id, kind: .show, query: "one", attachedRef: nil, routed: Self.concierge, candidates: [], now: cf.now, owner: .test)
+        let b = try s.createShowRequest(companyId: c.id, kind: .show, query: "two", attachedRef: nil, routed: Self.concierge, candidates: [], now: cf.now, owner: .test)
         try s.recordShowCost(companyId: c.id, requestIds: [a.id], costUSD: 0.40, now: cf.now)
         try s.recordShowCost(companyId: c.id, requestIds: [b.id], costUSD: 0.20, now: cf.now)
         // Before calibration: 2.5% of 5H per dollar (`ShowCost.fallbackPerDollar5h`); the 7D share needs the weekly calibration.

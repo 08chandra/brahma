@@ -42,7 +42,7 @@ import GRDB
             // The combined gate: one prd ask, approved by the owner at +0:52.
             let prd = try store.propose(companyId: c.id, by: .agent(ceo.id), kind: .prd, title: "Brief", summary: "s", viaOwner: true,
                                         now: MilestoneTests.at(10))
-            try store.ownerDecide(askId: prd.id, approve: true, now: MilestoneTests.at(52))
+            try store.ownerDecide(askId: prd.id, approve: true, now: MilestoneTests.at(52), owner: .test)
             // First merge at +2:00.
             let item = try store.createWorkItem(companyId: c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Skeleton"))
             try store.writer.write { db in

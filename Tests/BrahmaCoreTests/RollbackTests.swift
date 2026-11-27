@@ -388,7 +388,7 @@ import Glibc
         #expect(Self.message { _ = try request(fx, "R-2") } == "R-3 is still proposed; reject \(ask3.ref) first")
         #expect(try fx.store.release(companyId: fx.company.id, ref: "R-2")?.rollbackStatus == nil)
         // Approved (not started yet): it runs first.
-        _ = try fx.store.ownerDecide(askId: ask3.id, approve: true, now: fx.w.clock.now)
+        _ = try fx.store.ownerDecide(askId: ask3.id, approve: true, now: fx.w.clock.now, owner: .test)
         #expect(Self.message { _ = try request(fx, "R-2") } == "R-3 is still approved; roll back after it finishes")
     }
 

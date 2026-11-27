@@ -30,7 +30,7 @@ import Glibc
     }
 
     func export(_ cf: CollabFixture, _ ref: WorkRef, to url: URL, known: [(name: String, value: String)] = []) throws -> URL {
-        try cf.store.exportRef(companyId: cf.c.id, ref: ref, to: url, knownValues: known, paths: cf.paths, now: cf.now)
+        try cf.store.exportRef(companyId: cf.c.id, ref: ref, to: url, knownValues: known, paths: cf.paths, now: cf.now, owner: .test)
     }
 
     func activity(_ cf: CollabFixture, _ kind: ActivityKind) throws -> [String] {
@@ -206,7 +206,7 @@ import Glibc
         try cf.addResource(21, name: "notes.md", ext: "md", bytes: Data("# Notes\n".utf8))
         let written = try export(cf, WorkRef(kind: .resource, id: "21"), to: try tempDir().appending(path: "notes.md"))
         let report = try cf.store.purgeResource(companyId: cf.c.id, number: 21, backups: [], contentVault: ContentVault(paths: cf.paths),
-                                                paths: cf.paths, now: cf.now)
+                                                paths: cf.paths, now: cf.now, owner: .test)
         #expect(report.exports == [written.path])
         #expect(try cf.store.undeliveredNotices().filter { $0.title == Store.exportedCopiesTitle }.map(\.body)
             == ["you exported F-21 to \(written.path) · Brahma can't delete it; delete it if you no longer need it"])
@@ -235,7 +235,7 @@ import Glibc
         let out = try tempDir()
         func save() throws -> URL {
             try cf.store.exportRef(companyId: cf.c.id, ref: ref, to: out.appending(path: "deck"), knownValues: [], paths: cf.paths,
-                                   archives: FlattenOnlyReader(), now: cf.now)
+                                   archives: FlattenOnlyReader(), now: cf.now, owner: .test)
         }
         #expect(refusal { try save() } != nil, "its structure can't be verified: refused until vouched")
         _ = try cf.store.vouchFile(companyId: cf.c.id, canonical: ref.canonical, sha256: SHA256.hex(pdf), now: cf.now)

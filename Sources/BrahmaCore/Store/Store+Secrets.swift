@@ -93,8 +93,9 @@ extension Store {
     /// chose, whatever the request proposed) and the ask is approved through `ownerDecide` with the note "provided". The
     /// value never touches the ask or any other row.
     @discardableResult
-    public func provideSecret(askId: String, value: String, isTest: Bool, vault: any SecretVault, now: Date = Store.now()) throws -> Ask {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+    public func provideSecret(askId: String, value: String, isTest: Bool, vault: any SecretVault, now: Date = Store.now(),
+                              owner: OwnerPrincipal) throws -> Ask {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
         guard let ask = try ask(id: askId) else { throw WorkError.notFound("no such ask") }
         guard ask.kind == .request, let request = SecretRequests.requested(ask) else {
             throw WorkError.invalid("\(ask.ref) is not a secret request")
@@ -117,7 +118,7 @@ extension Store {
                 }
                 try upsertSecretMeta(db, companyId: ask.companyId, name: request.name, isTest: isTest, now: now)
                 let decided = try ownerDecide(db: db, askId: askId, approve: true, note: "provided", acknowledgeChange: false, currentHash: nil,
-                                              grant: nil, providingSecret: true, now: now)
+                                              grant: nil, by: .owner(owner), providingSecret: true, now: now)
                 prior = try vault.value(companyId: ask.companyId, name: request.name)
                 try vault.set(companyId: ask.companyId, name: request.name, value: value)
                 wroteVault = true

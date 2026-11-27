@@ -158,7 +158,7 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         #expect(try w.asks().count == 3)
         // No value anywhere: the reason is redacted at write like any ask text.
         try w.set("KNOWN_KEY", "known-value-abcdef", test: false)
-        _ = try w.store.ownerDecide(askId: ask.id, approve: false, note: "no")
+        _ = try w.store.ownerDecide(askId: ask.id, approve: false, note: "no", owner: .test)
         _ = try w.call(w.eng, "request_secret", ["name": .string("FIFTH_KEY"), "reason": .string("I saw known-value-abcdef in the logs")])
         let fifth = try #require(try w.asks().last { $0.title == "Secret FIFTH_KEY" })
         #expect(fifth.summary == "I saw [redacted KNOWN_KEY] in the logs")
@@ -169,7 +169,7 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         let w = try W()
         _ = try w.call(w.eng, "request_secret", ["name": .string("STRIPE_TEST_KEY"), "reason": .string("sandbox"), "test": .bool(true)])
         let ask = try #require(try w.asks().first)
-        let decided = try w.store.provideSecret(askId: ask.id, value: "sk_test_provided_value_123", isTest: true, vault: w.vault, now: w.now)
+        let decided = try w.store.provideSecret(askId: ask.id, value: "sk_test_provided_value_123", isTest: true, vault: w.vault, now: w.now, owner: .test)
         #expect(decided.status == .approved); #expect(decided.ownerNote == "provided")
         let meta = try #require(try w.store.secrets(companyId: w.company.id).first)
         #expect(meta.name == "STRIPE_TEST_KEY"); #expect(meta.isTest)
@@ -181,13 +181,13 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         let i = try w.item(); try w.claim(i, w.eng)
         #expect(try w.call(w.eng, "use_secret", ["name": .string("STRIPE_TEST_KEY")]).hasPrefix("STRIPE_TEST_KEY will be in your environment from your next turn"))
         // Only a pending secret request can be provided for.
-        #expect(throws: WorkError.self) { try w.store.provideSecret(askId: ask.id, value: "again-value-12345", isTest: true, vault: w.vault) }
+        #expect(throws: WorkError.self) { try w.store.provideSecret(askId: ask.id, value: "again-value-12345", isTest: true, vault: w.vault, owner: .test) }
         let question = try w.store.requestFromOwner(companyId: w.company.id, by: .agent(w.eng.id), title: "Q", question: "why?")
-        #expect(throws: WorkError.self) { try w.store.provideSecret(askId: question.id, value: "value-for-nothing", isTest: false, vault: w.vault) }
+        #expect(throws: WorkError.self) { try w.store.provideSecret(askId: question.id, value: "value-for-nothing", isTest: false, vault: w.vault, owner: .test) }
         // An engine-held answer to a test request is the owner's call: the request's flag is only a proposal.
         _ = try w.call(w.eng, "request_secret", ["name": .string("API_TOKEN"), "reason": .string("prod"), "test": .bool(true)])
         let second = try #require(try w.asks().first { $0.title == "Secret API_TOKEN" })
-        _ = try w.store.provideSecret(askId: second.id, value: "engine-held-token-123", isTest: false, vault: w.vault)
+        _ = try w.store.provideSecret(askId: second.id, value: "engine-held-token-123", isTest: false, vault: w.vault, owner: .test)
         #expect(try w.store.secrets(companyId: w.company.id).first { $0.name == "API_TOKEN" }?.isTest == false)
     }
 
@@ -753,14 +753,14 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         _ = try w.call(w.eng, "request_secret", ["name": .string("ATOMIC_KEY"), "reason": .string("r"), "test": .bool(true)])
         let ask = try #require(try w.asks().first)
         // The generic owner approve does not approve a secret request: there is nothing to approve without a value.
-        let generic = w.failure { try w.store.ownerDecide(askId: ask.id, approve: true, note: "ok"); return "approved" }
+        let generic = w.failure { try w.store.ownerDecide(askId: ask.id, approve: true, note: "ok", owner: .test); return "approved" }
         #expect(generic.contains("provide"), Comment(rawValue: generic))
         #expect(try w.store.ask(id: ask.id)?.status == .pendingOwner)
         #expect(try w.store.secrets(companyId: w.company.id).isEmpty)
         // Rejecting it is still the owner's call.
-        _ = try w.store.ownerDecide(askId: ask.id, approve: false, note: "no")
+        _ = try w.store.ownerDecide(askId: ask.id, approve: false, note: "no", owner: .test)
         // A request decided meanwhile cannot be provided for, and the vault keeps no value from the attempt.
-        #expect(throws: WorkError.self) { try w.store.provideSecret(askId: ask.id, value: "late-value-123456", isTest: true, vault: w.vault) }
+        #expect(throws: WorkError.self) { try w.store.provideSecret(askId: ask.id, value: "late-value-123456", isTest: true, vault: w.vault, owner: .test) }
         #expect(try w.vault.value(companyId: w.company.id, name: "ATOMIC_KEY") == nil)
         #expect(try w.store.secrets(companyId: w.company.id).isEmpty)
     }
@@ -943,9 +943,9 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
         }
         let racing = RacingVault(inner: w.vault)
         let (store, vault) = (w.store, w.vault)
-        racing.hook = { _ = try store.provideSecret(askId: ask.id, value: "first-value-123456", isTest: false, vault: vault) }
+        racing.hook = { _ = try store.provideSecret(askId: ask.id, value: "first-value-123456", isTest: false, vault: vault, owner: .test) }
         #expect(throws: WorkError.self) {
-            try w.store.provideSecret(askId: ask.id, value: "second-value-12345", isTest: true, vault: racing)
+            try w.store.provideSecret(askId: ask.id, value: "second-value-12345", isTest: true, vault: racing, owner: .test)
         }
         #expect(try w.vault.value(companyId: w.company.id, name: "RACE_KEY") == "first-value-123456", "the winner's value stays")
         #expect(try w.store.secrets(companyId: w.company.id).map(\.isTest) == [false], "under the winner's flag")
@@ -959,7 +959,7 @@ private let rsa = "-----BEGIN RSA " + "PRIVATE KEY-----"
             func value(companyId: String, name: String) throws -> String? { nil }
             func delete(companyId: String, name: String) throws {}
         }
-        #expect(throws: Down.self) { try w.store.provideSecret(askId: down.id, value: "down-value-123456", isTest: true, vault: FailingVault()) }
+        #expect(throws: Down.self) { try w.store.provideSecret(askId: down.id, value: "down-value-123456", isTest: true, vault: FailingVault(), owner: .test) }
         #expect(try w.store.ask(id: down.id)?.status.isPending == true)
         #expect(!(try w.store.secrets(companyId: w.company.id).contains { $0.name == "DOWN_KEY" }))
     }

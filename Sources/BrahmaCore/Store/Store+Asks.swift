@@ -555,8 +555,8 @@ extension Store {
     /// settled ask releases the merge step.
     @discardableResult
     public func ownerDecide(askId: String, approve: Bool, note: String = "", acknowledgeChange: Bool = false,
-                            now: Date = Store.now()) throws -> Ask {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+                            now: Date = Store.now(), owner: OwnerPrincipal) throws -> Ask {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
         if let seen = try ask(id: askId), let ref = Self.quarantineRef(of: seen) {
             guard seen.status.isPending else { throw WorkError.conflict("\(seen.ref) is already \(seen.status.rawValue)") }
             if approve {
@@ -564,10 +564,11 @@ extension Store {
                 return accepted.ask ?? seen
             }
         }
-        return try ownerDecideRecorded(askId: askId, approve: approve, note: note, acknowledgeChange: acknowledgeChange, now: now)
+        return try ownerDecideRecorded(askId: askId, approve: approve, note: note, acknowledgeChange: acknowledgeChange, now: now, owner: owner)
     }
 
-    private func ownerDecideRecorded(askId: String, approve: Bool, note: String, acknowledgeChange: Bool, now: Date) throws -> Ask {
+    private func ownerDecideRecorded(askId: String, approve: Bool, note: String, acknowledgeChange: Bool, now: Date,
+                                     owner: OwnerPrincipal) throws -> Ask {
         // Read and hash the document before the write transaction; the proposed path and hash never change.
         var currentHash: String?? = nil
         if approve, !acknowledgeChange, let seen = try ask(id: askId), seen.payload?.documentPath != nil,
@@ -576,7 +577,7 @@ extension Store {
         }
         return try writer.write { db in
             try ownerDecide(db: db, askId: askId, approve: approve, note: note, acknowledgeChange: acknowledgeChange,
-                            currentHash: currentHash, grant: nil, now: now)
+                            currentHash: currentHash, grant: nil, by: .owner(owner), now: now)
         }
     }
 
@@ -584,11 +585,23 @@ extension Store {
     /// (`.some(nil)`: unreadable; nil: not read). Approving a `grant` ask needs `grant` (`Store.approveAccess`, with the scope
     /// and duration the owner chose) and writes the grant in the same transaction; a plain approve of one is refused. Besides
     /// the owner paths, its one caller is an access preset the owner turned on (`requestAccess`, owner-delegated, note
-    /// `auto: <title>`, `decidedBy` `preset:<id>`).
+    /// `auto: <title>`, `decidedBy` `preset:<id>`). Final wave B1 (Ruling C6-4 addition): `authority` is required: the owner's
+    /// principal, or the `PolicyPrincipal` that only the engine's preset evaluator mints from an owner-configured preset row
+    /// (`AccessPresets.evaluate`); a preset only ever approves the access ask it was minted for, with its own grant, and the
+    /// decision records `preset:<id>`, never the owner.
     func ownerDecide(db: Database, askId: String, approve: Bool, note: String, acknowledgeChange: Bool, currentHash: String??,
-                     grant: GrantApproval?, decidedBy: String = "owner", extensionApproved: Bool = false,
+                     grant: GrantApproval?, by authority: DecisionAuthority, extensionApproved: Bool = false,
                      providingSecret: Bool = false, now: Date) throws -> Ask {
+        let decidedBy = authority.decidedBy
         var ask = try requireAsk(db, askId)
+        if case .preset(let policy) = authority {
+            guard approve, ask.kind == .grant, let grant, grant.approvedBy == decidedBy, policy.askId == ask.id,
+                  !extensionApproved, !providingSecret else {
+                throw WorkError.forbidden(OwnerPrincipal.refusal)
+            }
+        } else if case .owner = authority {
+            try ProcessRole.refuseInAgentProcess()
+        }
         // A human task is answered only by doing it (`completeHumanTask`, values to the vault) or declining it (Task 9).
         if ask.kind == .humanTask { throw Self.humanTaskConflict(ask) }
         // A secret request is approved only by providing the secret (`Store.provideSecret`): a bare approve has no value to give.
@@ -630,8 +643,9 @@ extension Store {
 
     /// The owner sends a decision ask back: `rejected`, with the new direction as the answer.
     @discardableResult
-    public func ownerReplan(askId: String, text: String, now: Date = Store.now()) throws -> Ask {
-        try writer.write { db in
+    public func ownerReplan(askId: String, text: String, now: Date = Store.now(), owner: OwnerPrincipal) throws -> Ask {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1: an owner decision like `ownerDecide`
+        return try writer.write { db in
             var ask = try requireAsk(db, askId)
             if ask.kind == .humanTask { throw Self.humanTaskConflict(ask) }
             guard ask.kind.isDecision else { throw WorkError.invalid("\(ask.ref) is not a decision") }
@@ -648,16 +662,18 @@ extension Store {
     /// The owner answers a question (`info` ask), or (Plan C Task C5) an agent's file request (`FileRequests.isFileRequest`:
     /// `Store.answerFileRequest`, `declineFileRequest`); the requester gets the answer as a DM from the owner.
     @discardableResult
-    public func ownerAnswer(askId: String, text: String, now: Date = Store.now()) throws -> Ask {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
-        return try writer.write { db in try ownerAnswer(db: db, askId: askId, text: text, now: now).ask }
+    public func ownerAnswer(askId: String, text: String, now: Date = Store.now(), owner: OwnerPrincipal) throws -> Ask {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
+        return try writer.write { db in try ownerAnswer(db: db, askId: askId, text: text, owner: owner, now: now).ask }
     }
 
     /// `ownerAnswer` inside the caller's write transaction, with the answer DM's stored `kind` and chips (Plan C Task C5: a file
     /// request's answer is the drop's `kind = share` message). Returns the ask and the DM (nil when the requester is the engine
     /// or killed).
+    /// Final wave B1: the owner principal is required here too (no preset answers a question).
     func ownerAnswer(db: Database, askId: String, text: String, kind: MessageKind = .text, inline: [MessageRef] = [],
-                     firstInlinePosition: Int = 0, now: Date) throws -> (ask: Ask, message: Message?) {
+                     firstInlinePosition: Int = 0, owner: OwnerPrincipal, now: Date) throws -> (ask: Ask, message: Message?) {
+        try ProcessRole.refuseInAgentProcess()
         var ask = try requireAsk(db, askId)
         guard ask.kind == .info || FileRequests.isFileRequest(ask) else { throw WorkError.invalid("\(ask.ref) is not a question") }
         guard ask.status == .pendingOwner else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
@@ -675,8 +691,8 @@ extension Store {
 
     /// The owner acknowledges an FYI (a policy-approved ask) or an engine alert (which then counts as answered).
     @discardableResult
-    public func acknowledge(askId: String, now: Date = Store.now()) throws -> Ask {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+    public func acknowledge(askId: String, now: Date = Store.now(), owner: OwnerPrincipal) throws -> Ask {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
         return try writer.write { db in
             var ask = try requireAsk(db, askId)
             if ask.kind == .engineAlert, ask.status == .pendingOwner {

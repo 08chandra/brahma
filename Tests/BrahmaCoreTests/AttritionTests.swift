@@ -236,7 +236,7 @@ import GRDB
         let ceo = try w.hire("ceo", "ceo"), cpo = try w.hire("cpo", "cpo", manager: ceo)
         try w.kill(ceo)
         let ask = try #require(try w.asks().first { $0.title == "Confirm @cpo as acting CEO" })
-        try w.store.ownerDecide(askId: ask.id, approve: false, now: w.now)
+        try w.store.ownerDecide(askId: ask.id, approve: false, now: w.now, owner: .test)
         #expect(try w.fresh(cpo).actingRole == nil)
         let issue = try #require(try w.store.orgIssues(companyId: w.company.id).first)
         #expect(issue.kind == "noRoot")
@@ -251,7 +251,7 @@ import GRDB
         let ceo = try w.hire("ceo", "ceo"), cpo = try w.hire("cpo", "cpo", manager: ceo)
         try w.kill(ceo)
         let ask = try #require(try w.asks().first { $0.title == "Confirm @cpo as acting CEO" })
-        try w.store.ownerDecide(askId: ask.id, approve: true, now: w.now)
+        try w.store.ownerDecide(askId: ask.id, approve: true, now: w.now, owner: .test)
         #expect(try w.fresh(cpo).actingRole == "ceo")
         #expect(try w.store.orgIssues(companyId: w.company.id).isEmpty)
     }

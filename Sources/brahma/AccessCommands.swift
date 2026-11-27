@@ -62,12 +62,12 @@ struct AccessApprove: ParsableCommand {
     @Option(help: "Why.") var note: String = ""
 
     func run() throws {
-        try requireOwnerShell()
+        let owner = try requireOwnerShell()
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
         guard let a = try store.ask(companyId: c.id, ref: ask) else { throw fail("no ask \(ask) in \(c.name)") }
         let grant: Grant
-        do { grant = try store.approveAccess(askId: a.id, scope: scope, duration: duration, note: note) } catch let e as WorkError {
+        do { grant = try store.approveAccess(askId: a.id, scope: scope, duration: duration, note: note, owner: owner) } catch let e as WorkError {
             throw fail(e.message)
         } catch {
             throw fail("\(error)")
@@ -162,11 +162,11 @@ struct Presets: ParsableCommand {
     }
 
     func run() throws {
-        try requireOwnerShell()
+        let owner = try requireOwnerShell()
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
         if words.count == 2, let preset = AccessPreset(rawValue: words[1]) {
-            try store.setPreset(companyId: c.id, preset, enabled: words[0] == "enable")
+            try store.setPreset(companyId: c.id, preset, enabled: words[0] == "enable", owner: owner)
         }
         let on = try store.enabledPresets(companyId: c.id)
         print(safe(c.name))

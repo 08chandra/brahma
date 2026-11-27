@@ -96,6 +96,7 @@ extension Store {
             // 5. The presets decide before the ask is routed, so an ask they resolve never reaches the owner as "approval needed".
             let company = try requireCompany(db, companyId)
             guard let requester = try Agent.fetchOne(db, key: agentId) else { throw WorkError.forbidden("not in your company") }
+            // Whether a preset will decide it (the routing below), read from the owner's preset rows.
             let decision = AccessPresets.autoDecision(kind: kind, value: normalized, risk: kind.risk, requesterRole: requester.role,
                                                       company: company, enabled: try Store.enabledPresets(db, companyId: companyId),
                                                       pack: catalog.pack(company.packId))
@@ -107,17 +108,23 @@ extension Store {
                                   announce: decision == nil, now: now)
             ask.proposedGrant = ProposedGrant(scope: (scope ?? .agent).rawValue, durationSeconds: nil)
             try ask.update(db, columns: ["proposedGrant"])
-            guard let decision else { return AccessRequest(ask: ask, deduped: false, grant: nil) }
-            let approval = GrantApproval(kind: kind, value: normalized, scope: decision.scope, duration: decision.duration,
-                                         approvedBy: decision.approvedBy)
-            // The one engine-internal caller of `ownerDecide`: the owner turned this preset on, so the decision is theirs.
+            guard decision != nil,
+                  let evaluated = try AccessPresets.evaluate(db, companyId: companyId, askId: ask.id, kind: kind, value: normalized,
+                                                             requesterRole: requester.role, company: company,
+                                                             pack: catalog.pack(company.packId))
+            else { return AccessRequest(ask: ask, deduped: false, grant: nil) }
+            let (preset, policy) = (evaluated.decision, evaluated.principal)
+            let approval = GrantApproval(kind: kind, value: normalized, scope: preset.scope, duration: preset.duration,
+                                         approvedBy: preset.approvedBy)
+            // The one engine-internal caller of `ownerDecide`: the owner turned this preset on; the decision is the preset's,
+            // under the `PolicyPrincipal` its evaluator minted for this ask (recorded `preset:<id>`, never the owner).
             let decided = try ownerDecide(db: db, askId: ask.id, approve: true, note: "auto: \(ask.title)", acknowledgeChange: false,
-                                          currentHash: nil, grant: approval, decidedBy: decision.approvedBy, now: now)
+                                          currentHash: nil, grant: approval, by: .preset(policy), now: now)
             let grant = try Grant.filter(Column("askId") == ask.id).fetchOne(db)
             try notifyOwner(db: db, companyId: companyId, kind: .system, urgency: .normal,
-                            title: "Access approved by preset \(decision.preset.rawValue)",
-                            body: "\(decided.ref) \(ask.title) for @\(requester.name): \(grant?.ref ?? "?") (\(decision.scope.rawValue), "
-                                + "\(decision.duration.rawValue)). Revoke with brahma grants revoke \(company.slug) \(grant?.ref ?? "").",
+                            title: "Access approved by preset \(preset.preset.rawValue)",
+                            body: "\(decided.ref) \(ask.title) for @\(requester.name): \(grant?.ref ?? "?") (\(preset.scope.rawValue), "
+                                + "\(preset.duration.rawValue)). Revoke with brahma grants revoke \(company.slug) \(grant?.ref ?? "").",
                             now: now)
             return AccessRequest(ask: decided, deduped: false, grant: grant)
         }
@@ -158,12 +165,12 @@ extension Store {
     /// `ownerDecide` and the grant written in the same transaction.
     @discardableResult
     public func approveAccess(askId: String, scope: GrantScope, duration: GrantDuration, note: String = "",
-                              environment: SandboxEnvironment = .owner, now: Date = Store.now()) throws -> Grant {
-        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+                              environment: SandboxEnvironment = .owner, now: Date = Store.now(), owner: OwnerPrincipal) throws -> Grant {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process; final wave B1: the owner principal too
         let approval = try grantApproval(askId: askId, scope: scope, duration: duration, approvedBy: "owner", environment: environment)
         return try writer.write { db in
             let ask = try ownerDecide(db: db, askId: askId, approve: true, note: note, acknowledgeChange: false, currentHash: nil,
-                                      grant: approval, now: now)
+                                      grant: approval, by: .owner(owner), now: now)
             guard let grant = try Grant.filter(Column("askId") == ask.id).fetchOne(db) else { throw WorkError.conflict("no grant was written") }
             return grant
         }
@@ -363,7 +370,10 @@ extension Store {
 
     // MARK: Presets
 
-    public func setPreset(companyId: String, _ preset: AccessPreset, enabled: Bool) throws {
+    /// The owner turns an access preset on or off: the preset row `AccessPresets.evaluate` mints a `PolicyPrincipal` from
+    /// (final wave B1: owner only, the principal; never from an agent process).
+    public func setPreset(companyId: String, _ preset: AccessPreset, enabled: Bool, owner: OwnerPrincipal) throws {
+        try ProcessRole.refuseInAgentProcess()
         try writer.write { db in
             _ = try requireCompany(db, companyId)
             try db.execute(sql: """

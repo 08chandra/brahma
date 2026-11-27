@@ -31,16 +31,16 @@ enum LiveOwnerPolicy {
     static func settle(_ ask: Ask, store: Store, companyId: String) throws -> String {
         switch action(for: ask.kind) {
         case .approve:
-            _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true)
+            _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true, owner: .test)
             return "approve \(ask.ref) (\(ask.kind.rawValue): \(ask.title))"
         case .declineHumanTask:
             _ = try store.declineHumanTask(companyId: companyId, askId: ask.id, note: "not needed for this test")
             return "decline \(ask.ref) (human task: \(ask.title))"
         case .answer:
-            _ = try store.ownerAnswer(askId: ask.id, text: "Use your recommendation.")
+            _ = try store.ownerAnswer(askId: ask.id, text: "Use your recommendation.", owner: .test)
             return "answer \(ask.ref) (\(ask.title))"
         case .decline:
-            _ = try store.ownerDecide(askId: ask.id, approve: false, note: "declined by the live test: \(ask.kind.rawValue) is not on its approve list")
+            _ = try store.ownerDecide(askId: ask.id, approve: false, note: "declined by the live test: \(ask.kind.rawValue) is not on its approve list", owner: .test)
             return "decline \(ask.ref) (\(ask.kind.rawValue): \(ask.title))"
         }
     }
@@ -453,7 +453,7 @@ struct LiveSmokeTests {
                 let (release, ask) = try store.proposeDeploy(companyId: companyId, by: cto.id, version: "0.1.0", notes: "hello.txt on main",
                                                              vault: vault, adapters: { _ in adapter }, npmPresent: true)
                 server.serve(folder: release.ref)
-                _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true)
+                _ = try store.ownerDecide(askId: ask.id, approve: true, note: "approved by the live test", acknowledgeChange: true, owner: .test)
                 let live = try await waitFor("\(release.ref) deployed", seconds: 90) {
                     guard let r = try store.release(companyId: companyId, ref: release.ref) else { return false }
                     return !r.status.isOpen
@@ -569,7 +569,7 @@ struct LiveSmokeTests {
         let plan = try ResourceIntake.inspect(urls: [notes], knownValues: [], agentAreas: .none)
         try #require(plan.refusals.isEmpty && plan.items.count == 1, "plan: \(plan.refusals)")
         let added = try store.addResources(companyId: companyId, plan: plan, drop: ResourceDrop(), contentVault: ContentVault(paths: paths),
-                                           secretVault: secretVault, knownValues: [], paths: paths)
+                                           secretVault: secretVault, knownValues: [], paths: paths, owner: .test)
         let resource = try #require(added.first)
         #expect(resource.number == 1 && !resource.tainted, "resource: F-\(resource.number) tainted \(resource.tainted)")
         let item = try store.createWorkItem(companyId: companyId, by: .owner, draft: WorkItemDraft(

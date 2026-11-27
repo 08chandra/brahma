@@ -90,20 +90,20 @@ struct Approve: ParsableCommand {
     }
 
     func run() throws {
-        try requireOwnerShell()
+        let owner = try requireOwnerShell()
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
         let a = try resolveAsk(store, c, ask)
         let done: Ask
         if let replan {
-            done = try refusing { try store.ownerReplan(askId: a.id, text: replan) }
+            done = try refusing { try store.ownerReplan(askId: a.id, text: replan, owner: owner) }
         } else if a.kind == .engineAlert || (a.fyi && a.status == .approved) {
-            done = try refusing { try store.acknowledge(askId: a.id) }
+            done = try refusing { try store.acknowledge(askId: a.id, owner: owner) }
         } else if a.kind == .extension, !reject {
             // An extension install is materialized by the app before it is approved; the CLI never decides it (Task 5a).
             throw fail(ExtensionLibrary.cliApproveRefusal)
         } else {
-            done = try refusing { try store.ownerDecide(askId: a.id, approve: !reject, note: note, acknowledgeChange: ackChanged) }
+            done = try refusing { try store.ownerDecide(askId: a.id, approve: !reject, note: note, acknowledgeChange: ackChanged, owner: owner) }
         }
         // Brahma's quarantine ask (A2): approving it merged the recorded commit; rejecting it kept main and the ref.
         var effect = ""
@@ -126,11 +126,11 @@ struct Answer: ParsableCommand {
     @Argument(help: "Your answer.") var text: String
 
     func run() throws {
-        try requireOwnerShell()
+        let owner = try requireOwnerShell()
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
         let a = try resolveAsk(store, c, ask)
-        let done = try refusing { try store.ownerAnswer(askId: a.id, text: text) }
+        let done = try refusing { try store.ownerAnswer(askId: a.id, text: text, owner: owner) }
         print("\(done.ref) \(done.status.rawValue)")
     }
 }
@@ -143,11 +143,11 @@ struct Rescind: ParsableCommand {
     @Option(help: "Why. The requester and the approver are told.") var note: String
 
     func run() throws {
-        try requireOwnerShell()
+        let owner = try requireOwnerShell()
         let (store, _) = try openStore()
         let c = try resolveCompany(store, company)
         let a = try resolveAsk(store, c, ask)
-        let done = try refusing { try store.ownerRescind(askId: a.id, note: note) }
+        let done = try refusing { try store.ownerRescind(askId: a.id, note: note, owner: owner) }
         print("\(done.ref) \(done.status.rawValue)")
     }
 }

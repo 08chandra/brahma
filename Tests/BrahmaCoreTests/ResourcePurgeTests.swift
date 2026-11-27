@@ -59,17 +59,17 @@ import Glibc
     static func contains(_ data: Data, _ token: String) -> Bool { data.range(of: Data(token.utf8)) != nil }
 
     func vouch(_ w: W, _ n: Int) throws {
-        try w.store.vouchResource(companyId: w.company.id, number: n, contentVault: w.contentVault, paths: w.paths)
+        try w.store.vouchResource(companyId: w.company.id, number: n, contentVault: w.contentVault, paths: w.paths, owner: .test)
     }
 
     func rescope(_ w: W, _ n: Int, _ scope: AccessClass, futureHolders: Bool = false) throws {
         try w.store.setResourceScope(companyId: w.company.id, number: n, scope: scope, futureHolders: futureHolders,
-                                     contentVault: w.contentVault, paths: w.paths)
+                                     contentVault: w.contentVault, paths: w.paths, owner: .test)
     }
 
     func purge(_ w: W, _ n: Int, backups: [(name: String, takenAt: Date)] = [], now: Date = Store.now()) throws -> PurgeReport {
         try w.store.purgeResource(companyId: w.company.id, number: n, backups: backups, contentVault: w.contentVault,
-                                  paths: w.paths, now: now)
+                                  paths: w.paths, now: now, owner: .test)
     }
 
     func sweep(_ w: W) -> ResourceMirrorResult {
@@ -291,7 +291,7 @@ import Glibc
     @Test func purgedLinkKeepsOnlyRefAndKind() throws {
         let (w, _) = try Self.onDisk()
         try w.store.addLink(companyId: w.company.id, url: "https://vendor.example.com/deal?k=LINKTOKENQX", drop: ResourceDrop(),
-                            contentVault: w.contentVault)
+                            contentVault: w.contentVault, owner: .test)
         #expect(try w.store.resource(companyId: w.company.id, number: 1)?.url?.contains("LINKTOKENQX") == true)
         _ = try purge(w, 1)
         let tomb = try #require(try w.store.resource(companyId: w.company.id, number: 1))
@@ -534,7 +534,7 @@ import Glibc
         }
         // A link, announced in a DM: from now on only its ref is ever written.
         try w.store.addLink(companyId: w.company.id, url: "https://hostqzx.example.org/pathtokenqz/a", drop: try w.drop(.dm(handle: "eng-1")),
-                            contentVault: w.contentVault)
+                            contentVault: w.contentVault, owner: .test)
         #expect(try w.store.pendingInbox(agentId: w.eng1.id).first?.1.text == "[link F-1]")
         #expect(try w.activity().contains { $0.kind == .resource && $0.text == "You added [link F-1] (agent @eng-1)" })
         // A file posted in #design with the owner's own words, and a folder and a file commented on an item.
@@ -637,7 +637,7 @@ import Glibc
         let text = "the PUFFIN plan\n"
         try w.add([try w.file("plan.md", text)])
         try w.add([try w.fixture("sample.pdf", as: "deck.pdf")], ResourceDrop(scope: .agent(w.eng1.id)))
-        try w.store.addLink(companyId: w.company.id, url: "https://example.com/doc", drop: ResourceDrop(), contentVault: w.contentVault)
+        try w.store.addLink(companyId: w.company.id, url: "https://example.com/doc", drop: ResourceDrop(), contentVault: w.contentVault, owner: .test)
         try w.add([try w.file("gone.md", "purged text\n")])
         _ = try purge(w, 4)
         let other = try W(store: w.store, name: "Beta")

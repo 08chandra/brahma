@@ -108,7 +108,7 @@ import Glibc
         @discardableResult
         func proposeAndApprove(_ version: String = "0.1.0") throws -> Release {
             let (r, ask) = try propose(version)
-            _ = try store.ownerDecide(askId: ask.id, approve: true, now: w.clock.now)
+            _ = try store.ownerDecide(askId: ask.id, approve: true, now: w.clock.now, owner: .test)
             let approved = try reload(r)
             #expect(approved.status == .approved)
             return approved

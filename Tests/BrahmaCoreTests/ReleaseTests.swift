@@ -125,7 +125,7 @@ import GRDB
         }
         let fx = try Self.fixture()
         try fx.store.setAutonomy(companyId: fx.company.id, .auto)
-        for p in AccessPreset.allCases { try fx.store.setPreset(companyId: fx.company.id, p, enabled: true) }
+        for p in AccessPreset.allCases { try fx.store.setPreset(companyId: fx.company.id, p, enabled: true, owner: .test) }
         let ceo = try fx.store.hire(companyId: fx.company.id, name: "ceo-1", role: "ceo", model: "m")
         let (r, ask) = try fx.propose("0.1.0")
         #expect(ask.status == .pendingOwner); #expect(ask.internalApproverId == nil)
@@ -137,7 +137,7 @@ import GRDB
         }
         #expect(try fx.store.release(companyId: fx.company.id, ref: r.ref)?.status == .proposed)
         // Only the owner's decision approves it.
-        let decided = try fx.store.ownerDecide(askId: ask.id, approve: true)
+        let decided = try fx.store.ownerDecide(askId: ask.id, approve: true, owner: .test)
         #expect(decided.status == .approved)
         #expect(try fx.store.release(companyId: fx.company.id, ref: r.ref)?.status == .approved)
     }
@@ -163,7 +163,7 @@ import GRDB
         #expect(fx.message("1..2") == ReleasePolicy.badVersion)
         #expect(fx.message("x.lock") == ReleasePolicy.badVersion)
         let (r1, ask1) = try fx.propose("1.0-RC")
-        try fx.store.ownerDecide(askId: ask1.id, approve: false, note: "not yet")
+        try fx.store.ownerDecide(askId: ask1.id, approve: false, note: "not yet", owner: .test)
         #expect(try fx.store.release(companyId: fx.company.id, ref: r1.ref)?.status == .rejected)
         #expect(fx.message("1.0-rc") == "release 1.0-rc already exists (as 1.0-RC)")
         #expect(try fx.store.releases(companyId: fx.company.id).count == 1)
@@ -203,7 +203,7 @@ import GRDB
         // 3. Another open release.
         #expect(fx.message("0.2.0") == "R-1 is still proposed")
         // Rejected: the release is rejected; a duplicate version stays refused, a new one is allowed.
-        try fx.store.ownerDecide(askId: ask1.id, approve: false, note: "not yet")
+        try fx.store.ownerDecide(askId: ask1.id, approve: false, note: "not yet", owner: .test)
         #expect(try fx.store.release(companyId: fx.company.id, ref: r1.ref)?.status == .rejected)
         #expect(fx.message("0.1.0") == "release 0.1.0 already exists")
         // 6. No npm: refused and the owner is told.
@@ -273,7 +273,7 @@ import GRDB
         let fx = try Self.fixture()
         let (r, ask) = try fx.propose("0.1.0")
         let t1 = Date(timeIntervalSince1970: 1_800_000_100)
-        let approved = try fx.store.ownerDecide(askId: ask.id, approve: true, now: t1)
+        let approved = try fx.store.ownerDecide(askId: ask.id, approve: true, now: t1, owner: .test)
         var row = try #require(try fx.store.release(companyId: fx.company.id, ref: r.ref))
         #expect(row.status == .approved); #expect(row.approvedBy == "owner"); #expect(row.approvedAt == t1)
         // Re-applying the effect is a no-op; so is applying it once the executor has moved on.
@@ -290,15 +290,15 @@ import GRDB
     @Test func rescindBeforeStartCancels() throws {
         let fx = try Self.fixture()
         let (r1, ask1) = try fx.propose("0.1.0")
-        try fx.store.ownerDecide(askId: ask1.id, approve: true)
-        try fx.store.ownerRescind(askId: ask1.id, note: "wait")
+        try fx.store.ownerDecide(askId: ask1.id, approve: true, owner: .test)
+        try fx.store.ownerRescind(askId: ask1.id, note: "wait", owner: .test)
         #expect(try fx.store.release(companyId: fx.company.id, ref: r1.ref)?.status == .cancelled)
         #expect(try !fx.store.allNotices().contains { $0.title.contains("already started") })
         // Rescinded after the executor started: nothing changes, the owner is told how to undo it.
         let (r2, ask2) = try fx.propose("0.2.0")
-        try fx.store.ownerDecide(askId: ask2.id, approve: true)
+        try fx.store.ownerDecide(askId: ask2.id, approve: true, owner: .test)
         try fx.setStatus(r2, .deploying)
-        try fx.store.ownerRescind(askId: ask2.id)
+        try fx.store.ownerRescind(askId: ask2.id, owner: .test)
         #expect(try fx.store.release(companyId: fx.company.id, ref: r2.ref)?.status == .deploying)
         let notice = try #require(try fx.store.allNotices().last { $0.companyId == fx.company.id })
         #expect(notice.title == "R-2 already started")

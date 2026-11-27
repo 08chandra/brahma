@@ -272,7 +272,9 @@ public enum ExtensionLibrary {
     /// an install: the verified tree goes read-only into `<home>/extensions/store/<id>/<hash12>/`, the plugin parts into
     /// `<ws>/.brahma/ext/<id>/<hash12>/plugin/` (not in any turn's allowWrite), the rows are written, the staging dir removed.
     /// `roles` replaces the roles ticked on the card (nil: the proposal's).
-    public static func approve(askId: String, roles: [String]?, store: Store, paths: BrahmaPaths, now: Date = Store.now()) throws {
+    public static func approve(askId: String, roles: [String]?, store: Store, paths: BrahmaPaths, now: Date = Store.now(),
+                               owner: OwnerPrincipal) throws {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1: an owner decision
         guard let ask = try store.ask(id: askId) else { throw WorkError.notFound("no such ask") }
         guard ask.kind == .extension, let payload = ExtensionAskPayload.read(ask) else { throw WorkError.invalid("\(ask.ref) is not an extension ask") }
         guard ask.status.isPending else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
@@ -312,15 +314,15 @@ public enum ExtensionLibrary {
                     if exists == 0 { try ExtensionBinding(companyId: company.id, id: id, scope: "role", target: role, op: "add", createdAt: now).insert(db) }
                 }
                 _ = try store.ownerDecide(db: db, askId: ask.id, approve: true, note: "", acknowledgeChange: true, currentHash: nil, grant: nil,
-                                          extensionApproved: true, now: now)
+                                          by: .owner(owner), extensionApproved: true, now: now)
                 try Store.recordExtensionEvent(db, companyId: company.id, extId: id, kind: "installed",
                                                detail: "\(hash) for \(chosen.isEmpty ? "no role" : chosen.joined(separator: ", "))", now: now)
             }
             try? FileManager.default.removeItem(at: staged)
         case "remove":
-            try remove(companyId: company.id, id: id, store: store, paths: paths, now: now, deciding: ask)
+            try remove(companyId: company.id, id: id, store: store, paths: paths, now: now, deciding: ask, owner: owner)
         case "rollback":
-            try rollback(companyId: company.id, id: id, store: store, paths: paths, now: now, deciding: ask)
+            try rollback(companyId: company.id, id: id, store: store, paths: paths, now: now, deciding: ask, owner: owner)
         case "bind", "unbind":
             guard let role = payload.role else { throw WorkError.invalid("\(ask.ref) names no role") }
             try store.writer.write { db in
@@ -330,16 +332,16 @@ public enum ExtensionLibrary {
                                      createdAt: now).insert(db)
                 try Store.recordExtensionEvent(db, companyId: company.id, extId: id, kind: payload.action, detail: role, now: now)
             }
-            try decide(store, ask)
+            try decide(store, ask, owner: owner)
         default:
             throw WorkError.invalid("\(ask.ref): unknown extension action '\(Store.flat(payload.action, max: 40))'")
         }
     }
 
-    private static func decide(_ store: Store, _ ask: Ask) throws {
+    private static func decide(_ store: Store, _ ask: Ask, owner: OwnerPrincipal) throws {
         try store.writer.write { db in
             _ = try store.ownerDecide(db: db, askId: ask.id, approve: true, note: "", acknowledgeChange: true, currentHash: nil, grant: nil,
-                                      extensionApproved: true, now: Store.now())
+                                      by: .owner(owner), extensionApproved: true, now: Store.now())
         }
     }
 
@@ -422,7 +424,9 @@ public enum ExtensionLibrary {
 
     /// Unmounts from the next session (the mount set changes), removes the bindings and the extension grants, and keeps a
     /// "removed by owner" override when the pack still suggests the extension. The store copies stay for a later rollback.
-    public static func remove(companyId: String, id: String, store: Store, paths: BrahmaPaths, now: Date = Store.now(), deciding ask: Ask? = nil) throws {
+    public static func remove(companyId: String, id: String, store: Store, paths: BrahmaPaths, now: Date = Store.now(), deciding ask: Ask? = nil,
+                              owner: OwnerPrincipal) throws {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1: an owner decision
         guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
         guard try store.installedExtensions(companyId: companyId).contains(where: { $0.id == id }) else { throw WorkError.notFound("no extension '\(id)'") }
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)
@@ -442,14 +446,16 @@ public enum ExtensionLibrary {
             try Store.recordExtensionEvent(db, companyId: companyId, extId: id, kind: "removed", detail: suggested ? "pack suggestion overridden" : nil, now: now)
             if let ask {
                 _ = try store.ownerDecide(db: db, askId: ask.id, approve: true, note: "", acknowledgeChange: true, currentHash: nil, grant: nil,
-                                          extensionApproved: true, now: now)
+                                          by: .owner(owner), extensionApproved: true, now: now)
             }
         }
     }
 
     /// Back to the previous approved hash (its store copy is still there); the workspace plugin parts are materialized again
     /// when missing. Immediate: it was already approved once.
-    public static func rollback(companyId: String, id: String, store: Store, paths: BrahmaPaths, now: Date = Store.now(), deciding ask: Ask? = nil) throws {
+    public static func rollback(companyId: String, id: String, store: Store, paths: BrahmaPaths, now: Date = Store.now(), deciding ask: Ask? = nil,
+                                owner: OwnerPrincipal) throws {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1: an owner decision
         guard let company = try store.company(id: companyId) else { throw WorkError.notFound("no such company") }
         guard let current = try store.installedExtensions(companyId: companyId).first(where: { $0.id == id }) else { throw WorkError.notFound("no extension '\(id)'") }
         // The install history (rollbacks excluded): the version approved right before the current one (M10: idempotent).
@@ -483,7 +489,7 @@ public enum ExtensionLibrary {
             try Store.recordExtensionEvent(db, companyId: companyId, extId: id, kind: "rollback", detail: "\(previous) from \(current.hash.prefix(12))", now: now)
             if let ask {
                 _ = try store.ownerDecide(db: db, askId: ask.id, approve: true, note: "", acknowledgeChange: true, currentHash: nil, grant: nil,
-                                          extensionApproved: true, now: now)
+                                          by: .owner(owner), extensionApproved: true, now: now)
             }
         }
     }

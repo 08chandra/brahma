@@ -65,7 +65,8 @@ extension Store {
     @discardableResult
     public func exportRef(companyId: String, ref: WorkRef, to destination: URL, knownValues: [(name: String, value: String)],
                           paths: BrahmaPaths, archives: any ArchiveReader = UnavailableArchiveReader(),
-                          now: Date = Store.now()) throws -> URL {
+                          now: Date = Store.now(), owner: OwnerPrincipal) throws -> URL {
+        try ProcessRole.refuseInAgentProcess()  // final wave B1 (FR I-2): an owner read, never from an agent process
         let canonical = ref.canonical
         let shown = SecretGate.shown(canonical, knownValues: knownValues)
         let folder = try exportFolder(destination, paths: paths)

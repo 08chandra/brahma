@@ -169,7 +169,7 @@ private struct LabWorld {
         let second = try #require(try w.extensionAsks().first { ExtensionAskPayload.read($0)?.extId == "tone-two" })
         #expect(try w.store.internalDecide(askId: second.id, by: .agent(w.cto.id), approve: true, note: "").status == .pendingOwner)
         // The owner's approval installs it as the company's own.
-        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now)
+        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test)
         let installed = try #require(try w.store.installedExtensions(companyId: w.company.id).first { $0.id == "brand-voice" })
         #expect(installed.publisher == "company:\(w.company.slug)"); #expect(installed.sourceType == "lab")
         #expect(!installed.provenanceTainted)
@@ -700,7 +700,7 @@ private struct LabWorld {
         w.recordLab(tainted: true)
         _ = try w.propose(LabWorld.args("brand-voice"))
         let ask = try #require(try w.extensionAsks().first)
-        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now)
+        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: w.store, paths: w.paths, now: w.world.clock.now, owner: .test)
         let installed = try #require(try w.store.installedExtensions(companyId: w.company.id).first)
         #expect(installed.publisher == "company:\(w.company.slug)")
         #expect(installed.provenanceTainted)
@@ -722,7 +722,7 @@ private struct LabWorld {
         clean.recordLab(tainted: false)
         _ = try clean.propose(LabWorld.args("brand-voice"))
         let cleanAsk = try #require(try clean.extensionAsks().first)
-        try ExtensionLibrary.approve(askId: cleanAsk.id, roles: nil, store: clean.store, paths: clean.paths, now: clean.world.clock.now)
+        try ExtensionLibrary.approve(askId: cleanAsk.id, roles: nil, store: clean.store, paths: clean.paths, now: clean.world.clock.now, owner: .test)
         let cleanPublisher: (String) -> String? = { id in (try? clean.store.extensionPublisher(companyId: clean.company.id, extId: id)) ?? nil }
         #expect(TaintPolicy.source(toolName: "Skill", toolInput: ["skill": .string("brand-voice:brand-voice")],
                                    publisher: cleanPublisher) == nil)

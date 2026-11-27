@@ -80,7 +80,7 @@ struct LiveSafetyTests {
         #expect(ask.internalApproverId == cto.id)
         // The CTO approves internally: the ask moves on to the owner (prompt-change is reserved).
         #expect(try store.internalDecide(askId: ask.id, by: .agent(cto.id), approve: true, note: "fine").status == .pendingOwner)
-        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: store, paths: paths)
+        try ExtensionLibrary.approve(askId: ask.id, roles: nil, store: store, paths: paths, owner: .test)
         _ = try MessageRouter(store: store).sendDM(companyId: company.id, from: .owner, to: eng.name, text: "Say hello. Then stop.")
         await orchestrator.tick()
         try await orchestrator.waitUntilIdle(timeout: .seconds(300))

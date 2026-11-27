@@ -498,11 +498,11 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         }
         #expect(AskKind.humanTask.title == "Human task"); #expect(AskKind.humanTask.isReservedKind)
         for approve in [true, false] {
-            #expect(Self.message { try h.store.ownerDecide(askId: ask.id, approve: approve) } == "\(ask.ref) is a human task; mark it done or decline it")
+            #expect(Self.message { try h.store.ownerDecide(askId: ask.id, approve: approve, owner: .test) } == "\(ask.ref) is a human task; mark it done or decline it")
         }
-        do { _ = try h.store.ownerDecide(askId: ask.id, approve: true); Issue.record("approved") }
+        do { _ = try h.store.ownerDecide(askId: ask.id, approve: true, owner: .test); Issue.record("approved") }
         catch let e as WorkError { #expect(e == .conflict("\(ask.ref) is a human task; mark it done or decline it")) }
-        #expect(Self.message { try h.store.ownerReplan(askId: ask.id, text: "do it differently") } == "\(ask.ref) is a human task; mark it done or decline it")
+        #expect(Self.message { try h.store.ownerReplan(askId: ask.id, text: "do it differently", owner: .test) } == "\(ask.ref) is a human task; mark it done or decline it")
         #expect(try h.fresh(ask).status == .pendingOwner)
         // No agent tool decides it either: `decide` is for internal approvers.
         let tools = CompanyTools(store: h.store, companyId: h.acme.id, agentId: try #require(try h.store.agents(companyId: h.acme.id).first { $0.name == "ceo" }).id)

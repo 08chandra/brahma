@@ -7,7 +7,7 @@ import GRDB
 @Suite(.scratch) struct PresetTests {
     @Test func webPresetAutoApprovesExactDocsHost() throws {
         let g = try GrantWorld()
-        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: true)
+        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: true, owner: .test)
         let reply = try g.request("web_domain", "docs.stripe.com")
         #expect(reply.contains("A-1") && reply.contains("G-1"), "\(reply)")
         let ask = try g.ask("A-1")
@@ -33,9 +33,35 @@ import GRDB
         #expect(AccessPresets.docsHosts.count == 20)
     }
 
+    /// Final wave B1 (controller Ruling C6-4 addition): `request_access` runs in the agent's `brahma mcp` process. There, a
+    /// preset the owner turned on still decides (under the `PolicyPrincipal` its evaluator minted, recorded `preset:<id>`, never
+    /// the owner); with no matching preset row nothing decides, and the owner-only paths refuse with the generic text. A preset
+    /// authority approves only its own access ask with its own grant.
+    @Test func agentProcessReachesTheDecisionOnlyThroughAMatchingPreset() throws {
+        let g = try GrantWorld()
+        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: true, owner: .test)
+        let owner = try OwnerPrincipal.test
+        #if DEBUG
+        try OwnerPrincipal.simulatingAgentProcess {
+            _ = try g.request("web_domain", "docs.stripe.com")
+            _ = try g.request("web_domain", "example.org")
+            #expect(throws: WorkError.self) { try g.store.approveAccess(askId: try g.ask("A-2").id, scope: .agent, duration: .sprint, owner: owner) }
+            #expect(throws: WorkError.self) { try g.store.ownerDecide(askId: try g.ask("A-2").id, approve: true, owner: owner) }
+            #expect(throws: WorkError.self) { try g.store.setPreset(companyId: g.company.id, .autoModeLowRisk, enabled: true, owner: owner) }
+        }
+        #endif
+        #expect(try g.ask("A-1").status == .approved && g.ask("A-1").decidedBy == "preset:readonly-web-engineers")
+        #expect(try g.ask("A-2").status == .pendingOwner, "no preset row decides it")
+        #expect(try !g.store.enabledPresets(companyId: g.company.id).contains(.autoModeLowRisk))
+        // A preset row the owner never enabled mints nothing.
+        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: false, owner: .test)
+        _ = try g.request("web_domain", "react.dev")
+        #expect(try g.ask("A-3").status == .pendingOwner)
+    }
+
     @Test func webPresetIgnoresWildcardAndUnknownHost() throws {
         let g = try GrantWorld()
-        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: true)
+        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: true, owner: .test)
         _ = try g.request("web_domain", "*.stripe.com")
         _ = try g.request("web_domain", "example.org")
         #expect(try g.ask("A-1").status == .pendingOwner)
@@ -45,7 +71,7 @@ import GRDB
 
     @Test func webPresetIgnoresNetworkDomain() throws {
         let g = try GrantWorld()
-        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: true)
+        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: true, owner: .test)
         _ = try g.request("network_domain", "docs.stripe.com")
         #expect(try g.ask("A-1").status == .pendingOwner)
         #expect(try g.store.grants(companyId: g.company.id, includeInactive: true).isEmpty)
@@ -53,7 +79,7 @@ import GRDB
 
     @Test func autoLowRiskNeedsAutoAutonomy() throws {
         let g = try GrantWorld()
-        try g.store.setPreset(companyId: g.company.id, .autoModeLowRisk, enabled: true)
+        try g.store.setPreset(companyId: g.company.id, .autoModeLowRisk, enabled: true, owner: .test)
         let designer = try g.store.hire(companyId: g.company.id, name: "des-1", role: "designer", model: "sonnet")
         _ = try g.request("web_domain", "example.org", by: designer)
         #expect(try g.ask("A-1").status == .pendingOwner, "the company's autonomy is not auto")
@@ -102,8 +128,8 @@ import GRDB
         _ = try g.request("web_domain", "docs.stripe.com")
         #expect(try g.ask("A-1").status == .pendingOwner)
         // Disabled again after being on: back to the owner.
-        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: true)
-        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: false)
+        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: true, owner: .test)
+        try g.store.setPreset(companyId: g.company.id, .readOnlyWebForEngineers, enabled: false, owner: .test)
         _ = try g.request("web_domain", "react.dev")
         #expect(try g.ask("A-2").status == .pendingOwner)
     }

@@ -238,7 +238,7 @@ import GRDB
         _ = w.refusal { try w.tools().call(name: "share", arguments: ["refs": .array([.string("F-62")]), "to": .string("@qa-2")]) }
         _ = try w.store.vouchFile(companyId: w.cf.c.id, canonical: "F-62", sha256: SHA256.hex(pdf), now: w.cf.now)
         let r = try w.store.createShowRequest(companyId: w.cf.c.id, kind: .show, query: "the plan", attachedRef: nil,
-                                              routed: ConciergeTests.routed, candidates: [], now: w.cf.now)
+                                              routed: ConciergeTests.routed, candidates: [], now: w.cf.now, owner: .test)
         _ = try #require(try w.store.beginConciergeRun(r, now: w.cf.now))
         let tools = CompanyTools(store: w.store, companyId: w.cf.c.id, agentId: ConciergeCaps.agentId, paths: w.cf.paths, vault: MemoryVault(),
                                  archives: EngineGateArchives(broker: QueuedRefGate(store: w.store, conciergeRequestId: r.id, timeout: .seconds(30))),

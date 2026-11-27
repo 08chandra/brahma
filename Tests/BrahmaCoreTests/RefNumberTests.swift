@@ -61,7 +61,7 @@ import GRDB
     @Test func purgedNumberNeverReused() throws {
         let w = try W()
         let n = try w.copy("purge me")
-        _ = try w.store.purgeResource(companyId: w.c.id, number: n, backups: [], contentVault: ContentVault(paths: w.cf.paths), paths: w.cf.paths)
+        _ = try w.store.purgeResource(companyId: w.c.id, number: n, backups: [], contentVault: ContentVault(paths: w.cf.paths), paths: w.cf.paths, owner: .test)
         #expect(try w.copy("after") == n + 1)
         #expect(try w.ownerOpen("F-\(n)") != Store.removedText, "a purge keeps its tombstone")
     }

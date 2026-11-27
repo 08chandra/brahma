@@ -309,7 +309,7 @@ import GRDB
         let s = f.store, c = f.c
         func request() throws -> ShowRequest {
             try s.createShowRequest(companyId: c.id, kind: .show, query: "show me the changes", attachedRef: nil,
-                                    routed: RoutedTarget(target: .agent(f.fx.eng1.id), reason: "holds ENG-1", busy: false), candidates: [], now: f.cf.now)
+                                    routed: RoutedTarget(target: .agent(f.fx.eng1.id), reason: "holds ENG-1", busy: false), candidates: [], now: f.cf.now, owner: .test)
         }
         for raw in ["wt:@eng-1", "ENG-1:changes"] {
             let r = try request()

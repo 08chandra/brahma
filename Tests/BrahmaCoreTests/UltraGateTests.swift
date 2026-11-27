@@ -336,7 +336,7 @@ private struct ApprovalWorld {
         #expect(try w.request(item, "ultra", by: w.mgr, id: "r2").kind == .coolingDown)
         #expect(try w.boosts(item).count == 1)
         // Approved by the owner, the run waits for the item's next turn.
-        _ = try w.store.ownerDecide(askId: ask.id, approve: true, note: "go", now: w.now)
+        _ = try w.store.ownerDecide(askId: ask.id, approve: true, note: "go", now: w.now, owner: .test)
         #expect(try w.store.pendingUltraRun(itemId: item.id)?.approver == .owner)
     }
 
@@ -349,7 +349,7 @@ private struct ApprovalWorld {
             let a = try w.store.fileFailurePathBoost(companyId: w.company.id, itemId: item.id, reason: "2 counted failed checks at R4", now: w.now)
             #expect(a.status == .pendingOwner, "\(preset)"); #expect(a.requesterId == "system"); #expect(a.risk == .high)
             #expect(a.payload?.options.count == 2); #expect(a.summary.contains("wants an Ultra run: 2 counted failed checks at R4"))
-            _ = try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now)
+            _ = try w.store.ownerDecide(askId: a.id, approve: true, note: "", now: w.now, owner: .test)
             let run = try #require(try w.store.pendingUltraRun(itemId: item.id))
             #expect(run.origin == .failurePath); #expect(run.variant == .full)
         }

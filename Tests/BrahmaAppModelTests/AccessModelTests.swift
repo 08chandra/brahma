@@ -138,10 +138,10 @@ import GRDB
     @Test func grantRowsText() async throws {
         let a = try await AccessWorld.make()
         let item = try a.w.item("Stripe hooks")
-        let g1 = try a.store.approveAccess(askId: try a.request(.webDomain, "docs.stripe.com").id, scope: .role, duration: .always, environment: a.env)
+        let g1 = try a.store.approveAccess(askId: try a.request(.webDomain, "docs.stripe.com").id, scope: .role, duration: .always, environment: a.env, owner: .test)
         let g2 = try a.store.approveAccess(askId: try a.request(.networkDomain, "api.stripe.com", itemId: item.id).id,
-                                           scope: .item, duration: .sprint, environment: a.env)
-        let g3 = try a.store.approveAccess(askId: try a.request(.webDomain, "docs.github.com").id, scope: .once, duration: .turn, environment: a.env)
+                                           scope: .item, duration: .sprint, environment: a.env, owner: .test)
+        let g3 = try a.store.approveAccess(askId: try a.request(.webDomain, "docs.github.com").id, scope: .once, duration: .turn, environment: a.env, owner: .test)
         _ = try a.store.consumeGrants(ids: [g1.id], turnId: "t-1", now: Date(timeIntervalSince1970: 1_800_000_000))
         await a.access.reload()
         let rows = a.access.grants
@@ -162,7 +162,7 @@ import GRDB
 
     @Test func revokeHidesFromActive() async throws {
         let a = try await AccessWorld.make()
-        let grant = try a.store.approveAccess(askId: try a.request().id, scope: .agent, duration: .always, environment: a.env)
+        let grant = try a.store.approveAccess(askId: try a.request().id, scope: .agent, duration: .always, environment: a.env, owner: .test)
         await a.access.reload()
         #expect(a.access.grants.count == 1)
         #expect(a.access.revokeConfirmation(a.access.grants[0]) == "Revoke \(grant.ref)? It stops at the agent's next turn.")

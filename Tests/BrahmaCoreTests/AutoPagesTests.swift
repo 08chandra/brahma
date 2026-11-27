@@ -296,7 +296,7 @@ import GRDB
         let file = URL(fileURLWithPath: w.company.workspacePath).appending(path: ".brahma/kb/Company/Release history.md")
         #expect(!FileManager.default.fileExists(atPath: file.path))
         // A refresh with unchanged inputs keeps the owner's vouch; the vouch never comes from the engine.
-        try w.store.kbVouch(companyId: w.company.id, path: AutoPageKind.releaseHistory.rawValue)
+        try w.store.kbVouch(companyId: w.company.id, path: AutoPageKind.releaseHistory.rawValue, owner: .test)
         #expect(try w.store.refreshAutoPages(companyId: w.company.id, now: w.at(500)).isEmpty)
         #expect(try #require(try w.page(.releaseHistory)).tainted == false)
         // A tainted sprint summary taints its page the same way (the retro rule: the closer at closing).

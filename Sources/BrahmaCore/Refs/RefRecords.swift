@@ -270,6 +270,10 @@ final class RefHooks: @unchecked Sendable {
     /// `markHeldItemsIfTainted`), as a database that refuses writes would.
     var failTaintRecords: Bool { lock.withLock { taintRecordFails } }
     func setFailTaintRecords(_ fails: Bool) { lock.withLock { taintRecordFails = fails } }
+    private var taintHoldReadFails = false
+    /// Controller Ruling FW-1: reading the taint holds fails (the orchestrator then starts nothing that ships this tick).
+    var failTaintHoldRead: Bool { lock.withLock { taintHoldReadFails } }
+    func setFailTaintHoldRead(_ fails: Bool) { lock.withLock { taintHoldReadFails = fails } }
     private var leaseFails: Set<String> = []
     /// C3b fix round 4 (N3-1): putting a share artifact of these lease kinds (`resource`, `snapshot`, `shareRef`) under a
     /// share's lease fails (a lease write that hits BUSY or a full disk).

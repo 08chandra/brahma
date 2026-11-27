@@ -359,4 +359,43 @@ public enum AccessPresets {
         }
         return nil
     }
+
+    /// Final wave B1 (controller Ruling C6-4 addition): the engine's preset evaluator, the ONLY place a `PolicyPrincipal` is
+    /// minted. Inside the caller's write transaction, after the access ask `askId` was filed: the owner-configured preset rows
+    /// (`accessPreset`, enabled) are read here, `autoDecision` runs over them, and only a decision whose preset is one of
+    /// those rows gets a principal, bound to that preset and that ask. Nil: no preset decides it (the owner does).
+    static func evaluate(_ db: Database, companyId: String, askId: String, kind: GrantKind, value: String, requesterRole: String,
+                         company: Company, pack: IndustryPack?) throws -> (decision: Decision, principal: PolicyPrincipal)? {
+        let enabled = try Store.enabledPresets(db, companyId: companyId)
+        guard let decision = autoDecision(kind: kind, value: value, risk: kind.risk, requesterRole: requesterRole, company: company,
+                                          enabled: enabled, pack: pack),
+              enabled.contains(decision.preset) else { return nil }
+        return (decision, PolicyPrincipal(presetId: decision.preset.rawValue, askId: askId))
+    }
+}
+
+/// Final wave B1 (controller Ruling C6-4 addition): the authority an access preset's auto-decision acts under. It has no
+/// public initializer: only `AccessPresets.evaluate` (this file) mints one, from an owner-configured preset row, for one ask.
+/// `Store.ownerDecide(db:…)` takes it (as `DecisionAuthority.preset`) only to approve that access ask with that preset's grant,
+/// and records the decision as `preset:<id>` ("decided by preset <id>"), never as the owner's.
+public struct PolicyPrincipal: Sendable, Equatable {
+    public let presetId: String
+    public let askId: String
+
+    fileprivate init(presetId: String, askId: String) { self.presetId = presetId; self.askId = askId }
+}
+
+/// Who decides an ask through `Store.ownerDecide(db:…)` (final wave B1): the owner, by their principal, or an access preset the
+/// owner turned on, by the `PolicyPrincipal` the preset evaluator minted.
+public enum DecisionAuthority: Sendable {
+    case owner(OwnerPrincipal)
+    case preset(PolicyPrincipal)
+
+    /// What the decision records (`Ask.decidedBy`).
+    var decidedBy: String {
+        switch self {
+        case .owner: "owner"
+        case .preset(let p): "preset:\(p.presetId)"
+        }
+    }
 }

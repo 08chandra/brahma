@@ -416,7 +416,7 @@ import BrahmaKeychain
         try w.untaint(w.eng1)
         try w.write(w.eng1, "Eng/Doc", "clean three")
         #expect(try w.page("Eng/Doc")?.tainted == true, "an untainted write never clears page taint")
-        try w.store.kbVouch(companyId: w.company.id, path: "Eng/Doc")
+        try w.store.kbVouch(companyId: w.company.id, path: "Eng/Doc", owner: .test)
         let current = w.call(w.eng2, "kb_read", ["path": .string("Eng/Doc")])
         #expect(current.ok); #expect(!current.text.contains("untrusted")); #expect(try !w.agent(w.eng2).sessionTainted)
         let old = w.call(w.eng2, "kb_read", ["path": .string("Eng/Doc"), "revision": .number(2)])
@@ -552,7 +552,7 @@ import BrahmaKeychain
         let w = try W()
         try w.taint(w.eng1)
         let r = try w.write(w.eng1, "Research/Market", "# Size\nbig")
-        try w.store.kbVouch(companyId: w.company.id, path: "Research/Market")
+        try w.store.kbVouch(companyId: w.company.id, path: "Research/Market", owner: .test)
         let page = try #require(try w.page("Research/Market"))
         #expect(!page.tainted); #expect(page.vouchedAt != nil)
         #expect(try w.store.kbRevisions(companyId: w.company.id, path: "Research/Market").last?.tainted == false)
@@ -563,7 +563,7 @@ import BrahmaKeychain
         }
         #expect(lines.contains { $0.hasPrefix("@eng-1 edited kb:Research/Market (rev 1, +2 −0 lines)") })
         #expect(lines.contains("owner vouched for kb:Research/Market"))
-        #expect(w.refusal { try w.store.kbVouch(companyId: w.company.id, path: "Nope") } != nil)
+        #expect(w.refusal { try w.store.kbVouch(companyId: w.company.id, path: "Nope", owner: .test) } != nil)
     }
 
     @Test func agentStatusRules() throws {
