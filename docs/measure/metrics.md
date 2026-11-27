@@ -23,7 +23,8 @@ is estimated, sampled or inferred from text. This page is the definition of reco
   2 landings before links existed excluded`). Rows from before a record existed are excluded with the basis stated, never
   counted as zero.
 - **Window.** `--since <date>` is midnight in the owner's time zone (`ownerSettings.timeZone`); the default window is the
-  last 28 days; `--since all` starts at `company.createdAt`. A metric is windowed on the time its *event* happened: landings
+  last 28 days and `--since all` starts at `company.createdAt` (both plan X6a pinned numbers: `MeasureWindow.defaultDays`
+  = 28; `all` = since the company was created). A metric is windowed on the time its *event* happened: landings
   on the landing time, asks on the decision time, messages on `createdAt`, counters on their day.
 - **Scope.** Every query is `WHERE companyId = ?`; git-derived metrics read only the company's own workspace repository
   (`company.workspacePath`). Two companies sharing a history never see each other's rows.
@@ -34,11 +35,11 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 |---|---|---|
 | **landing** | one move of `main` by the merge queue: a `mergeBatch` row with `landCommit` set **and** `step` in `landed`, `recorded`, `cleaned`, `done` (a batch at `landing` counts only when git confirms `landCommit` is an ancestor of `main`; one at `checked` has not moved `main` yet). | `mergeBatch.landCommit`, `mergeBatch.step` |
 | **landed item** | an item whose merge request is in that batch's `landedIds`: `mergeRequest.itemId` for each id in `landedIds` (`landedIds` hold merge-request ids). The item's own merged commit is `mergeBatch.candidates[requestId]` = `mergeRequest.mergedCommit`. | `mergeBatch.landedIds`, `mergeRequest.itemId`, `mergeRequest.mergedCommit` |
-| **landing time** | the landed requests' `mergeRequest.finishedAt` (stamped when the landing is recorded), else `mergeBatch.updatedAt`. | |
+| **landing time** | the landed requests' `mergeRequest.finishedAt` (stamped when the landing is recorded), else `mergeBatch.updatedAt` **(Task 0 proposal, not a controller's call)**. | `mergeRequest.finishedAt`, `mergeBatch.updatedAt` |
 | **approval time** | `mergeRequest.enqueuedAt`: an item is queued the moment its review approves it. | `mergeRequest.enqueuedAt` |
 | **caught in review** | a `changesRequested` event followed by a later `submitted` event on the same item (a resubmission is a code change: an unchanged worktree commits nothing). Spec §8.6.1's "follow-up changed code covered by the finding" needs path-level findings that reviews do not record yet; until they do, this is the definition. The owner's addition (2026-11-24) narrows the headline to **confirmed** catches, below. | `workItemEvent.kind` = `changesRequested`, `submitted` |
-| **confirmed catch** (owner, 11/24) | a caught-in-review sequence whose resubmission was then confirmed by a later passing check on that item: a `verificationRun` with `purpose = 'submit'` and `status = 'passed'` finishing after the `submitted` event, **or** a `mergeRun` with `kind = 'main'` and `status = 'passed'` for the batch that landed the item (`mergeRun.batchId = mergeRequest.batchId`, `mergeRequest.status = 'merged'`) finishing after it. A change request with no later confirmed resubmission is not counted. | `verificationRun.purpose/status/finishedAt`, `mergeRun.kind/status/batchId`, `mergeRequest.batchId/status` |
-| **escaped** | a defect found after landing: a `regressionOf` link to a landed item created in the window, **plus** a failed audit of a landed item (`reviewAudit.verdict = 'failed'` — the stored value; auto-merged items that escaped review), **deduplicated by the landed (target) item**: the audit's follow-up item carries a `regressionOf` link to the same item, so one defect counts once. The detail lists the source of each. | `workItemLink.kind = regressionOf` (migration `vX6a-measure`), `reviewAudit.verdict`, `reviewAudit.auditedAt` |
+| **confirmed catch** (owner, 11/24) | a caught-in-review sequence whose resubmission was then confirmed by a later passing check on that item: a `verificationRun` for that `itemId` (`purpose` `submit` or `merge`) with `status = 'passed'` finishing after the `submitted` event, **or** a `mergeRun` with `kind = 'item'` and that `itemId` and `status = 'passed'` finishing after it, **or** — when `company.mainCheck` is set — the `mergeRun` with `kind = 'main'` and `status = 'passed'` of the batch that landed the item (`mergeRun.batchId = mergeRequest.batchId`, `mergeRequest.status = 'merged'`) finishing after it. A change request with no later confirmed resubmission is not counted. | `verificationRun.itemId/purpose/status/finishedAt`, `mergeRun.kind/itemId/status/batchId/finishedAt`, `mergeRequest.batchId/status`, `company.mainCheck` |
+| **escaped** | a defect found after landing, **keyed to the target item's landing time**: a `regressionOf` link to an item that landed in the window (the link may be created at any time up to now), **plus** a failed audit of an item that landed in the window (`reviewAudit.verdict = 'failed'` — the stored value; auto-merged items that escaped review), **deduplicated by the landed (target) item**: the audit's follow-up item carries a `regressionOf` link to the same item, so one defect counts once. The detail lists the source of each. | `workItemLink.kind = regressionOf` (migration `vX6a-measure`), `reviewAudit.verdict`, `reviewAudit.auditedAt` |
 | **revert** | a `revertOf` link to a landed item, **or** an engine-detected exact inverse: the stable patch-id of `git diff <merged> <base>` for landed item L equals the patch-id of `git diff <base'> <merged'>` of a later landed item within the lookback. `base` is the landed commit's first parent (in a batch of several items, the previous candidate), not `mergeRequest.baseCommit`, which is the batch's base. Partial reverts are found only through links. | `workItemLink.kind = revertOf`; git `patch-id --stable` over `mergeRequest.mergedCommit` |
 | **owner touch** | an ask the owner decided in the window (`ask.ownerDecidedAt` in the window **and** `ask.decidedBy = 'owner'` — an access preset also stamps `ownerDecidedAt`) **plus** an owner-authored message in the company in the window (`message.senderId = 'owner'`, `message.kind <> 'system'`). | `ask.ownerDecidedAt`, `ask.decidedBy`, `message.senderId`, `message.createdAt` |
 | **idle while actionable** | company-active seconds during which the company had no running turn **and** at least one agent was blocked by `usageLimit` or a cap closure, or was ready but held by `paceClosed` / `paceStrict`. Recorded per tick by the measure recorder (there is no such record today). | `measureCounter.idleActionableSeconds` (Task 5), ÷ company-active seconds |
@@ -62,8 +63,9 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 | | |
 |---|---|
 | **Definition** | landed items whose change was reverted within N days of landing ÷ landed items that have had N days to be reverted. **Headline: 14 days** (spec). **Detail rows: 7 days, 14 days, 30 days, each with its own n.** |
-| **Numerator (N)** | landed items in the window with a `revertOf` link pointing at them whose linked item landed within N days, or whose landed range is the exact inverse (patch-id) of a later landing within N days. |
-| **Denominator (N)** | landed items in the window whose landing time is at least N days before `now` (an item landed 3 days ago cannot yet fail a 7-day test and is excluded, basis stated). |
+| **Population (N)** | the items landed in the window whose landing time is at least N days before `now`. Numerator and denominator are both taken over this set: an item landed 3 days ago is in neither the 7-day numerator nor the 7-day denominator (it cannot yet have passed the test); the basis states how many were excluded. |
+| **Numerator (N)** | items of the population with a `revertOf` link pointing at them whose linked item landed within N days of the landing, or whose landed range is the exact inverse (patch-id) of a later landing within N days. |
+| **Denominator (N)** | the population. |
 | **Source** | `workItemLink` (`revertOf`), `mergeRequest.mergedCommit`, git `diff`/`patch-id --stable` in the company workspace. Bounded: ≤ 2000 landed items per run, each git call ≤ 10 s. |
 | **Status** | `insufficient data (n=…)` below 20 in the denominator; `not measured: no landings old enough` when the denominator is empty. |
 
@@ -73,7 +75,7 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 |---|---|
 | **Definition** | confirmed catches ÷ (confirmed catches + escaped). Spec: "defects caught in review ÷ (caught + escaped)". **Controller's call** on what "caught" means and **owner's call** that only confirmed catches count are in the vocabulary above. |
 | **Numerator** | items with at least one confirmed catch whose confirming check finished in the window. One item with three rounds counts once (an item is a defect caught, not a round). |
-| **Denominator** | numerator + escaped defects found in the window (deduplicated by target item). |
+| **Denominator** | numerator + escaped defects whose **target item landed in the window** (the `regressionOf` link or failed audit may have been recorded at any time up to now; deduplicated by target item). Basis: `escapes found so far`. |
 | **Detail** | unconfirmed change requests (a `changesRequested` with no later `submitted` + passing check) are listed with their count and are **not** in the rate; the basis says so. |
 | **Source** | `workItemEvent.kind/itemId/createdAt` (`changesRequested`, `submitted`), `verificationRun.purpose/status/finishedAt`, `mergeRun.kind/status/finishedAt/batchId`, `mergeRequest.batchId/status`, `workItemLink`, `reviewAudit.verdict/auditedAt` |
 | **Status** | `insufficient data (n=…)` below 20. Catches and escapes from before `vX6a-measure` have no links; the basis states the start of link history. |
@@ -83,7 +85,7 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 | | |
 |---|---|
 | **Definition** | escaped defects ÷ landed items. |
-| **Numerator** | escaped defects (vocabulary) whose link or failed audit was recorded in the window. |
+| **Numerator** | escaped defects (vocabulary) keyed to the **target item's landing time**: `regressionOf` links and failed audits, whenever recorded up to now, whose target item landed in the window. Basis: `escapes found so far` (an item landed yesterday has had one day to escape; the number can only grow as the window ages). |
 | **Denominator** | landed items in the window. |
 | **Source** | `workItemLink` (`regressionOf`), `reviewAudit.verdict = 'failed'`, `reviewAudit.auditedAt`, landings |
 
@@ -92,11 +94,12 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 | | |
 |---|---|
 | **Definition** | spend and effort per landed item: `$LE (subscription)` and `$ (gateway)` per landed item, with turns, tokens and awake time. |
-| **`$LE (subscription)`** | Σ `itemFact.costLE` of landed items in the window ÷ landed items with an `itemFact` row. `itemFact.reviewCostLE` is shown beside it (review turns are not in `costLE`). Items without a fact row (containers, items done before facts existed) are excluded with the basis stated. |
+| **Denominator (all legs)** | one denominator for the whole metric: landed items in the window that have an `itemFact` row. Items without a fact row (containers, items done before facts existed) are excluded from every leg with the basis stated. |
+| **`$LE (subscription)`** | Σ `itemFact.costLE` of those items ÷ the denominator. `itemFact.reviewCostLE` is shown beside it (review turns are not in `costLE`). |
 | **`$ (gateway)`** | `not applicable: X1 gateway columns absent` (ruling R4). When X1 lands this leg reads `itemFact.meteredUSD` / `turn.meteredUSD`. |
-| **turns** | Σ `itemFact.turnsUsed` ÷ landed items (work turns: `turn.kind = 'work'`, not infra, not session resets, outcome succeeded or failed). |
-| **tokens** | Σ `itemFact.tokensUsed` ÷ landed items (input + output + cache creation; ultra turns excluded, cache reads excluded). |
-| **awake time** | Σ `itemFact.cycleActiveSeconds` ÷ landed items with a non-null value: **company-active seconds** from first claim to completion, the engine's awake clock, never wall-clock. |
+| **turns** | Σ `itemFact.turnsUsed` ÷ the denominator (work turns: `turn.kind = 'work'`, not infra, not session resets, outcome succeeded or failed). |
+| **tokens** | Σ `itemFact.tokensUsed` ÷ the denominator (input + output + cache creation; ultra turns excluded, cache reads excluded). |
+| **awake time** | Σ `itemFact.cycleActiveSeconds` ÷ the denominator: **company-active seconds** from first claim to completion, the engine's awake clock, never wall-clock. A never-claimed item has a null value and contributes 0; the basis names how many. |
 | **Source** | `itemFact.costLE/reviewCostLE/turnsUsed/tokensUsed/cycleActiveSeconds/completedAt`; landings |
 
 ### 6. Owner touches per landed item (spec §8.6.1)
@@ -122,7 +125,7 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 
 | | |
 |---|---|
-| **approval → land** | median and p95 (nearest rank) of `mergeRequest.finishedAt − mergeRequest.enqueuedAt` over requests with `status = 'merged'` whose `finishedAt` is in the window; n = that count. **Controller's call:** approval time is `enqueuedAt`. |
+| **approval → land** | median and p95 (nearest rank) of `mergeRequest.finishedAt − mergeRequest.enqueuedAt` over requests with `status = 'merged'` whose `finishedAt` is in the window; n = that count. **Controller's call:** approval time is `enqueuedAt`. `enqueuedAt` is the merge request's: an owner retry (`brahma merge retry`) cancels the old request and creates a new one stamped at retry time, so approval → land measures the latest enqueue of the item, not its first approval. |
 | **bisect isolations** | batches in the window whose `landedIds` count is smaller than `requestIds` count because a member bounced (`mergeRequest.status = 'bounced'`, `failure` in `itemCheckFailed`, `mainCheckFailed`), ÷ batches in the window. |
 | **flake rate** | `mergeRun` rows with `flaky = 1` ÷ finished `mergeRun` rows (`status` in `passed`, `failed`, `timedOut`) with `kind` in `main`, `item`, finishing in the window. |
 | **Source** | `mergeRequest.enqueuedAt/finishedAt/status/failure`, `mergeBatch.requestIds/landedIds`, `mergeRun.kind/status/flaky/finishedAt` |
@@ -153,7 +156,7 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 |---|---|
 | **Definition** | for each (role, model): first-pass rate, confirmed review catch rate, rework rounds and `$LE` per landed item, each with its denominator. |
 | **Attribution** | the landed item's assignee (`itemFact.ownerId` → `agent.role`, `agent.model`); the item's work turns' `turn.modelsUsed` is shown when it names a different model family than `agent.model` (the owner may have changed the agent's model since; `modelsUsed` is cumulative over resumed sessions, so it is shown, not used to split cost). **Routed model and provider: `not applicable: X1 gateway columns absent`.** |
-| **Rows** | per (role, model): landed items (n); first-pass (`itemFact.firstPass`); catches confirmed where the agent was the **reviewer** (`workItemEvent.actorId` of the `changesRequested` event) ÷ (caught + escaped) for items it reviewed; rework rounds Σ `itemFact.reworkRounds` ÷ n; `$LE` Σ `itemFact.costLE` ÷ n. |
+| **Rows** | per (role, model): landed items (n); first-pass (`itemFact.firstPass`); catches confirmed where the agent was the **reviewer** — the landed item's `itemFact.reviewerId` (the item's reviewer at completion; it exists), falling back to the `workItemEvent.actorId` of the item's `reviewApproved` / `changesRequested` events when `reviewerId` is null — ÷ (caught + escaped) for items it reviewed; rework rounds Σ `itemFact.reworkRounds` ÷ n; `$LE` Σ `itemFact.costLE` ÷ n. |
 | **Status** | each row carries its own `insufficient data (n=…)` below 20 landed items. |
 | **Source** | `itemFact.ownerId/firstPass/reworkRounds/costLE`, `agent.role/model`, `turn.modelsUsed`, `workItemEvent.actorId` |
 

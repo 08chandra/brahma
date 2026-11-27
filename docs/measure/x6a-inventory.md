@@ -77,7 +77,7 @@ Status words: **as named** · **renamed to …** · **absent (not merged: S/R/P/
 
 | Plan name | Status | What the tree uses |
 |---|---|---|
-| `turn.meteredUSD`, `turn.routedModel`, `turn.provider`, `turn.authRoute`, `itemFact.meteredUSD`, `gatewayCharge`, `providerCap` | absent (not merged: X1) | Subscription leg only: `itemFact.costLE` (`Migrations.swift:623`), `turn.costLE` (`:591`), `turn.costUSD` (`:43`). Model attribution: `agent.model` (`:23`; `Agent.model` `Sources/BrahmaCore/Model/Agent.swift:25`) and `turn.modelsUsed` (`:599`; written `Sources/BrahmaCore/Orchestrator+Budget.swift:70`, the result's `modelUsage` keys comma-joined, **cumulative over `--resume`**). Ruling R4: gateway legs print `not applicable: X1 gateway columns absent`. |
+| `turn.meteredUSD`, `turn.routedModel`, `turn.provider`, `turn.authRoute`, `itemFact.meteredUSD`, `gatewayCharge`, `providerCap` | absent (not merged: X1) | Subscription leg only: `itemFact.costLE` (`Migrations.swift:620`), `turn.costLE` (`:591`), `turn.costUSD` (`:43`). Model attribution: `agent.model` (`:23`; `Agent.model` `Sources/BrahmaCore/Model/Agent.swift:25`) and `turn.modelsUsed` (`:599`; written `Sources/BrahmaCore/Orchestrator+Budget.swift:70`, the result's `modelUsage` keys comma-joined, **cumulative over `--resume`**). Ruling R4: gateway legs print `not applicable: X1 gateway columns absent`. |
 | X8a (`linux-vm`, isolation backend, VM canary) | absent (not merged: X8a) | No `linux-vm`/`Containerization`/`IsolationBackend` name in `Sources/`. Sandbox = Seatbelt (`Sources/BrahmaCore/Sandbox/`). Nothing in X6a reads it. |
 
 ---
@@ -215,7 +215,7 @@ Indexes `verificationRun_item (itemId)` `:313`, `verificationRun_status (status)
 ### 2.6 `itemFact` — every column (`Migrations.swift:605–630`, `v3-facts`)
 
 Written once per completed non-container item inside the completing transaction (`OutcomeFactsObserver.itemCompleted`,
-`Work/OutcomeFacts.swift:53–61`; the fact builder `:63`). `audited`/`auditVerdict` are updated later by
+`Work/OutcomeFacts.swift:53–59`; the fact builder `:61`). `audited`/`auditVerdict` are updated later by
 `Store.recordAuditFact` (`:135–137`).
 
 | Column | Created | `ItemFact` property (`OutcomeFacts.swift:8–50`) | Meaning |
@@ -226,13 +226,13 @@ Written once per completed non-container item inside the completing transaction 
 | `tier` TEXT NOT NULL | :609 | `tier` | `s`/`m`/`l` |
 | `ownerId` TEXT | :610 | `ownerId` | the assignee (agent id) |
 | `reviewerId` TEXT | :611 | `reviewerId` | |
-| `firstPass` BOOLEAN NOT NULL | :612 | `firstPass` | first non-inconclusive submit run passed un-flaky and `reviewRejections == 0` (`:77`) |
+| `firstPass` BOOLEAN NOT NULL | :612 | `firstPass` | first non-inconclusive submit run passed un-flaky and `reviewRejections == 0` (`:69`) |
 | `verificationRuns` INTEGER NOT NULL default 0 | :613–616 loop | `verificationRuns` | finished, non-inconclusive runs (submit + merge) |
 | `failedRuns` | same | `failedRuns` | failed/timedOut/error |
 | `flakyRuns` | same | `flakyRuns` | |
 | `inconclusiveRuns` | same | `inconclusiveRuns` | |
 | `reworkRounds` | same | `reworkRounds` | |
-| `reviewRejections` | same | `reviewRejections` | count of `changesRequested` events (`:75`) |
+| `reviewRejections` | same | `reviewRejections` | count of `changesRequested` events (`:67`) |
 | `turnsUsed` | same | `turnsUsed` | `Store.itemUsage` (`Work/Budget.swift:68–79`): `turn.kind = 'work' AND infra = 0 AND sessionResetReason IS NULL AND (stopReason IS NULL OR stopReason <> 'sessionReset')`, outcome in (succeeded, failed) |
 | `tokensUsed` | same | `tokensUsed` | input + output + cacheCreation, ultra turns excluded (`Budget.swift:71`) |
 | `tierMaxTurns`, `tierMaxTokens` | same | same | |
@@ -241,17 +241,17 @@ Written once per completed non-container item inside the completing transaction 
 | `cycleActiveSeconds` INTEGER | :617 | `cycleActiveSeconds: Int?` | **company-active** seconds first claim → completion (nil if never claimed) |
 | `checkAuthorId` TEXT | :618 | `checkAuthorId` | |
 | `checkAuthorRole` TEXT | :619 | `checkAuthorRole` | `owner`, `system` or the agent's role |
-| `costLE` DOUBLE NOT NULL default 0 | :622 | `costLE` | $LE of the item's counted work turns (subscription leg) |
-| `tierMaxCostLE` DOUBLE NOT NULL default 0 | :623 | `tierMaxCostLE` | |
-| `reviewCostLE` DOUBLE NOT NULL default 0 | :624 | `reviewCostLE` | Σ `turn.costLE` where `kind = 'review'` for the item (`OutcomeFacts.swift:81–83`) |
-| `autoMerged` BOOLEAN NOT NULL default 0 | :625 | `autoMerged` | |
-| `audited` BOOLEAN NOT NULL default 0 | :626 | `audited` | |
-| `auditVerdict` TEXT | :627 | `auditVerdict: String?` | `ok` / `failed` (copied from `reviewAudit.verdict`) |
-| `rungAtPass` INTEGER | :628 | `rungAtPass` | |
-| `modesUsed` TEXT | :629 | `modesUsed` | comma-joined |
+| `costLE` DOUBLE NOT NULL default 0 | :620 | `costLE` | $LE of the item's counted work turns (subscription leg) |
+| `tierMaxCostLE` DOUBLE NOT NULL default 0 | :621 | `tierMaxCostLE` | |
+| `reviewCostLE` DOUBLE NOT NULL default 0 | :622 | `reviewCostLE` | Σ `turn.costLE` where `kind = 'review'` for the item (`OutcomeFacts.swift:73–75`) |
+| `autoMerged` BOOLEAN NOT NULL default 0 | :623 | `autoMerged` | |
+| `audited` BOOLEAN NOT NULL default 0 | :624 | `audited` | |
+| `auditVerdict` TEXT | :625 | `auditVerdict: String?` | `ok` / `failed` (copied from `reviewAudit.verdict`) |
+| `rungAtPass` INTEGER | :626 | `rungAtPass` | |
+| `modesUsed` TEXT | :627 | `modesUsed` | comma-joined |
 | `completedAt` DATETIME NOT NULL | :630 | `completedAt` | |
 
-Index `itemFact_company (companyId, completedAt)` `:631`. Read: `Store.itemFacts(companyId:limit:)` (`OutcomeFacts.swift:123`,
+Index `itemFact_company (companyId, completedAt)` `:630`. Read: `Store.itemFacts(companyId:limit:)` (`OutcomeFacts.swift:123`,
 default limit 50 — Task 5 needs a window query). `itemFact.meteredUSD`: **NOT FOUND (X1 absent)** → `not applicable`.
 
 ### 2.7 `workItemEvent` (`Migrations.swift:254–263`, `v3-work`; `:1134` `v5-taint-2`; `:1828` `vC-share`)
@@ -364,7 +364,7 @@ Existing read is per channel (`Store.messages(channelId:limit:before:)`, `Store+
 | `costLE` DOUBLE | :591 | `costLE` | $LE (subscription leg) |
 | `modelsUsed` TEXT | :599 (v3-budgets-models) | `modelsUsed` | result `modelUsage` keys, comma-joined, **cumulative over `--resume`** (`Orchestrator+Budget.swift:70`) |
 | `pid` INTEGER | :839 (v5-owner-guard) | `pid: Int32?` | the CLI process of the turn |
-| `freshSessionReason` TEXT | :954 (v5-extensions-2) | `freshSessionReason` | `"tainted"` after a refused high-risk call under taint (`Store+Taint.swift:145`) |
+| `freshSessionReason` TEXT | :954 (v5-extensions-2) | `freshSessionReason` | `"tainted"` after a refused high-risk call under taint (`Store+Taint.swift:149`) |
 | `taintedAt` DATETIME, `taintSource` TEXT | :1102–1103 (v5-taint) | same | |
 
 Indexes: `turn_agent_started (agentId, startedAt)` `:45`; `turn_item (itemId)` `:592`; `turn_session (sessionId)` `:593`.
@@ -531,12 +531,12 @@ uppercased, `Store+WorkItems.swift:116–120`, e.g. `ACME-12`).
 **The company's first `main` commit (R8, Task 6):** for an imported company it is `company.importedCommit`
 (`Migrations.swift:784`; `Company.importedCommit` `Model/Company.swift:71`; set in `Store.createCompany` from the staged import's
 head, `Store.swift:228–229`, `importedFrom` beside it). For a company created fresh, `GitWorkspace.ensureRepo`
-(`GitWorkspace.swift:1016–1037`) makes the root commit `"Import existing files"` (`:1034`, `--allow-empty`) and records nothing
+(`GitWorkspace.swift:1016–1037`) makes the root commit `"Import existing files"` (`:1035`, `--allow-empty`) and records nothing
 in the database → **none — Task 6 uses the root commit of first-parent history** when `importedCommit` is NULL. Owner
 interventions Task 6 must classify: `brahma main accept` → `Store.acceptMainCommit` (`Store+MainGuard.swift:201`) writes
 `company.mainCommit` and an `activityEvent` kind `work`, text `the owner accepted <ref> (<sha12>) into main at <sha7>…`
 (`:243–244`); `brahma merge adopt-main` → `Store.adoptMain` (`:79–120`) writes `activityEvent` kind `merge`, text `main adopted
-at <sha7> by the owner|the engine` (`:116–117`). The current record of `main` is `company.mainCommit` (`:338`,
+at <sha7> by the owner|the engine` (`:113`). The current record of `main` is `company.mainCommit` (`:338`,
 `finalizeMainCommit` `Store+Merge.swift:115`); `company.pendingMainCommit` (`:358`) is the head the engine is about to move to.
 
 ---
@@ -610,8 +610,8 @@ ancestor pid (`ProcessAncestry.chain(of: getpid())`) is a recorded live turn lea
 `quietly: true` throws `ExitCode.failure` without printing (for commands anyone may run that only show owner detail to the
 owner). `ProcessRole` (`Sources/BrahmaCore/Collab/OwnerPrincipal.swift:6–17`): `unknown, owner, agent`, sticky towards
 `.agent`; `ProcessRole.refuseInAgentProcess()` throws `WorkError.forbidden(OwnerPrincipal.refusal)` in an agent process;
-`OwnerPrincipal.enterAgentProcess()` (`:70`) is called by `brahma mcp` and every turn entry point; `requireAgentProcess()`
-(`:77`). `brahma measure` (read-only, owner shell or any shell) should call `requireOwnerShell(quietly: false)`: the
+`OwnerPrincipal.enterAgentProcess()` (`:69`) is called by `brahma mcp` and every turn entry point; `requireAgentProcess()`
+(`:76`). `brahma measure` (read-only, owner shell or any shell) should call `requireOwnerShell(quietly: false)`: the
 ancestry/environment check is the "refuses inside an agent turn" the plan asks for (ruling R6).
 
 ### 3.5 `BudgetView` and its model (Task 8's MEASURE panel)
@@ -622,7 +622,7 @@ ancestry/environment check is the "refuses inside an agent turn" the plan asks f
   company selected")` (`:35`); `.task(id: model.selectedCompanyId) { model.ensureStorage() }` (`:39`). Text goes through
   `Text(verbatim:)`, fonts `BrahmaTheme.mono`/`monoSmall`.
 - `Sources/BrahmaAppModel/Budget/BudgetModel.swift:8–43`: `@MainActor public struct BudgetModel` with `panels = ["WEEKLY", "BY
-  MODE", "STORAGE"]` (`:10`), `paceLine`, `modeBreakdownLine`, `storage: StorageModel`; `AppModel.budget` (`:31–33`) is computed
+  MODE", "STORAGE"]` (`:9`), `paceLine`, `modeBreakdownLine`, `storage: StorageModel`; `AppModel.budget` (`:30–32`) is computed
   from `storage`, `paceLine`, `modeBreakdownLine`; `AppModel.ensureStorage()` (`:36–42`) lazily creates `StorageModel(store:
   paths: sizing:)` and runs `Task { await model.show(companyId:) }`.
 - `Sources/BrahmaAppModel/Budget/StorageModel.swift:17–100`: `@MainActor @Observable public final class StorageModel`; `show(companyId:)`
@@ -661,7 +661,7 @@ ancestry/environment check is the "refuses inside an agent turn" the plan asks f
 | "landing = `landCommit` set" | `landCommit` is written at step `checked`, before `main` moves | Task 3: require `step` ≥ `landed` (or git confirmation at `landing`) |
 | per-item base commit for a batch | `mergeRequest.baseCommit` is the batch base for every member | Tasks 3–4: base = `<mergedCommit>^1` / previous candidate |
 | company-active seconds **in a window** | `companyActivity` is a running total | Task 2 schema + Task 5 recorder: daily `activeSeconds` counter |
-| reserve breach / cap overrun records | none (`usageState` is one overwritten row; no cap record) | Task 5 recorders (`reserveBreaches`; cap overruns `not measured` unless recorded) |
+| reserve breach / cap overrun records | none (`usageState` is one overwritten row; no cap record) | Task 5 recorder `reserveBreaches`; cap overruns are `not applicable: no cap-overrun record` (no source exists) |
 | taint-refusal event row | none; trace is `turn.freshSessionReason = 'tainted'` on the next turn | Task 5: count with basis "turns, not calls" |
 | channel refusals, `landGate: owner`, rubric pass rate | X4 / non-code packs absent | `not applicable` |
 | `turn.meteredUSD`, `routedModel`, `provider`, `authRoute`, `itemFact.meteredUSD`, `gatewayCharge`, `providerCap` | X1 absent | `not applicable: X1 gateway columns absent` (R4) |
