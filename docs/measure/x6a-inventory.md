@@ -249,7 +249,7 @@ Written once per completed non-container item inside the completing transaction 
 | `auditVerdict` TEXT | :625 | `auditVerdict: String?` | `ok` / `failed` (copied from `reviewAudit.verdict`) |
 | `rungAtPass` INTEGER | :626 | `rungAtPass` | |
 | `modesUsed` TEXT | :627 | `modesUsed` | comma-joined |
-| `completedAt` DATETIME NOT NULL | :630 | `completedAt` | |
+| `completedAt` DATETIME NOT NULL | :628 | `completedAt` | |
 
 Index `itemFact_company (companyId, completedAt)` `:630`. Read: `Store.itemFacts(companyId:limit:)` (`OutcomeFacts.swift:123`,
 default limit 50 — Task 5 needs a window query). `itemFact.meteredUSD`: **NOT FOUND (X1 absent)** → `not applicable`.

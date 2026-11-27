@@ -77,8 +77,9 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 | **Numerator** | items with at least one confirmed catch whose confirming check finished in the window. One item with three rounds counts once (an item is a defect caught, not a round). |
 | **Denominator** | numerator + escaped defects whose **target item landed in the window** (the `regressionOf` link or failed audit may have been recorded at any time up to now; deduplicated by target item). Basis: `escapes found so far`. |
 | **Detail** | unconfirmed change requests (a `changesRequested` with no later `submitted` + passing check) are listed with their count and are **not** in the rate; the basis says so. |
-| **Source** | `workItemEvent.kind/itemId/createdAt` (`changesRequested`, `submitted`), `verificationRun.purpose/status/finishedAt`, `mergeRun.kind/status/finishedAt/batchId`, `mergeRequest.batchId/status`, `workItemLink`, `reviewAudit.verdict/auditedAt` |
+| **Source** | `workItemEvent.kind/itemId/createdAt` (`changesRequested`, `submitted`), `verificationRun.itemId/purpose/status/finishedAt`, `mergeRun.kind/itemId/status/finishedAt/batchId`, `mergeRequest.batchId/status`, `company.mainCheck`, `workItemLink`, `reviewAudit.verdict/auditedAt` |
 | **Status** | `insufficient data (n=…)` below 20. Catches and escapes from before `vX6a-measure` have no links; the basis states the start of link history. |
+| **Basis (clocks)** | the two legs are windowed on different clocks and the basis says so: a **catch** is in the window when its confirming check finished in the window; an **escape** is in the window when its target item landed in the window (whenever the link or failed audit was recorded). |
 
 ### 4. Escape rate (spec §8.6.1)
 
@@ -125,7 +126,7 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 
 | | |
 |---|---|
-| **approval → land** | median and p95 (nearest rank) of `mergeRequest.finishedAt − mergeRequest.enqueuedAt` over requests with `status = 'merged'` whose `finishedAt` is in the window; n = that count. **Controller's call:** approval time is `enqueuedAt`. `enqueuedAt` is the merge request's: an owner retry (`brahma merge retry`) cancels the old request and creates a new one stamped at retry time, so approval → land measures the latest enqueue of the item, not its first approval. |
+| **approval → land** | median and p95 (nearest rank) of `mergeRequest.finishedAt − mergeRequest.enqueuedAt` over requests with `status = 'merged'` whose `finishedAt` is in the window; n = that count. **Controller's call:** approval time is `enqueuedAt`. `enqueuedAt` is the merge request's: an owner retry (`brahma merge retry`) leaves the old request as it is (its status unchanged, `retryRequestedAt` stamped) and inserts a fresh request with `enqueuedAt` = the retry time, so approval → land measures the latest enqueue of the item, not its first approval; only requests that reached `merged` are in the sample. |
 | **bisect isolations** | batches in the window whose `landedIds` count is smaller than `requestIds` count because a member bounced (`mergeRequest.status = 'bounced'`, `failure` in `itemCheckFailed`, `mainCheckFailed`), ÷ batches in the window. |
 | **flake rate** | `mergeRun` rows with `flaky = 1` ÷ finished `mergeRun` rows (`status` in `passed`, `failed`, `timedOut`) with `kind` in `main`, `item`, finishing in the window. |
 | **Source** | `mergeRequest.enqueuedAt/finishedAt/status/failure`, `mergeBatch.requestIds/landedIds`, `mergeRun.kind/status/flaky/finishedAt` |
@@ -158,7 +159,7 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 | **Attribution** | the landed item's assignee (`itemFact.ownerId` → `agent.role`, `agent.model`); the item's work turns' `turn.modelsUsed` is shown when it names a different model family than `agent.model` (the owner may have changed the agent's model since; `modelsUsed` is cumulative over resumed sessions, so it is shown, not used to split cost). **Routed model and provider: `not applicable: X1 gateway columns absent`.** |
 | **Rows** | per (role, model): landed items (n); first-pass (`itemFact.firstPass`); catches confirmed where the agent was the **reviewer** — the landed item's `itemFact.reviewerId` (the item's reviewer at completion; it exists), falling back to the `workItemEvent.actorId` of the item's `reviewApproved` / `changesRequested` events when `reviewerId` is null — ÷ (caught + escaped) for items it reviewed; rework rounds Σ `itemFact.reworkRounds` ÷ n; `$LE` Σ `itemFact.costLE` ÷ n. |
 | **Status** | each row carries its own `insufficient data (n=…)` below 20 landed items. |
-| **Source** | `itemFact.ownerId/firstPass/reworkRounds/costLE`, `agent.role/model`, `turn.modelsUsed`, `workItemEvent.actorId` |
+| **Source** | `itemFact.ownerId/reviewerId/firstPass/reworkRounds/costLE`, `agent.role/model`, `turn.modelsUsed`, `workItemEvent.actorId` |
 
 ### 12. Idle while actionable (plan X6a, controller's call)
 
