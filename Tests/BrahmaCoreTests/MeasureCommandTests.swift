@@ -47,7 +47,12 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let md = try brahma(["measure", "Acme"], home: rig.home)
         #expect(md.status == 0, "\(md.stderr)")
         #expect(md.stdout.hasPrefix("# measure Acme — "), "\(md.stdout)")
-        for id in MetricId.all { #expect(md.stdout.contains("| \(id.label) | not applicable: not built yet |"), "\(id.rawValue)") }
+        // Task 3's landing metrics are built: with nothing landed they say so; every other metric is not built yet.
+        let built: Set<MetricId> = [.greenMain, .firstPass, .queueHealth]
+        for id in MetricId.all where !built.contains(id) { #expect(md.stdout.contains("| \(id.label) | not applicable: not built yet |"), "\(id.rawValue)") }
+        #expect(md.stdout.contains("| \(MetricId.greenMain.label) | not measured: no landings in the window |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.firstPass.label) | not measured: no landings in the window |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.queueHealth.label) | 0 |"), "\(md.stdout)")
         #expect(md.stdout.contains("docs/measure/metrics.md"))
         #expect(md.stdout.split(separator: "\n").count > 15, "the table is printed line by line, not flattened")
 
@@ -57,7 +62,9 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let report = try MeasureReport.decode(data)
         #expect(report.company == "Acme" && report.companyId == rig.company.id)
         #expect(report.metrics.map(\.id) == MetricId.all)
-        #expect(report.metrics.allSatisfy { $0.status == .notApplicable(reason: "not built yet") })
+        #expect(report.metrics.filter { !built.contains($0.id) }.allSatisfy { $0.status == .notApplicable(reason: "not built yet") })
+        #expect(report.metrics.first { $0.id == .greenMain }?.status == .notMeasured(reason: "no landings in the window"))
+        #expect(report.metrics.first { $0.id == .queueHealth }?.status == .ok)
         #expect(["UTC", "GMT"].contains(report.timeZone), "Foundation names the UTC zone GMT: \(report.timeZone)")
         // The JSON decodes back to the same report: re-encoding it gives the same bytes, and decoding those the same value.
         let again = try report.json()

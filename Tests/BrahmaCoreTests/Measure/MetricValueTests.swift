@@ -22,8 +22,24 @@ import Testing
         // The inverted units count their numerator as events, and still never divide by a zero denominator.
         for unit in [MetricUnit.perUSD, .perHour] {
             let z = MetricValue.rate(.itemsPerDollar, numerator: 25, denominator: 0, unit: unit, basis: "")
-            #expect(z.status == .ok, "\(unit)")
+            #expect(z.status == .insufficient(n: 0), "\(unit)")
             #expect(z.display == "insufficient data (n=0)", "\(unit): \(z.display)")
+        }
+    }
+
+    /// A denominator of zero or less is `insufficient(n: 0)` for every rate unit, so the status always agrees with the display —
+    /// even when the event count (the numerator for `perUSD`/`perHour`, or an explicit `events:`) is 20 or more.
+    @Test func nonPositiveDenominatorIsInsufficientForEveryRateUnit() throws {
+        for unit in [MetricUnit.ratio, .usd, .perUSD, .perHour] {
+            for denominator in [0.0, -1, -40] {
+                let v = MetricValue.rate(.itemsPerDollar, numerator: 40, denominator: denominator, unit: unit, basis: "")
+                #expect(v.status == .insufficient(n: 0), "\(unit) over \(denominator)")
+                #expect(v.display == "insufficient data (n=0)", "\(unit) over \(denominator): \(v.display)")
+                let forced = MetricValue.rate(.itemsPerDollar, numerator: 40, denominator: denominator, unit: unit, basis: "", events: 40)
+                #expect(forced.status == .insufficient(n: 0), "\(unit) over \(denominator) with events: 40")
+            }
+            // The same rate over a positive denominator is measured.
+            #expect(MetricValue.rate(.itemsPerDollar, numerator: 40, denominator: 20, unit: unit, basis: "", events: 20).status == .ok, "\(unit)")
         }
     }
 

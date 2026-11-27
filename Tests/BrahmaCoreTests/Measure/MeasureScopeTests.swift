@@ -47,22 +47,38 @@ import Testing
                                    companyId: acme.id, window: window, now: now)
         #expect(r.metrics.map(\.id) == MetricId.all)
         #expect(r.metrics.map(\.label) == MetricId.all.map(\.label))
-        // Task 1 ships the frame: every metric says it is not built yet, and says so with its reason.
-        for m in r.metrics {
+        // Task 1 ships the frame: a metric not built yet says so, with its reason. Task 3's three are built.
+        let built: Set<MetricId> = [.greenMain, .firstPass, .queueHealth]
+        for m in r.metrics where !built.contains(m.id) {
             #expect(m.status == .notApplicable(reason: "not built yet"), "\(m.id.rawValue)")
             #expect(m.display == "not applicable: not built yet")
         }
+        for m in r.metrics where built.contains(m.id) { #expect(m.status != .notApplicable(reason: "not built yet"), "\(m.id.rawValue)") }
         #expect(r.window == window && r.generatedAt == now)
         #expect(!r.brahmaBuild.isEmpty)
         // The markdown names the company, every metric, and the definitions page.
         let md = r.markdown()
         #expect(md.hasPrefix("# measure Acme — "), "\(md)")
-        for id in MetricId.all { #expect(md.contains("| \(id.label) | not applicable: not built yet |"), "\(id.rawValue)") }
+        for id in MetricId.all where !built.contains(id) { #expect(md.contains("| \(id.label) | not applicable: not built yet |"), "\(id.rawValue)") }
+        for id in built { #expect(md.contains("| \(id.label) | "), "\(id.rawValue)") }
         #expect(md.contains("docs/measure/metrics.md"))
         // JSON round-trips to an equal report.
         let encoded = try r.json()
         let back = try MeasureReport.decode(encoded)
         #expect(back == r)
+    }
+
+    /// The report's function table names every metric id (a new id cannot be forgotten); an id outside `all` is `not built yet`.
+    @Test func everyMetricIdHasAFunction() throws {
+        for id in MetricId.all { #expect(Measure.functions[id] != nil, "\(id.rawValue)") }
+        #expect(Measure.functions.count == MetricId.all.count)
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme")
+        let window = try MeasureWindow.parse("all", now: MeasureFixtures.t0, companyCreated: acme.createdAt, tz: TimeZone(identifier: "UTC")!)
+        let ctx = MeasureContext(store: store, git: GitWorkspace(root: URL(fileURLWithPath: acme.workspacePath)), company: acme,
+                                 window: window, now: MeasureFixtures.t0)
+        let stray = MetricId(rawValue: "stray")
+        #expect(try Measure.function(for: stray)(ctx).status == .notApplicable(reason: "not built yet"))
     }
 
     @Test func unknownCompanyIsAnError() throws {

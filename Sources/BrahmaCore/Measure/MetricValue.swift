@@ -117,13 +117,15 @@ public struct MetricValue: Codable, Equatable, Sendable {
 
     /// A rate: `ok` from `minEvents` events, else `insufficient(n:)`. The events are the denominator for `ratio` and `usd` (landings,
     /// landed items) and the NUMERATOR for the inverted units `perUSD` and `perHour` (landed items over dollars or hours; controller
-    /// ruling, fix round 1); `events` overrides that when a metric counts something else. A non-finite number is never an event.
+    /// ruling, fix round 1); `events` overrides that when a metric counts something else. A non-finite number is never an event,
+    /// and a denominator of zero or less is `insufficient(n: 0)` for every rate unit (there is nothing to divide by, whatever the
+    /// event count says).
     public static func rate(_ id: MetricId, label: String? = nil, numerator: Double, denominator: Double, unit: MetricUnit,
                             basis: String, detail: [MetricValue] = [], events: Int? = nil) -> MetricValue {
         precondition(unit.isRate, "rate(…) takes a rate unit; use count(…) or seconds(…)")
         let counted = events.map(Double.init) ?? (unit == .perUSD || unit == .perHour ? numerator : denominator)
         let finite = counted.isFinite && numerator.isFinite && denominator.isFinite
-        let n = finite ? max(0, Int(counted.rounded(.down))) : 0
+        let n = finite && denominator > 0 ? max(0, Int(counted.rounded(.down))) : 0
         let status: MetricStatus = n >= minEvents ? .ok : .insufficient(n: n)
         return MetricValue(id: id, label: label ?? id.label, numerator: numerator, denominator: denominator, unit: unit, basis: basis,
                            detail: detail, status: status)

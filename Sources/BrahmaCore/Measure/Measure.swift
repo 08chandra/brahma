@@ -149,16 +149,28 @@ public enum Measure {
                              metrics: metrics, generatedAt: now, brahmaBuild: build)
     }
 
-    /// The function that measures `id`. Every id is listed so a new metric is wired here, by name.
-    static func function(for id: MetricId) -> MetricFunction {
-        switch id {
-        case .greenMain, .revertRate, .reviewCatch, .escapeRate, .usagePerLanded, .ownerTouches, .firstPass, .queueHealth, .safety,
-             .nonCode, .modelRanking, .idleActionable, .itemsPerDollar, .itemsPerPlanHour, .ownerMinutes:
-            return notBuilt(id)
-        default:
-            return notBuilt(id)
-        }
-    }
+    /// The function for every id of `MetricId.all`, by name (`MeasureScopeTests.everyMetricIdHasAFunction` holds the table complete).
+    /// A metric not built yet maps to `notBuilt`; a task wires its functions here.
+    static let functions: [MetricId: MetricFunction] = [
+        .greenMain: { try LandingMetrics.greenMain($0) },
+        .revertRate: notBuilt(.revertRate),
+        .reviewCatch: notBuilt(.reviewCatch),
+        .escapeRate: notBuilt(.escapeRate),
+        .usagePerLanded: notBuilt(.usagePerLanded),
+        .ownerTouches: notBuilt(.ownerTouches),
+        .firstPass: { try LandingMetrics.firstPass($0) },
+        .queueHealth: { try LandingMetrics.queueHealth($0) },
+        .safety: notBuilt(.safety),
+        .nonCode: notBuilt(.nonCode),
+        .modelRanking: notBuilt(.modelRanking),
+        .idleActionable: notBuilt(.idleActionable),
+        .itemsPerDollar: notBuilt(.itemsPerDollar),
+        .itemsPerPlanHour: notBuilt(.itemsPerPlanHour),
+        .ownerMinutes: notBuilt(.ownerMinutes),
+    ]
+
+    /// The function that measures `id`; an id the table does not know is `not built yet`.
+    static func function(for id: MetricId) -> MetricFunction { functions[id] ?? notBuilt(id) }
 
     static func notBuilt(_ id: MetricId) -> MetricFunction { { _ in .notApplicable(id, reason: "not built yet") } }
 }

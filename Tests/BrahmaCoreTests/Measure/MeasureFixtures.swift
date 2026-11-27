@@ -98,6 +98,78 @@ enum MeasureFixtures {
         return f
     }
 
+    // MARK: Task 3 — runs, smoke, bounces
+
+    /// Gives (or takes away) the company's main check: with one set, the merge queue records a `main`-kind `mergeRun` per
+    /// tested candidate (inventory §2.3).
+    static func setMainCheck(_ store: Store, company: Company, _ spec: CheckSpec? = CheckSpec(command: "true")) throws {
+        try store.writer.write { db in
+            guard var c = try Company.fetchOne(db, key: company.id) else { throw FakeError(description: "no company \(company.id)") }
+            c.mainCheck = spec
+            try c.update(db)
+        }
+    }
+
+    /// One `mergeRun` of a batch as `MergeQueue.runCheck` records it: a `main` run has no request; an `item` run names the request
+    /// and its item. `candidateCommit` defaults to the batch's `landCommit` (the candidate that landed). A flake re-run is a second
+    /// row at `attempt: 2, flaky: true` beside the failed first attempt.
+    @discardableResult
+    static func mergeRun(_ store: Store, company: Company, batch: MergeBatch, kind: MergeRun.Kind, request: MergeRequest? = nil,
+                         candidateCommit: String? = nil, attempt: Int = 1, flaky: Bool = false, status: VerificationStatus = .passed,
+                         finishedAt: Date) throws -> MergeRun {
+        let run = MergeRun(companyId: company.id, batchId: batch.id, requestId: request?.id, prefix: batch.requestIds.count,
+                           candidateCommit: candidateCommit ?? batch.landCommit, kind: kind, itemId: request?.itemId, command: "true",
+                           status: status, attempt: attempt, flaky: flaky, exitCode: status == .passed ? 0 : 1,
+                           startedAt: finishedAt.addingTimeInterval(-10), finishedAt: finishedAt)
+        try store.writer.write { db in try run.insert(db) }
+        return run
+    }
+
+    /// A smoke run of `main` at `commit` (`mainSmokeRun`, inventory §2.4). One `merge` run per commit (the partial unique index).
+    @discardableResult
+    static func mainSmokeRun(_ store: Store, company: Company, commit: String, status: MainSmokeStatus, reason: MainSmokeReason = .merge,
+                             finishedAt: Date) throws -> MainSmokeRun {
+        let run = MainSmokeRun(companyId: company.id, commit: commit, status: status, exitCode: status == .passed ? 0 : 1, reason: reason,
+                               createdAt: finishedAt.addingTimeInterval(-20), startedAt: finishedAt.addingTimeInterval(-10), finishedAt: finishedAt)
+        try store.writer.write { db in try run.insert(db) }
+        return run
+    }
+
+    /// One `verificationRun` of an item's check (inventory §2.5).
+    @discardableResult
+    static func verificationRun(_ store: Store, company: Company, item: WorkItem, purpose: VerificationPurpose = .submit,
+                                status: VerificationStatus = .passed, attempt: Int = 1, flaky: Bool = false, finishedAt: Date)
+        throws -> VerificationRun {
+        let run = VerificationRun(id: UUID().uuidString, companyId: company.id, itemId: item.id, checkRevision: 1, scriptHash: "",
+                                  commit: String(repeating: "a", count: 40), command: "true", workingDirectory: "", timeoutSeconds: 60,
+                                  purpose: purpose, attempt: attempt, status: status, flaky: flaky, exitCode: status == .passed ? 0 : 1,
+                                  createdAt: finishedAt.addingTimeInterval(-20), startedAt: finishedAt.addingTimeInterval(-10),
+                                  finishedAt: finishedAt)
+        try store.writer.write { db in try run.insert(db) }
+        return run
+    }
+
+    /// A request of `batch` that the bisection bounced (`Store.bounceMerge`): `status = bounced`, `failure`, `finishedAt` = the
+    /// bounce time, and the batch's `requestIds` grown by it (it is never in `landedIds`). The item is left as it was.
+    @discardableResult
+    static func bounce(_ store: Store, company: Company, batch: MergeBatch, item: WorkItem, number: Int,
+                       failure: MergeFailure = .itemCheckFailed, enqueuedAt: Date, bouncedAt: Date) throws -> MergeRequest {
+        var r = MergeRequest(companyId: company.id, itemId: item.id, number: number, status: .bounced,
+                             headCommit: String(repeating: "b", count: 40), enqueuedAt: enqueuedAt)
+        r.batchId = batch.id
+        r.failure = failure
+        r.startedAt = enqueuedAt
+        r.finishedAt = bouncedAt
+        let row = r
+        try store.writer.write { db in
+            try row.insert(db)
+            guard var b = try MergeBatch.fetchOne(db, key: batch.id) else { throw FakeError(description: "no batch \(batch.id)") }
+            b.requestIds.append(row.id)
+            try b.update(db)
+        }
+        return r
+    }
+
     /// A company with `landed` items landed in one batch, each with a fact. Tasks 3–5 add asks, messages and runs here.
     @discardableResult
     static func seed(_ store: Store, name: String, landed: Int, workspacePath: String? = nil, now: Date = t0) throws -> Company {
