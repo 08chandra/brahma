@@ -5,7 +5,7 @@ import Testing
 /// Final-wave item 20 (FW-B2): the smoke, UI-snapshot and map runs never write the owner's real `dev.brahma.app` defaults. The
 /// app refuses a harness launch except as a harness copy (its own throwaway defaults domain); the scripts launch only such a
 /// copy and remove its domain; test suites (C6 M13) are removed when the test process exits.
-@Suite struct AppDefaultsTests {
+@Suite(.scratch) struct AppDefaultsTests {
     static let repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
 
     @Test func harnessLaunchesRunOnlyAsAHarnessCopy() {
@@ -46,8 +46,8 @@ import Testing
     /// domain. Run on a stand-in bundle (no app is launched, no owner defaults are read or written).
     @Test func harnessCopyHasItsOwnIdentifier() throws {
         let fm = FileManager.default
-        let dir = fm.temporaryDirectory.appending(path: "brahma-harness-\(UUID().uuidString)")
-        defer { try? fm.removeItem(at: dir) }
+        let dir = try tempDir()
+        ScratchScope.current?.allowExecutable(named: "Brahma")   // the stand-in bundle's executable (and its copy), never run
         let bundle = dir.appending(path: ".build/Brahma.app/Contents")
         try fm.createDirectory(at: bundle.appending(path: "MacOS"), withIntermediateDirectories: true)
         try fm.copyItem(atPath: "/usr/bin/true", toPath: bundle.appending(path: "MacOS/Brahma").path)

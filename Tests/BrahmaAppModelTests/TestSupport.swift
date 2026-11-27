@@ -124,7 +124,7 @@ enum TestDefaults {
 
     static func removeAll() {
         let all = lock.withLock { names }
-        let prefs = FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Preferences")
+        let prefs = FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Preferences")  // raw-temp-api: only the plists of the suites made here are removed
         for name in all {
             UserDefaults().removePersistentDomain(forName: name)
             try? FileManager.default.removeItem(at: prefs.appending(path: "\(name).plist"))
