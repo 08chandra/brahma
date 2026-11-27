@@ -244,7 +244,7 @@ struct GoldenWorld {
     func gatewayLaunch(routed: Set<ModelClass> = [.deep, .standard]) -> GatewayLaunch {
         GatewayLaunch(baseURL: "http://127.0.0.1:4100/t/", token: GatewayToken(value: String(repeating: "0123456789abcdef", count: 4)),
                       aliases: GatewayLaunch.aliases(for: routed), denyProxy: "http://127.0.0.1:4101",
-                      configDir: ClaudeGatewayCompile.configDir(layout: layout).path)
+                      configDir: paths.runDir.appending(path: "gateway-config/\(eng.id)").path)
     }
 
     /// The gateway golden's request: the ambient-auth cell with `gatewayLaunch()`.

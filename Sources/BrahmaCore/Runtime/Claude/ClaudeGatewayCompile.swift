@@ -27,8 +27,6 @@ public enum ClaudeGatewayCompile {
     /// The engine variable that tells the shell prefix which proxy value is the turn's deny proxy, so agent Bash never
     /// inherits it (it is not a secret: the proxy refuses everything).
     public static let denyProxyMarker = "BRAHMA_DENY_PROXY"
-    /// The gateway config dir's name inside the agent home (`configDir(layout:)`).
-    public static let configDirName = ".claude-gateway"
 
     /// Which `ANTHROPIC_DEFAULT_*_MODEL` names a class: `opus`, `sonnet` and `haiku` are what `claude` resolves its own
     /// aliases (and a forced sub-agent's `sonnet`) through.
@@ -36,20 +34,15 @@ public enum ClaudeGatewayCompile {
         .deep: "ANTHROPIC_DEFAULT_OPUS_MODEL", .standard: "ANTHROPIC_DEFAULT_SONNET_MODEL", .fast: "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     ]
 
-    /// The agent's isolated, persistent gateway config dir: `<agent home>/.claude-gateway` (Ruling 62). The same for every
-    /// gateway turn of the agent, so `--resume` keeps working; an empty scratch dir the launcher creates, never a copy of the
-    /// owner's.
-    public static func configDir(layout: SandboxLayout) -> URL {
-        layout.agentHome.appending(path: configDirName, directoryHint: .isDirectory)
-    }
-
     /// The `gateway:` part of the child environment (`ChildEnvironment.make(gateway:)`): the base URL, the token, the traffic
     /// switch, the default-model variable of each routed class, the deny proxy in all six proxy names and the config dir.
     /// Refused (fail closed) when `g` is malformed: a token that is not `TurnTokenFormat`, a base URL that is not
     /// `http://127.0.0.1:<port>/t/`, a deny proxy that is not `http://127.0.0.1:<port>` or is the gateway's own port, an alias
-    /// that is not `brahma-<class>`, or a config dir that is not a plain absolute path or is (or lies in) the owner's own config
-    /// dir in `owner` (the launcher's environment).
-    public static func environment(_ g: GatewayLaunch, owner: [String: String] = [:]) throws(RuntimeCompileError) -> [String: String] {
+    /// that is not `brahma-<class>`, or a config dir that is not a plain absolute path, is (or lies in) the owner's own config
+    /// dir in `owner` (the launcher's environment), or is (or lies in, or holds) one of `reachable`, the places the turn's
+    /// sandbox or tools can reach (Ruling 63: the dir is `GatewayConfigDir`'s, in the engine's run area).
+    public static func environment(_ g: GatewayLaunch, owner: [String: String] = [:],
+                                   reachable: [String] = []) throws(RuntimeCompileError) -> [String: String] {
         guard TurnTokenFormat.isWellFormed(g.token.value) else {
             throw .invalid("the gateway turn has no well-formed turn token; it was not started (no base URL without a token)")
         }
@@ -62,7 +55,7 @@ public enum ClaudeGatewayCompile {
         for (c, alias) in g.aliases where alias != GatewayLaunch.alias(c) {
             throw .invalid("the \(c.rawValue) alias must be \(GatewayLaunch.alias(c))")
         }
-        try checkConfigDir(g.configDir, owner: owner)
+        try checkConfigDir(g.configDir, owner: owner, reachable: reachable)
         var env = ["ANTHROPIC_BASE_URL": g.baseURL, "ANTHROPIC_API_KEY": g.token.value,
                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "CLAUDE_CONFIG_DIR": g.configDir]
         for (c, alias) in g.aliases { if let name = defaultModelVariable[c] { env[name] = alias } }
@@ -74,13 +67,28 @@ public enum ClaudeGatewayCompile {
     /// The engine variables (`extra`, `BRAHMA_*`) a gateway turn adds: the deny-proxy marker the shell prefix reads.
     public static func extra(_ g: GatewayLaunch) -> [String: String] { [denyProxyMarker: g.denyProxy] }
 
-    /// A mode turn's `availableModels` gains the routed aliases (Ruling 62), so `--model brahma-<class>` is a model the turn
-    /// may name. Strings in an existing non-empty array: the settings shape is unchanged. A turn with no `availableModels`
-    /// (the concierge) is left as it is.
+    /// The turn's settings for the gateway: `availableModels` gains the routed aliases (Ruling 62), so `--model brahma-<class>`
+    /// is a model the turn may name; and the config dir is named in the deny lists (Ruling 63) — the sandbox's `denyWrite` and
+    /// `denyRead` for Bash, and `Read`/`Edit`/`Write` deny rules for the tools, as the owner's `~/.claude` is. It already lies
+    /// in the data home, a protected root of every sandboxed turn; this says it again for the one dir a turn's CLI writes.
+    /// Only strings join existing non-empty arrays: the settings shape is unchanged.
     public static func settings(_ s: inout ClaudeSettings, _ g: GatewayLaunch) {
-        guard var models = s.availableModels else { return }
-        for c in ModelClass.allCases { if let alias = g.aliases[c], !models.contains(alias) { models.append(alias) } }
-        s.availableModels = models
+        if var models = s.availableModels {
+            for c in ModelClass.allCases { if let alias = g.aliases[c], !models.contains(alias) { models.append(alias) } }
+            s.availableModels = models
+        }
+        let forms = Array(Set([g.configDir, SandboxPath.resolve(g.configDir)])).sorted()
+        func adding(_ list: [String]?, _ more: [String]) -> [String] { (list ?? []) + more.filter { !(list ?? []).contains($0) } }
+        if var sandbox = s.sandbox, var fs = sandbox.filesystem {
+            fs.denyWrite = adding(fs.denyWrite, forms)
+            fs.denyRead = adding(fs.denyRead, forms)
+            sandbox.filesystem = fs
+            s.sandbox = sandbox
+        }
+        let rules = forms.flatMap { p in ["Read", "Edit", "Write"].flatMap { ClaudeSettingsCompiler.rules($0, p) } }
+        var permissions = s.permissions ?? ClaudeSettings.Permissions()
+        permissions.deny = adding(permissions.deny, rules)
+        s.permissions = permissions
     }
 
     /// Finishes a launch compiled with `environment(g)` in its child environment: checks that the environment carries the
@@ -122,9 +130,10 @@ public enum ClaudeGatewayCompile {
         return port
     }
 
-    /// A plain absolute path (no `.`/`..` component, no quote, backslash or control character), and never the owner's config
-    /// dir (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`) or a place inside it.
-    static func checkConfigDir(_ dir: String, owner: [String: String]) throws(RuntimeCompileError) {
+    /// A plain absolute path (no `.`/`..` component, no quote, backslash or control character), never the owner's config dir
+    /// (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`) or a place inside it, and never a place a turn reaches (`reachable`: equal,
+    /// inside or above one, in either the given or the resolved form).
+    static func checkConfigDir(_ dir: String, owner: [String: String], reachable: [String]) throws(RuntimeCompileError) {
         let components = dir.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
         guard dir.hasPrefix("/"), dir.count > 1, !SandboxPath.isUnsafe(dir), !dir.hasSuffix("/"),
               !components.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else {
@@ -137,6 +146,15 @@ public enum ClaudeGatewayCompile {
             let root = o.hasSuffix("/") ? String(o.dropLast()) : o
             if dir == root || dir.hasPrefix(root + "/") {
                 throw .invalid("the gateway config dir may never be the owner's Claude config dir")
+            }
+        }
+        let forms = Set([dir, SandboxPath.resolve(dir)])
+        for place in reachable where !place.isEmpty {
+            for p in Set([place, SandboxPath.resolve(place)]) {
+                let root = p.count > 1 && p.hasSuffix("/") ? String(p.dropLast()) : p
+                for d in forms where d == root || d.hasPrefix(root + "/") || root.hasPrefix(d + "/") {
+                    throw .invalid("the gateway config dir must lie outside every place the turn can reach (\(root))")
+                }
             }
         }
     }

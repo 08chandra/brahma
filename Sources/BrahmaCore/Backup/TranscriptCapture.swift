@@ -46,6 +46,9 @@ public struct TranscriptCapture: Sendable {
 
     public let paths: BrahmaPaths
     public private(set) var source: TranscriptSource
+    /// Set by `reading(configDir:)` (a gateway turn's config dir, Ruling 63): no component of the path to the session file —
+    /// from `/` through the config dir, `projects/` and the project folder to the file — may be a link.
+    public private(set) var refusesLinkedComponents = false
     public let compressor: Compressor
     /// Upper bound on the bytes of one capture; the rest is taken by the next one.
     static let maxChunk = 256 * 1024 * 1024
@@ -62,6 +65,7 @@ public struct TranscriptCapture: Sendable {
         guard let configDir, !configDir.isEmpty else { return self }
         var copy = self
         copy.source = TranscriptSource(configDir: URL(fileURLWithPath: configDir, isDirectory: true))
+        copy.refusesLinkedComponents = true
         return copy
     }
 
@@ -221,9 +225,11 @@ public struct TranscriptCapture: Sendable {
     /// `projects/*/<sessionId>.jsonl`, the newest by modification time. Links are not followed.
     func newestFile(sessionId: String) -> (url: URL, size: Int)? {
         let fm = FileManager.default
+        if refusesLinkedComponents, !Self.isRealDirectoryPath(source.projectsDir) { return nil }
         guard let projects = try? fm.contentsOfDirectory(atPath: source.projectsDir.path) else { return nil }
         var best: (url: URL, size: Int, mtime: Double)?
         for name in projects.sorted() {
+            if refusesLinkedComponents, !Self.isRealDirectory(source.projectsDir.appending(path: name)) { continue }
             let url = source.projectsDir.appending(path: name).appending(path: "\(sessionId).jsonl")
             var st = stat()
             guard lstat(url.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { continue }
@@ -231,6 +237,25 @@ public struct TranscriptCapture: Sendable {
             if best == nil || mtime > best!.mtime { best = (url, Int(st.st_size), mtime) }
         }
         return best.map { ($0.url, $0.size) }
+    }
+
+    /// Every component of `url`'s absolute path, from `/`, is a real directory (`lstat`: never a link). The path is taken as
+    /// written (never standardized, which on macOS swaps `/private/var` for the link `/var`); a `.` or `..` component fails.
+    static func isRealDirectoryPath(_ url: URL) -> Bool {
+        let path = url.path
+        guard path.hasPrefix("/") else { return false }
+        var current = URL(fileURLWithPath: "/", isDirectory: true)
+        for part in path.split(separator: "/") {
+            guard part != ".", part != ".." else { return false }
+            current = current.appending(path: String(part), directoryHint: .isDirectory)
+            guard isRealDirectory(current) else { return false }
+        }
+        return true
+    }
+
+    static func isRealDirectory(_ url: URL) -> Bool {
+        var st = stat()
+        return lstat(url.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
     }
 
     static func modificationTime(_ st: stat) -> Double {

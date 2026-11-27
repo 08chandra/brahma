@@ -51,7 +51,7 @@
     "CLAUDE_CODE_DISABLE_WORKFLOWS" : "1",
     "CLAUDE_CODE_SHELL_PREFIX" : "<WS>/.brahma/bin/shell-eng-1.sh",
     "CLAUDE_CODE_TMPDIR" : "<AGENTTMP>",
-    "CLAUDE_CONFIG_DIR" : "<WS>/.brahma/home/eng-1/.claude-gateway",
+    "CLAUDE_CONFIG_DIR" : "<RUN>/gateway-config/<AGENT>",
     "DEVELOPER_DIR" : "/Applications/Xcode.app/Contents/Developer",
     "HOME" : "<USERHOME>",
     "http_proxy" : "http://127.0.0.1:4101",
@@ -697,7 +697,13 @@
         "Bash(sudo *)",
         "Bash(screencapture *)",
         "Bash(claude *)",
-        "Bash(*/claude *)"
+        "Bash(*/claude *)",
+        "Read(/<RUN>/gateway-config/<AGENT>)",
+        "Read(/<RUN>/gateway-config/<AGENT>/**)",
+        "Edit(/<RUN>/gateway-config/<AGENT>)",
+        "Edit(/<RUN>/gateway-config/<AGENT>/**)",
+        "Write(/<RUN>/gateway-config/<AGENT>)",
+        "Write(/<RUN>/gateway-config/<AGENT>/**)"
       ]
     },
     "sandbox" : {
@@ -788,7 +794,8 @@
           "<USERHOME>/Library/Application Support/Claude",
           "<USERHOME>/Library/Application Support/Slack",
           "<USERHOME>/Library/Application Support/1Password",
-          "<USERHOME>/Library/Application Support/Code"
+          "<USERHOME>/Library/Application Support/Code",
+          "<RUN>/gateway-config/<AGENT>"
         ],
         "denyWrite" : [
           "<USERHOME>/.ssh",
@@ -888,7 +895,8 @@
           "/private/tmp/claude-tool-results",
           "/tmp/claude-tool-results",
           "/private/tmp/claude",
-          "/tmp/claude"
+          "/tmp/claude",
+          "<RUN>/gateway-config/<AGENT>"
         ]
       },
       "network" : {

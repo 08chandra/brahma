@@ -61,7 +61,7 @@ public struct ClaudeRuntime: AgentRuntime {
         var profile = try Self.validatedProfile(r)
         var gatewayEnvironment: [String: String] = [:]
         if let g = r.gateway {
-            gatewayEnvironment = try ClaudeGatewayCompile.environment(g, owner: baseEnvironment)
+            gatewayEnvironment = try ClaudeGatewayCompile.environment(g, owner: baseEnvironment, reachable: Self.reachablePlaces(r))
             ClaudeGatewayCompile.settings(&profile.settings, g)
             profile.environment.merge(ClaudeGatewayCompile.extra(g)) { $1 }
         }
@@ -121,6 +121,18 @@ public struct ClaudeRuntime: AgentRuntime {
         case .subscription: .rateLimitEvents
         case .gateway: .proxyMetered
         }
+    }
+
+    /// The places a turn's sandbox or tools can reach (Ruling 63: a gateway config dir must lie outside all of them): the
+    /// workspace, the working and extra directories and, on a sandboxed turn, every writable, readable and read-only entry
+    /// of its scope, its Claude temp dir and the toolchain temp dir.
+    static func reachablePlaces(_ r: TurnRequest) -> [String] {
+        var places = [r.company.workspacePath, r.workingDirectory] + r.addDirs + (r.planDirectory.map { [$0] } ?? [])
+        if let scope = r.sandbox {
+            places += ([scope.workspace, scope.cwd] + scope.writable + scope.readable + scope.readOnlyDirs).map(\.path)
+            places += [scope.claudeTmp, scope.toolchainTempWrite].compactMap { $0?.path }
+        }
+        return places
     }
 
     /// The compiled profile of `r`, validated: the runner's check before it starts a process.

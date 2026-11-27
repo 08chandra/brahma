@@ -56,7 +56,19 @@ private func goldenArgv(_ name: String) throws -> [String] {
             #expect(world.normalize(spec.arguments.joined(separator: "\n"))
                     == (try goldenArgv(subscriptionCellName)).joined(separator: "\n"), "routed \(routed)")
             #expect(spec.arguments == plain.arguments)
-            if routed.isEmpty { #expect(spec.files == plain.files) }
+            if routed.isEmpty {
+                // The settings are the subscription turn's but for the config dir's deny entries (Ruling 63).
+                let dir = try #require(try world.gatewayRequest().gateway?.configDir)
+                func stripped(_ spec: LaunchSpec) throws -> ClaudeSettings {
+                    var s = try JSONDecoder().decode(ClaudeSettings.self, from: try #require(spec.files.first?.contents))
+                    s.sandbox?.filesystem?.denyWrite?.removeAll { $0 == dir }
+                    s.sandbox?.filesystem?.denyRead?.removeAll { $0 == dir }
+                    s.permissions?.deny?.removeAll { $0.contains(dir) }
+                    return s
+                }
+                #expect(try stripped(spec) == (try stripped(plain)))
+                #expect(spec.files.map(\.path) == plain.files.map(\.path))
+            }
             let gatewayNames = ChildEnvironment.gatewayVariables.union(ChildEnvironment.gatewayOverrides)
                 .union([ClaudeGatewayCompile.denyProxyMarker])
             let changed = Set(spec.environment.keys).union(plain.environment.keys).filter { spec.environment[$0] != plain.environment[$0] }
@@ -125,7 +137,7 @@ private func goldenArgv(_ name: String) throws -> [String] {
         for name in ClaudeGatewayCompile.proxyNames { #expect(spec.environment[name] == "http://127.0.0.1:\(proxy.port)", "\(name)") }
         for name in ClaudeGatewayCompile.noProxyNames { #expect(spec.environment[name] == "127.0.0.1,localhost", "\(name)") }
         #expect(spec.environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1")
-        #expect(spec.environment["CLAUDE_CONFIG_DIR"] == ClaudeGatewayCompile.configDir(layout: world.layout).path)
+        #expect(spec.environment["CLAUDE_CONFIG_DIR"] == world.gatewayLaunch().configDir)
         #expect(spec.environment["CLAUDE_CODE_OAUTH_TOKEN"] == nil && spec.environment["ANTHROPIC_AUTH_TOKEN"] == nil)
         #expect(spec.environment[ClaudeGatewayCompile.denyProxyMarker] == "http://127.0.0.1:\(proxy.port)")
         let reply = try connectThrough(proxy.port, "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n")
@@ -176,16 +188,16 @@ private func goldenArgv(_ name: String) throws -> [String] {
         #expect(plain.out == deny + "\n")
     }
 
-    /// The gateway config dir is the agent's own, under its home, the same for every gateway turn of the agent (so
-    /// `--resume` keeps working), another agent's differs, and it is never the owner's config dir.
+    /// The gateway config dir is the agent's own, in the engine's run area (Ruling 63), the same for every gateway turn of the
+    /// agent (so `--resume` keeps working), another agent's differs, it is never the owner's config dir, and it lies outside
+    /// every place the turn can reach.
     @Test func configDirIsPerAgentAndStable() throws {
         let world = try GoldenWorld()
-        let dir = ClaudeGatewayCompile.configDir(layout: world.layout).path
-        #expect(dir.hasPrefix(world.layout.agentHome.path + "/"))
-        #expect(dir == ClaudeGatewayCompile.configDir(layout: SandboxLayout(paths: world.paths, company: world.company,
-                                                                           agentHandle: "eng-1")).path)
-        #expect(dir != ClaudeGatewayCompile.configDir(layout: SandboxLayout(paths: world.paths, company: world.company,
-                                                                           agentHandle: "eng-2")).path)
+        let dir = try GatewayConfigDir.directory(paths: world.paths, agentId: world.eng.id).path
+        #expect(dir == world.gatewayLaunch().configDir)
+        #expect(dir == world.paths.runDir.appending(path: "gateway-config/\(world.eng.id)").path)
+        #expect(dir != (try GatewayConfigDir.directory(paths: world.paths, agentId: "other-agent")).path)
+        #expect(throws: GatewayConfigDir.Refusal.self) { try GatewayConfigDir.directory(paths: world.paths, agentId: "../x") }
         // Two turns, two tokens, one config dir; set on every gateway turn whatever the owner's environment holds.
         var owner = world.baseEnvironment
         owner["CLAUDE_CONFIG_DIR"] = world.userHome.appending(path: "owner-cc").path
@@ -201,6 +213,44 @@ private func goldenArgv(_ name: String) throws -> [String] {
             var r = try world.gatewayRequest()
             r.gateway?.configDir = bad
             #expect(throws: RuntimeCompileError.self, "\(bad)") { try compile(r, world: world, base: owner) }
+        }
+    }
+
+    /// Ruling 63 (X1-39): the config dir lies outside every place the sandboxed turn can write or read, and the compiled
+    /// settings deny Bash writes and reads to it and the Read/Edit/Write tools on it. A dir in the agent's home, its worktree,
+    /// its Claude temp dir or the workspace (where the agent could plant settings or hooks) never compiles.
+    @Test func configDirOutsideTheSandboxAndDenied() throws {
+        let world = try GoldenWorld()
+        let r = try world.gatewayRequest()
+        let dir = try #require(r.gateway?.configDir)
+        let scope = try #require(r.sandbox)
+        for place in ClaudeRuntime.reachablePlaces(r) + scope.writable.map(\.path) + [scope.cwd.path] {
+            #expect(!dir.hasPrefix(place + "/") && dir != place, "\(dir) is in \(place)")
+        }
+        let spec = try compile(r, world: world)
+        let settingsPath = try #require(value(after: "--settings", in: spec.arguments))
+        let file = try #require(spec.files.first { $0.path == settingsPath })
+        let settings = try JSONDecoder().decode(ClaudeSettings.self, from: file.contents)
+        let fs = try #require(settings.sandbox?.filesystem)
+        #expect(fs.denyWrite?.contains(dir) == true && fs.denyRead?.contains(dir) == true)
+        #expect(!(fs.allowWrite ?? []).contains { dir == $0 || dir.hasPrefix($0 + "/") }, "\(fs.allowWrite ?? [])")
+        #expect(!(fs.allowRead ?? []).contains { dir == $0 || dir.hasPrefix($0 + "/") }, "\(fs.allowRead ?? [])")
+        let deny = settings.permissions?.deny ?? []
+        for tool in ["Read", "Edit", "Write"] {
+            #expect(deny.contains("\(tool)(/\(dir))") && deny.contains("\(tool)(/\(dir)/**)"), "\(tool)")
+        }
+        // The data home stays a protected root as well (denyRead/denyWrite and the Read/Edit rules), as the owner's ~/.claude.
+        #expect(fs.denyWrite?.contains(world.paths.home.path) == true && deny.contains("Edit(/\(world.paths.home.path)/**)"))
+        // A subscription turn's settings are untouched (its golden is byte-identical).
+        let plain = try compile(try world.request(ParityShapes.ambientAuthCell), world: world)
+        #expect(!plain.files.contains { String(decoding: $0.contents, as: UTF8.self).contains("gateway-config") })
+        // Agent-reachable places are refused.
+        let refused = [world.layout.agentHome.appending(path: ".claude-gateway").path, world.ws.appending(path: "cc").path,
+                       try #require(scope.claudeTmp).appending(path: "cc").path, scope.cwd.path]
+        for bad in refused {
+            var g = r
+            g.gateway?.configDir = bad
+            #expect(throws: RuntimeCompileError.self, "\(bad)") { try compile(g, world: world) }
         }
     }
 

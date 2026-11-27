@@ -30,6 +30,9 @@ public enum EngineAlerts {
     /// (`ProviderHost.validate`, Ruling X1-38): a key bound to another host, a base URL off the pinned-host rules.
     public static let providerRecordReason = "provider-record"
 
+    /// The reason that keys the alert of a quarantined gateway config dir (`GatewayConfigDir.prepare`, Plan X1 Ruling 63).
+    public static let gatewayConfigReason = "gateway-config"
+
     /// The reason that keys the alert about an engine file under `.brahma/` that was a link or not a regular file.
     public static let engineFileReason = "engine-file"
 
