@@ -209,4 +209,33 @@ import GRDB
         #expect(!(try store.hasLanded(companyId: acme.id, itemId: zItems[0].id)), "another company's landing is not this company's")
         #expect(try store.landings(companyId: zeta.id, in: window).flatMap(\.items).map(\.itemId) == [zItems[0].id])
     }
+
+    /// Ruling R24: `landCommit` and `landedIds` are written at `checked`, before `main` moves, and the post-`checked` abort paths
+    /// (stopped, main moved, blocked, off main, a git error, recovery abandoning the batch) finish the batch to `done` with both
+    /// still set and requeue its requests. A request is a landed item only when it is `merged` with `batchId` = that batch; a
+    /// batch with no such request is not a landing.
+    @Test func abandonedBatchIsNotALanding() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme")
+        let items = try MeasureFixtures.items(store, company: acme, count: 3, now: Self.t0.addingTimeInterval(-10 * 86_400))
+        // Batch 1 reached `checked`, then was abandoned to `done`: its requests went back to `queued` (batchId cleared).
+        let abandoned = try MeasureFixtures.land(store, company: acme, items: [items[0], items[1]], number: 1,
+                                                 enqueuedAt: Self.t0.addingTimeInterval(-3 * 86_400), landedAt: Self.t0.addingTimeInterval(-2 * 86_400))
+        try store.writer.write { db in
+            try db.execute(sql: "UPDATE mergeRequest SET status = 'queued', batchId = NULL, finishedAt = NULL WHERE batchId = ?",
+                           arguments: [abandoned.batch.id])
+        }
+        // Batch 2 landed one item of a request whose status is merged but whose batchId names another batch: not this batch's item.
+        let other = try MeasureFixtures.land(store, company: acme, items: [items[2]], number: 2,
+                                             enqueuedAt: Self.t0.addingTimeInterval(-3 * 86_400), landedAt: Self.t0.addingTimeInterval(-86_400))
+        try store.writer.write { db in
+            try db.execute(sql: "UPDATE mergeRequest SET batchId = ? WHERE id = ?", arguments: [UUID().uuidString, other.requests[0].id])
+        }
+
+        let window = MeasureWindow(since: Self.t0.addingTimeInterval(-7 * 86_400), until: Self.t0)
+        #expect(try store.landings(companyId: acme.id, in: window).isEmpty)
+        #expect(!(try store.hasLanded(companyId: acme.id, itemId: items[0].id)))
+        #expect(!(try store.hasLanded(companyId: acme.id, itemId: items[1].id)))
+        #expect(!(try store.hasLanded(companyId: acme.id, itemId: items[2].id)))
+    }
 }

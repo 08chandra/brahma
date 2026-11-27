@@ -1,8 +1,12 @@
 import Foundation
 import GRDB
 
-/// One move of `main` by the merge queue, as `docs/measure/metrics.md` defines a landing (controller ruling R13): a `mergeBatch`
-/// row with `landCommit` set and `step` at or after `landed`. Tasks 3, 4 and 6 and `linkItem` read landings only through here.
+/// One move of `main` by the merge queue, as `docs/measure/metrics.md` defines a landing (controller rulings R13, R24): a
+/// `mergeBatch` row with `landCommit` set, `step` at or after `landed`, and at least one landed item — a `landedIds` request that is
+/// `merged` with `batchId` = the batch. `landCommit`/`landedIds` are written at `checked`, before `main` moves, and the abort paths
+/// after `checked` (stopped, main moved, blocked, off main, a git error, recovery abandoning the batch) finish the batch to `done`
+/// with both still set and requeue its requests; such a batch has no merged request of its own and is not a landing. Tasks 3, 4
+/// and 6 and `linkItem` read landings only through here.
 public struct Landing: Equatable, Sendable {
     public var batchId: String
     /// The batch's number (`B-<n>`).
@@ -13,11 +17,13 @@ public struct Landing: Equatable, Sendable {
     public var baseCommit: String?
     /// The landing time: `mergeBatch.finishedAt`, else `updatedAt` (a batch landed but not yet at `done`).
     public var finishedAt: Date
-    /// The items that landed, in `landedIds` order.
+    /// The items that landed, in `landedIds` order; never empty.
     public var items: [LandedItem]
 }
 
-/// An item that landed in a batch: `mergeRequest.itemId` for one id of `mergeBatch.landedIds` (request ids, never item ids).
+/// An item that landed in a batch: `mergeRequest.itemId` for one id of `mergeBatch.landedIds` (request ids, never item ids) whose
+/// request is `merged` with `batchId` = that batch (ruling R24). A request requeued from an abandoned batch keeps its id in that
+/// batch's `landedIds`; it lands, once, in the batch that merged it.
 public struct LandedItem: Equatable, Sendable {
     public var itemId: String
     public var key: String
@@ -37,7 +43,7 @@ extension Store {
         try writer.read { db in try Self.landings(db, companyId: companyId, in: window) }
     }
 
-    /// True when `itemId` is a landed item of one of the company's landings.
+    /// True when `itemId` is a landed item of one of the company's landings (ruling R24: its request merged by that batch).
     public func hasLanded(companyId: String, itemId: String) throws -> Bool {
         try writer.read { db in try Self.hasLanded(db, companyId: companyId, itemId: itemId) }
     }
@@ -46,7 +52,8 @@ extension Store {
         try landings(db, companyId: companyId, in: nil).contains { landing in landing.items.contains { $0.itemId == itemId } }
     }
 
-    /// `window` nil: every landing of the company.
+    /// `window` nil: every landing of the company. Callers that read other tables for the same landings use this inside their own
+    /// read, so the landings and the rows they join come from one snapshot.
     static func landings(_ db: Database, companyId: String, in window: MeasureWindow?) throws -> [Landing] {
         let steps = landedSteps.map { "'\($0.rawValue)'" }.joined(separator: ", ")
         var sql = "SELECT * FROM mergeBatch WHERE companyId = ? AND landCommit IS NOT NULL AND step IN (\(steps))"
@@ -78,11 +85,15 @@ extension Store {
             guard let landCommit = b.landCommit else { return nil }
             let finishedAt = b.finishedAt ?? b.updatedAt
             let items = b.landedIds.compactMap { requestId -> LandedItem? in
-                // A landed request id with no request row (or an item row gone) is not an item: it is left out, never guessed.
-                guard let r = requests[requestId], let key = keys[r.itemId] else { return nil }
+                // Ruling R24: only a request this batch merged. A request requeued from it (status back to `queued`, or merged
+                // later by another batch) is not its item. A landed request id with no request row (or an item row gone) is left
+                // out, never guessed.
+                guard let r = requests[requestId], r.status == .merged, r.batchId == b.id, let key = keys[r.itemId] else { return nil }
                 return LandedItem(itemId: r.itemId, key: key, requestId: requestId, mergedCommit: b.candidates[requestId] ?? r.mergedCommit,
                                   landedAt: r.finishedAt ?? finishedAt)
             }
+            // A batch with no request it merged never moved `main`: not a landing.
+            guard !items.isEmpty else { return nil }
             return Landing(batchId: b.id, number: b.number, landCommit: landCommit, baseCommit: b.base, finishedAt: finishedAt, items: items)
         }
     }

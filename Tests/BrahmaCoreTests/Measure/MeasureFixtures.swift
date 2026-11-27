@@ -110,15 +110,22 @@ enum MeasureFixtures {
         }
     }
 
-    /// One `mergeRun` of a batch as `MergeQueue.runCheck` records it: a `main` run has no request; an `item` run names the request
-    /// and its item. `candidateCommit` defaults to the batch's `landCommit` (the candidate that landed). A flake re-run is a second
-    /// row at `attempt: 2, flaky: true` beside the failed first attempt.
+    /// One `mergeRun` of a batch as `MergeQueue.runCheck` records it (`blamedRun`, MergeQueue.swift): an `item` run names the
+    /// request and item it checks; a `main` run names the owning member of the prefix it checked — `request`, else the batch's
+    /// last landed request (the last member of the prefix that landed); a `mainAtBase` run names none. `candidateCommit`
+    /// defaults to the batch's `landCommit` (the candidate that landed). A flake re-run is a second row at `attempt: 2,
+    /// flaky: true` beside the failed first attempt (every passing re-run is recorded flaky).
     @discardableResult
     static func mergeRun(_ store: Store, company: Company, batch: MergeBatch, kind: MergeRun.Kind, request: MergeRequest? = nil,
                          candidateCommit: String? = nil, attempt: Int = 1, flaky: Bool = false, status: VerificationStatus = .passed,
                          finishedAt: Date) throws -> MergeRun {
-        let run = MergeRun(companyId: company.id, batchId: batch.id, requestId: request?.id, prefix: batch.requestIds.count,
-                           candidateCommit: candidateCommit ?? batch.landCommit, kind: kind, itemId: request?.itemId, command: "true",
+        var owner = request
+        if kind == .main, owner == nil, let last = batch.landedIds.last ?? batch.requestIds.last {
+            owner = try store.writer.read { db in try MergeRequest.fetchOne(db, key: last) }
+        }
+        let run = MergeRun(companyId: company.id, batchId: batch.id, requestId: kind == .mainAtBase ? nil : owner?.id,
+                           prefix: batch.requestIds.count, candidateCommit: candidateCommit ?? batch.landCommit, kind: kind,
+                           itemId: kind == .mainAtBase ? nil : owner?.itemId, command: "true",
                            status: status, attempt: attempt, flaky: flaky, exitCode: status == .passed ? 0 : 1,
                            startedAt: finishedAt.addingTimeInterval(-10), finishedAt: finishedAt)
         try store.writer.write { db in try run.insert(db) }
@@ -150,7 +157,9 @@ enum MeasureFixtures {
     }
 
     /// A request of `batch` that the bisection bounced (`Store.bounceMerge`): `status = bounced`, `failure`, `finishedAt` = the
-    /// bounce time, and the batch's `requestIds` grown by it (it is never in `landedIds`). The item is left as it was.
+    /// bounce time, and the batch's `requestIds` grown by it (it is never in `landedIds`). A request bounced for a failed check was
+    /// a checked candidate, so it joins `candidates` too (written at `rebased`); one bounced on a conflict never got a candidate.
+    /// The item is left as it was.
     @discardableResult
     static func bounce(_ store: Store, company: Company, batch: MergeBatch, item: WorkItem, number: Int,
                        failure: MergeFailure = .itemCheckFailed, enqueuedAt: Date, bouncedAt: Date) throws -> MergeRequest {
@@ -165,6 +174,7 @@ enum MeasureFixtures {
             try row.insert(db)
             guard var b = try MergeBatch.fetchOne(db, key: batch.id) else { throw FakeError(description: "no batch \(batch.id)") }
             b.requestIds.append(row.id)
+            if failure == .itemCheckFailed || failure == .mainCheckFailed { b.candidates[row.id] = String(repeating: "c", count: 40) }
             try b.update(db)
         }
         return r

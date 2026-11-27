@@ -2,8 +2,8 @@ import Foundation
 import GRDB
 
 /// The landing metrics of `brahma measure` (Plan X6a Task 3): green-main (`docs/measure/metrics.md` §1, ruling R17), first-pass (§7)
-/// and queue health (§8). Every landing comes from `Store.landings` (the one landing query, ruling R13/R20); every other query is
-/// `WHERE companyId = ?` with bound parameters. Nothing here estimates: a landing without the record a metric needs is excluded and
+/// and queue health (§8). Every landing comes from `Store.landings` (the one landing query, rulings R13/R20/R24), read in the same
+/// transaction as the runs and facts joined to it; every other query is `WHERE companyId = ?` with bound parameters. Nothing here estimates: a landing without the record a metric needs is excluded and
 /// counted in the basis, never scored.
 public enum LandingMetrics {
     // MARK: Green-main
@@ -19,9 +19,9 @@ public enum LandingMetrics {
     ///    (superseded, could not run) says nothing.
     /// A landing with neither a `main` nor an `item` run is excluded from the denominator and counted in the basis.
     public static func greenMain(_ ctx: MeasureContext) throws -> MetricValue {
-        let landings = try ctx.store.landings(companyId: ctx.companyId, in: ctx.window)
-        guard !landings.isEmpty else { return .notMeasured(.greenMain, reason: "no landings in the window") }
-        return try ctx.store.writer.read { db in
+        try ctx.store.writer.read { db in
+            let landings = try Store.landings(db, companyId: ctx.companyId, in: ctx.window)
+            guard !landings.isEmpty else { return .notMeasured(.greenMain, reason: "no landings in the window") }
             var green = 0, byMain = 0, byVerification = 0, unjudged = 0
             var detail: [MetricValue] = []
             for landing in landings {
@@ -39,7 +39,8 @@ public enum LandingMetrics {
                 if verdict.reasons.isEmpty {
                     green += 1
                 } else {
-                    detail.append(.count(.greenMain, label: "M-\(landing.number): \(verdict.reasons.joined(separator: "; "))", 0,
+                    // One row per non-green landing; its value is that one landing.
+                    detail.append(.count(.greenMain, label: "M-\(landing.number): \(verdict.reasons.joined(separator: "; "))", 1,
                                          basis: "not green; landed \(landing.landCommit.prefix(7)) at \(MeasureReport.iso(landing.finishedAt))"))
                 }
             }
@@ -49,12 +50,12 @@ public enum LandingMetrics {
                                     basis: "landings in the window (\(landings.count)); a landing is judged by its main check run, else by "
                                         + "its item check runs at the land commit")
             }
-            var source: String
+            let source: String
             switch (byMain, byVerification) {
             case (_, 0): source = "main check runs"
             case (0, _):
-                source = (ctx.company.mainCheck == nil ? "no main check configured" : "no main check run recorded")
-                    + "; verification runs (item checks at the land commit)"
+                // Whether a main check is configured now says nothing about when these batches ran; the runs are the record.
+                source = "no main check run recorded; verification runs (item checks at the land commit)"
             default: source = "main check runs for \(byMain), verification runs (item checks at the land commit) for \(byVerification)"
             }
             var basis = "landings in the window judged by \(source) (\(judged)); a failed merge smoke of the land commit counts against"
@@ -122,11 +123,11 @@ public enum LandingMetrics {
     /// `itemFact.firstPass` over the landed items in the window that have a fact row (metrics.md §7). Items without one are excluded
     /// and counted in the basis; the detail shows the check failures and review rejections the facts recorded.
     public static func firstPass(_ ctx: MeasureContext) throws -> MetricValue {
-        let landings = try ctx.store.landings(companyId: ctx.companyId, in: ctx.window)
-        guard !landings.isEmpty else { return .notMeasured(.firstPass, reason: "no landings in the window") }
-        var seen = Set<String>()
-        let itemIds = landings.flatMap(\.items).map(\.itemId).filter { seen.insert($0).inserted }
-        return try ctx.store.writer.read { db in
+        try ctx.store.writer.read { db in
+            let landings = try Store.landings(db, companyId: ctx.companyId, in: ctx.window)
+            guard !landings.isEmpty else { return .notMeasured(.firstPass, reason: "no landings in the window") }
+            var seen = Set<String>()
+            let itemIds = landings.flatMap(\.items).map(\.itemId).filter { seen.insert($0).inserted }
             var facts = 0, passed = 0, failedRuns = 0, rejections = 0
             for chunk in chunks(itemIds) {
                 let marks = chunk.map { _ in "?" }.joined(separator: ", ")
@@ -163,14 +164,15 @@ public enum LandingMetrics {
     /// `activeSeconds` counter is daily, so no record gives one request's company-active seconds, and none is estimated. Then bisect
     /// isolations and the flake rate over `mergeRun` and `verificationRun`.
     public static func queueHealth(_ ctx: MeasureContext) throws -> MetricValue {
-        let landings = try ctx.store.landings(companyId: ctx.companyId, in: ctx.window)
-        let landed = landings.flatMap { landing in landing.items.map { (item: $0, landedAt: $0.landedAt) } }
-        return try ctx.store.writer.read { db in
+        try ctx.store.writer.read { db in
+            let landings = try Store.landings(db, companyId: ctx.companyId, in: ctx.window)
+            let landed = landings.flatMap { landing in landing.items.map { (item: $0, landedAt: $0.landedAt) } }
             var detail = try durations(db, ctx: ctx, landed: landed)
             detail.append(try bisectIsolations(db, ctx: ctx))
             detail.append(try flakeRate(db, ctx: ctx))
             return .count(.queueHealth, Double(landed.count),
-                          basis: "merged requests whose landing (batch finishedAt, else updatedAt) is in the window, from \(plural(landings.count, "landing"))",
+                          basis: "merged requests of the landings whose batch finishedAt (else updatedAt) is in the window, from "
+                              + "\(plural(landings.count, "landing")); the durations end at each request's finishedAt (else the batch's)",
                           detail: detail)
         }
     }
@@ -209,8 +211,10 @@ public enum LandingMetrics {
         ]
     }
 
-    /// Requests the bisection bounced for a failed item or main check out of a batch of two or more, by bounce time (metrics.md §8;
-    /// a request bounced alone, or for a conflict or a secret, is not an isolation).
+    /// Requests the bisection bounced for a failed item or main check out of a batch of two or more checked candidates, by bounce
+    /// time (metrics.md §8). The size is `mergeBatch.candidates` (the members that rebased and were checked, written at `rebased`),
+    /// not `requestIds`, which also holds requests bounced on a conflict before any check. A request bounced from a batch of one
+    /// checked candidate, or for a conflict or a secret, is not an isolation.
     static func bisectIsolations(_ db: Database, ctx: MeasureContext) throws -> MetricValue {
         let bounced = try Row.fetchAll(db, sql: """
             SELECT id, batchId FROM mergeRequest
@@ -223,15 +227,15 @@ public enum LandingMetrics {
             let marks = chunk.map { _ in "?" }.joined(separator: ", ")
             for b in try MergeBatch.fetchAll(db, sql: "SELECT * FROM mergeBatch WHERE companyId = ? AND id IN (\(marks))",
                                              arguments: StatementArguments([ctx.companyId]) + StatementArguments(chunk)) {
-                sizes[b.id] = b.requestIds.count
+                sizes[b.id] = b.candidates.count
             }
         }
         var isolated = 0, alone = 0
         for row in bounced {
             if (sizes[row["batchId"] as String] ?? 0) >= 2 { isolated += 1 } else { alone += 1 }
         }
-        var basis = "requests bounced for a failed item or main check from a batch of ≥ 2 requests, by bounce time"
-        if alone > 0 { basis += "; \(alone) bounced from a batch of one (not an isolation)" }
+        var basis = "requests bounced for a failed item or main check from a batch of ≥ 2 checked candidates, by bounce time"
+        if alone > 0 { basis += "; \(alone) bounced from a batch of one checked candidate (not an isolation)" }
         return .count(.queueHealth, label: "bisect isolations", Double(isolated), basis: basis)
     }
 

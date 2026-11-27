@@ -116,7 +116,11 @@ window-filtered query). Writes: `advanceBatch(id:to:base:candidates:landCommit:l
 **Landing, as the tree records it (refines the brief):** a landing is a `mergeBatch` row with `landCommit` set **and `step` in
 (`landed`, `recorded`, `cleaned`, `done`)** — `landCommit` alone is written one step before `main` moves. A batch at `landing`
 with `landCommit` set is a landing only if git confirms `landCommit` is an ancestor of `main` (what `repairUnrecordedLandings`
-checks). Landed items = `mergeRequest.itemId` for each id in `landedIds`. Landing time (Task 0 proposal for Task 3): the
+checks). Landed items = `mergeRequest.itemId` for each id in `landedIds` **whose request is `merged` with `batchId` = that batch**,
+and a batch with no such request is not a landing (ruling R24: the abort paths after `checked` — stopped, main moved, blocked, off
+main, a git error, recovery abandoning the batch — finish the batch to `done` keeping `landCommit`/`landedIds` and requeue the
+requests with the same ids; `mergeBatch.error IS NULL` is no filter, since an inconclusive result sets it after a real landing).
+Landing time (Task 0 proposal for Task 3): the
 landed requests' `mergeRequest.finishedAt` (all set to the same `now` in `recordLanded`, `Store+MergeQueue.swift:320`), falling
 back to `mergeBatch.updatedAt`.
 
@@ -658,7 +662,7 @@ ancestry/environment check is the "refuses inside an agent turn" the plan asks f
 |---|---|---|
 | `reviewAudit.verdict = 'fail'` | the stored values are `ok` / `failed` (`Store+Audit.swift:488`) | Task 4 uses `'failed'` |
 | `mergeBatch.landedIds` as item ids | they are `mergeRequest.id`s; item = `mergeRequest.itemId` (`MergeQueue.swift:537`) | Tasks 2–4, 6 join through `mergeRequest` |
-| "landing = `landCommit` set" | `landCommit` is written at step `checked`, before `main` moves | Task 3: require `step` ≥ `landed` (or git confirmation at `landing`) |
+| "landing = `landCommit` set" | `landCommit` is written at step `checked`, before `main` moves; post-`checked` aborts finish to `done` keeping it | Task 3: require `step` ≥ `landed` (or git confirmation at `landing`) and, per R24, a `landedIds` request `merged` with `batchId` = the batch |
 | per-item base commit for a batch | `mergeRequest.baseCommit` is the batch base for every member | Tasks 3–4: base = `<mergedCommit>^1` / previous candidate |
 | company-active seconds **in a window** | `companyActivity` is a running total | Task 2 schema + Task 5 recorder: daily `activeSeconds` counter |
 | reserve breach / cap overrun records | none (`usageState` is one overwritten row; no cap record) | Task 5 recorder `reserveBreaches`; cap overruns are `not applicable: no cap-overrun record` (no source exists) |

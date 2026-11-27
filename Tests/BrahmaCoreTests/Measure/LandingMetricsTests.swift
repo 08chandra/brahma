@@ -41,24 +41,27 @@ import Testing
 
     // MARK: green-main
 
-    /// A main run that passed only on its second attempt is not green: the first attempt is the one that counts.
+    /// The first attempt is the one that counts. A main run that failed and passed its re-run (which `MergeQueue` always records
+    /// flagged flaky) is not green, and neither is one that failed both attempts. Each non-green row counts its one landing.
     @Test func greenMainCountsFirstAttemptOnly() throws {
         let store = try Store.inMemory()
         let acme = try MeasureFixtures.company(store, name: "Acme")
         try MeasureFixtures.setMainCheck(store, company: acme)
         let rows = try landings(store, acme, count: 20)
-        try mainPasses(store, acme, rows, except: [20])
-        let late = rows[19]
-        let t = late.batch.finishedAt ?? now
-        try MeasureFixtures.mergeRun(store, company: acme, batch: late.batch, kind: .main, attempt: 1, status: .failed, finishedAt: t.addingTimeInterval(-60))
-        try MeasureFixtures.mergeRun(store, company: acme, batch: late.batch, kind: .main, attempt: 2, status: .passed, finishedAt: t)
+        try mainPasses(store, acme, rows, except: [19, 20])
+        for (row, second) in [(rows[18], VerificationStatus.failed), (rows[19], .passed)] {
+            let t = row.batch.finishedAt ?? now
+            try MeasureFixtures.mergeRun(store, company: acme, batch: row.batch, kind: .main, attempt: 1, status: .failed, finishedAt: t.addingTimeInterval(-60))
+            try MeasureFixtures.mergeRun(store, company: acme, batch: row.batch, kind: .main, attempt: 2, flaky: second == .passed, status: second, finishedAt: t)
+        }
 
         let m = try LandingMetrics.greenMain(context(store, acme))
         #expect(m.id == .greenMain && m.unit == .ratio)
         #expect(m.status == .ok)
-        #expect(m.numerator == 19 && m.denominator == 20)
-        #expect(m.display == "95.0% (19/20)")
-        #expect(detailLabels(m) == ["M-20: main run passed on attempt 2"], "\(detailLabels(m))")
+        #expect(m.numerator == 18 && m.denominator == 20)
+        #expect(m.display == "90.0% (18/20)")
+        #expect(detailLabels(m) == ["M-19: main run failed", "M-20: main run flaky (passed on attempt 2)"], "\(detailLabels(m))")
+        #expect(m.detail.allSatisfy { $0.numerator == 1 && $0.display == "1" }, "\(m.detail.map(\.display))")
         #expect(m.basis.contains("main check runs"), "\(m.basis)")
     }
 
@@ -140,10 +143,34 @@ import Testing
         let m = try LandingMetrics.greenMain(context(store, acme))
         #expect(m.status == .ok)
         #expect(m.numerator == 19 && m.denominator == 20, "\(m.display)")
-        #expect(m.basis.contains("no main check configured; verification runs"), "\(m.basis)")
+        #expect(m.basis.contains("no main check run recorded; verification runs"), "\(m.basis)")
         #expect(m.basis.contains("2 landings with no check run excluded"), "\(m.basis)")
         let labels = detailLabels(m)
         #expect(labels.count == 1 && labels[0].hasPrefix("M-11: ") && labels[0].contains("flaky"), "\(labels)")
+    }
+
+    /// A bisected batch: the whole-batch candidate failed both attempts, the prefix that landed passed first time. The landing is
+    /// judged only by the runs at its land commit (`candidateCommit = landCommit`), for main runs and for the item-run fallback.
+    @Test func bisectedBatchJudgedAtLandCommit() throws {
+        let other = String(repeating: "e", count: 40)
+        for kind in [MergeRun.Kind.main, .item] {
+            let store = try Store.inMemory()
+            let acme = try MeasureFixtures.company(store, name: "Acme")
+            if kind == .main { try MeasureFixtures.setMainCheck(store, company: acme) }
+            let row = try landings(store, acme, count: 1)[0]
+            let t = row.batch.finishedAt ?? now
+            let request: MergeRequest? = kind == .item ? row.request : nil
+            try MeasureFixtures.mergeRun(store, company: acme, batch: row.batch, kind: kind, request: request, candidateCommit: other,
+                                         attempt: 1, status: .failed, finishedAt: t.addingTimeInterval(-300))
+            try MeasureFixtures.mergeRun(store, company: acme, batch: row.batch, kind: kind, request: request, candidateCommit: other,
+                                         attempt: 2, status: .failed, finishedAt: t.addingTimeInterval(-240))
+            try MeasureFixtures.mergeRun(store, company: acme, batch: row.batch, kind: kind, request: request, attempt: 1, status: .passed,
+                                         finishedAt: t.addingTimeInterval(-60))
+
+            let m = try LandingMetrics.greenMain(context(store, acme))
+            #expect(m.numerator == 1 && m.denominator == 1, "\(kind): \(m.display)")
+            #expect(m.detail.isEmpty, "\(kind): \(detailLabels(m))")
+        }
     }
 
     /// Fewer than 20 landings: the count is shown as insufficient, never a percentage. No landings: not measured.
@@ -203,6 +230,7 @@ import Testing
         let m = try LandingMetrics.queueHealth(context(store, acme))
         #expect(m.id == .queueHealth && m.unit == .count && m.status == .ok)
         #expect(m.numerator == 41, "merged requests in the window")
+        #expect(m.basis.contains("batch finishedAt") && m.basis.contains("request's finishedAt"), "\(m.basis)")
         let median = m.detail.first { $0.label.contains("median") }
         let p95 = m.detail.first { $0.label.contains("p95") }
         #expect(median?.unit == .seconds && median?.numerator == 20.5, "\(String(describing: median))")
@@ -241,6 +269,48 @@ import Testing
         let isolations = m.detail.first { $0.label == "bisect isolations" }
         #expect(isolations?.unit == .count && isolations?.status == .ok)
         #expect(isolations?.numerator == 2, "\(String(describing: isolations))")
+    }
+
+    /// Ruling R24: a request requeued from a batch that reached `checked` and was abandoned (`done`, landCommit and landedIds kept)
+    /// and later merged by another batch is one merged request, from one landing.
+    @Test func requeuedRequestCountsOnce() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme")
+        let row = try landings(store, acme, count: 1)[0]
+        var abandoned = row.batch
+        abandoned.id = UUID().uuidString
+        abandoned.number = 99
+        abandoned.landCommit = String(repeating: "d", count: 40)
+        abandoned.finishedAt = (row.batch.finishedAt ?? now).addingTimeInterval(-1800)
+        abandoned.updatedAt = abandoned.finishedAt ?? now
+        let abandonedRow = abandoned
+        try store.writer.write { db in try abandonedRow.insert(db) }
+        #expect(abandoned.landedIds == [row.request.id])
+
+        let m = try LandingMetrics.queueHealth(context(store, acme))
+        #expect(m.numerator == 1, "\(m.display)")
+        #expect(m.basis.contains("from 1 landing"), "\(m.basis)")
+        #expect(try store.landings(companyId: acme.id, in: window).map(\.number) == [1])
+    }
+
+    /// The batch size of a bisection is its checked candidates, not every request it took: a request that bounced on a conflict
+    /// was never checked. A two-request batch with one conflict bounce and one item-check bounce isolated nothing.
+    @Test func bisectSizedByCheckedCandidates() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme")
+        let items = try MeasureFixtures.items(store, company: acme, count: 2, now: now.addingTimeInterval(-10 * 86_400))
+        let t = now.addingTimeInterval(-2 * 86_400)
+        var batch = MergeBatch(companyId: acme.id, number: 1, step: .done, requestIds: [], startedAt: t)
+        batch.updatedAt = t; batch.finishedAt = t
+        let batchRow = batch
+        try store.writer.write { db in try batchRow.insert(db) }
+        try MeasureFixtures.bounce(store, company: acme, batch: batch, item: items[0], number: 1, failure: .conflict, enqueuedAt: t.addingTimeInterval(-600), bouncedAt: t)
+        try MeasureFixtures.bounce(store, company: acme, batch: batch, item: items[1], number: 2, failure: .itemCheckFailed, enqueuedAt: t.addingTimeInterval(-600), bouncedAt: t)
+
+        let m = try LandingMetrics.queueHealth(context(store, acme))
+        let isolations = m.detail.first { $0.label == "bisect isolations" }
+        #expect(isolations?.numerator == 0, "\(String(describing: isolations))")
+        #expect(isolations?.basis.contains("1 bounced from a batch of one checked candidate") == true, "\(isolations?.basis ?? "nil")")
     }
 
     /// Flaky ÷ finished runs over both tables: `mergeRun` (`main`, `item`; never `mainAtBase`) and `verificationRun`; `inconclusive`
