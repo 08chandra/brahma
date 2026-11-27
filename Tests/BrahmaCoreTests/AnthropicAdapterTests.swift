@@ -237,6 +237,52 @@ import Foundation
         }
     }
 
+    /// Ruling 49 m2: at most `maxSteps` values and keys (a 32 MiB `[0,0,…]` would be 16M nodes); a realistic large request —
+    /// the fixture plus a 30 MiB base64 image — is far below it.
+    @Test func strictJSONCapsTotalValues() throws {
+        let tooMany = "[" + Array(repeating: "0", count: StrictJSON.maxSteps).joined(separator: ",") + "]"
+        #expect(throws: StrictJSON.Failure.tooManyValues) { try StrictJSON.parse(Data(tooMany.utf8)) }
+        do {
+            _ = try CanonicalRequest.tree(Data(tooMany.utf8))
+            Issue.record("refused")
+        } catch {
+            #expect(error.status == 400 && error.message == "Brahma: the request body holds more than \(StrictJSON.maxSteps) values")
+        }
+        let fixture = try AnthropicFixture.text("request-claude", "json").trimmingCharacters(in: .newlines)
+        let image = #"{"type":"image","source":{"type":"base64","media_type":"image/png","data":""# + String(repeating: "A", count: 30 << 20) + #""}}"#
+        let large = fixture.replacingOccurrences(of: #"{"type":"text","text":"Read hello.txt","cache_control":{"type":"ephemeral"}}"#,
+                                                 with: image)
+        #expect(large.utf8.count > 30 << 20)
+        var work = StrictJSON.Work()
+        _ = try StrictJSON.parse(Data(large.utf8), work: &work)
+        #expect(work.steps < 1000)
+    }
+
+    /// Ruling 49 m1: a leading U+FEFF in a string or key is kept, raw or escaped.
+    @Test func strictJSONKeepsALeadingByteOrderMark() throws {
+        let tree = try StrictJSON.parse(Data("{\"\u{FEFF}k\":\"\u{FEFF}x\",\"e\":\"\\ufeffy\"}".utf8))
+        #expect(tree.members?.first?.key == "\u{FEFF}k")
+        #expect(tree["\u{FEFF}k"] == .string("\u{FEFF}x"))
+        #expect(tree["e"] == .string("\u{FEFF}y"))
+        #expect(try StrictJSON.parse(tree.serialized()) == tree)
+    }
+
+    /// Ruling 49 m6: a non-streamed response whose task is cancelled mid-body is never relayed (no truncated 200).
+    @Test func cancelledNonStreamedResponseIsNotRelayed() async throws {
+        let rig = try ReplyRig()
+        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        continuation.yield(Data(#"{"type":"message","content":[{"type":"text","text":"par"#.utf8))
+        let reply = rig.reply
+        let task = Task {
+            try await AnthropicAdapter().translate(status: 200, headers: ["content-type": "application/json"], body: stream,
+                                                   streamed: false, into: reply, redact: { $0 })
+        }
+        task.cancel()
+        #expect(try await task.value == nil)
+        rig.finish()
+        await #expect(throws: TestPeerError.eof) { try await rig.peer.readHead() }
+    }
+
     // MARK: Responses
 
     /// The stream reaches the client unchanged (events split across upstream chunks are re-joined into whole events) while the

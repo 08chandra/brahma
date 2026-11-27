@@ -32,6 +32,10 @@ public indirect enum StrictJSON: Equatable, Sendable {
     public static let maxDepth = 64
     /// The longest path a refusal shows; a longer one keeps its end, after an ellipsis.
     public static let maxPathLength = 256
+    /// The most values and keys one body may hold (Ruling 49 m2). Each becomes a node, so a 32 MiB `[0,0,…]` (16M values)
+    /// would cost about a gigabyte per connection; a real `claude` request — a long conversation, a dozen tool schemas,
+    /// base64 images (one string each) — holds tens of thousands at most.
+    public static let maxSteps = 2_000_000
 
     /// How much work a parse did (Ruling 47's deterministic seam: a test proves growth is linear by counting, not timing).
     struct Work: Equatable {
@@ -45,6 +49,8 @@ public indirect enum StrictJSON: Equatable, Sendable {
     public enum Failure: Error, Equatable, Sendable {
         case malformed
         case tooDeep
+        /// More than `maxSteps` values and keys.
+        case tooManyValues
         case duplicateKey(path: String)
     }
 
@@ -132,6 +138,7 @@ public indirect enum StrictJSON: Equatable, Sendable {
         /// The value at `i`; `depth` is the number of containers it is inside.
         mutating func value(depth: Int) throws(Failure) -> StrictJSON {
             work.steps += 1
+            guard work.steps <= StrictJSON.maxSteps else { throw .tooManyValues }
             guard i < bytes.count else { throw .malformed }
             switch bytes[i] {
             case UInt8(ascii: "{"):
@@ -157,6 +164,7 @@ public indirect enum StrictJSON: Equatable, Sendable {
             while true {
                 guard i < bytes.count, bytes[i] == UInt8(ascii: "\"") else { throw .malformed }
                 work.steps += 1
+                guard work.steps <= StrictJSON.maxSteps else { throw .tooManyValues }
                 let key = try string()
                 path.append(.key(key))
                 guard seen.insert(key).inserted else { throw .duplicateKey(path: renderedPath()) }
@@ -256,8 +264,9 @@ public indirect enum StrictJSON: Equatable, Sendable {
                     throw .malformed
                 }
             }
-            guard let s = String(bytes: out, encoding: .utf8) else { throw .malformed }
-            return s
+            // Validate, then decode without `String(bytes:encoding:)`, which drops a leading U+FEFF (the value must be kept).
+            guard String(bytes: out, encoding: .utf8) != nil else { throw .malformed }
+            return String(decoding: out, as: UTF8.self)
         }
 
         mutating func hex4() throws(Failure) -> UInt32 {

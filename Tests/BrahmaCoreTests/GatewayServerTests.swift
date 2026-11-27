@@ -293,6 +293,14 @@ struct GatewayHarness {
     let handler: RecordingHandler
     let server: GatewayServer
     let beforeDispatch = Hook()
+    /// How many times a connection started waiting for a head: `first` (a fresh connection's first byte), `idle` (keep-alive).
+    final class HeadWaits: @unchecked Sendable {
+        private let lock = NSLock()
+        private var first = 0, idle = 0
+        func record(_ isFirst: Bool) { lock.withLock { if isFirst { first += 1 } else { idle += 1 } } }
+        var counts: (first: Int, idle: Int) { lock.withLock { (first, idle) } }
+    }
+    let headWaits = HeadWaits()
 
     init(timing: GatewayTiming = .pinned, _ behaviour: RecordingHandler.Behaviour? = nil) {
         clock = ManualAwakeClock()
@@ -300,7 +308,7 @@ struct GatewayHarness {
         if let behaviour { handler = RecordingHandler(behaviour) } else { handler = RecordingHandler() }
         let hook = beforeDispatch
         server = GatewayServer(registry: registry, handler: handler, timing: timing, clock: serverClock,
-                               beforeDispatch: { hook.action?($0) })
+                               beforeDispatch: { hook.action?($0) }, awaitingHead: { [headWaits] in headWaits.record($0) })
     }
 
     /// Advances the server clock by `step` until `done` (at most `steps` times): the server computes a deadline when its
@@ -681,22 +689,25 @@ func rawRequest(method: String = "POST", target: String = "/t/v1/messages?beta=t
         let token = h.mint().value
         do {
             let (peer, served) = h.connect()
-            // While the server clock stands still nothing times out, however long a loaded machine takes...
-            #expect(await peer.staysQuiet(milliseconds: 300))
-            // ...and once 5 s have passed on it with no byte, the connection is closed.
-            #expect(await h.advanceServerClock(by: .seconds(6)) { await peer.seesEOF(within: 1) })
+            // The server reports when the connection waits for its first byte (its deadline is set from then).
+            #expect(await eventually { h.headWaits.counts.first == 1 })
+            h.serverClock.advance(by: .seconds(4))
+            #expect(await peer.staysQuiet(milliseconds: 600), "4 s is inside the 5 s first-byte bound")
+            h.serverClock.advance(by: .seconds(2))
+            #expect(await peer.seesEOF(), "6 s is past it")
             await served.value
         }
         do {
             let (peer, served) = h.connect()
+            #expect(await eventually { h.headWaits.counts.first == 2 })
             await peer.write(rawRequest(token: token))
             #expect(try await peer.readResponse().status == 200)
-            // Between keep-alive requests the first-byte bound no longer applies: 6 s idle is fine...
-            h.serverClock.advance(by: .seconds(6))
-            await peer.write(rawRequest(token: token))
-            #expect(try await peer.readResponse().status == 200)
-            // ...and past the 60 s idle bound the connection is closed.
-            #expect(await h.advanceServerClock(by: .seconds(61)) { await peer.seesEOF(within: 1) })
+            // Between keep-alive requests the 60 s idle bound applies, not the 5 s first-byte bound.
+            #expect(await eventually { h.headWaits.counts.idle == 1 })
+            h.serverClock.advance(by: .seconds(59))
+            #expect(await peer.staysQuiet(milliseconds: 600), "59 s idle is inside the 60 s bound")
+            h.serverClock.advance(by: .seconds(2))
+            #expect(await peer.seesEOF(), "61 s is past it")
             await served.value
         }
     }

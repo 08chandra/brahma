@@ -12,7 +12,9 @@ public struct AdapterId: RawRepresentable, Hashable, Codable, Sendable {
 /// Why the gateway did not serve a request, in the shape it answers with (the Anthropic error body). Messages never hold a key:
 /// upstream text is redacted with the key's value before it becomes one.
 public enum GatewayError: Error, Equatable, Sendable {
-    /// The gateway cannot serve the request now (no key, no provider, no transport): HTTP 503. `reason` has no `Brahma:` prefix.
+    /// The gateway cannot serve the request now (no key, no provider, no adapter, no transport, cancelled): HTTP 400
+    /// `invalid_request_error`, "Brahma: unavailable: <reason>" (Ruling 48: `claude` retries anything but a 400 for minutes,
+    /// while a 400 ends the turn at once). `reason` has no prefix.
     case unavailable(String)
     /// A policy refusal (Ruling 19: status 400 `invalid_request_error`, message `Brahma: <reason>`), or a cap (Task 9).
     case refused(status: Int, type: String, message: String)
@@ -21,14 +23,14 @@ public enum GatewayError: Error, Equatable, Sendable {
 
     public var status: Int {
         switch self {
-        case .unavailable: 503
+        case .unavailable: GatewayRefusal.status
         case .refused(let status, _, _), .upstream(let status, _): status
         }
     }
 
     public var type: String {
         switch self {
-        case .unavailable: "api_error"
+        case .unavailable: GatewayRefusal.type
         case .refused(_, let type, _): type
         case .upstream(let status, _): Self.errorType(status: status)
         }
@@ -36,7 +38,7 @@ public enum GatewayError: Error, Equatable, Sendable {
 
     public var message: String {
         switch self {
-        case .unavailable(let reason): "Brahma: " + reason
+        case .unavailable(let reason): "Brahma: unavailable: " + reason
         case .refused(_, _, let message), .upstream(_, let message): message
         }
     }

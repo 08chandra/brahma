@@ -132,22 +132,51 @@ import Foundation
         #expect(rig.upstream.requests.count == 1)
     }
 
-    /// An image or document the provider would download from a URL is refused (in a message or a tool result); inline
-    /// sources, and a tool call whose arguments merely mention a URL source, pass.
-    @Test func urlSourcesRefused() async throws {
+    /// Content sources are an allowlist (base64, text, content): a URL the provider would fetch, a Files-API `file` it would
+    /// read from the provider organization, or an unknown type are refused wherever a source appears — a message image or
+    /// document, a system block, a document nested in a tool result. Inline sources pass, and so does a tool call whose
+    /// arguments merely mention a source.
+    @Test func contentSourcesAllowlisted() async throws {
         let rig = try ModelGatewayRig([Self.ok])
         let token = rig.grant()
-        let image = #"{"type":"image","source":{"type":"url","url":"https://x.example/a.png?d=secret"}}"#
-        let document = #"{"type":"document","source":{"type":"url","url":"https://x.example/a.pdf"}}"#
-        for content in ["[\(image)]", "[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":[\(document)]}]"] {
-            let body = #"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":\#(content)}]}"#
-            Self.expectForbidden(try await rig.exchange(body, token: token), "a URL source would let the provider fetch the network")
+        for source in [#"{"type":"url","url":"https://x.example/a.png?d=secret"}"#, #"{"type":"file","file_id":"file_011CNha8iCJcU1wXNR6q4V8w"}"#,
+                       #"{"type":"s3","bucket":"b"}"#, #"{"url":"https://x.example"}"#] {
+            let image = #"{"type":"image","source":\#(source)}"#
+            let document = #"{"type":"document","source":\#(source)}"#
+            let nested = #"[{"type":"tool_result","tool_use_id":"t","content":[\#(document)]}]"#
+            let content = #"{"type":"document","source":{"type":"content","content":[\#(image)]}}"#
+            for blocks in ["[\(image)]", "[\(document)]", nested, "[\(content)]"] {
+                let body = #"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":\#(blocks)}]}"#
+                Self.expectForbidden(try await rig.exchange(body, token: token), "is not allowed; send the content inline")
+            }
+            let system = #"{"model":"claude-opus-5-5","max_tokens":16,"system":[\#(document)],"messages":[]}"#
+            Self.expectForbidden(try await rig.exchange(system, token: token), "content source")
         }
-        let system = #"{"model":"claude-opus-5-5","max_tokens":16,"system":[\#(document)],"messages":[]}"#
-        Self.expectForbidden(try await rig.exchange(system, token: token), "a URL source")
         #expect(rig.upstream.requests.isEmpty)
-        let inline = #"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO"}}]},{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Fetch","input":{"source":{"type":"url","url":"https://x.example"}}}]}]}"#
-        #expect(try await rig.exchange(inline, token: token).status == 200)
+        let inline = #"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO"}},{"type":"document","source":{"type":"text","media_type":"text/plain","data":"hi"}},{"type":"document","source":{"type":"content","content":[{"type":"text","text":"hi"}]}}]},{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Fetch","input":{"source":{"type":"url","url":"https://x.example"}}}]}]}"#
+        let ok = try await rig.exchange(inline, token: token)
+        #expect(ok.status == 200, "\(ok.text)")
+    }
+
+    /// Ruling 49 m3: a server-tool type or an inline tool definition anywhere in `system` or `messages` is refused, not only
+    /// in `tools`; the history blocks of a server tool already used (`server_tool_use`, `web_search_tool_result`) are not tools.
+    @Test func serverToolsRefusedAnywhere() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let token = rig.grant()
+        let blocks = [
+            #"{"type":"web_fetch_20260209","name":"web_fetch"}"#, #"{"type":"code_execution_20260521","name":"code_execution"}"#,
+            #"{"type":"mcp_toolset","mcp_server_name":"x"}"#, #"{"type":"tool_definition","tool":{"name":"x"}}"#,
+            #"{"name":"Grep","input_schema":{"type":"object"}}"#,
+        ]
+        for block in blocks {
+            let inMessages = #"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":[{"type":"text","text":"hi"},\#(block)]}]}"#
+            Self.expectForbidden(try await rig.exchange(inMessages, token: token), "not allowed")
+            let inSystem = #"{"model":"claude-opus-5-5","max_tokens":16,"system":[\#(block)],"messages":[]}"#
+            Self.expectForbidden(try await rig.exchange(inSystem, token: token), "not allowed")
+        }
+        #expect(rig.upstream.requests.isEmpty)
+        let history = #"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"assistant","content":[{"type":"server_tool_use","id":"s","name":"web_search","input":{"query":"q"}},{"type":"web_search_tool_result","tool_use_id":"s","content":[]}]}]}"#
+        #expect(try await rig.exchange(history, token: token).status == 200)
     }
 
     /// Ruling X1-34 (2): an unknown top-level key or beta is refused before anything goes upstream (it may carry a pricing
@@ -231,23 +260,24 @@ import Foundation
         #expect(rig.upstream.requests.isEmpty)
     }
 
-    /// No key in the vault: a 503 naming the secret (never its value), and nothing is sent upstream.
+    /// No key in the vault: Ruling 48's 400 "Brahma: unavailable: …" naming the secret (never its value) — a 400 ends the
+    /// turn at once where `claude` would retry a 503 for minutes — and nothing is sent upstream.
     @Test func missingKeyIsUnavailable() async throws {
         let rig = try ModelGatewayRig([Self.ok], storeKey: false)
         let response = try await rig.exchange(Self.body("claude-opus-5-5"), token: rig.grant())
-        #expect(response.status == 503)
-        #expect(response.text.contains(Provider.anthropicKeyName), "\(response.text)")
+        #expect(response.status == 400 && response.errorType == "invalid_request_error")
+        #expect(response.text.contains("Brahma: unavailable: no provider key: set \(Provider.anthropicKeyName)"), "\(response.text)")
         #expect(rig.upstream.requests.isEmpty)
         // A provider without a key secret, a missing provider, a LAN provider and an unknown adapter are unavailable too.
         for provider in [AnthropicFixture.provider(keySecret: nil), AnthropicFixture.provider(lan: true),
                          AnthropicFixture.provider(adapter: "openai-compatible"), AnthropicFixture.provider(keySecret: "OPENAI_API_KEY")] {
             let rig = try ModelGatewayRig([Self.ok], providers: [provider])
             let r = try await rig.exchange(Self.body("claude-opus-5-5"), token: rig.grant())
-            #expect(r.status == 503, "\(provider): \(r.text)")
+            #expect(r.status == 400 && r.text.contains("Brahma: unavailable: "), "\(provider): \(r.text)")
             #expect(rig.upstream.requests.isEmpty)
         }
         let none = try ModelGatewayRig([Self.ok], providers: [])
-        #expect(try await none.exchange(Self.body("claude-opus-5-5"), token: none.grant()).status == 503)
+        #expect(try await none.exchange(Self.body("claude-opus-5-5"), token: none.grant()).text.contains("Brahma: unavailable: provider anthropic is not configured"))
     }
 
     /// A transport failure, an upstream that answers with a redirect, or a broken body are errors the client sees — never an
@@ -259,7 +289,12 @@ import Foundation
                        .respond(status: 200, headers: ["content-type": "application/json"], chunks: [], hold: false)] {
             let rig = try ModelGatewayRig([script])
             let response = try await rig.exchange(Self.body("claude-opus-5-5"), token: rig.grant())
-            #expect(response.status >= 500, "\(script): \(response.status) \(response.text)")
+            // Ruling 48: unavailable is a 400 (the turn ends at once); a failed or misbehaving provider is a 502.
+            if case .fail(.unavailable) = script {
+                #expect(response.status == 400 && response.text.contains("Brahma: unavailable: "), "\(response.text)")
+            } else {
+                #expect(response.status == 502, "\(script): \(response.status) \(response.text)")
+            }
             #expect(response.errorType != nil, "\(response.text)")
             #expect(rig.upstream.requests.count == 1)
         }

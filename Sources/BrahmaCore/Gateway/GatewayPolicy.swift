@@ -8,8 +8,11 @@ import Foundation
 ///   searches or runs code on the turn's behalf would bypass it (and give a tainted session an exfiltration path). So
 ///   `mcp_servers` is refused, every tool whose `type` is present and not `custom` (a server tool: web fetch / search, code
 ///   execution, computer use, tool search, any versioned `*_20xx…` type) is refused unless the turn's grant lists that exact
-///   type in `serverTools` (empty in X1; `TurnTokenRegistry.markTainted` clears it), and a content block whose `source` is a
-///   URL (an image or document the provider would download) is refused.
+///   type in `serverTools` (empty in X1; `TurnTokenRegistry.markTainted` clears it). The same holds anywhere in `system` and
+///   `messages` (Ruling 49 m3): a server-tool `type` there is refused, and so is any inline tool definition. Content sources
+///   are an allowlist too: `base64`, `text`, and `content` (whose blocks are checked in turn); any other `source` — a URL the
+///   provider would download, a Files-API `file` it would read from the provider organization under the engine's key, or
+///   a type added later — is refused, wherever an image, a document or a tool result can carry one.
 /// - **Only what the price book meters.** Top-level body keys outside `bodyKeys` are refused (a new key may carry a pricing
 ///   modifier the meter does not model, Ruling 39), and so is every `anthropic-beta` value outside `betas`.
 ///
@@ -73,8 +76,8 @@ public enum GatewayPolicy {
                 throw forbidden("server tool \(shown(name)) would let the provider reach the network; it is not allowed")
             }
         }
-        for key in ["system", "messages"] where top[key].map(hasURLSource) == true {
-            throw forbidden("a URL source would let the provider fetch the network; send the content instead")
+        for key in ["system", "messages"] {
+            if let content = top[key] { try checkContent(content, grant: grant) }
         }
         let betas = headers.filter { $0.name == "anthropic-beta" }
         guard betas.count <= 1 else { throw forbidden("send at most one anthropic-beta header") }
@@ -86,18 +89,48 @@ public enum GatewayPolicy {
         }
     }
 
-    /// Whether any object under `value` is a content `source` of type `url`.
-    static func hasURLSource(_ value: StrictJSON) -> Bool {
+    /// The content `source` types the provider reads from the request itself; every other is refused.
+    public static let contentSources: Set<String> = ["base64", "text", "content"]
+
+    /// Content block types that define a tool inline (refused in `system` and `messages`).
+    static let inlineToolTypes: Set<String> = ["tool_definition", "tool_definitions", "tools"]
+
+    /// Whether `type` names a provider-side tool: a known one (`providerNetworkTools`, `mcp_toolset`) or any versioned
+    /// `<name>_YYYYMMDD` type. Result and use blocks (`web_search_tool_result`, `server_tool_use`) are not tool types.
+    static func isServerToolType(_ type: String) -> Bool {
+        if providerNetworkTools.contains(type) { return true }
+        let parts = type.split(separator: "_")
+        guard parts.count >= 2, let last = parts.last else { return false }
+        return last.count == 8 && last.allSatisfy { $0.isASCII && $0.isNumber }
+    }
+
+    /// Walks `system` / `messages` content: refuses a content source outside `contentSources`, a server-tool type the grant
+    /// does not name, and an inline tool definition. A tool call's `input` (the model's arguments to a client tool) is not
+    /// content and is skipped.
+    static func checkContent(_ value: StrictJSON, grant: TurnGrant) throws(GatewayError) {
         switch value {
         case .array(let items):
-            return items.contains(where: hasURLSource)
+            for item in items { try checkContent(item, grant: grant) }
         case .object(let fields):
-            if let source = value["source"], case .object = source, source["type"]?.stringValue == "url" { return true }
-            // A tool call's `input` is the model's arguments to a client tool, not content the provider fetches.
-            let isToolUse = value["type"]?.stringValue == "tool_use"
-            return fields.contains { !(isToolUse && $0.key == "input") && hasURLSource($0.value) }
+            let type = value["type"]?.stringValue
+            if let type {
+                if inlineToolTypes.contains(type) { throw forbidden("an inline tool definition is not allowed") }
+                if isServerToolType(type), !grant.serverTools.contains(type) {
+                    throw forbidden("server tool \(shown(type)) would let the provider reach the network; it is not allowed")
+                }
+            }
+            if value["input_schema"] != nil { throw forbidden("an inline tool definition is not allowed") }
+            if let source = value["source"], case .object = source {
+                guard let kind = source["type"]?.stringValue, contentSources.contains(kind) else {
+                    let shownKind = source["type"]?.stringValue.map(shown) ?? "(none)"
+                    throw forbidden("content source \(shownKind) is not allowed; send the content inline (base64 or text)")
+                }
+            }
+            for field in fields where !(type == "tool_use" && field.key == "input") {
+                try checkContent(field.value, grant: grant)
+            }
         default:
-            return false
+            return
         }
     }
 

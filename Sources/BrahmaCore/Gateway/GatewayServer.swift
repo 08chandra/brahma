@@ -36,6 +36,9 @@ public final class GatewayServer: @unchecked Sendable {
     private let clock: any AwakeClock
     /// Test seam: runs after a request's body is read and before the pre-dispatch re-check.
     private let beforeDispatch: (@Sendable (TurnGrant) -> Void)?
+    /// Test seam: runs when a connection starts waiting for a request head with an empty buffer (true: a fresh connection's
+    /// first byte; false: a keep-alive connection's next request), after its deadline is set.
+    private let awaitingHead: (@Sendable (Bool) -> Void)?
 
     public convenience init(registry: TurnTokenRegistry, handler: any GatewayHandler) {
         self.init(registry: registry, handler: handler, timing: .pinned, beforeDispatch: nil)
@@ -43,8 +46,9 @@ public final class GatewayServer: @unchecked Sendable {
 
     /// `timing`, `clock` and `beforeDispatch` are for tests.
     init(registry: TurnTokenRegistry, handler: any GatewayHandler, timing: GatewayTiming, clock: any AwakeClock = SystemAwakeClock(),
-         beforeDispatch: (@Sendable (TurnGrant) -> Void)?) {
+         beforeDispatch: (@Sendable (TurnGrant) -> Void)?, awaitingHead: (@Sendable (Bool) -> Void)? = nil) {
         self.registry = registry; self.handler = handler; self.timing = timing; self.clock = clock; self.beforeDispatch = beforeDispatch
+        self.awaitingHead = awaitingHead
     }
 
     // MARK: Listening
@@ -216,7 +220,7 @@ public final class GatewayServer: @unchecked Sendable {
             _ = lock.withLock { connections.removeValue(forKey: wire.id) }
             wire.close()
         }
-        let connection = HTTPConnection(wire: wire, timing: timing)
+        let connection = HTTPConnection(wire: wire, timing: timing, awaitingHead: awaitingHead)
         while true {
             switch connection.nextHead() {
             case .closed:
@@ -302,8 +306,11 @@ final class HTTPConnection {
     private let timing: GatewayTiming
     private var buffer: [UInt8] = []
     private var heads = 0
+    private let awaitingHead: (@Sendable (Bool) -> Void)?
 
-    init(wire: Wire, timing: GatewayTiming) { self.wire = wire; self.timing = timing }
+    init(wire: Wire, timing: GatewayTiming, awaitingHead: (@Sendable (Bool) -> Void)? = nil) {
+        self.wire = wire; self.timing = timing; self.awaitingHead = awaitingHead
+    }
 
     enum Next { case head(RequestHead), refused(HTTPRefusal), closed }
 
@@ -313,7 +320,7 @@ final class HTTPConnection {
         var deadline = wire.deadline(after: heads == 0 ? timing.firstByte : timing.keepAliveIdle)
         heads += 1
         var started = !buffer.isEmpty
-        if started { deadline = wire.deadline(after: timing.headTimeout) }
+        if started { deadline = wire.deadline(after: timing.headTimeout) } else { awaitingHead?(heads == 1) }
         while true {
             switch HTTPHead.scan(buffer) {
             case .refused(let refusal):
