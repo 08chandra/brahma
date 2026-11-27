@@ -26,10 +26,15 @@ public struct TurnGrant: Sendable, Equatable {
     public var passThroughFamilies: Set<String>
     /// Models that must not receive `tools`.
     public var textOnlyModels: Set<String>
+    /// Provider-side tool types (e.g. `web_search_20260209`) this turn may declare (Ruling 45). Empty unless Task 14 grants
+    /// one; cleared for good when the turn is tainted (`TurnTokenRegistry.markTainted`). Every other server tool is refused.
+    public var serverTools: Set<String>
 
     public init(turnId: String, companyId: String, agentId: String, itemId: String? = nil, provider: String,
-                aliases: [String: RoutedTarget] = [:], passThroughFamilies: Set<String> = [], textOnlyModels: Set<String> = []) {
+                aliases: [String: RoutedTarget] = [:], passThroughFamilies: Set<String> = [], textOnlyModels: Set<String> = [],
+                serverTools: Set<String> = []) {
         self.turnId = turnId; self.companyId = companyId; self.agentId = agentId; self.itemId = itemId; self.provider = provider
         self.aliases = aliases; self.passThroughFamilies = passThroughFamilies; self.textOnlyModels = textOnlyModels
+        self.serverTools = serverTools
     }
 }

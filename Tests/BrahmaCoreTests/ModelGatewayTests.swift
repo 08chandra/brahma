@@ -84,6 +84,110 @@ import Foundation
         }
     }
 
+    // MARK: Ruling X1-34: no provider-side network; only metered fields and betas
+
+    /// The betas X1-0 recorded `claude` 2.1.325 sending, in its order.
+    static let recordedBetas = "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,"
+        + "mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,effort-2025-11-24,"
+        + "thinking-display-updates-2026-08-18"
+
+    static func expectForbidden(_ r: TestResponse, _ reason: String, sourceLocation: SourceLocation = #_sourceLocation) {
+        #expect(r.status == 403 && r.errorType == "permission_error", "\(r.status) \(r.text)", sourceLocation: sourceLocation)
+        #expect(r.text.contains("Brahma: ") && r.text.contains(reason), "\(r.text)", sourceLocation: sourceLocation)
+    }
+
+    /// The request `claude` really sends — client tools, thinking, context management, effort, an inline image, metadata,
+    /// and the nine recorded betas — passes.
+    @Test func claudesOwnRequestPasses() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let body = try AnthropicFixture.text("request-claude", "json").trimmingCharacters(in: .newlines)
+        let r = try await rig.exchange(body, token: rig.grant(), extra: ["anthropic-beta: \(Self.recordedBetas)"])
+        #expect(r.status == 200, "\(r.text)")
+        #expect(rig.upstream.requests.first?.headers["anthropic-beta"] == Self.recordedBetas)
+        #expect(GatewayPolicy.betas.count == 9)
+    }
+
+    @Test func mcpServersRefused() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let r = try await rig.exchange(Self.body("claude-opus-5-5", extra: #","mcp_servers":[{"type":"url","url":"https://x.example/mcp","name":"x"}]"#),
+                                       token: rig.grant())
+        Self.expectForbidden(r, "mcp_servers would let the provider reach the network")
+        #expect(rig.upstream.requests.isEmpty)
+    }
+
+    /// A tool whose `type` is a server tool is refused, whatever its version; a client tool (no type, or `custom`) passes.
+    @Test func serverToolTypesRefused() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let token = rig.grant()
+        for type in ["web_fetch_20250910", "web_fetch_20260209", "web_search_20250305", "web_search_20260209", "code_execution_20260521",
+                     "computer_toolset_20260801", "bash_20250124", "text_editor_20250728", "tool_search_tool_regex_20251119",
+                     "mcp_toolset", "memory_20250818", "web_search_2099_01_01"] {
+            let tools = #","tools":[{"name":"Read","input_schema":{"type":"object"}},{"type":"\#(type)","name":"x"}]"#
+            Self.expectForbidden(try await rig.exchange(Self.body("claude-opus-5-5", extra: tools), token: token),
+                                 "server tool \(type) would let the provider reach the network")
+        }
+        #expect(rig.upstream.requests.isEmpty)
+        let custom = #","tools":[{"type":"custom","name":"Read","input_schema":{"type":"object"}},{"name":"Grep","input_schema":{"type":"object"}}]"#
+        #expect(try await rig.exchange(Self.body("claude-opus-5-5", extra: custom), token: token).status == 200)
+        #expect(rig.upstream.requests.count == 1)
+    }
+
+    /// An image or document the provider would download from a URL is refused (in a message or a tool result); inline
+    /// sources, and a tool call whose arguments merely mention a URL source, pass.
+    @Test func urlSourcesRefused() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let token = rig.grant()
+        let image = #"{"type":"image","source":{"type":"url","url":"https://x.example/a.png?d=secret"}}"#
+        let document = #"{"type":"document","source":{"type":"url","url":"https://x.example/a.pdf"}}"#
+        for content in ["[\(image)]", "[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":[\(document)]}]"] {
+            let body = #"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":\#(content)}]}"#
+            Self.expectForbidden(try await rig.exchange(body, token: token), "a URL source would let the provider fetch the network")
+        }
+        let system = #"{"model":"claude-opus-5-5","max_tokens":16,"system":[\#(document)],"messages":[]}"#
+        Self.expectForbidden(try await rig.exchange(system, token: token), "a URL source")
+        #expect(rig.upstream.requests.isEmpty)
+        let inline = #"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO"}}]},{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Fetch","input":{"source":{"type":"url","url":"https://x.example"}}}]}]}"#
+        #expect(try await rig.exchange(inline, token: token).status == 200)
+    }
+
+    /// Ruling X1-34 (2): an unknown top-level key or beta is refused before anything goes upstream (it may carry a pricing
+    /// modifier the meter does not model); one anthropic-beta header at most.
+    @Test func unknownBodyKeysAndBetasRefused() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let token = rig.grant()
+        for extra in [#","container":"c1""#, #","context_1m":true"#, #","top_k":5"#, #","x_future":{}"#] {
+            Self.expectForbidden(try await rig.exchange(Self.body("claude-opus-5-5", extra: extra), token: token), "is not allowed")
+        }
+        for beta in ["fast-mode-2026-02-01", "web-fetch-2025-09-10", "mcp-client-2025-11-20", "context-1m-2025-08-07",
+                     "claude-code-20250219,code-execution-2025-08-25", "claude-code-20250219,", "claude-code-20250219\tx"] {
+            let r = try await rig.exchange(Self.body("claude-opus-5-5"), token: token, extra: ["anthropic-beta: \(beta)"])
+            Self.expectForbidden(r, "is not allowed")
+        }
+        let twice = try await rig.exchange(Self.body("claude-opus-5-5"), token: token,
+                                           extra: ["anthropic-beta: claude-code-20250219", "anthropic-beta: effort-2025-11-24"])
+        Self.expectForbidden(twice, "at most one anthropic-beta header")
+        #expect(rig.upstream.requests.isEmpty)
+        // The known-safe keys and a recorded beta (spaces after commas allowed) pass.
+        let safe = #","thinking":{"type":"adaptive"},"output_config":{"effort":"high"},"context_management":{"edits":[]},"safeguards":{},"top_p":1,"stop_sequences":[],"tool_choice":{"type":"auto"}"#
+        let ok = try await rig.exchange(Self.body("claude-opus-5-5", extra: safe), token: token,
+                                        extra: ["anthropic-beta: claude-code-20250219, effort-2025-11-24"])
+        #expect(ok.status == 200, "\(ok.text)")
+    }
+
+    /// A server tool the grant names is sent; once the turn is tainted it is refused like any other.
+    @Test func markTaintedClearsGrantedServerTools() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let token = rig.grant(serverTools: ["web_search_20260209"])
+        let search = Self.body("claude-opus-5-5", extra: #","tools":[{"type":"web_search_20260209","name":"web_search"}]"#)
+        #expect(try await rig.exchange(search, token: token).status == 200)
+        let fetch = Self.body("claude-opus-5-5", extra: #","tools":[{"type":"web_fetch_20260209","name":"web_fetch"}]"#)
+        Self.expectForbidden(try await rig.exchange(fetch, token: token), "server tool web_fetch_20260209")
+        rig.registry.markTainted(token)
+        #expect(rig.registry.admit(token.value)?.serverTools == [])
+        Self.expectForbidden(try await rig.exchange(search, token: token), "server tool web_search_20260209")
+        #expect(rig.upstream.requests.count == 1)
+    }
+
     @Test func malformedOrRepeatedKeysRefusedBeforeRouting() async throws {
         let rig = try ModelGatewayRig([Self.ok])
         let token = rig.grant()

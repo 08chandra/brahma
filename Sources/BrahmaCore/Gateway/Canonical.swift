@@ -30,24 +30,27 @@ public struct CanonicalRequest: Codable, Sendable, Equatable {
         self.stopSequences = stopSequences; self.metadata = metadata; self.extra = extra
     }
 
-    /// Decodes a request body. Refused (400, Ruling 19) unless it is exactly one JSON object with no top-level key — and no key
-    /// of `metadata` — appearing twice (a repeated `model` could be routed on one value and reach the provider with the other),
-    /// then a valid Messages request.
+    /// Decodes a request body. Refused (400, Ruling 19) unless it passes `checkObject` (a repeated `model` could be routed on
+    /// one value and reach the provider with the other), then is a valid Messages request.
     public static func decode(_ body: Data) throws(GatewayError) -> CanonicalRequest {
-        let bytes = [UInt8](body)
-        let top: [JSONObjectScan.Member]
+        try checkObject(body)
         do {
-            top = try JSONObjectScan.members(of: bytes)
+            return try JSONDecoder().decode(CanonicalRequest.self, from: body)
+        } catch {
+            throw .refused(status: GatewayRefusal.status, type: GatewayRefusal.type, message: "Brahma: the request body is not a Messages request")
+        }
+    }
+
+    /// Refuses a body that is not exactly one JSON object with no top-level key, and no key of `metadata`, appearing twice.
+    static func checkObject(_ body: Data) throws(GatewayError) {
+        let bytes = [UInt8](body)
+        do {
+            let top = try JSONObjectScan.members(of: bytes)
             if let metadata = top.first(where: { $0.key == "metadata" }), bytes[metadata.value.lowerBound] == UInt8(ascii: "{") {
                 _ = try JSONObjectScan.members(of: bytes, objectAt: metadata.value.lowerBound)
             }
         } catch {
             throw .refused(status: GatewayRefusal.status, type: GatewayRefusal.type, message: "Brahma: the request body is not one JSON object with unique keys")
-        }
-        do {
-            return try JSONDecoder().decode(CanonicalRequest.self, from: body)
-        } catch {
-            throw .refused(status: GatewayRefusal.status, type: GatewayRefusal.type, message: "Brahma: the request body is not a Messages request")
         }
     }
 

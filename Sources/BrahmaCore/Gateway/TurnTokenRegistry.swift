@@ -39,6 +39,12 @@ public final class TurnTokenRegistry: EmergencyStopObserver, @unchecked Sendable
         return lock.withLock { live[token] }
     }
 
+    /// The turn read untrusted content (Ruling 45; Task 14 wires the taint hook): its grant loses every provider-side tool for
+    /// good, so no later request of the turn can ask the provider to reach the network.
+    public func markTainted(_ token: GatewayToken) {
+        lock.withLock { live[token.value]?.serverTools = [] }
+    }
+
     /// Ends a turn's token: new requests are refused at once; in-flight ones get `inFlightGrace`, then are cut.
     public func endTurn(_ token: GatewayToken) {
         let key = token.value

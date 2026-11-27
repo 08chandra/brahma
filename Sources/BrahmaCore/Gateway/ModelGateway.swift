@@ -4,6 +4,7 @@ import Foundation
 /// body, routes the model by the turn's grant, applies the policy refusals, reads the provider key from the vault, and sends the
 /// request upstream through the provider's adapter. The meter is wired in Task 9.
 ///
+/// Every request first passes `GatewayPolicy` (no provider-side network, only metered fields and betas; Ruling X1-34).
 /// Routing: `grant.aliases[model]` names the provider and upstream model; otherwise `model` is served as sent, by the grant's
 /// provider, only when it is one of `grant.passThroughFamilies` (exact ids); anything else is refused. The key is read per
 /// request with `vault.nonInteractive()` and lives only in the local scope of that request's `forward`: never stored, logged
@@ -64,13 +65,14 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     }
 
     private func serve(_ r: GatewayRequest, grant: TurnGrant, reply: GatewayReply) async throws(GatewayError) {
+        try CanonicalRequest.checkObject(r.body)
+        try GatewayPolicy.check(body: r.body, headers: r.headers, grant: grant)
         let canonical = try CanonicalRequest.decode(r.body)
         let target = try Self.route(canonical.model, grant: grant)
         if let tools = canonical.tools, !tools.isEmpty,
            grant.textOnlyModels.contains(target.model) || grant.textOnlyModels.contains(canonical.model) {
             throw .policy("model \(Self.shown(canonical.model)) does not take tools")
         }
-        if let modifier = Self.unpricedModifier(canonical) { throw .policy(modifier) }
         guard isLive(reply) else { return }
         let provider: Provider
         do {
@@ -164,17 +166,5 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
             ("a"..."z").contains($0) || ("A"..."Z").contains($0) || ("0"..."9").contains($0) || "._-:[]".unicodeScalars.contains($0)
         }
         return plain ? model : "the requested model"
-    }
-
-    /// Ruling 39: a request field that changes the price the price book does not model is refused rather than metered at the
-    /// standard rate (an undercount fails open): fast mode (`speed` other than `standard`), regional inference (`inference_geo`
-    /// other than `global`), a service tier other than `standard_only`, and server-side `fallbacks` (served, and billed, by
-    /// another model).
-    static func unpricedModifier(_ r: CanonicalRequest) -> String? {
-        if let speed = r.extra["speed"], speed != .string("standard") { return "fast mode is not priced" }
-        if let geo = r.extra["inference_geo"], geo != .string("global") { return "inference_geo is not priced" }
-        if let tier = r.extra["service_tier"], tier != .string("standard_only") { return "service_tier is not priced" }
-        if r.extra["fallbacks"] != nil { return "fallbacks is not priced" }
-        return nil
     }
 }

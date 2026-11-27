@@ -152,9 +152,9 @@ final class ModelGatewayRig: @unchecked Sendable {
     var providerLookups: Int { recorder.lock.withLock { recorder.lookups } }
 
     func grant(aliases: [String: TurnGrant.RoutedTarget] = ["brahma-standard": .init(provider: "anthropic", model: "claude-sonnet-5-5")],
-               passThrough: Set<String> = ["claude-opus-5-5"], textOnly: Set<String> = []) -> GatewayToken {
+               passThrough: Set<String> = ["claude-opus-5-5"], textOnly: Set<String> = [], serverTools: Set<String> = []) -> GatewayToken {
         registry.mint(TurnGrant(turnId: "turn-1", companyId: "co-1", agentId: "agent-1", provider: "anthropic", aliases: aliases,
-                                passThroughFamilies: passThrough, textOnlyModels: textOnly))
+                                passThroughFamilies: passThrough, textOnlyModels: textOnly, serverTools: serverTools))
     }
 
     func connect() -> (peer: TestPeer, served: Task<Void, Never>) {
