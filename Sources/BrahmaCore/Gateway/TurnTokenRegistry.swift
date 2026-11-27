@@ -144,6 +144,11 @@ final class GatewayLease: @unchecked Sendable {
         if runNow { action() }
     }
 
+    /// Removes the cut action: a cut from now on only marks the lease (until the next `arm`, which then runs at once).
+    func disarm() {
+        lock.withLock { onCut = nil }
+    }
+
     /// The turn ended: the request may run until `deadline` (awake), not after.
     func expire(at deadline: Duration) {
         lock.withLock {

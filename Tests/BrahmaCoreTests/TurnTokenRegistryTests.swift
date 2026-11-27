@@ -169,6 +169,85 @@ import Foundation
         }
     }
 
+    /// Sends a head declaring 1000 body bytes plus the first 500 of them, and waits until the request holds its lease.
+    private func halfSentBody(_ h: GatewayHarness, _ token: GatewayToken) async throws -> (TestPeer, Task<Void, Never>) {
+        let (peer, served) = h.connect()
+        await peer.write(rawRequest(token: token.value, body: String(repeating: "a", count: 500), extra: ["Content-Length: 1000"],
+                                    contentLength: false))
+        let deadline = AwakeTime.deadline(after: .seconds(20))
+        while h.registry.inFlightRequests == 0, AwakeTime.now < deadline { try await Task.sleep(for: .milliseconds(2)) }
+        #expect(h.registry.inFlightRequests == 1, "the request was admitted and is reading its body")
+        return (peer, served)
+    }
+
+    /// X1-33: a request revoked while its body is still arriving is cut there and never dispatched.
+    @Test func revocationMidBodyCutsBeforeDispatch() async throws {
+        let revocations: [(String, @Sendable (GatewayHarness, GatewayToken) async -> Void)] = [
+            ("revokeAll", { h, _ in h.registry.revokeAll(reason: "test") }),
+            ("stopAll", { h, _ in await h.registry.stopAll(reason: "everything stopped by the owner") }),
+        ]
+        for (name, revoke) in revocations {
+            let h = GatewayHarness()
+            let token = h.mint()
+            let (peer, served) = try await halfSentBody(h, token)
+            await revoke(h, token)
+            #expect(await peer.seesEOF(within: 10), "\(name): cut mid-body")
+            // The rest of the body arriving now changes nothing.
+            await peer.write(String(repeating: "b", count: 500))
+            await served.value
+            #expect(h.handler.callCount == 0, "\(name): never dispatched")
+            #expect(h.registry.inFlightRequests == 0)
+        }
+        // The end of a turn mid-body: the request may keep uploading within the grace, and is cut when the grace runs out.
+        let h = GatewayHarness()
+        let token = h.mint()
+        let (peer, served) = try await halfSentBody(h, token)
+        h.registry.endTurn(token)
+        h.clock.advance(by: .seconds(29))
+        #expect(await peer.staysQuiet(milliseconds: 100), "not cut inside the grace")
+        h.clock.advance(by: .seconds(1))
+        #expect(await peer.seesEOF(within: 10))
+        await served.value
+        #expect(h.handler.callCount == 0)
+    }
+
+    /// X1-33 (b): a request whose lease is revoked after its body was read but before dispatch is refused 401, not dispatched.
+    @Test func revocationBeforeDispatchIs401() async throws {
+        // Revoked outright.
+        do {
+            let h = GatewayHarness()
+            let token = h.mint()
+            let registry = h.registry
+            h.beforeDispatch.action = { _ in registry.revokeAll(reason: "test") }
+            let response = try await h.exchange(rawRequest(token: token.value))
+            #expect(response.status == 401 && response.errorType == "authentication_error")
+            #expect(h.handler.callCount == 0)
+        }
+        // The turn ended and its grace ran out before dispatch.
+        do {
+            let h = GatewayHarness()
+            let token = h.mint()
+            let (registry, clock) = (h.registry, h.clock)
+            h.beforeDispatch.action = { _ in
+                registry.endTurn(token)
+                clock.advance(by: TurnTokenRegistry.inFlightGrace)
+            }
+            let response = try await h.exchange(rawRequest(token: token.value))
+            #expect(response.status == 401)
+            #expect(h.handler.callCount == 0)
+        }
+        // Control: a turn that ended inside the grace still has its admitted request served (it was in flight).
+        do {
+            let h = GatewayHarness()
+            let token = h.mint()
+            let registry = h.registry
+            h.beforeDispatch.action = { _ in registry.endTurn(token) }
+            #expect(try await h.exchange(rawRequest(token: token.value)).status == 200)
+            #expect(h.handler.callCount == 1)
+            #expect(try await h.exchange(rawRequest(token: token.value)).status == 401, "new requests are refused")
+        }
+    }
+
     @Test func stopRevokesAll() async throws {
         let streams = [IdleStream(), IdleStream()]
         let index = Counter()

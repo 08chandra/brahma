@@ -60,12 +60,43 @@ public enum GatewayLimits {
     public static let maxBodyBytes = 32 * 1024 * 1024
     /// Open client connections at once; past it a connection is answered 503 and closed.
     public static let maxConnections = 64
+    /// A fresh connection whose first byte has not arrived after this long is closed (Ruling 42).
+    public static let firstByteTimeout: Duration = .seconds(5)
     /// A keep-alive connection with no new request for this long is closed.
     public static let keepAliveIdle: Duration = .seconds(60)
     /// A request head must be complete this long after its first byte (slow-header clients are closed).
     public static let headTimeout: Duration = .seconds(30)
     /// A body read or a response write that makes no progress for this long ends the connection.
     public static let ioStall: Duration = .seconds(30)
+    /// The whole body must arrive within `bodyBaseAllowance + contentLength / bodyMinBytesPerSecond`, and never later than
+    /// `bodyMaxDuration` after the head (X1-33): `claude` sends the body from memory over loopback at hundreds of MiB/s, so
+    /// 1 MiB/s is a floor no legitimate client nears even on a loaded machine, while a trickling client holds an admitted
+    /// request for at most 60 s (a 32 MiB body gets 42 s).
+    public static let bodyBaseAllowance: Duration = .seconds(10)
+    public static let bodyMinBytesPerSecond = 1 << 20
+    public static let bodyMaxDuration: Duration = .seconds(60)
+}
+
+/// The connection timeouts one server uses: the pinned `GatewayLimits`, or shorter ones in tests.
+struct GatewayTiming: Sendable {
+    var firstByte: Duration
+    var keepAliveIdle: Duration
+    var headTimeout: Duration
+    var ioStall: Duration
+    var bodyBase: Duration
+    var bodyBytesPerSecond: Int
+    var bodyMax: Duration
+
+    static let pinned = GatewayTiming(
+        firstByte: GatewayLimits.firstByteTimeout, keepAliveIdle: GatewayLimits.keepAliveIdle, headTimeout: GatewayLimits.headTimeout,
+        ioStall: GatewayLimits.ioStall, bodyBase: GatewayLimits.bodyBaseAllowance, bodyBytesPerSecond: GatewayLimits.bodyMinBytesPerSecond,
+        bodyMax: GatewayLimits.bodyMaxDuration)
+
+    /// How long a body of `count` bytes may take in all.
+    func bodyAllowance(_ count: Int) -> Duration {
+        let proportional = Duration.milliseconds(Int64(count) * 1000 / Int64(max(1, bodyBytesPerSecond)))
+        return min(bodyMax, bodyBase + proportional)
+    }
 }
 
 /// One request header, name lower-cased.

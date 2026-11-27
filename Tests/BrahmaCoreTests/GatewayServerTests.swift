@@ -266,16 +266,28 @@ final class RecordingHandler: GatewayHandler, @unchecked Sendable {
 
 /// A server over socketpairs: `connect()` hands one end to `serve(connection:)` and returns the other.
 struct GatewayHarness {
+    /// What the server runs between reading a body and its pre-dispatch check (set by a test, nil by default).
+    final class Hook: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: (@Sendable (TurnGrant) -> Void)?
+        var action: (@Sendable (TurnGrant) -> Void)? {
+            get { lock.withLock { stored } }
+            set { lock.withLock { stored = newValue } }
+        }
+    }
+
     let clock: ManualAwakeClock
     let registry: TurnTokenRegistry
     let handler: RecordingHandler
     let server: GatewayServer
+    let beforeDispatch = Hook()
 
-    init(_ behaviour: RecordingHandler.Behaviour? = nil) {
+    init(timing: GatewayTiming = .pinned, _ behaviour: RecordingHandler.Behaviour? = nil) {
         clock = ManualAwakeClock()
         registry = TurnTokenRegistry(clock: clock)
         if let behaviour { handler = RecordingHandler(behaviour) } else { handler = RecordingHandler() }
-        server = GatewayServer(registry: registry, handler: handler)
+        let hook = beforeDispatch
+        server = GatewayServer(registry: registry, handler: handler, timing: timing, beforeDispatch: { hook.action?($0) })
     }
 
     static func grant(_ turn: String = "turn-1") -> TurnGrant {
@@ -610,6 +622,164 @@ func rawRequest(method: String = "POST", target: String = "/t/v1/messages?beta=t
         #expect(error["type"] as? String == "invalid_request_error")
         #expect(error["message"] as? String == "Brahma: a \"quoted\"\nline\u{1}")
         #expect(GatewayRefusal.status == 400 && GatewayRefusal.type == "invalid_request_error")
+    }
+
+    /// X1-33 (c): the body has an overall deadline proportional to its declared length, capped, on top of the per-read stall
+    /// bound, so a client trickling bytes cannot hold an admitted request open.
+    @Test func slowBodyIsCutAtItsOverallDeadline() async throws {
+        // The pinned allowance: 10 s + 1 s per MiB, never past 60 s.
+        #expect(GatewayLimits.bodyBaseAllowance == .seconds(10) && GatewayLimits.bodyMinBytesPerSecond == 1 << 20
+                && GatewayLimits.bodyMaxDuration == .seconds(60))
+        #expect(GatewayTiming.pinned.bodyAllowance(0) == .seconds(10))
+        #expect(GatewayTiming.pinned.bodyAllowance(GatewayLimits.maxBodyBytes) == .seconds(42))
+        #expect(GatewayTiming.pinned.bodyAllowance(Int(Int32.max)) == .seconds(60))
+        var timing = GatewayTiming.pinned
+        timing.bodyBase = .milliseconds(300)
+        timing.bodyMax = .seconds(1)
+        let h = GatewayHarness(timing: timing)
+        let token = h.mint().value
+        let (peer, served) = h.connect()
+        let started = AwakeTime.now
+        await peer.write(rawRequest(token: token, body: "", extra: ["Content-Length: 1000"], contentLength: false))
+        // One byte every 50 ms: never stalls a single read for long, but would need 50 s for the whole body.
+        let drip = Task.detached {
+            for _ in 0..<1000 {
+                if await peer.write([0x61]) == 0 { return }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+        #expect(await peer.seesEOF(within: 20))
+        #expect(started.duration(to: AwakeTime.now) < .seconds(10), "cut near the 300 ms allowance, not at the 30 s stall bound")
+        drip.cancel()
+        await served.value
+        #expect(h.handler.callCount == 0)
+    }
+
+    /// Ruling 42 (m2): a fresh connection must send its first byte within `firstByteTimeout`; between keep-alive requests the
+    /// longer idle bound applies.
+    @Test func freshConnectionMustSpeakFirst() async throws {
+        #expect(GatewayLimits.firstByteTimeout == .seconds(5) && GatewayLimits.keepAliveIdle == .seconds(60))
+        var timing = GatewayTiming.pinned
+        timing.firstByte = .milliseconds(200)
+        let h = GatewayHarness(timing: timing)
+        let token = h.mint().value
+        do {
+            let (peer, served) = h.connect()
+            let started = AwakeTime.now
+            #expect(await peer.seesEOF(within: 20))
+            #expect(started.duration(to: AwakeTime.now) < .seconds(5))
+            await served.value
+        }
+        do {
+            let (peer, served) = h.connect()
+            await peer.write(rawRequest(token: token))
+            #expect(try await peer.readResponse().status == 200)
+            #expect(await peer.staysQuiet(milliseconds: 600), "an idle keep-alive connection outlives the first-byte bound")
+            await peer.write(rawRequest(token: token))
+            #expect(try await peer.readResponse().status == 200)
+            peer.close()
+            await served.value
+        }
+    }
+
+    /// Ruling 42 (m1): once the server has finished a request, its reply is closed: a write from a task the handler left
+    /// behind is refused and nothing reaches the connection (where the next response is being served).
+    @Test func writeAfterFinishIsRefused() async throws {
+        final class Box: @unchecked Sendable {
+            private let lock = NSLock()
+            private var stored: [GatewayReply] = []
+            func add(_ r: GatewayReply) { lock.withLock { stored.append(r) } }
+            var first: GatewayReply? { lock.withLock { stored.first } }
+        }
+        let box = Box()
+        let h = GatewayHarness { _, _, reply in
+            box.add(reply)
+            await reply.send(status: 200, json: Data("{}".utf8))
+        }
+        let token = h.mint().value
+        let (peer, served) = h.connect()
+        await peer.write(rawRequest(token: token))
+        #expect(try await peer.readResponse().status == 200)
+        // The second exchange on the connection proves the server finished the first.
+        await peer.write(rawRequest(token: token))
+        #expect(try await peer.readResponse().status == 200)
+        let stale = try #require(box.first)
+        #expect(await stale.send(status: 200, json: Data(#"{"stale":true}"#.utf8)) == false)
+        #expect(await stale.startEvents() == false)
+        #expect(await stale.event(Data("x".utf8)) == false)
+        #expect(await stale.endEvents() == false)
+        #expect(await peer.staysQuiet(milliseconds: 100), "the stale reply wrote nothing")
+        peer.close()
+        await served.value
+        // Directly, on a socket that is still open: a reply finished before it answered refuses every later write.
+        let registry = TurnTokenRegistry(clock: ManualAwakeClock())
+        let lease = try #require(registry.open(registry.mint(GatewayHarness.grant()).value))
+        var fds: [Int32] = [0, 0]
+        #if canImport(Darwin)
+        let type = SOCK_STREAM
+        #else
+        let type = Int32(SOCK_STREAM.rawValue)
+        #endif
+        #expect(socketpair(AF_UNIX, type, 0, &fds) == 0)
+        let other = TestPeer(fd: fds[1])
+        let wire = try #require(Wire(fd: fds[0], ioStall: .seconds(1)))
+        let reply = GatewayReply(wire: wire, lease: lease, close: false)
+        #expect(reply.finish() == .unanswered)
+        #expect(await reply.send(status: 200, json: Data("{}".utf8)) == false)
+        #expect(await reply.startEvents() == false)
+        #expect(await other.staysQuiet(milliseconds: 100), "nothing was written after finish")
+        wire.close()
+        lease.finish()
+        other.close()
+    }
+
+    /// Ruling 42 (m1): once closed, a wire never calls recv or send on its descriptor (which may already belong to another
+    /// connection).
+    @Test func wireNeverTouchesAClosedSocket() throws {
+        var fds: [Int32] = [0, 0]
+        #if canImport(Darwin)
+        let type = SOCK_STREAM
+        #else
+        let type = Int32(SOCK_STREAM.rawValue)
+        #endif
+        #expect(socketpair(AF_UNIX, type, 0, &fds) == 0)
+        let peer = TestPeer(fd: fds[1])
+        let wire = try #require(Wire(fd: fds[0], ioStall: .seconds(1)))
+        #expect(wire.writeBlocking(Array("ok".utf8), deadline: AwakeTime.deadline(after: .seconds(1))))
+        wire.close()
+        #expect(wire.writeBlocking(Array("late".utf8), deadline: AwakeTime.deadline(after: .seconds(1))) == false)
+        if case .eof = wire.readBlocking(max: 16, deadline: AwakeTime.deadline(after: .milliseconds(100))) {} else {
+            Issue.record("a closed wire must not read")
+        }
+        peer.close()
+        // A descriptor that cannot be configured is refused and closed.
+        #expect(Wire(fd: -1, ioStall: .seconds(1)) == nil)
+    }
+
+    /// Ruling 42 (m7): past the connection cap a connection gets the 503 refusal (shut and drained like every refusal), and the
+    /// served ones are untouched.
+    @Test func connectionCapAnswers503() async throws {
+        var timing = GatewayTiming.pinned
+        timing.firstByte = .seconds(120)  // the idle connections that fill the cap must outlive a loaded test run
+        let h = GatewayHarness(timing: timing)
+        let token = h.mint().value
+        var open: [(TestPeer, Task<Void, Never>)] = []
+        for _ in 0..<GatewayLimits.maxConnections { open.append(h.connect()) }
+        let deadline = AwakeTime.deadline(after: .seconds(20))
+        while h.server.activeConnections < GatewayLimits.maxConnections, AwakeTime.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(h.server.activeConnections == GatewayLimits.maxConnections)
+        let (extra, extraServed) = h.connect()
+        let busy = try await extra.readResponse()
+        #expect(busy.status == 503 && busy.errorType == "overloaded_error" && busy.head.headers["connection"] == "close")
+        #expect(await extra.seesEOF())
+        await extraServed.value
+        // A served connection still works.
+        await open[0].0.write(rawRequest(token: token))
+        #expect(try await open[0].0.readResponse().status == 200)
+        for (peer, served) in open { peer.close(); await served.value }
+        #expect(h.server.activeConnections == 0)
     }
 
     /// The accept loop: a real loopback listener, a request served through it, then a clean stop (thread joined, port closed).
