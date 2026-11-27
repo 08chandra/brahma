@@ -38,13 +38,18 @@ public struct PriceBook: Sendable {
     public static let pinnedOn = "2026-10-06"
 
     /// Keyed `<provider>/<model>`. The Anthropic models `ModelAllowlist.models` resolves to, by full id (X1-0), at that
-    /// reference's first-party rates: its stated cache-read rates (0.05× input on Opus 5.5, $0.20 on Sonnet 5.5, 0.1× input
-    /// otherwise) and its 5-minute cache-write rate (1.25× input). Haiku 5.5 is at its rate for prompts of 100K tokens or fewer.
-    /// No OpenAI-compatible model is pinned: the owner prices those (Ruling 36).
+    /// reference's first-party rates. No OpenAI-compatible model is pinned: the owner prices those (Ruling 36).
+    ///
+    /// The pinned values are upper bounds (Ruling 37). The meter guards dollar caps, so a price that is too low fails open (a
+    /// company spends past its cap) and one that is too high fails closed (a cap trips early). So the cache-write rate is the
+    /// 1-hour rate (2× input), never the 5-minute one (1.25×), because the usage does not say which TTL was written. A tiered
+    /// model is pinned at its highest tier: Haiku 5.5 is at its rates for prompts above 100K tokens ($0.50 / $2.50), and its
+    /// cache rates are derived from that input rate. Cache reads are the reference's stated rates: 0.05× input on Opus 5.5,
+    /// $0.20 on Sonnet 5.5, and 0.1× input otherwise. Exact tiering can come later with a tiered `Price`.
     public static let pinned: [String: Price] = [
-        "anthropic/claude-opus-5-5": Price(inPerMTok: 4, outPerMTok: 20, cacheReadPerMTok: 0.20, cacheWritePerMTok: 5),
-        "anthropic/claude-sonnet-5-5": Price(inPerMTok: 2, outPerMTok: 10, cacheReadPerMTok: 0.20, cacheWritePerMTok: 2.5),
-        "anthropic/claude-haiku-5-5": Price(inPerMTok: 0.10, outPerMTok: 0.50, cacheReadPerMTok: 0.01, cacheWritePerMTok: 0.125),
+        "anthropic/claude-opus-5-5": Price(inPerMTok: 4, outPerMTok: 20, cacheReadPerMTok: 0.20, cacheWritePerMTok: 8),
+        "anthropic/claude-sonnet-5-5": Price(inPerMTok: 2, outPerMTok: 10, cacheReadPerMTok: 0.20, cacheWritePerMTok: 4),
+        "anthropic/claude-haiku-5-5": Price(inPerMTok: 0.50, outPerMTok: 2.50, cacheReadPerMTok: 0.05, cacheWritePerMTok: 1),
     ]
 
     private let table: [String: Price]

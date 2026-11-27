@@ -12,8 +12,8 @@ import Testing
         let fresh = try runBrahma(["settings", "model-price"], home: home)
         #expect(fresh.status == 0, "\(fresh.stderr)")
         #expect(fresh.stdout.contains(unit), "\(fresh.stdout)")
-        #expect(fresh.stdout.contains("anthropic/claude-opus-5-5  in $4  out $20  cache read $0.2  cache write $5  pinned 2026-10-06\n"), "\(fresh.stdout)")
-        #expect(fresh.stdout.contains("anthropic/claude-haiku-5-5  in $0.1  out $0.5  cache read $0.01  cache write $0.125  pinned 2026-10-06\n"), "\(fresh.stdout)")
+        #expect(fresh.stdout.contains("anthropic/claude-opus-5-5  in $4  out $20  cache read $0.2  cache write $8  pinned 2026-10-06\n"), "\(fresh.stdout)")
+        #expect(fresh.stdout.contains("anthropic/claude-haiku-5-5  in $0.5  out $2.5  cache read $0.05  cache write $1  pinned 2026-10-06\n"), "\(fresh.stdout)")
         #expect(!fresh.stdout.contains("owner"), "\(fresh.stdout)")
 
         let set = try runBrahma(["settings", "model-price", "openai/gpt-x", "1.5", "6", "--cache-read", "0.4"], home: home)
@@ -29,7 +29,7 @@ import Testing
         #expect(list.contains("openai/gpt-x  in $1.5  out $6  cache read $0.4  cache write $1.5  owner\n"), "\(list)")
         #expect(list.contains("openrouter/acme/model-1  in $3  out $4  cache read $3  cache write $3  owner\n"), "\(list)")
         #expect(list.contains("anthropic/claude-opus-5-5  in $7  out $30  cache read $0.5  cache write $9  owner\n"), "\(list)")
-        #expect(list.contains("anthropic/claude-opus-5-5  in $4  out $20  cache read $0.2  cache write $5  pinned 2026-10-06, overridden by owner\n"), "\(list)")
+        #expect(list.contains("anthropic/claude-opus-5-5  in $4  out $20  cache read $0.2  cache write $8  pinned 2026-10-06, overridden by owner\n"), "\(list)")
 
         // Setting again replaces the row; the store holds exactly the owner's rows.
         #expect(try runBrahma(["settings", "model-price", "openai/gpt-x", "2", "8"], home: home).status == 0)

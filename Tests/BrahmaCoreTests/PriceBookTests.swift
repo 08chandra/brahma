@@ -28,13 +28,26 @@ import Testing
         // Aliases are never keys: the gateway prices the full id the request names.
         for alias in ["opus", "sonnet", "haiku"] { #expect(book.price(provider: "anthropic", model: alias) == nil) }
         // The claude-api skill's pricing reference (cached 2026-10-06), USD per million tokens.
-        #expect(PriceBook.pinned["anthropic/claude-opus-5-5"] == Price(inPerMTok: 4, outPerMTok: 20, cacheReadPerMTok: 0.20, cacheWritePerMTok: 5))
-        #expect(PriceBook.pinned["anthropic/claude-sonnet-5-5"] == Price(inPerMTok: 2, outPerMTok: 10, cacheReadPerMTok: 0.20, cacheWritePerMTok: 2.5))
-        #expect(PriceBook.pinned["anthropic/claude-haiku-5-5"] == Price(inPerMTok: 0.10, outPerMTok: 0.50, cacheReadPerMTok: 0.01, cacheWritePerMTok: 0.125))
+        // Upper bounds (Ruling 37): the 1-hour cache-write rate, and a tiered model's highest tier.
+        #expect(PriceBook.pinned["anthropic/claude-opus-5-5"] == Price(inPerMTok: 4, outPerMTok: 20, cacheReadPerMTok: 0.20, cacheWritePerMTok: 8))
+        #expect(PriceBook.pinned["anthropic/claude-sonnet-5-5"] == Price(inPerMTok: 2, outPerMTok: 10, cacheReadPerMTok: 0.20, cacheWritePerMTok: 4))
+        #expect(PriceBook.pinned["anthropic/claude-haiku-5-5"] == Price(inPerMTok: 0.50, outPerMTok: 2.50, cacheReadPerMTok: 0.05, cacheWritePerMTok: 1))
         #expect(PriceBook.pinnedOn == "2026-10-06")
         #expect(PriceBook.pinned.values.allSatisfy { p in
             ([p.inPerMTok, p.outPerMTok] + [p.cacheReadPerMTok, p.cacheWritePerMTok].compactMap { $0 }).allSatisfy { $0.isFinite && $0 > 0 }
         })
+    }
+
+    /// Ruling 37: a price too low fails open against a dollar cap, so every pinned cache write is the 1-hour rate (2× input,
+    /// above the 5-minute 1.25×) and Haiku 5.5 is at its >100K-prompt tier, not its $0.10 / $0.50 short-prompt rates.
+    @Test func pinnedPricesAreUpperBounds() throws {
+        for (key, p) in PriceBook.pinned {
+            #expect(p.cacheWritePerMTok == 2 * p.inPerMTok, "\(key) cache write is not the 1-hour rate")
+            #expect(p.cacheWriteRate > 1.25 * p.inPerMTok, "\(key)")
+        }
+        let haiku = try #require(PriceBook.pinned["anthropic/claude-haiku-5-5"])
+        #expect(haiku.inPerMTok == 0.50 && haiku.outPerMTok == 2.50, "\(haiku)")
+        #expect(haiku.inPerMTok > 0.10 && haiku.outPerMTok > 0.50, "above the short-prompt tier")
     }
 
     @Test func ownerRowOverridesPinned() {
