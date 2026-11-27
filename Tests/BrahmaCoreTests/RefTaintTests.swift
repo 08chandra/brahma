@@ -270,7 +270,7 @@ import GRDB
         try cf.store.markTainted(agentId: engId, source: "docs.swift.org")
         #expect(try cf.store.refTaint(file, companyId: cId) == (true, Self.reason))
         #expect(try cf.store.refTaint(diff, companyId: cId) == (true, Self.reason))
-        // C5b: live worktree content is read by the holder, the assignee, the reviewer, the owner and the concierge only.
+        // C5b (Ruling C5b-5): live worktree content is read by the lease holder (else the assignee), the reviewer, the owner and the concierge only.
         let resolved = try cf.fx.resolve(.owner, file)
         #expect(resolved.tainted && resolved.taintReason == Self.reason)
         #expect(try cf.fx.resolve(.qa2, file).visibility == .refused)

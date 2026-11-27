@@ -317,15 +317,85 @@ final class PassthroughRecordingRunner: GitProcessRunning, @unchecked Sendable {
         #expect(live.tainted && live.taintReason == Self.taintReason)
         #expect(try f.snapshot(.revisions(from: "r1", to: "worktree")).tainted)
         #expect(try f.snapshot(.revisions(from: "r1", to: "r2")).tainted)
-        // Ranges that don't include r2 are clean, and so is the holder's session.
-        #expect(!(try f.snapshot(.head)).tainted)
-        #expect(!(try f.snapshot(.lastCheck)).tainted)
+        // Fix round 2 (R1-2): a compare whose base is (or descends from) r2 shows r2's lines as context, so it is marked too.
+        #expect(try f.snapshot(.head).tainted)
+        #expect(try f.snapshot(.lastCheck).tainted)
+        // A pair that displays nothing of r2 is clean, and so is the holder's session.
         #expect(!(try f.snapshot(.revisions(from: "base", to: "r1"))).tainted)
         // The resolver, the open path and the board agree with the snapshot.
         let resolved = try f.fx.resolve(.owner, try f.fx.ref("ENG-1:changes"))
         #expect(resolved.tainted && resolved.taintReason == Self.taintReason)
-        #expect(!(try f.fx.resolve(.owner, try f.fx.ref("ENG-1:diff@worktree?vs=head"))).tainted)
+        #expect(try f.fx.resolve(.owner, try f.fx.ref("ENG-1:diff@worktree?vs=head")).tainted)
         #expect(try f.cf.open(.qa2, "ENG-1:changes").tainted)
         #expect(try f.store.changesBoard(companyId: f.c.id, reader: .owner, knownValues: [], now: f.cf.now).first { $0.key == "ENG-1" }?.tainted == true)
+    }
+
+    // MARK: Fix round 2
+
+    /// R1-2: whatever a compare displays on either side carries its taint — a tainted base commit (r2) marks every mode that
+    /// shows its lines, as context, as `-` lines or as `+` lines.
+    @Test(arguments: [CompareMode.main, .head, .lastCheck, .revisions(from: "r1", to: "r2"), .revisions(from: "r1", to: "worktree"),
+                      .revisions(from: "r2", to: "worktree"), .revisions(from: "r2", to: "head"), .revisions(from: "base", to: "r2")])
+    func baseSideTaintMarksEveryCompare(_ m: CompareMode) throws {
+        let f = try ChangesFixture()
+        #expect(!(try f.snapshot(m)).tainted)
+        try Self.taintR2(f)
+        let s = try f.snapshot(m)
+        #expect(s.tainted && s.taintReason == Self.taintReason, "\(m)")
+        let resolved = try f.fx.resolve(.owner, m.ref(key: "ENG-1"))
+        #expect(resolved.tainted, "\(m)")
+        // A pair that never shows r2 stays clean.
+        #expect(try f.store.refTaint(try f.fx.ref("ENG-1:diff@base..r1"), companyId: f.c.id) == (false, nil))
+    }
+
+    /// R1-3 (Ruling C5b-5): the live readers are the lease holder if there is one, else the assignee, plus the reviewer and
+    /// the owner.
+    @Test func assigneeNotReaderWhileAnotherHolds() throws {
+        let f = try ChangesFixture()
+        let live = try f.fx.ref("ENG-1:diff@worktree"), file = try f.fx.ref("ENG-1:src/a.ts@worktree")
+        let (itemId, cId, eng3Id, now) = (f.item.id, f.c.id, f.fx.eng3.id, f.cf.now)
+        // eng-3 takes the lease; eng-1 stays the assignee.
+        try f.store.writer.write { db in
+            try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [itemId])
+            try WorkLease(itemId: itemId, companyId: cId, agentId: eng3Id, acquiredAt: now, expiresActive: 1e12).insert(db)
+        }
+        for ref in [live, file] {
+            #expect(try f.fx.resolve(.eng1, ref).visibility == .refused, "the assignee is not a reader while another agent holds the lease")
+            #expect(try f.store.resolveRef(ref, for: .agent(eng3Id), companyId: cId).visibility == .full)
+            #expect(try f.fx.resolve(.qa2, ref).visibility == .full)
+            #expect(try f.fx.resolve(.owner, ref).visibility == .full)
+            #expect(try f.fx.resolve(.concierge, ref).visibility == .full)
+        }
+        #expect(try f.store.changesBoard(companyId: cId, reader: .agent(f.fx.eng1.id), knownValues: [], now: now).isEmpty)
+        #expect(try f.store.changesBoard(companyId: cId, reader: .agent(eng3Id), knownValues: [], now: now).map(\.key) == ["ENG-1"])
+        // No lease: the assignee reads again.
+        try f.store.writer.write { db in try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [itemId]) }
+        #expect(try f.fx.resolve(.eng1, live).visibility == .full)
+        #expect(try f.store.resolveRef(live, for: .agent(eng3Id), companyId: cId).visibility == .refused)
+    }
+
+    /// R1-4 (Ruling C5b-6): `.brahma/progress/<KEY>.md` is live content of the item: the live reader set only; anything else
+    /// under `progress/` is refused for everyone (fail closed).
+    @Test func progressFileFollowsLiveRule() throws {
+        let f = try ChangesFixture()
+        try f.fx.git.write(".brahma/progress/ENG-1.md", "# ENG-1\n\n## Plan\nship five\n")
+        try f.fx.git.write(".brahma/progress/ENG-9.md", "stray\n")
+        try f.fx.git.write(".brahma/progress/notes.txt", "stray\n")
+        let progress = try f.fx.ref(".brahma/progress/ENG-1.md")
+        #expect(try f.fx.resolve(.eng1, progress).visibility == .full)
+        #expect(try f.fx.resolve(.qa2, progress).visibility == .full)
+        #expect(try f.fx.resolve(.owner, progress).visibility == .full)
+        #expect(try f.fx.resolve(.concierge, progress).visibility == .full)
+        #expect(try f.store.resolveRef(progress, for: .agent(f.eng7.id), companyId: f.c.id).visibility == .refused)
+        #expect(try f.fx.resolve(.cto, progress).visibility == .refused)
+        #expect(f.cf.failure {
+            try f.store.openRef(companyId: f.c.id, reader: .agent(f.eng7.id), ref: ".brahma/progress/ENG-1.md", lines: nil, copy: false, turnId: nil,
+                                context: f.fx.ctx, knownValues: [], paths: f.cf.paths, now: f.cf.now)
+        } == Store.refUnavailable)
+        #expect(try f.cf.open(.eng1, ".brahma/progress/ENG-1.md").text.contains("    | ship five"))
+        for stray in [".brahma/progress/ENG-9.md", ".brahma/progress/notes.txt"] {
+            #expect(try f.fx.resolve(.owner, try f.fx.ref(stray)).visibility == .refused, "\(stray)")
+            #expect(try f.fx.resolve(.eng1, try f.fx.ref(stray)).visibility == .refused, "\(stray)")
+        }
     }
 }

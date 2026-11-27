@@ -207,6 +207,31 @@ import GRDB
         #expect(events.first { $0.kind == .reviewComment }?.taintedOrigin == true)
     }
 
+    /// R1-1: the quote DM goes to the live reader set and nobody else — an `@handle` in a quoted line or in the path never adds
+    /// a recipient, wakes anyone or reaches an inbox; `@here` in a quoted line is no broadcast.
+    @Test func quoteDMNeverMentions() throws {
+        let f = try ChangesFixture(edits: false)
+        let (eng7Id, cId) = (f.eng7.id, f.c.id)
+        try f.store.writer.write { db in try db.execute(sql: "UPDATE agent SET state = 'sleeping' WHERE id = ?", arguments: [eng7Id]) }
+        try f.fx.git.write("@eng-7.ts", "// ping @eng-7 and @here\nsecond\n", in: f.wt)
+        let s = try f.snapshot(.head)
+        let anchor = DiffAnchor(path: "@eng-7.ts", side: "new", line: 1, hunkHeader: try Self.hunkHeader(s, path: "@eng-7.ts"), lineText: "// ping @eng-7 and @here")
+        let c = try f.store.addDiffComment(companyId: cId, key: "ENG-1", compare: .head, anchor: anchor, text: "Who is this for?", knownValues: [], now: f.cf.now)
+        let dm = try Self.dm(f, c)
+        #expect(dm.channel == "dm:eng-1:owner" && dm.message.text.contains("@eng-7") && dm.message.text.contains("\"@eng-7.ts\""))
+        let (inbox, members, notices, state) = try f.store.writer.read { db in
+            (try Row.fetchAll(db, sql: "SELECT agentId FROM inboxItem WHERE messageId = ?", arguments: [dm.message.id]).map { $0["agentId"] as String },
+             try String.fetchAll(db, sql: "SELECT member FROM channelMember WHERE channelId = ? ORDER BY member", arguments: [dm.message.channelId]),
+             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM inboxItem WHERE agentId = ?", arguments: [eng7Id]) ?? -1,
+             try String.fetchOne(db, sql: "SELECT state FROM agent WHERE id = ?", arguments: [eng7Id]))
+        }
+        #expect(inbox == [f.fx.eng1.id], "the holder alone gets the DM")
+        #expect(members == [f.fx.eng1.id, "owner"].sorted())
+        #expect(notices == 0 && state == "sleeping", "eng-7 is neither delivered to nor woken")
+        #expect(try Self.notices(f, f.eng7).isEmpty)
+        #expect(try f.store.writer.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM broadcastLog WHERE companyId = ?", arguments: [cId]) } == 0)
+    }
+
     @Test func revertRequestNeverTouchesWorktree() throws {
         let f = try ChangesFixture()
         let runner = PassthroughRecordingRunner()

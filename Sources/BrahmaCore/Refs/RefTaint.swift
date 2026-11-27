@@ -440,24 +440,45 @@ extension Store {
     /// the base is the merge base with main, else the symmetric range between the compare's base and its target (or the branch
     /// head for the live worktree). A base that can't be resolved reads as tainted.
     private func compareRangeSource(_ ref: WorkRef, item: WorkItem) throws -> String? {
-        guard let compare = CompareMode(ref: ref) else { return nil }
-        if compare == .head { return nil }
-        var committed = WorkRef(kind: .diff, id: item.key)
-        if compare == .main || compare == .revisions(from: "base", to: "head") || compare == .revisions(from: "base", to: "worktree") {
-            return try commitSource(committed, item: item)
-        }
+        // A live diff ref that names no compare can't be judged: tainted (fail closed).
+        guard let compare = CompareMode(ref: ref) else { return "outside content" }
         guard let company = try company(id: item.companyId) else { return "outside content" }
         let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
         let bases: (base: String, target: String?)
         do { bases = try changesBases(companyId: item.companyId, item: item, compare: compare, git: git) } catch { return "outside content" }
-        let target = try bases.target ?? git.head("item/\(item.key)")
-        committed.rev = target
+        let target: String
+        do { target = try bases.target ?? git.head("item/\(item.key)") } catch { return "outside content" }
         let rows = try unclearedCommits(companyId: item.companyId)
-        if let source = try Self.symmetricRangeSource(git, bases.base, target, rows: rows) { return source }
-        // Restore epochs and orphaned items (Rulings 22–25) judge the branch as a whole.
+        // Fix round 2 (R1-2): both trees are displayed (context and `-` lines come from the base), so every commit either side
+        // holds since its merge base with main counts, plus the pair's symmetric range.
+        if let source = try Self.displayedRangeSource(git, bases.base, target, rows: rows) { return source }
+        // Restore epochs and orphaned items (Rulings 22–25) judge the branch as a whole, up to the target.
+        var committed = WorkRef(kind: .diff, id: item.key)
+        committed.rev = target
         guard try openRestoreEpochs(companyId: item.companyId).isEmpty, try orphanedItems(companyId: item.companyId, rows: rows)[item.id] == nil
         else { return try commitSource(committed, item: item) }
         return nil
+    }
+
+    /// R1-2: the source of the first uncleared tainted commit whose content a diff of `a` against `b` can display: the
+    /// symmetric range `a...b`, and each side's own commits since its merge base with `main` (`merge-base(main, side)..side`).
+    /// A side with no merge base with `main`, a pair with none, or a range that can't be listed reads as tainted (fail closed).
+    static func displayedRangeSource(_ git: SafeGit, _ a: String, _ b: String, rows: [TaintedCommit]) throws -> String? {
+        guard !rows.isEmpty else { return nil }
+        do {
+            var shas: [String] = []
+            if a != b {
+                _ = try git.mergeBase(a, b)
+                shas += try git.revList(a, b) + git.revList(b, a)
+            }
+            for side in Set([a, b]) {
+                let mainBase = try git.mergeBase("main", side)
+                if mainBase != side { shas += try git.revList(mainBase, side) }
+            }
+            return rows.first { row in shas.contains { $0.hasPrefix(row.sha) } }?.source
+        } catch {
+            return "outside content"
+        }
     }
 
     /// C5b: the source of the first uncleared tainted commit in `from..to` (full or abbreviated shas, verified by git), or the
@@ -469,7 +490,7 @@ extension Store {
         let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
         do {
             let refs = try reachabilityRefs(companyId: companyId)
-            return try Self.symmetricRangeSource(git, try git.verifyRev(from, reachableFrom: refs), try git.verifyRev(to, reachableFrom: refs), rows: rows)
+            return try Self.displayedRangeSource(git, try git.verifyRev(from, reachableFrom: refs), try git.verifyRev(to, reachableFrom: refs), rows: rows)
         } catch {
             return "outside content"
         }

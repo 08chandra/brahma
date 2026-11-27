@@ -73,8 +73,11 @@ public struct MessageRouter: Sendable {
 
     /// In-transaction `sendDM`.
     @discardableResult
+    /// Plan C Task C5b (R1-1): `parseMentions: false` delivers to the DM's two parties only — no `@handle` in the text adds a
+    /// recipient and no `@here`/`@team` broadcasts (for engine-composed DMs that quote file content).
     func sendDM(db: Database, companyId: String, from: Sender, to handle: String, text: String, now: Date,
-                replyTo: String? = nil, kind: MessageKind = .text, inline: [MessageRef] = [], firstInlinePosition: Int = 0) throws -> Message {
+                replyTo: String? = nil, kind: MessageKind = .text, inline: [MessageRef] = [], firstInlinePosition: Int = 0,
+                parseMentions: Bool = true) throws -> Message {
         let target = handle.hasPrefix("@") ? String(handle.dropFirst()).lowercased() : handle.lowercased()
         try validate(from, companyId: companyId, db)
         let toMember: String
@@ -105,7 +108,7 @@ public struct MessageRouter: Sendable {
                                               members: [from.id, toMember], now: now)
         }
         return try deliver(db, channel: channel, from: from, text: text, now: now, parentId: parentId, kind: kind, inline: inline,
-                           firstInlinePosition: firstInlinePosition).message
+                           firstInlinePosition: firstInlinePosition, parseMentions: parseMentions).message
     }
 
     private func validate(_ sender: Sender, companyId: String, _ db: Database) throws {
@@ -128,7 +131,7 @@ public struct MessageRouter: Sendable {
     /// event, inside the caller's transaction. A reply (`parentId`, its thread's root) updates the thread's counters first and
     /// is woken by `WakePolicy.threadWakes`; the reply that caps its thread is followed by @system's one `ThreadPolicy.capNote`.
     private func deliver(_ db: Database, channel: Channel, from: Sender, text: String, now: Date, parentId: String? = nil,
-                         kind: MessageKind = .text, inline: [MessageRef] = [], firstInlinePosition: Int = 0) throws -> PostResult {
+                         kind: MessageKind = .text, inline: [MessageRef] = [], firstInlinePosition: Int = 0, parseMentions: Bool = true) throws -> PostResult {
         let text = try store.redact(text)
         // Task 10: agent text that claims to be the owner is flagged (digest prefix, activity, the app's chip); it never acts.
         let impersonates = OwnerImpersonation.flags(text: text, sender: from)
@@ -169,7 +172,7 @@ public struct MessageRouter: Sendable {
         var recipientIds = try String.fetchAll(db, sql: "SELECT member FROM channelMember WHERE channelId = ? ORDER BY rowid",
                                                arguments: [channel.id]).filter { $0 != "owner" && $0 != "system" && $0 != from.id }
         var mentionedIds = Set<String>()
-        for mention in Self.mentions(in: text) where mention != "owner" {
+        for mention in (parseMentions ? Self.mentions(in: text) : []) where mention != "owner" {
             if let a = try Agent.filter(Column("companyId") == channel.companyId && Column("name") == mention).fetchOne(db),
                a.state != .killed, a.id != from.id {
                 mentionedIds.insert(a.id)
@@ -178,7 +181,7 @@ public struct MessageRouter: Sendable {
         }
 
         // A broadcast is applied only for the owner or a rate-limited manager/executive.
-        var broadcast = WakePolicy.broadcast(in: text)
+        var broadcast = parseMentions ? WakePolicy.broadcast(in: text) : nil
         var applied: Bool?
         var refusal: String?
         var senderTeam: String?

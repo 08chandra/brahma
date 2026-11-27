@@ -163,7 +163,8 @@ extension Store {
                                 alsoNotify: target.map { [$0] } ?? [], alsoNotifyRole: .holder, onlyAlsoNotify: true, taintedOverride: taint, now: now)
             var messageId: String?
             if let target, let handle = try RefAccess.handle(db, companyId, target) {
-                let message = try router.sendDM(db: db, companyId: companyId, from: .owner, to: handle, text: dmBody, now: now)
+                // R1-1: the quoted lines and the path are file text; they name no recipient and broadcast nothing.
+                let message = try router.sendDM(db: db, companyId: companyId, from: .owner, to: handle, text: dmBody, now: now, parseMentions: false)
                 messageId = message.id
                 if snapshot.tainted {
                     try db.execute(sql: "UPDATE message SET taintedOrigin = 1, fromTaintedSession = 1, taintSource = ? WHERE id = ? AND companyId = ?",

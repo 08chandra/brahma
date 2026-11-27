@@ -101,6 +101,13 @@ public enum RefAccess {
                 // C5b-2: a live worktree file (no pinned blob) follows the live worktree rule like the live diff.
                 if ref.isWorktree, ref.rev == nil, ref.params["share"] == nil { return try liveDiffSubject(db, companyId, item, record: .file(place: nil)) }
             }
+            // Ruling C5b-6: `.brahma/progress/<KEY>.md` read from disk is the item's live content (the live worktree rule); any
+            // other name under `progress/`, or a key of no item, is refused for everyone (fail closed). A pinned blob of it keeps
+            // the company class (and Ruling 8's taint).
+            if ref.branch == nil, ref.rev == nil, ref.params["share"] == nil, ref.id.hasPrefix(".brahma/progress/") {
+                guard let item = try progressItem(db, companyId, path: ref.id) else { return Subject(forbiddenPlace: true, record: .file(place: nil)) }
+                return try liveDiffSubject(db, companyId, item, record: .file(place: nil))
+            }
             if isForbiddenPlace(ref.id) { return Subject(forbiddenPlace: true, record: .file(place: nil)) }
             guard let place = privatePlace(ref) else { return Subject(record: .file(place: nil)) }
             guard ref.branch == nil, ref.rev == nil,
@@ -256,15 +263,25 @@ public enum RefAccess {
         return privatePlace(WorkRef(kind: .file, id: path)) == nil
     }
 
-    /// Plan C Task C5b, the live worktree rule: an unpinned live diff (`@worktree`, `:changes`, `wt:`, `@r<n>..worktree`) is
-    /// readable by the owner, the concierge, the lease holder (else the assignee) and the item's reviewer; any other agent
-    /// is refused (never offered an approver). Pinned snapshots keep the company class.
+    /// Plan C Task C5b, the live worktree rule (Ruling C5b-5): unpinned live content of an item (a live diff — `@worktree`,
+    /// `:changes`, `wt:`, `@r<n>..worktree` —, a live worktree file, the item's progress file) is readable by the owner, the
+    /// concierge, the current lease holder (else the assignee) and the item's reviewer; any other agent is refused (never
+    /// offered an approver). Pinned snapshots and blobs keep the company class.
     static func liveDiffSubject(_ db: Database, _ companyId: String, _ item: WorkItem, record: Record? = nil) throws -> Subject {
         var readers: Set<String> = []
-        if let holder = try Store.leaseHolderId(db: db, itemId: item.id) { readers.insert(holder) }
-        if let assignee = item.ownerId { readers.insert(assignee) }
+        if let holder = try Store.leaseHolderId(db: db, itemId: item.id) { readers.insert(holder) } else if let assignee = item.ownerId { readers.insert(assignee) }
         if let reviewer = item.reviewerId { readers.insert(reviewer) }
         return Subject(readerSet: readers, refusedWhenUnreadable: true, record: record ?? .diff(item))
+    }
+
+    /// The item of this company whose progress file `path` is (`.brahma/progress/<KEY>.md`, the key as `GitWorkspace` accepts
+    /// it), or nil.
+    static func progressItem(_ db: Database, _ companyId: String, path: String) throws -> WorkItem? {
+        let rest = path.dropFirst(".brahma/progress/".count)
+        guard rest.hasSuffix(".md"), !rest.contains("/") else { return nil }
+        let key = String(rest.dropLast(3))
+        guard (try? GitWorkspace.validKey(key)) != nil else { return nil }
+        return try item(db, companyId, key)
     }
 
     /// The item whose lease the agent `handle` of this company holds now (the most recent lease), for `wt:@handle`.
