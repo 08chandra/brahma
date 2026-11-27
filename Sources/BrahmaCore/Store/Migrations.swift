@@ -2027,6 +2027,30 @@ enum Migrations {
                 t.add(column: "messageId", .text)
             }
         }
+        m.registerMigration("vX6a-measure") { db in
+            // Plan X6a Task 2. `workItemLink`: an item is a regression of, or reverts, a landed item (`docs/measure/metrics.md`,
+            // "escaped" and "revert"); written by the owner (CLI), an agent (`create_work_item`) or the engine (a failed audit's
+            // follow-up). The primary key makes the same link twice one link.
+            try db.create(table: "workItemLink") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("kind", .text).notNull()                  // regressionOf | revertOf
+                t.column("targetId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("createdBy", .text).notNull()             // "owner", an agent id, or "system"
+                t.column("createdAt", .datetime).notNull()
+                t.primaryKey(["itemId", "kind", "targetId"])
+            }
+            try db.create(index: "workItemLink_company", on: "workItemLink", columns: ["companyId", "kind", "createdAt"])
+            // `measureCounter`: per-company daily counters the measure recorder (Task 5) accrues — company-active seconds,
+            // idle-while-actionable seconds, reserve breaches — keyed by the owner's calendar day (`YYYY-MM-DD`).
+            try db.create(table: "measureCounter") { t in
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("name", .text).notNull()
+                t.column("day", .text).notNull()                   // owner-calendar YYYY-MM-DD
+                t.column("value", .double).notNull().defaults(to: 0)
+                t.primaryKey(["companyId", "name", "day"])
+            }
+        }
     }
 }
 

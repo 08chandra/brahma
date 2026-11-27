@@ -543,6 +543,10 @@ extension Store {
         try db.execute(sql: "INSERT OR IGNORE INTO workItemDependency (itemId, dependsOnId, linkedBy, createdAt) VALUES (?, ?, 'system', ?)",
                        arguments: [created.id, item.id, now])
         try recordItemEvent(db: db, item: created, actor: "system", kind: .dependencyAdded, text: "depends on \(item.key)", now: now)
+        // Plan X6a Task 2: the follow-up is a regression of the audited (landed, auto-merged) item, so `measure` counts the
+        // failed audit and a later `regressionOf` filing on the same item once.
+        try Self.insertLink(db, ItemLink(companyId: item.companyId, itemId: created.id, kind: .regressionOf, targetId: item.id,
+                                         createdBy: "system", createdAt: now))
         return created
     }
 }

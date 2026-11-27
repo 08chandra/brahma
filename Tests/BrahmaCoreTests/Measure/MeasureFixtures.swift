@@ -34,9 +34,11 @@ enum MeasureFixtures {
     /// `engineSetStatus(… .done)`): `status = done`, `doneAt = updatedAt = landedAt`, `mergeState = none`, `mergedCommit`,
     /// `leaseHeadCommit = nil`. Before a landing an item is `inReview` with `mergeState = pending`; the fixture's items start `ready`
     /// (never claimed), which the measure metrics do not read.
+    /// `step` other than `done` (Task 2): the journal row as a batch that stopped there (`checked`: landCommit written, `main`
+    /// not moved; `recorded`: landed, `finishedAt` not yet stamped) — the items are still marked as above.
     @discardableResult
-    static func land(_ store: Store, company: Company, items: [WorkItem], number: Int, enqueuedAt: Date, landedAt: Date)
-        throws -> (batch: MergeBatch, requests: [MergeRequest]) {
+    static func land(_ store: Store, company: Company, items: [WorkItem], number: Int, enqueuedAt: Date, landedAt: Date,
+                     step: MergeStep = .done) throws -> (batch: MergeBatch, requests: [MergeRequest]) {
         func sha(_ seed: String) -> String { String(seed.utf8.map { String(format: "%02x", $0) }.joined().prefix(40)).padding(toLength: 40, withPad: "0", startingAt: 0) }
         let batchId = UUID().uuidString
         var requests: [MergeRequest] = []
@@ -53,7 +55,7 @@ enum MeasureFixtures {
             candidates[r.id] = r.candidateCommit ?? ""
             requests.append(r)
         }
-        var batch = MergeBatch(id: batchId, companyId: company.id, number: number, step: .done, requestIds: requests.map(\.id),
+        var batch = MergeBatch(id: batchId, companyId: company.id, number: number, step: step, requestIds: requests.map(\.id),
                                startedAt: enqueuedAt)
         batch.base = sha("base-\(number)")
         batch.candidates = candidates

@@ -41,6 +41,8 @@ extension CompanyTools {
         ]
         var create = fields
         create["status"] = s.prop("string", "backlog (default) or ready")
+        create["regression_of"] = s.prop("string", "Key of a landed item this one is a regression of (a defect found after it landed)")
+        create["revert_of"] = s.prop("string", "Key of a landed item this one reverts")
         var update = fields
         update["key"] = key
         update["status"] = s.prop("string", "backlog, ready or blocked (the engine sets inReview and done)")
@@ -326,8 +328,20 @@ extension CompanyTools {
             guard let st = WorkItemStatus(rawValue: s) else { throw ToolError(message: "unknown status '\(String(s.prefix(40)))'") }
             draft.status = st
         }
-        let created = try store.createWorkItem(companyId: companyId, by: .agent(agentId), draft: draft)
-        return "Created \(created.key): \(created.title) (\(created.status.rawValue))."
+        // Links to landed items (Plan X6a Task 2): the targets are resolved here (company-scoped, not found otherwise), the landed
+        // check and the creation happen in one transaction, so a refused link creates nothing.
+        var links: [(kind: ItemLinkKind, targetId: String)] = []
+        var targetKeys: [String: String] = [:]          // target id → the engine's key for it
+        for (argument, kind) in [("regression_of", ItemLinkKind.regressionOf), ("revert_of", .revertOf)] {
+            guard let raw = try optString(args, argument), !isNone(raw) else { continue }
+            let target = try item(key: raw)
+            links.append((kind, target.id))
+            targetKeys[target.id] = target.key
+        }
+        let (created, made) = try store.createWorkItem(companyId: companyId, by: .agent(agentId), draft: draft, links: links)
+        var out = "Created \(created.key): \(created.title) (\(created.status.rawValue))."
+        for link in made { out += "\nLinked: \(created.key) \(link.kind.rawValue) \(targetKeys[link.targetId] ?? link.targetId)" }
+        return out
     }
 
     private func updateWorkItem(_ args: [String: JSONValue]) throws -> String {

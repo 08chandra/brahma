@@ -48,7 +48,7 @@ private func handleMap(_ store: Store, _ company: Company) throws -> [String: St
 struct ItemsGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "items", abstract: "List, show and change work items.",
-        subcommands: [List.self, Show.self, Add.self, Edit.self, Depend.self, Confirm.self, Readopt.self], defaultSubcommand: List.self)
+        subcommands: [List.self, Show.self, Add.self, Edit.self, Depend.self, Confirm.self, Readopt.self, Link.self], defaultSubcommand: List.self)
 
     /// An item branch the engine found moved outside its holder's turns: the owner takes it as it is, so submits work again.
     struct Readopt: ParsableCommand {

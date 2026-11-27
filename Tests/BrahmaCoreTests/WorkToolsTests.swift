@@ -280,6 +280,61 @@ import GRDB
         #expect(items.map { $0["title"] as? String } == ["urgent", "low"])
         #expect(try t.error(t.eng, "list_work", ["scope": .string("everything")]).contains("scope"))
     }
+
+    // MARK: Item links (Plan X6a Task 2)
+
+    @Test func createWithRegressionOf() throws {
+        let t = try T()
+        try t.create(t.mgr, ["title": .string("Landed one"), "status": .string("ready")])
+        try t.create(t.mgr, ["title": .string("Landed two"), "status": .string("ready")])
+        let now = MeasureFixtures.t0
+        try MeasureFixtures.land(t.store, company: t.company, items: [try t.item("ACME-1"), try t.item("ACME-2")], number: 1,
+                                 enqueuedAt: now.addingTimeInterval(-3600), landedAt: now)
+        // The link is reported as a plain line after the creation line; the keys are the engine's, resolved from the argument.
+        let out = try t.create(t.eng, ["title": .string("Login broke"), "type": .string("bug"), "regression_of": .string(" acme-1 ")])
+        #expect(out.hasPrefix("Created ACME-3: Login broke (backlog)."), Comment(rawValue: out))
+        #expect(out.contains("\nLinked: ACME-3 regressionOf ACME-1"), Comment(rawValue: out))
+        #expect(!out.contains("acme-1"), "the agent's spelling is never echoed")
+        let window = MeasureWindow(since: now.addingTimeInterval(-86_400), until: Date().addingTimeInterval(86_400))
+        let links = try t.store.itemLinks(companyId: t.company.id, kind: .regressionOf, in: window)
+        #expect(links.map(\.itemId) == [try t.item("ACME-3").id])
+        #expect(links.map(\.targetId) == [try t.item("ACME-1").id])
+        #expect(links.map(\.createdBy) == [t.eng.id], "the MCP tool attributes the link to the agent")
+        // Both kinds at once: two lines, two links.
+        let both = try t.create(t.eng, ["title": .string("Undo two"), "regression_of": .string("ACME-1"), "revert_of": .string("ACME-2")])
+        #expect(both.contains("Linked: ACME-4 regressionOf ACME-1") && both.contains("Linked: ACME-4 revertOf ACME-2"), Comment(rawValue: both))
+        #expect(try t.store.itemLinks(companyId: t.company.id, kind: .revertOf, in: window).map(\.targetId) == [try t.item("ACME-2").id])
+        // The schema offers them.
+        let create = try #require(t.tools(t.eng).specs().first { $0.name == "create_work_item" })
+        let props = try #require(create.inputSchema.objectValue?["properties"]?.objectValue)
+        #expect(props["regression_of"] != nil && props["revert_of"] != nil)
+    }
+
+    @Test func refusedLinkCreatesNothing() throws {
+        let t = try T()
+        try t.create(t.mgr, ["title": .string("Never landed"), "status": .string("ready")])
+        let before = try t.store.workItems(companyId: t.company.id).count
+        #expect(before == 1)
+        // An unlanded target: the whole call fails with the refusal, and no item exists.
+        let unlanded = try t.error(t.eng, "create_work_item", ["type": .string("bug"), "title": .string("Bug"), "regression_of": .string("ACME-1")])
+        #expect(unlanded == "ACME-1 has not landed; only landed items can regress or be reverted")
+        #expect(try t.store.workItems(companyId: t.company.id).count == before)
+        // An unknown or another company's target: not found, nothing created.
+        let other = try T(name: "Zeta")
+        try other.create(other.mgr, ["title": .string("Zeta's"), "status": .string("ready")])
+        try MeasureFixtures.land(other.store, company: other.company, items: [try other.item("ZETA-1")], number: 1, enqueuedAt: MeasureFixtures.t0, landedAt: MeasureFixtures.t0)
+        for key in ["ACME-77", "ZETA-1"] {
+            let e = try t.error(t.eng, "create_work_item", ["type": .string("bug"), "title": .string("Bug"), "revert_of": .string(key)])
+            #expect(e == "no such work item \(key)", Comment(rawValue: e))
+        }
+        #expect(try t.store.workItems(companyId: t.company.id).count == before)
+        let window = MeasureWindow(since: MeasureFixtures.t0.addingTimeInterval(-86_400), until: Date().addingTimeInterval(86_400))
+        #expect(try t.store.itemLinks(companyId: t.company.id, kind: .regressionOf, in: window).isEmpty)
+        #expect(try t.store.itemLinks(companyId: t.company.id, kind: .revertOf, in: window).isEmpty)
+        // Without a link argument the tool is what it was.
+        let plain = try t.create(t.eng, ["title": .string("Plain")])
+        #expect(plain == "Created ACME-2: Plain (backlog).", Comment(rawValue: plain))
+    }
 }
 
 infix operator ∪: AdditionPrecedence
