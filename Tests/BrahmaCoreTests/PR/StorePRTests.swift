@@ -133,13 +133,14 @@ import GRDB
 
         try store.addTrustedLogin("octocat", companyId: c.id, by: .owner, now: now)
         try store.addTrustedLogin("Hubot", companyId: c.id, by: .owner, now: now)
-        #expect(try store.trustedLogins(companyId: c.id) == [TrustedLogin(companyId: c.id, login: "Hubot", addedBy: "owner", addedAt: now),
+        // Ruling 25: stored lowercase (logins compare case-insensitively).
+        #expect(try store.trustedLogins(companyId: c.id) == [TrustedLogin(companyId: c.id, login: "hubot", addedBy: "owner", addedAt: now),
                                                              TrustedLogin(companyId: c.id, login: "octocat", addedBy: "owner", addedAt: now)])
         #expect(throws: WorkError.forbidden(Store.prOwnerOnly)) { try store.addTrustedLogin("x", companyId: c.id, by: .agent("a1")) }
         #expect(throws: WorkError.forbidden(Store.prOwnerOnly)) { try store.removeTrustedLogin("Hubot", companyId: c.id, by: .system) }
         #expect(throws: WorkError.self) { try store.addTrustedLogin(" ", companyId: c.id, by: .owner) }
         try store.removeTrustedLogin("octocat", companyId: c.id, by: .owner)
-        #expect(try store.trustedLogins(companyId: c.id).map(\.login) == ["Hubot"])
+        #expect(try store.trustedLogins(companyId: c.id).map(\.login) == ["hubot"])
         #expect(throws: WorkError.notFound("no trusted login 'ghost'")) { try store.removeTrustedLogin("ghost", companyId: c.id, by: .owner) }
 
         let link = IssueLink(companyId: c.id, provider: .github, target: "acme/app", label: "brahma", cursor: nil, lastPolled: nil)

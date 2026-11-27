@@ -50,6 +50,36 @@ import GRDB
         #expect(try restored.engineStopped()?.note?.contains(line) == true)
     }
 
+    /// Ruling 25: logins compare case-insensitively in a restore too. A login removed live untrusts the items imported under it
+    /// whatever the case their author was recorded in; a login both sides trust (one row written in its typed case before the
+    /// ruling) is kept.
+    @Test func restoreComparesLoginsCaseInsensitively() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        try env.store.addTrustedLogin("Alice", companyId: acme.id, by: .owner, now: Self.now)
+        try env.store.writer.write { db in
+            try TrustedLogin(companyId: acme.id, login: "Bob", addedBy: "owner", addedAt: Self.now).insert(db)
+        }
+        let fromAlice = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(type: .task, title: "from alice"))
+        try Self.setOrigin(env.store, fromAlice, url: "https://github.com/acme/app/issues/7", author: "ALICE", trusted: true)
+        let fromBob = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(type: .task, title: "from bob"))
+        try Self.setOrigin(env.store, fromBob, url: "https://github.com/acme/app/issues/8", author: "bob", trusted: true)
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        // After the snapshot: alice removed (typed in another case); Bob's row rewritten lowercase, as an add now stores it.
+        try env.store.removeTrustedLogin("aLiCe", companyId: acme.id, by: .owner)
+        try env.store.removeTrustedLogin("BOB", companyId: acme.id, by: .owner)
+        try env.store.addTrustedLogin("Bob", companyId: acme.id, by: .owner, now: Self.now)
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        #expect(try restored.trustedLogins(companyId: acme.id).map { $0.login.lowercased() } == ["bob"], "the restore widened the trust list")
+        #expect(try #require(try restored.workItem(id: fromAlice.id)).originTrusted == false, "an item from the removed login stayed trusted")
+        #expect(try #require(try restored.workItem(id: fromBob.id)).originTrusted == true)
+        #expect(outcome.warnings.contains { $0.contains("Acme: trusted login alice, removed after the snapshot, stays removed") }, "\(outcome.warnings)")
+        #expect(!outcome.warnings.contains { $0.lowercased().contains("trusted login bob") }, "\(outcome.warnings)")
+    }
+
     /// No link is stricter than a link; a label filter is stricter than none; a link re-pointed live keeps the live target.
     @Test func restoreKeepsTheStricterIssueLink() throws {
         let env = try BackupEnv()

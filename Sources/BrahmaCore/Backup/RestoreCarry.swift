@@ -334,11 +334,18 @@ struct RestoreCarry {
         try keepLivePRLandings(live, into: db)
         try keepNarrowerPRActionApprovals(live, into: db)
         if try db.tableExists("trustedLogin") {
+            // Ruling 25: logins compare case-insensitively (keys are in `TrustList.normalize` form; rows and authors are
+            // matched in that form, whatever case they were stored in).
             for key in Set(try Settings.readTrustedLogins(db)).subtracting(live.trustedLogins).sorted() {
                 let (companyId, login) = Settings.split(key)
-                try db.execute(sql: "DELETE FROM trustedLogin WHERE companyId = ? AND login = ?", arguments: [companyId, login])
-                try db.execute(sql: "UPDATE workItem SET originTrusted = 0 WHERE companyId = ? AND originAuthor = ? AND originTrusted = 1",
-                               arguments: [companyId, login])
+                for row in try Store.trustedLoginRows(db, companyId: companyId, login: login) { try row.delete(db) }
+                let authors = try String.fetchAll(db, sql: """
+                    SELECT DISTINCT originAuthor FROM workItem WHERE companyId = ? AND originTrusted = 1 AND originAuthor IS NOT NULL
+                    """, arguments: [companyId]).filter { TrustList.normalize($0) == login }
+                for author in authors {
+                    try db.execute(sql: "UPDATE workItem SET originTrusted = 0 WHERE companyId = ? AND originAuthor = ? AND originTrusted = 1",
+                                   arguments: [companyId, author])
+                }
             }
         }
         if try db.tableExists("issueLink") {
@@ -630,8 +637,11 @@ extension RestoreCarry {
             return (parts.first ?? key, parts.count > 1 ? parts[1] : "")
         }
 
+        /// `companyId|login`, the login in `TrustList.normalize` form (Ruling 25).
         static func readTrustedLogins(_ db: Database) throws -> [String] {
-            try Row.fetchAll(db, sql: "SELECT companyId, login FROM trustedLogin").map { "\($0["companyId"] as String)|\($0["login"] as String)" }
+            try Row.fetchAll(db, sql: "SELECT companyId, login FROM trustedLogin").map {
+                "\($0["companyId"] as String)|\(TrustList.normalize($0["login"] as String))"
+            }
         }
 
         static func readIssueLinks(_ db: Database) throws -> [String: IssueLinkSetting] {

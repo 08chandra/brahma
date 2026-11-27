@@ -3,12 +3,20 @@ import Foundation
 
 /// An in-memory GitHub for PR mode's tests (Plan X8): repositories with visibility, a default branch and branch protection;
 /// branches; pull requests whose `mergeable_state` follows the protection (`blocked`, `unstable`, `behind`, `clean`); check
-/// runs; reviews pinned to a `commit_id`; comments; issues; commits with `verification.verified` and `author.login`. Every
-/// call is logged (`requests`: `GET /repos/o/r`, ...). Conforms to `GitHubAPI`; later tasks add the PR and issue calls.
+/// runs (with their output); reviews pinned to a `commit_id`; comments; issues; commits with `verification.verified` and
+/// `author.login`. Every call is logged (`requests`: `GET /repos/o/r`, ...). Conforms to `GitHubAPI`; later tasks add the
+/// merge and issue calls.
 final class FakeGitHub: GitHubAPI, @unchecked Sendable {
     struct Protection: Equatable { var requiredChecks: [String] = []; var requiredReviews = 0 }
-    struct CheckRun: Equatable { var name: String; var headSHA: String; var conclusion: String? }
-    struct Review: Equatable { var user: String; var state: String; var commitId: String }
+    struct CheckRun: Equatable {
+        var name: String
+        var headSHA: String
+        var conclusion: String?
+        var status = "completed"
+        /// `output.text`.
+        var output = ""
+    }
+    struct Review: Equatable { var user: String; var state: String; var commitId: String; var body = "" }
     struct Comment: Equatable { var user: String; var body: String }
     struct IssueRecord: Equatable { var number: Int; var title: String; var body: String; var user: String; var labels: [String]; var state = "open" }
     struct Commit: Equatable { var sha: String; var authorLogin: String?; var verified: Bool }
@@ -74,9 +82,9 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
         return try result.get()
     }
 
-    static func pr(_ repo: GitHubRepoRef, _ p: PullRequest) -> GitHubPR {
+    static func pr(_ repo: GitHubRepoRef, _ p: PullRequest, mergeableState: String? = nil) -> GitHubPR {
         GitHubPR(number: p.number, htmlURL: "https://github.com/\(repo.owner)/\(repo.name)/pull/\(p.number)", state: p.state, merged: p.merged,
-                 headRef: p.head, headSHA: p.headSHA, baseRef: p.base, title: p.title, body: p.body)
+                 headRef: p.head, headSHA: p.headSHA, baseRef: p.base, title: p.title, body: p.body, mergeableState: mergeableState)
     }
 
     func update(_ repo: GitHubRepoRef, _ change: (inout Repo) -> Void) {
@@ -88,17 +96,26 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
     func snapshot(_ repo: GitHubRepoRef) -> Repo? { lock.withLock { repos[repo] } }
 
     /// GitHub's `mergeable_state` for a PR under the repository's protection: `behind` when the base moved past the PR's base,
-    /// `blocked` when approvals at the head are missing, `unstable` when a required check is not green at the head, else `clean`.
+    /// `blocked` when a required check is not green at the head, approvals at the head are missing or a reviewer's latest
+    /// decisive review requests changes, `unstable` when another check at the head did not pass, else `clean`.
     func mergeableState(_ repo: GitHubRepoRef, pr number: Int) -> String? {
         lock.withLock {
             guard let r = repos[repo], let pr = r.pulls.first(where: { $0.number == number }) else { return nil }
-            if let tip = r.branches[pr.base], tip != pr.baseSHA { return "behind" }
-            let approvals = Set(pr.reviews.filter { $0.state == "APPROVED" && $0.commitId == pr.headSHA }.map(\.user)).count
-            if approvals < r.protection.requiredReviews { return "blocked" }
-            let green = Set(r.checkRuns.filter { $0.headSHA == pr.headSHA && $0.conclusion == "success" }.map(\.name))
-            if !Set(r.protection.requiredChecks).isSubset(of: green) { return "unstable" }
-            return "clean"
+            return Self.mergeableState(r, pr)
         }
+    }
+
+    private static func mergeableState(_ r: Repo, _ pr: PullRequest) -> String {
+        if let tip = r.branches[pr.base], tip != pr.baseSHA { return "behind" }
+        let approvals = Set(pr.reviews.filter { $0.state == "APPROVED" && $0.commitId == pr.headSHA }.map(\.user)).count
+        var latest: [String: String] = [:]
+        for review in pr.reviews where ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].contains(review.state) { latest[review.user.lowercased()] = review.state }
+        let runs = r.checkRuns.filter { $0.headSHA == pr.headSHA }
+        let green = Set(runs.filter { $0.conclusion == "success" }.map(\.name))
+        if approvals < r.protection.requiredReviews || latest.values.contains("CHANGES_REQUESTED")
+            || !Set(r.protection.requiredChecks).isSubset(of: green) { return "blocked" }
+        if runs.contains(where: { !["success", "neutral", "skipped"].contains($0.conclusion ?? "") }) { return "unstable" }
+        return "clean"
     }
 
     // MARK: GitHubAPI
@@ -159,7 +176,28 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
         try logged("GET /repos/\(repo.owner)/\(repo.name)/pulls/\(number)") {
             if down { throw Failure.unavailable }
             guard let r = repos[repo] else { throw Failure.notFound("/repos/\(repo.owner)/\(repo.name)") }
-            return r.pulls.first { $0.number == number }.map { Self.pr(repo, $0) }
+            return r.pulls.first { $0.number == number }.map { Self.pr(repo, $0, mergeableState: $0.state == "open" ? Self.mergeableState(r, $0) : nil) }
+        }
+    }
+
+    func checkRuns(_ repo: GitHubRepoRef, sha: String) async throws -> [GitHubCheckRun] {
+        try logged("GET /repos/\(repo.owner)/\(repo.name)/commits/\(sha)/check-runs") {
+            if down { throw Failure.unavailable }
+            guard let r = repos[repo] else { throw Failure.notFound("/repos/\(repo.owner)/\(repo.name)") }
+            return r.checkRuns.filter { $0.headSHA == sha }.map {
+                GitHubCheckRun(name: $0.name, headSHA: $0.headSHA, status: $0.status, conclusion: $0.conclusion, title: "", summary: "", text: $0.output)
+            }
+        }
+    }
+
+    func reviews(_ repo: GitHubRepoRef, number: Int) async throws -> [GitHubReview] {
+        try logged("GET /repos/\(repo.owner)/\(repo.name)/pulls/\(number)/reviews") {
+            if down { throw Failure.unavailable }
+            guard let r = repos[repo] else { throw Failure.notFound("/repos/\(repo.owner)/\(repo.name)") }
+            guard let pr = r.pulls.first(where: { $0.number == number }) else { throw Failure.notFound("/pulls/\(number)") }
+            return pr.reviews.enumerated().map { i, review in
+                GitHubReview(id: i + 1, user: GitHubUser(login: review.user), state: review.state, body: review.body, commitId: review.commitId)
+            }
         }
     }
 }

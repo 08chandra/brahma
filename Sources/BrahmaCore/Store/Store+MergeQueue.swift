@@ -583,7 +583,7 @@ extension Store {
     }
 
     /// The item goes back to its holder: `inProgress`, nothing approved, `mergeFailed` with the reason and a system DM.
-    private func returnUnmerged(_ db: Database, item current: WorkItem, request: MergeRequest, now: Date, dm: String? = nil) throws {
+    func returnUnmerged(_ db: Database, item current: WorkItem, request: MergeRequest, now: Date, dm: String? = nil) throws {
         var item = current
         let detail = request.detail ?? "the merge did not complete"
         item.mergeState = .none

@@ -62,6 +62,10 @@ public protocol GitHubAPI: Sendable {
     /// `GET /repos/{o}/{r}/pulls?head=<head>&state=<state>`: `head` is `<owner>:<branch>`, `state` `open`, `closed` or `all`.
     /// How an unknown `open-pr` is reconciled.
     func pulls(_ repo: GitHubRepoRef, head: String, state: String) async throws -> [GitHubPR]
-    /// `GET /repos/{o}/{r}/pulls/{number}`; nil when there is none (404).
+    /// `GET /repos/{o}/{r}/pulls/{number}`; nil when there is none (404). Carries `mergeable_state`.
     func pull(_ repo: GitHubRepoRef, number: Int) async throws -> GitHubPR?
+    /// `GET /repos/{o}/{r}/commits/{sha}/check-runs` (`filter=latest`), every page: the checks on a PR's head.
+    func checkRuns(_ repo: GitHubRepoRef, sha: String) async throws -> [GitHubCheckRun]
+    /// `GET /repos/{o}/{r}/pulls/{number}/reviews`, every page, oldest first.
+    func reviews(_ repo: GitHubRepoRef, number: Int) async throws -> [GitHubReview]
 }

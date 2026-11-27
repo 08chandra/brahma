@@ -66,6 +66,8 @@ extension Store {
             return input
         }
         var report = StallExplainer.explain(input, timeZone: ownerTimeZone(), now: now)
+        // Plan X8 Task 4: a pull request that waits on GitHub (a failing check, a review) or is held says why.
+        report.reasons.append(contentsOf: try prWaitLines(companyId: companyId))
         // Task 14u (F9): an approved Ultra run that has not started says why.
         let waiting = (try? writer.read { db in try itemsWaitingForUltra(db: db, companyId: companyId) }) ?? []
         if !waiting.isEmpty {

@@ -16,6 +16,7 @@ import GRDB
         private let lock = NSLock()
         private var currentMode = Mode.land
         private var refspecs: [String] = []
+        private var argv: [[String]] = []
         private var hook: (@Sendable () -> Void)?
 
         init(github: FakeGitHub) { self.github = github }
@@ -26,6 +27,8 @@ import GRDB
         }
         /// Every `<sha>:<ref>` pushed.
         var pushes: [String] { lock.withLock { refspecs } }
+        /// Every push's whole argument list (after `git`).
+        var pushArguments: [[String]] { lock.withLock { argv } }
         func onPush(_ hook: (@Sendable () -> Void)?) { lock.withLock { self.hook = hook } }
 
         func run(args: [String], env: [String: String], credential: TokenHandle?, workingDirectory: URL, timeout: Duration,
@@ -34,7 +37,7 @@ import GRDB
             guard args.contains("push"), let spec = args.last, let colon = spec.firstIndex(of: ":") else {
                 return GitPushProcessResult(status: 2, stdout: Data(), stderr: Data("unexpected git call\n".utf8), timedOut: false)
             }
-            let (mode, hook) = lock.withLock { refspecs.append(spec); return (currentMode, self.hook) }
+            let (mode, hook) = lock.withLock { refspecs.append(spec); argv.append(args); return (currentMode, self.hook) }
             hook?()
             switch mode {
             case .land:

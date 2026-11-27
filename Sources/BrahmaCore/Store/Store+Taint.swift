@@ -34,6 +34,10 @@ extension Store {
     public func relayedTaint(inbox: [(InboxItem, Message, Channel)], notices: [PendingNotice], handoff: Handoff?,
                              handles: [String: String]) -> String? {
         func who(_ id: String) -> String { "@" + (handles[id] ?? "unknown") }
+        // Plan X8 Task 4: EXTERNAL feedback from GitHub on the item's PR taints its reader with its own source.
+        if let n = notices.first(where: { $0.event.kind == .prFeedback && $0.event.taintedOrigin }) {
+            return PRFeedback.taintSource(ofEventText: n.event.text) ?? "github: PR feedback"
+        }
         // C3b: a message stamped with its session's taint (`fromTaintedSession`) relays it as the write-time mark does.
         if let m = inbox.first(where: { $0.1.taintedOrigin || $0.1.fromTaintedSession }) { return "relayed: message from \(who(m.1.senderId))" }
         if let n = notices.first(where: { $0.event.taintedOrigin }) { return "relayed: \(n.itemKey) \(n.event.kind.rawValue) by \(who(n.event.actorId))" }

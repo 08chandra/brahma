@@ -75,26 +75,36 @@ extension Store {
         }
     }
 
-    /// Owner only. Adding a login already listed keeps the first record.
+    /// Owner only. Stored normalized (Ruling 25: `TrustList.normalize`, logins compare case-insensitively); adding a login
+    /// already listed, in any case, keeps the first record.
     public func addTrustedLogin(_ login: String, companyId: String, by sender: Sender, now: Date = Store.now()) throws {
         guard sender == .owner else { throw WorkError.forbidden(Self.prOwnerOnly) }
-        let login = login.trimmingCharacters(in: .whitespacesAndNewlines)
+        let login = TrustList.normalize(login)
         guard !login.isEmpty, login.unicodeScalars.allSatisfy({ !CharacterSet.whitespacesAndNewlines.contains($0) }) else {
             throw WorkError.invalid("a login has no spaces")
         }
         try writer.write { db in
             guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
+            guard try Self.trustedLoginRows(db, companyId: companyId, login: login).isEmpty else { return }
             try TrustedLogin(companyId: companyId, login: login, addedBy: sender.id, addedAt: now).insert(db, onConflict: .ignore)
         }
     }
 
-    /// Owner only. Items already imported keep the trust they were imported with.
+    /// Owner only. Removes the login in any case (a row stored before Ruling 25 kept its typed case). Items already imported
+    /// keep the trust they were imported with.
     public func removeTrustedLogin(_ login: String, companyId: String, by sender: Sender) throws {
         guard sender == .owner else { throw WorkError.forbidden(Self.prOwnerOnly) }
         try writer.write { db in
-            let removed = try TrustedLogin.filter(Column("companyId") == companyId && Column("login") == login).deleteAll(db)
-            guard removed > 0 else { throw WorkError.notFound("no trusted login '\(login)'") }
+            let rows = try Self.trustedLoginRows(db, companyId: companyId, login: login)
+            guard !rows.isEmpty else { throw WorkError.notFound("no trusted login '\(login)'") }
+            for row in rows { try row.delete(db) }
         }
+    }
+
+    /// The company's `trustedLogin` rows that are `login` under Ruling 25 (compared in `TrustList.normalize` form).
+    static func trustedLoginRows(_ db: Database, companyId: String, login: String) throws -> [TrustedLogin] {
+        let key = TrustList.normalize(login)
+        return try TrustedLogin.filter(Column("companyId") == companyId).fetchAll(db).filter { TrustList.normalize($0.login) == key }
     }
 
     // MARK: Issue links

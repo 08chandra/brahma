@@ -153,8 +153,11 @@ import Foundation
         // Plan C Task C5b: the owner's inline review comment wakes whoever holds the work, nobody else.
         #expect(W.noticeWakes(kind: .reviewComment, recipientRole: .holder))
         for r in [NoticeRecipientRole.owner, .reviewer, .author, .mentioned] { #expect(!W.noticeWakes(kind: .reviewComment, recipientRole: r)) }
+        // Plan X8 Task 4: GitHub's feedback on the item's PR wakes its owner agent (or holder), nobody else.
+        #expect(W.noticeWakes(kind: .prFeedback, recipientRole: .owner)); #expect(W.noticeWakes(kind: .prFeedback, recipientRole: .holder))
+        for r in [NoticeRecipientRole.reviewer, .author, .mentioned, .other] { #expect(!W.noticeWakes(kind: .prFeedback, recipientRole: r)) }
         let waking: Set<WorkEventKind> = [.verificationPassed, .changesRequested, .verificationFailed, .mergeConflict, .mergeFailed, .dependencyDone, .commented,
-                                          .humanTaskDone, .humanTaskDeclined, .reviewComment]
+                                          .humanTaskDone, .humanTaskDeclined, .reviewComment, .prFeedback]
         let roles: [NoticeRecipientRole] = [.owner, .reviewer, .author, .holder, .waiter, .mentioned, .other]
         for k in WorkEventKind.allCases where !waking.contains(k) {
             for r in roles { #expect(!W.noticeWakes(kind: k, recipientRole: r), "\(k) must never wake (\(r))") }

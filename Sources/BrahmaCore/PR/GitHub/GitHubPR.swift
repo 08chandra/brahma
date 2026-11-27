@@ -18,11 +18,16 @@ public struct GitHubPR: Equatable, Sendable {
     /// `title` and `body` (null on GitHub reads as empty): what proves the PR's content is the engine's (Ruling 28).
     public var title: String
     public var body: String
+    /// `mergeable_state` of `GET /pulls/{n}` (nil from the list and from the `POST`): `clean`, `blocked`, `behind`, `dirty`,
+    /// `unstable`, `unknown`, `has_hooks`, `draft`. `clean` is GitHub's word that every required check and review is satisfied
+    /// (Plan X8 Task 4 reads no branch protection: this is how "required" is known).
+    public var mergeableState: String?
 
     public init(number: Int, htmlURL: String, state: String, merged: Bool, headRef: String, headSHA: String, baseRef: String,
-                title: String, body: String) {
+                title: String, body: String, mergeableState: String? = nil) {
         self.number = number; self.htmlURL = htmlURL; self.state = state; self.merged = merged
         self.headRef = headRef; self.headSHA = headSHA; self.baseRef = baseRef; self.title = title; self.body = body
+        self.mergeableState = mergeableState
     }
 
     public var isOpen: Bool { state == "open" }

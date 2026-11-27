@@ -191,8 +191,11 @@ public enum WorkNoticeDigest {
             let flat = String(String.UnicodeScalarView(n.event.text.unicodeScalars.map { blockedInline.contains($0) ? " " : $0 }))
             let text = flat.count > maxText ? String(flat.prefix(maxText)) + "…" : flat
             if n.event.taintedOrigin {
+                // Plan X8 Task 4: GitHub's feedback names GitHub (the event's own source line), not a session.
+                let source = n.event.kind == .prFeedback ? PRFeedback.taintSource(ofEventText: n.event.text) ?? "GitHub"
+                    : "@\(actor), a session that read outside content"
                 out += "\n- \(TaintPolicy.relayedPrefix)\(n.itemKey) \(n.event.kind.rawValue) by @\(actor):\n"
-                    + UntrustedBlock.render(source: "@\(actor), a session that read outside content", text: text, maxLines: 1)
+                    + UntrustedBlock.render(source: source, text: text, maxLines: 1)
             } else {
                 out += "\n- \(n.itemKey) \(n.event.kind.rawValue) by @\(actor): \(text)"
             }

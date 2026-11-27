@@ -324,6 +324,10 @@ public enum WorkEventKind: String, Codable, CaseIterable, Sendable, DatabaseValu
     /// Plan C Task C5b: the owner left an inline review comment (or a revert request) on the item's diff; the body is the
     /// `commented` event beside it. Wakes the lease holder (else the assignee).
     case reviewComment
+    /// Plan X8 Task 4: GitHub's feedback on the item's pull request (a failing check, a request for changes), written only by
+    /// the engine; its text starts with the source line `github: PR #<n> feedback` (`PRFeedback`). Tainted when any part is
+    /// EXTERNAL. Wakes the item's owner agent (else its holder); never in the activity feed.
+    case prFeedback
 
     /// Events that count as an agent making progress (the watchdog resets on them).
     public static let progress: Set<WorkEventKind> = [

@@ -65,6 +65,8 @@ public enum WakePolicy {
         case .referenced: false
         // Plan C Task C5b: the owner's inline review comment wakes whoever holds the work (the holder, else the assignee).
         case .reviewComment: recipientRole == .holder
+        // Plan X8 Task 4: GitHub's feedback on the item's pull request goes back to whoever carries the item on.
+        case .prFeedback: recipientRole == .owner || recipientRole == .holder
         default: false
         }
     }
