@@ -102,13 +102,81 @@ import GRDB
         #expect(plan.reposAhead == [RepoAhead(company: "Acme", commitsAfterSnapshot: 2)])
         #expect(plan.warnings == [RepoAhead(company: "Acme", commitsAfterSnapshot: 2).warning])
         #expect(plan.warnings.first?.contains("Brahma will not adopt them until you review main and accept it") == true)
+        // S5 fix 3 (R1, Ruling S-c1): the binary resolves its tools before it counts (red at f7820e4: it never installed them,
+        // so `commitCount` refused with `notInstalled` and the warning silently vanished).
         let result = try runBrahma(["restore", "--dry-run", snapshot.path], home: home.url)
         #expect(result.status == 0)
-        #expect(result.stdout.contains("Acme: repo has 2 commits after the snapshot; they are kept, but Brahma will not adopt them"))
+        #expect(result.stdout.contains("Acme: repo has 2 commits after the snapshot; they are kept, but Brahma will not adopt them"),
+                "stdout: \(result.stdout)\nstderr: \(result.stderr)")
+        #expect(!result.stdout.contains("could not check"))
+        #expect(!result.stdout.contains("git checks were skipped"))
         #expect(result.stdout.contains("nothing was changed"))
         let after = try snapshotOfTree(paths.home)
         #expect(after == before, "changed: \(Set(after).symmetricDifference(Set(before)).sorted())")   // not a byte, not a file, not a marker
         #expect(!FileManager.default.fileExists(atPath: BackupService.restoreMarker(paths: paths).path))
+    }
+
+    /// S5 fix 3 (R1): a repo whose commits cannot be counted (here: no tools installed in this task) is a warning that names
+    /// the company and the reason, never silence.
+    @Test func uncountableRepoIsReportedNotDropped() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        let snapshot = try env.service().snapshot(reason: .manual)
+        try env.store.close()
+        let fixture = GitFixture(existing: URL(fileURLWithPath: acme.workspacePath, isDirectory: true))
+        try fixture.write("later.txt", "x")
+        try fixture.git(["add", "-A"])
+        try fixture.git(["commit", "-m", "later"])
+        let plan = try ToolPaths.withIsolatedSlot { try env.service().planRestore(snapshot: snapshot) }
+        #expect(plan.reposAhead.isEmpty)
+        let warning = try #require(plan.warnings.first { $0.contains("could not check Acme's repo") }, "warnings: \(plan.warnings)")
+        #expect(warning.contains("\(ToolPathsError.notInstalled)"))
+        #expect(!warning.contains("\n"))
+        // The restore's own install: the snapshot's (and the live database's) workspaces are forbidden roots, then it counts.
+        let service = env.service()
+        #expect(try service.workspacePaths(snapshot: snapshot) == [acme.workspacePath])
+        #expect(try service.liveWorkspacePaths() == [acme.workspacePath])
+        let installed = try ToolPaths.withIsolatedSlot { () throws -> RestorePlan in
+            #expect(service.installRestoreTools(paths: env.paths, snapshot: snapshot) == nil)
+            #expect(ToolPaths.isInstalled)
+            return try service.planRestore(snapshot: snapshot)
+        }
+        #expect(installed.reposAhead == [RepoAhead(company: "Acme", commitsAfterSnapshot: 1)])
+        #expect(installed.reposUnchecked.isEmpty)
+        // Nothing lists a workspace (no live database, a snapshot without the table): nothing installed, and a note says so.
+        let barePaths = ownerPaths(try tempDir())
+        let bare = BackupService(paths: barePaths)
+        let empty = try tempDir().appending(path: "empty.sqlite")
+        try DatabaseQueue(path: empty.path).close()
+        ToolPaths.withIsolatedSlot {
+            let note = bare.installRestoreTools(paths: barePaths, snapshot: empty)
+            #expect(note?.contains("git checks were skipped") == true)
+            #expect(!ToolPaths.isInstalled)
+        }
+        // Only the live database lists one: a restore installs; a dry run (which never opens the live database) does not.
+        ToolPaths.withIsolatedSlot {
+            #expect(service.installRestoreTools(paths: env.paths, snapshot: empty, includeLive: false)?.contains("git checks were skipped") == true)
+            #expect(!ToolPaths.isInstalled)
+            #expect(service.installRestoreTools(paths: env.paths, snapshot: empty) == nil)
+            #expect(ToolPaths.isInstalled)
+        }
+    }
+
+    /// S5 fix 3 (R1): with no company workspace in the current database or the snapshot, `brahma restore` resolves no tools
+    /// (Ruling S-c1: never without the real forbidden roots) and says that its git checks were skipped, instead of nothing.
+    @Test func dryRunWithNoWorkspaceAnywhereSaysGitChecksWereSkipped() throws {
+        let home = try OwnerTestHome()
+        let paths = ownerPaths(home.url)
+        let snapshot: URL
+        do {
+            let store = try Store(path: paths.database.path, backupsDir: paths.backupsDir)
+            snapshot = try BackupService(paths: paths, writer: store.writer).snapshot(reason: .manual)
+            try store.close()
+        }
+        let result = try runBrahma(["restore", "--dry-run", snapshot.path], home: home.url)
+        #expect(result.status == 0, "stderr: \(result.stderr)")
+        #expect(result.stdout.contains("git checks were skipped"), "stdout: \(result.stdout)")
+        #expect(result.stdout.contains("nothing was changed"))
     }
 
     @Test func restoreIsAtomicRename() async throws {

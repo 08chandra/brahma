@@ -78,6 +78,8 @@ struct StartupErrorView: View {
             let result: Phase = await Task.detached {
                 let service = BackupService(paths: paths)
                 guard let latest = service.latestGood() else { return .failed("No snapshot passes its integrity check.") }
+                // B9 (Ruling S-c1, S5 fix 3): the store never opened, so nothing installed the tools the restore's git needs.
+                _ = service.installRestoreTools(paths: paths, snapshot: latest.url)
                 do {
                     try service.restore(try service.planRestore(snapshot: latest.url))
                     return .restored(latest.name)

@@ -195,11 +195,17 @@ struct RestoreCommand: ParsableCommand {
         } else {
             snapshot = URL(fileURLWithPath: path ?? "")
         }
+        // B9 (Ruling S-c1, S5 fix 3): restore never opens the store, but it runs engine git (the commits after the snapshot, the
+        // restore epoch's listing): its tools are installed first, outside every workspace the snapshot or (not in a dry run,
+        // which must not touch the live database's files) the current database lists; with none listed, none are, and the
+        // note says the git checks were skipped.
+        let toolsNote = service.installRestoreTools(paths: paths, snapshot: snapshot, includeLive: !dryRun)
         let plan: RestorePlan
         do { plan = try service.planRestore(snapshot: snapshot, date: walDate) } catch {
             if walDate != nil { try? FileManager.default.removeItem(at: snapshot) }
             throw fail("\(error)")
         }
+        if let toolsNote { print(safe("warning: \(toolsNote)")) }
         for warning in plan.warnings { print(safe("warning: \(warning)")) }
         if withFiles && plan.homeSnapshot == nil {
             throw fail("there is no data-home snapshot at or before \(plan.snapshotDate.map(stamp) ?? "that snapshot"); nothing was changed "

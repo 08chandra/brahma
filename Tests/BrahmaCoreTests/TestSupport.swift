@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 @testable import BrahmaCore
+@testable import BrahmaSafety
 import BrahmaKeychain
 
 /// Armed on first use (every temp dir touches it): any later Keychain call in this process crashes instead of
@@ -18,7 +19,8 @@ let keychainTrapArmed: Bool = {
 /// ask for a tool outside an orchestrator get one install, from the process's PATH with no forbidden roots (the test seam: no
 /// test puts a tool of a test workspace on the process's own PATH). Armed by every temp dir, like the traps.
 let toolPathsInstalled: Bool = {
-    if !ToolPaths.isInstalled { ToolPaths.install(forbiddenRoots: []) }
+    // S5 fix 3 (R2): the process slot, even when the first temp dir is asked for inside `ToolPaths.withIsolatedSlot`.
+    ToolPaths.installProcessWide(forbiddenRoots: [])
     return true
 }()
 

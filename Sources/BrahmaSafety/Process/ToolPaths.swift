@@ -347,6 +347,24 @@ public struct ToolPaths: Sendable, Equatable {
         return checked
     }
 
+    /// Test seam (S5 fix 3, R2): `install` into the PROCESS slot, whatever `withIsolatedSlot` the caller runs in, and only
+    /// while that slot is still empty (a test process's one seed install; an install that came first is kept). Returns
+    /// whether it installed. Internal: reached only through `@testable import`; production installs through `install`.
+    @discardableResult
+    static func installProcessWide(forbiddenRoots: [URL], path: String = ProcessInfo.processInfo.environment["PATH"] ?? "") -> Bool {
+        let target = processSlot
+        if isInstalledProcessWide { return false }
+        let resolved = resolve(path: path, forbiddenRoots: forbiddenRoots, xcrunFind: systemXcrunFind)
+        return target.lock.withLock {
+            guard target.result == nil else { return false }
+            target.result = resolved; target.path = path; target.forbidden = forbiddenRoots
+            return true
+        }
+    }
+
+    /// Whether the process slot (never an isolated one) holds an install (test seam, S5 fix 3).
+    static var isInstalledProcessWide: Bool { processSlot.lock.withLock { processSlot.result != nil } }
+
     /// Whether this process installed its tools yet (`engine` and `engineTool` refuse with `.notInstalled` until it did).
     public static var isInstalled: Bool { slot.lock.withLock { slot.result != nil } }
 

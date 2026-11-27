@@ -291,6 +291,10 @@ struct GitCommand: Sendable {
     /// keys; the engine's attributes override is put back. Returns the attribute source for the call.
     private func prepare(_ args: [String]) throws -> String? {
         if !attrSourceSupported, !Self.isTreeFree(args) {
+            // No engine git at all (not installed yet, none found): that is the reason, not its version (S5 fix 3).
+            if case .failure(let problem) = Self.tools() {
+                throw GitError.failed(command: args.joined(separator: " "), status: -1, stderr: "\(problem)")
+            }
             throw GitError.failed(command: args.joined(separator: " "), status: -1,
                                   stderr: "this git is older than 2.43 and cannot be kept from repository attributes; install a newer git")
         }

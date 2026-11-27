@@ -313,6 +313,19 @@ import Foundation
         }
     }
 
+    /// S5 fix 3 (R2): the test processes' seed install (`toolPathsInstalled`) lands in the process slot even when it is first
+    /// armed inside `withIsolatedSlot`; the isolated slot stays empty, and an install already in the process slot is kept.
+    @Test func testSeedInstallsTheProcessSlotFromInsideAnIsolatedSlot() {
+        ToolPaths.withIsolatedSlot {
+            ToolPaths.installProcessWide(forbiddenRoots: [])
+            #expect(!ToolPaths.isInstalled)                     // the isolated slot: untouched
+            #expect(ToolPaths.engine() == .failure(.notInstalled))
+            #expect(ToolPaths.isInstalledProcessWide)
+            #expect(!ToolPaths.installProcessWide(forbiddenRoots: []))   // already seeded: kept, not replaced
+        }
+        #expect(ToolPaths.isInstalled)                          // the process slot, outside any isolated one
+    }
+
     /// Ruling S5-4: a process the engine started (`brahma mcp`) takes the engine's git and checks it again under the same
     /// rules (owner and mode, Ruling S5-1, its resolved directory, the forbidden roots, the shim, 2.43); anything else is
     /// `gitMissing` (or `gitTooOld`), never a PATH walk.

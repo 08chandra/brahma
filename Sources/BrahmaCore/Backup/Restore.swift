@@ -203,16 +203,28 @@ public struct RepoAhead: Equatable, Sendable {
     }
 }
 
+/// A company whose repo could not be checked for commits after the snapshot (S5 fix 3, R1): git refused (the tools are not
+/// resolved, `ToolPathsError.notInstalled`) or failed. Said, never dropped: the commits it may hold are not adopted either way.
+public struct RepoUnchecked: Equatable, Sendable {
+    public let company: String
+    /// One line.
+    public let reason: String
+    public var warning: String { "could not check \(company)'s repo for commits after the snapshot: \(reason)" }
+}
+
 public struct RestorePlan: Equatable, Sendable {
     public let snapshot: URL
     public let snapshotDate: Date?
     public let reposAhead: [RepoAhead]
+    public let reposUnchecked: [RepoUnchecked]
     /// The newest data-home snapshot at or before the database snapshot: what `restore(_:withFiles:)` puts the files back to.
     public let homeSnapshot: HomeSnapshotInfo?
-    public var warnings: [String] { reposAhead.map(\.warning) }
+    public var warnings: [String] { reposAhead.map(\.warning) + reposUnchecked.map(\.warning) }
 
-    public init(snapshot: URL, snapshotDate: Date?, reposAhead: [RepoAhead], homeSnapshot: HomeSnapshotInfo? = nil) {
-        self.snapshot = snapshot; self.snapshotDate = snapshotDate; self.reposAhead = reposAhead; self.homeSnapshot = homeSnapshot
+    public init(snapshot: URL, snapshotDate: Date?, reposAhead: [RepoAhead], reposUnchecked: [RepoUnchecked] = [],
+                homeSnapshot: HomeSnapshotInfo? = nil) {
+        self.snapshot = snapshot; self.snapshotDate = snapshotDate; self.reposAhead = reposAhead
+        self.reposUnchecked = reposUnchecked; self.homeSnapshot = homeSnapshot
     }
 }
 
@@ -277,7 +289,8 @@ extension BackupService {
         if !openers.isEmpty { throw RestoreError.dbOpenElsewhere(openers) }
         try validate(snapshot: snapshot)
         let date = explicitDate ?? Self.parse(name: snapshot.lastPathComponent)?.date
-        return RestorePlan(snapshot: snapshot, snapshotDate: date, reposAhead: reposAhead(of: snapshot),
+        let repos = reposAhead(of: snapshot)
+        return RestorePlan(snapshot: snapshot, snapshotDate: date, reposAhead: repos.ahead, reposUnchecked: repos.unchecked,
                            homeSnapshot: date.flatMap { HomeSnapshot.newest(atOrBefore: $0, paths: lockPaths) })
     }
 
@@ -287,22 +300,73 @@ extension BackupService {
     }
 
     /// Companies whose `main` has commits the snapshot's record of it does not: they survive a restore (git is not touched).
-    private func reposAhead(of snapshot: URL) -> [RepoAhead] {
-        guard let queue = try? Self.openForReading(snapshot) else { return [] }
+    /// A repo git cannot count (tools not installed, git refused or failed) is `unchecked`, never silently left out (S5 fix 3, R1).
+    private func reposAhead(of snapshot: URL) -> (ahead: [RepoAhead], unchecked: [RepoUnchecked]) {
+        guard let queue = try? Self.openForReading(snapshot) else { return ([], []) }
         defer { try? queue.close() }
         let rows = (try? queue.read { db in
             try Row.fetchAll(db, sql: "SELECT name, workspacePath, mainCommit FROM company WHERE mainCommit IS NOT NULL ORDER BY createdAt, rowid")
         }) ?? []
         var ahead: [RepoAhead] = []
+        var unchecked: [RepoUnchecked] = []
         for row in rows {
             let name: String = row["name"], path: String = row["workspacePath"], recorded: String = row["mainCommit"]
             guard FileManager.default.fileExists(atPath: path + "/.git") else { continue }
             let git = GitWorkspace(root: URL(fileURLWithPath: path, isDirectory: true))
-            if let n = try? git.commitCount(from: recorded, to: GitWorkspace.mainRef), n > 0 {
-                ahead.append(RepoAhead(company: name, commitsAfterSnapshot: n))
+            do {
+                guard let n = try git.commitCount(from: recorded, to: GitWorkspace.mainRef) else {
+                    unchecked.append(RepoUnchecked(company: name, reason: "git could not count the commits from the recorded main "
+                        + "(\(Self.flatText(recorded))) to main"))
+                    continue
+                }
+                if n > 0 { ahead.append(RepoAhead(company: name, commitsAfterSnapshot: n)) }
+            } catch {
+                // One line, whole: the reason is the point (not `flatText`'s 200-character cut).
+                unchecked.append(RepoUnchecked(company: name, reason: "\(error)".split(whereSeparator: \.isNewline).joined(separator: " ")))
             }
         }
-        return ahead
+        return (ahead, unchecked)
+    }
+
+    /// The workspace of every company row in `snapshot` (the table `reposAhead` reads): `brahma restore`'s forbidden roots for
+    /// its tools, with the current database's (S5 fix 3, R1). Throws when the file or the table cannot be read.
+    public func workspacePaths(snapshot: URL) throws -> [String] {
+        try Self.companyWorkspacePaths(in: try Self.openForReading(snapshot))
+    }
+
+    /// The same, from the current database, opened `SQLITE_OPEN_READONLY`: it creates nothing and its close checkpoints
+    /// nothing. A reader still takes a read mark in the `-shm`, so a dry run does not call it. No database: it throws.
+    public func liveWorkspacePaths() throws -> [String] {
+        var config = Configuration()
+        config.readonly = true
+        return try Self.companyWorkspacePaths(in: try DatabaseQueue(path: database.path, configuration: config))
+    }
+
+    private static func companyWorkspacePaths(in queue: DatabaseQueue) throws -> [String] {
+        defer { bestEffort("close a database read for its workspaces") { try queue.close() } }
+        return try queue.read { db in try String.fetchAll(db, sql: "SELECT workspacePath FROM company ORDER BY createdAt, rowid") }
+    }
+
+    /// Ruling S-c1 for `brahma restore` (S5 fix 3, R1): it runs engine git (`reposAhead`, the restore epoch's listing) without
+    /// opening the store, so it installs the engine's tools here first, from `path`, with the data home, the workspaces
+    /// directory and the workspace of every company the snapshot and (with `includeLive`) the current database (read-only,
+    /// best effort) list as forbidden roots. A dry run passes `includeLive: false`: it must not change a byte of the data home,
+    /// and only the snapshot's repos are counted. When none is listed, the real roots are unknown: nothing is installed (every
+    /// git then refuses with `notInstalled`) and the returned note says the git checks were skipped. Nil when installed.
+    public func installRestoreTools(paths: BrahmaPaths, snapshot: URL, includeLive: Bool = true,
+                                    path: String = ProcessInfo.processInfo.environment["PATH"] ?? "") -> String? {
+        var workspaces: [String] = []
+        var reads: [() throws -> [String]] = [{ try workspacePaths(snapshot: snapshot) }]
+        if includeLive { reads.append { try liveWorkspacePaths() } }
+        for read in reads {
+            do { workspaces += try read() } catch { continue }   // unreadable: it lists nothing (the note below if none does)
+        }
+        guard !workspaces.isEmpty else {
+            return "git checks were skipped: neither the current database nor the snapshot lists a company workspace, so Brahma "
+                + "did not resolve its tools (it resolves them only outside every workspace it knows)"
+        }
+        ToolPaths.installForEngine(paths: paths, workspacePaths: Array(Set(workspaces)).sorted(), path: path)
+        return nil
     }
 
     // MARK: Restore

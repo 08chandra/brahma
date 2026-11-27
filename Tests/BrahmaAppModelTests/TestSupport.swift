@@ -1,6 +1,7 @@
 import Foundation
 import BrahmaCore
 import BrahmaAppModel
+@testable import BrahmaSafety
 import BrahmaKeychain
 
 /// Any Keychain call in this process crashes instead of prompting the owner (see the BrahmaCoreTests twin).
@@ -15,7 +16,8 @@ let keychainTrapArmed: Bool = {
 /// ask for a tool outside an orchestrator get one install, from the process's PATH with no forbidden roots (the test seam: no
 /// test puts a tool of a test workspace on the process's own PATH). Armed by every temp dir, like the traps.
 let toolPathsInstalled: Bool = {
-    if !ToolPaths.isInstalled { ToolPaths.install(forbiddenRoots: []) }
+    // S5 fix 3 (R2): the process slot, even when the first temp dir is asked for inside `ToolPaths.withIsolatedSlot`.
+    ToolPaths.installProcessWide(forbiddenRoots: [])
     return true
 }()
 
