@@ -145,14 +145,28 @@ extension Store {
     /// that day. Nothing recorded is 0.
     public func counters(companyId: String, name: String, in window: MeasureWindow, tz: TimeZone? = nil) throws -> Double {
         let zone = tz ?? ownerTimeZone()
-        let first = Self.measureDay(window.since, in: zone)
+        return try writer.read { db in try Self.counterTotal(db, companyId: companyId, name: name, in: window, tz: zone).sum }
+    }
+
+    /// The in-transaction form, with the number of day rows summed: a metric whose source is a counter tells "nothing recorded"
+    /// (no rows) from a recorded 0. `companyId` "" is an owner-wide counter (`reserveBreaches`).
+    static func counterTotal(_ db: Database, companyId: String, name: String, in window: MeasureWindow, tz: TimeZone) throws
+        -> (sum: Double, rows: Int) {
+        let first = measureDay(window.since, in: tz)
         // The last instant inside the window is just before `until`; its day is the last day the window touches.
-        let last = Self.measureDay(window.until.addingTimeInterval(-1), in: zone)
-        guard first <= last else { return 0 }
-        return try writer.read { db in
-            try Double.fetchOne(db, sql: "SELECT COALESCE(SUM(value), 0) FROM measureCounter WHERE companyId = ? AND name = ? AND day >= ? AND day <= ?",
-                                arguments: [companyId, name, first, last]) ?? 0
-        }
+        let last = measureDay(window.until.addingTimeInterval(-1), in: tz)
+        guard first <= last else { return (0, 0) }
+        let row = try Row.fetchOne(db, sql: """
+            SELECT COALESCE(SUM(value), 0) AS total, COUNT(*) AS days FROM measureCounter
+            WHERE companyId = ? AND name = ? AND day >= ? AND day <= ?
+            """, arguments: [companyId, name, first, last])
+        guard let row else { return (0, 0) }
+        return (row["total"] as Double, row["days"] as Int)
+    }
+
+    /// The earliest day the company's `name` counter has a row for (`YYYY-MM-DD`), or nil.
+    static func firstCounterDay(_ db: Database, companyId: String, name: String) throws -> String? {
+        try String.fetchOne(db, sql: "SELECT MIN(day) FROM measureCounter WHERE companyId = ? AND name = ?", arguments: [companyId, name])
     }
 
     /// `YYYY-MM-DD` of `date` in `zone`: the key of a day's counters.

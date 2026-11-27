@@ -2062,6 +2062,26 @@ enum Migrations {
             }
             try db.execute(sql: "INSERT INTO measureEpoch (name, at) VALUES ('links', ?)", arguments: [Store.now()])
         }
+        m.registerMigration("vX6a-measure-owner-counters") { db in
+            // Plan X6a Task 5. The measure recorder keeps one owner-wide counter, `reserveBreaches`, under company id "" (the usage
+            // snapshot is the owner's account, not a company's). `measureCounter.companyId` referenced `company`, which refuses "";
+            // the table is rebuilt without that reference and a trigger keeps the cascade a deleted company relied on. (GRDB runs
+            // migrations with foreign-key checks deferred, so the rebuild is safe; the rows are copied as they are.)
+            try db.create(table: "measureCounter_new") { t in
+                t.column("companyId", .text).notNull()            // a company id, or "" for an owner-wide counter
+                t.column("name", .text).notNull()
+                t.column("day", .text).notNull()                   // owner-calendar YYYY-MM-DD
+                t.column("value", .double).notNull().defaults(to: 0)
+                t.primaryKey(["companyId", "name", "day"])
+            }
+            try db.execute(sql: "INSERT INTO measureCounter_new (companyId, name, day, value) SELECT companyId, name, day, value FROM measureCounter")
+            try db.drop(table: "measureCounter")
+            try db.rename(table: "measureCounter_new", to: "measureCounter")
+            try db.execute(sql: """
+                CREATE TRIGGER measureCounter_companyDeleted AFTER DELETE ON company
+                BEGIN DELETE FROM measureCounter WHERE companyId = OLD.id; END
+                """)
+        }
     }
 }
 

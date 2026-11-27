@@ -47,8 +47,8 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let md = try brahma(["measure", "Acme"], home: rig.home)
         #expect(md.status == 0, "\(md.stderr)")
         #expect(md.stdout.hasPrefix("# measure Acme — "), "\(md.stdout)")
-        // Tasks 3 and 4's metrics are built: with nothing landed they say so; every other metric is not built yet.
-        let built: Set<MetricId> = [.greenMain, .firstPass, .queueHealth, .revertRate, .reviewCatch, .escapeRate]
+        // Every metric is built (Tasks 3–5): with nothing landed and nothing recorded each says so.
+        let built = Set(MetricId.all)
         for id in MetricId.all where !built.contains(id) { #expect(md.stdout.contains("| \(id.label) | not applicable: not built yet |"), "\(id.rawValue)") }
         #expect(md.stdout.contains("| \(MetricId.greenMain.label) | not measured: no landings in the window |"), "\(md.stdout)")
         #expect(md.stdout.contains("| \(MetricId.firstPass.label) | not measured: no landings in the window |"), "\(md.stdout)")
@@ -56,6 +56,15 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(md.stdout.contains("| \(MetricId.revertRate.label) | not measured: no landings in the window |"), "\(md.stdout)")
         #expect(md.stdout.contains("| \(MetricId.reviewCatch.label) | not measured: no landings or review events in the window |"), "\(md.stdout)")
         #expect(md.stdout.contains("| \(MetricId.escapeRate.label) | not measured: no landings in the window |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.usagePerLanded.label) | not measured: no landings in the window |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.ownerTouches.label) | not measured: no landings in the window |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.safety.label) | 0 (target 0) |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.nonCode.label) | not applicable: landGate items and rubric checks absent |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.modelRanking.label) | not measured: no landings in the window |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.idleActionable.label) | not measured: no active-seconds records in window |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.itemsPerDollar.label) | not measured: no landings in the window |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.itemsPerPlanHour.label) | not measured: no active-seconds records in window |"), "\(md.stdout)")
+        #expect(md.stdout.contains("| \(MetricId.ownerMinutes.label) | not measured: no owner-time records |"), "\(md.stdout)")
         #expect(md.stdout.contains("docs/measure/metrics.md"))
         #expect(md.stdout.split(separator: "\n").count > 15, "the table is printed line by line, not flattened")
 
@@ -71,6 +80,9 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(report.metrics.first { $0.id == .revertRate }?.status == .notMeasured(reason: "no landings in the window"))
         #expect(report.metrics.first { $0.id == .reviewCatch }?.status == .notMeasured(reason: "no landings or review events in the window"))
         #expect(report.metrics.first { $0.id == .escapeRate }?.status == .notMeasured(reason: "no landings in the window"))
+        #expect(report.metrics.first { $0.id == .ownerMinutes }?.status == .notMeasured(reason: "no owner-time records"))
+        #expect(report.metrics.first { $0.id == .nonCode }?.status == .notApplicable(reason: "landGate items and rubric checks absent"))
+        #expect(!report.metrics.contains { $0.status == .notApplicable(reason: "not built yet") })
         #expect(["UTC", "GMT"].contains(report.timeZone), "Foundation names the UTC zone GMT: \(report.timeZone)")
         // The JSON decodes back to the same report: re-encoding it gives the same bytes, and decoding those the same value.
         let again = try report.json()
@@ -119,6 +131,46 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(k.status == 1 && k.stderr.contains("owner key missing or invalid"), "\(k.stderr)")
     }
 
+    /// `--log-owner-minutes <n> [--day YYYY-MM-DD]` (owner ruling R7(d)): the owner's own time, the one write `measure` makes. It
+    /// adds to that day's counter and the report then reads it; refused inside an agent turn; a bad day or count is refused and
+    /// writes nothing.
+    @Test func logOwnerMinutesThenMeasure() throws {
+        let rig = try Rig()
+        let before = try brahma(["measure", "Acme", "--format", "json", "--since", "all"], home: rig.home)
+        #expect(try MeasureReport.decode(Data(before.stdout.utf8)).metrics.first { $0.id == .ownerMinutes }?.status
+                == .notMeasured(reason: "no owner-time records"))
+
+        let today = Store.measureDay(Date(), in: TimeZone(identifier: "UTC")!)
+        let logged = try brahma(["measure", "Acme", "--log-owner-minutes", "25"], home: rig.home)
+        #expect(logged.status == 0, "\(logged.stderr)")
+        #expect(logged.stdout.contains("Logged 25 owner minutes for Acme on \(today)"), "\(logged.stdout)")
+        let dated = try brahma(["measure", "Acme", "--log-owner-minutes", "5", "--day", today], home: rig.home)
+        #expect(dated.status == 0, "\(dated.stderr)")
+        #expect(try store(rig).counters(companyId: rig.company.id, name: MeasureCounter.ownerInterventionSeconds,
+                                         in: MeasureWindow(since: rig.company.createdAt, until: Date().addingTimeInterval(86_400))) == 30 * 60)
+
+        // The report reads the log: no landing yet, so not measured with the minutes in the detail.
+        let after = try brahma(["measure", "Acme", "--format", "json", "--since", "all"], home: rig.home)
+        let metric = try #require(try MeasureReport.decode(Data(after.stdout.utf8)).metrics.first { $0.id == .ownerMinutes })
+        #expect(metric.status == .notMeasured(reason: "no landings in the window"))
+        #expect(metric.detail.first { $0.label == "owner minutes logged" }?.numerator == 30)
+
+        // Refused: inside an agent turn; zero or negative minutes; a malformed or future day; --day alone.
+        let agent = try brahma(["measure", "Acme", "--log-owner-minutes", "5"], home: rig.home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(agent.status == 1 && agent.stderr.contains("owner commands can't run inside an agent turn"), "\(agent.stderr)")
+        for bad in [["--log-owner-minutes", "0"], ["--log-owner-minutes", "-3"], ["--log-owner-minutes", "5", "--day", "2026-13-01"],
+                    ["--log-owner-minutes", "5", "--day", "2999-01-01"], ["--day", today]] {
+            let r = try brahma(["measure", "Acme"] + bad, home: rig.home)
+            #expect(r.status != 0, "\(bad)")
+            #expect(r.stdout.isEmpty, "\(bad): \(r.stdout)")
+        }
+        #expect(try store(rig).counters(companyId: rig.company.id, name: MeasureCounter.ownerInterventionSeconds,
+                                         in: MeasureWindow(since: rig.company.createdAt, until: Date().addingTimeInterval(86_400))) == 30 * 60)
+    }
+
+    /// A fresh handle on the rig's database (the CLI wrote through its own).
+    func store(_ rig: Rig) throws -> Store { try Store(path: ownerPaths(rig.home).database.path) }
+
     @Test func unknownCompanyIsActionable() throws {
         let rig = try Rig()
         let r = try brahma(["measure", "Nope"], home: rig.home)
@@ -132,6 +184,6 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         // The help lists the command.
         #expect(try brahma(["--help"], home: rig.home).stdout.contains("measure"))
         let h = try brahma(["measure", "--help"], home: rig.home)
-        #expect(h.status == 0 && h.stdout.contains("--since") && h.stdout.contains("--format"), "\(h.stdout)")
+        #expect(h.status == 0 && h.stdout.contains("--since") && h.stdout.contains("--format") && h.stdout.contains("--log-owner-minutes"), "\(h.stdout)")
     }
 }

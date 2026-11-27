@@ -84,15 +84,16 @@ enum MeasureFixtures {
     /// The item's `itemFact` row (what `OutcomeFactsObserver` writes when an item completes), with the numbers a test wants.
     @discardableResult
     static func fact(_ store: Store, item: WorkItem, firstPass: Bool = true, costLE: Double = 1, turnsUsed: Int = 2,
-                     tokensUsed: Int = 1000, cycleActiveSeconds: Int? = 600, reviewRejections: Int = 0, completedAt: Date = t0)
+                     tokensUsed: Int = 1000, cycleActiveSeconds: Int? = 600, reviewRejections: Int = 0, completedAt: Date = t0,
+                     ownerId: String? = nil, reviewerId: String? = nil, reworkRounds: Int? = nil, reviewCostLE: Double = 0.1)
         throws -> ItemFact {
         let f = ItemFact(itemId: item.id, companyId: item.companyId, type: item.type.rawValue, tier: item.tier.rawValue,
-                         ownerId: item.ownerId, reviewerId: item.reviewerId, firstPass: firstPass, verificationRuns: 1,
-                         failedRuns: firstPass ? 0 : 1, flakyRuns: 0, inconclusiveRuns: 0, reworkRounds: reviewRejections,
+                         ownerId: ownerId ?? item.ownerId, reviewerId: reviewerId ?? item.reviewerId, firstPass: firstPass, verificationRuns: 1,
+                         failedRuns: firstPass ? 0 : 1, flakyRuns: 0, inconclusiveRuns: 0, reworkRounds: reworkRounds ?? reviewRejections,
                          reviewRejections: reviewRejections, turnsUsed: turnsUsed, tokensUsed: tokensUsed, tierMaxTurns: 10,
                          tierMaxTokens: 100_000, cycleActiveSeconds: cycleActiveSeconds, blockedActiveSeconds: 0,
                          checkAuthorId: "owner", checkAuthorRole: "owner", mergeConflicts: 0, costLE: costLE, tierMaxCostLE: 10,
-                         reviewCostLE: 0.1, autoMerged: false, audited: false, auditVerdict: nil, rungAtPass: 1, modesUsed: "balanced",
+                         reviewCostLE: reviewCostLE, autoMerged: false, audited: false, auditVerdict: nil, rungAtPass: 1, modesUsed: "balanced",
                          completedAt: completedAt)
         try store.writer.write { db in try f.save(db) }
         return f
@@ -245,6 +246,100 @@ extension MeasureFixtures {
             let (batch, requests) = try land(store, company: company, items: [item], number: firstNumber + i,
                                              enqueuedAt: at[i].addingTimeInterval(-600), landedAt: at[i])
             return (batch, requests[0], item)
+        }
+    }
+}
+
+// MARK: Task 5 — agents, turns, asks, messages, safety records, usage snapshots, counters
+
+extension MeasureFixtures {
+    /// An agent of `company` (a store row: no session, no worktree).
+    @discardableResult
+    static func agent(_ store: Store, company: Company, name: String, role: String = "engineer", model: String = "sonnet",
+                      state: AgentState = .ready, blocker: Blocker? = nil, paused: Bool = false) throws -> Agent {
+        let a = Agent(id: UUID().uuidString, companyId: company.id, name: name, role: role, model: model, sessionId: UUID().uuidString,
+                      sessionStarted: false, state: state, blocker: blocker, paused: paused, createdAt: t0)
+        try store.writer.write { db in try a.insert(db) }
+        return a
+    }
+
+    /// One finished turn of `agent` (`kind` work by default) about `item`, started at `at`.
+    @discardableResult
+    static func turn(_ store: Store, agent: Agent, item: WorkItem? = nil, kind: TurnKind = .work, outcome: TurnOutcome = .succeeded,
+                     modelsUsed: String? = nil, freshSessionReason: String? = nil, at: Date) throws -> Turn {
+        var t = Turn(id: UUID().uuidString, agentId: agent.id, companyId: agent.companyId, startedAt: at, endedAt: at.addingTimeInterval(60),
+                     outcome: outcome, summary: nil, costUSD: nil)
+        t.kind = kind
+        t.itemId = item?.id
+        t.modelsUsed = modelsUsed
+        t.freshSessionReason = freshSessionReason
+        let row = t
+        try store.writer.write { db in try row.insert(db) }
+        return row
+    }
+
+    /// An ask of `kind`, decided at `decidedAt` by `decidedBy` (`owner`, `@handle`, `policy:…`, `preset:…`) with `status`.
+    @discardableResult
+    static func ask(_ store: Store, company: Company, number: Int, kind: AskKind = .info, status: AskStatus = .approved,
+                    decidedBy: String? = "owner", decidedAt: Date?) throws -> Ask {
+        var a = Ask(id: UUID().uuidString, companyId: company.id, number: number, kind: kind, risk: .low, requesterId: "system",
+                    title: "ask \(number)", summary: "s", status: status, createdActive: 0, statusSinceActive: 0,
+                    createdAt: decidedAt ?? t0, updatedAt: decidedAt ?? t0)
+        a.decidedBy = decidedBy
+        a.ownerDecidedAt = decidedAt
+        let row = a
+        try store.writer.write { db in try row.insert(db) }
+        return row
+    }
+
+    /// A message in the company's channel (made on first use) from `senderId` (`owner`, `system` or an agent id).
+    @discardableResult
+    static func message(_ store: Store, company: Company, senderId: String, kind: MessageKind = .text, at: Date) throws -> Message {
+        try store.writer.write { db in
+            let channelId = "measure-general-\(company.id)"
+            if try Channel.fetchOne(db, key: channelId) == nil {
+                try Channel(id: channelId, companyId: company.id, name: "general", kind: .channel, createdAt: t0).insert(db)
+            }
+            var m = Message(id: UUID().uuidString, companyId: company.id, channelId: channelId, senderId: senderId, text: "hello",
+                            createdAt: at)
+            m.kind = kind
+            try m.insert(db)
+            return m
+        }
+    }
+
+    /// A refused `request_access` call.
+    static func accessRefusal(_ store: Store, company: Company, agent: Agent, at: Date) throws {
+        try store.writer.write { db in
+            var r = AccessRefusal(id: nil, companyId: company.id, agentId: agent.id, kind: "networkDomain", value: "example.com",
+                                  detail: "refused", createdActive: 0, createdAt: at)
+            try r.insert(db)
+        }
+    }
+
+    /// A passing sandbox canary (owner-wide) for a key of its own.
+    static func canaryPass(_ store: Store, key: String, at: Date) throws {
+        try store.writer.write { db in
+            try db.execute(sql: """
+                INSERT OR REPLACE INTO sandboxCanary (cliFingerprint, settingsShape, osVersion, cliVersion, passedAt, detail)
+                VALUES (?, 'shape', 'os', '1', ?, 'ok')
+                """, arguments: [key, at])
+        }
+    }
+
+    /// The owner account's usage snapshot (the single `usageState` row) as a turn's rate-limit event leaves it.
+    static func usage(_ store: Store, sevenDay: Double?, fiveHour: Double? = 0.1, status: String = "allowed", observedAt: Date) throws {
+        try store.saveRateLimit(RateLimitInfo(status: status, resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
+                                              fiveHourUtilization: fiveHour, sevenDayUtilization: sevenDay, observedAt: observedAt,
+                                              fiveHourResetsAt: observedAt.addingTimeInterval(3600),
+                                              sevenDayResetsAt: observedAt.addingTimeInterval(3 * 86_400)))
+    }
+
+    /// The sum of one counter of `companyId` (owner-wide: `""`) over every day.
+    static func counter(_ store: Store, companyId: String, _ name: String) throws -> Double {
+        try store.writer.read { db in
+            try Double.fetchOne(db, sql: "SELECT COALESCE(SUM(value), 0) FROM measureCounter WHERE companyId = ? AND name = ?",
+                                arguments: [companyId, name]) ?? 0
         }
     }
 }

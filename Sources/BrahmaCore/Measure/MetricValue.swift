@@ -52,7 +52,7 @@ public struct MetricId: RawRepresentable, Hashable, Codable, Sendable {
     }
 }
 
-/// How a metric's numerator and denominator read. Rates (`ratio`, `usd`, `perUSD`, `perHour`) need `MetricValue.minEvents` in the
+/// How a metric's numerator and denominator read. Rates (`ratio`, `usd`, `perUSD`, `perHour`, `perItem`) need `MetricValue.minEvents` in the
 /// denominator before a value is shown; `count` and `seconds` are plain numbers and are never insufficient.
 public enum MetricUnit: String, Codable, Sendable {
     /// numerator ÷ denominator as a percentage: `97.4% (38/39)`.
@@ -67,11 +67,13 @@ public enum MetricUnit: String, Codable, Sendable {
     case perUSD
     /// items per company-active hour: `1.22 per plan-hour (30/24.50)`.
     case perHour
+    /// a quantity per landed item (turns, tokens, touches, minutes): `0.25 per landed item (5/20)`. The events are the landed items.
+    case perItem
 
     /// Whether `minEvents` applies.
     public var isRate: Bool {
         switch self {
-        case .ratio, .usd, .perUSD, .perHour: return true
+        case .ratio, .usd, .perUSD, .perHour, .perItem: return true
         case .count, .seconds: return false
         }
     }
@@ -176,7 +178,7 @@ public struct MetricValue: Codable, Equatable, Sendable {
             return target.map { "\(n) (target \(Self.plain($0)))" } ?? n
         case .seconds:
             return "\(Self.plain(numerator)) s"
-        case .ratio, .usd, .perUSD, .perHour:
+        case .ratio, .usd, .perUSD, .perHour, .perItem:
             guard denominator > 0, numerator.isFinite, denominator.isFinite else { return "insufficient data (n=0)" }
             let q = numerator / denominator
             switch unit {
@@ -184,6 +186,7 @@ public struct MetricValue: Codable, Equatable, Sendable {
             case .usd: return "$\(Self.fixed(q, 2)) per landed item (\(Self.fixed(numerator, 2))/\(Self.plain(denominator)))"
             case .perUSD: return "\(Self.fixed(q, 2)) per $LE (\(Self.plain(numerator))/\(Self.fixed(denominator, 2)))"
             case .perHour: return "\(Self.fixed(q, 2)) per plan-hour (\(Self.plain(numerator))/\(Self.fixed(denominator, 2)))"
+            case .perItem: return "\(Self.fixed(q, 2)) per landed item (\(Self.pair(numerator, denominator)))"
             case .count, .seconds: return Self.plain(numerator)
             }
         }

@@ -137,8 +137,9 @@ public final class RevertDetector {
                 if firstFailure == nil { firstFailure = error.description }
             }
         }
-        // Every range tried failed and none was read: git is not reading this repository, which is not "no old landings".
-        if scanned.isEmpty, !unreadable.isEmpty, let firstFailure {
+        // Every range tried failed and none was read, and the scan ran to the end: git is not reading this repository, which is
+        // not "no old landings". A scan that stopped at a bound first is a stopped scan; `Scan.basis` says where it stopped.
+        if scanned.isEmpty, !unreadable.isEmpty, stoppedAt == nil, let firstFailure {
             throw SourceError.unavailable("git could not read any of the \(unreadable.count) landed items' commits (\(firstFailure))")
         }
         return Scan(pairs: Self.pair(scanned, forward: forward, inverse: inverse, lookback: limits.lookback),

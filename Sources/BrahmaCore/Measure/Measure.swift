@@ -7,12 +7,22 @@ public enum MeasureError: Error, Equatable, CustomStringConvertible {
     /// `--since` names a day after `now`.
     case sinceAfterNow(String)
     case unknownCompany(String)
+    /// `--day` was not a `YYYY-MM-DD` day.
+    case badDay(String)
+    /// `--day` names a day that has not begun in the owner's time zone.
+    case dayAfterToday(String)
+    /// `--log-owner-minutes` outside 1…1440.
+    case badMinutes(Int)
 
     public var description: String {
         switch self {
         case .badSince(let s): return "--since must be a date (YYYY-MM-DD) or 'all', not '\(s)'"
         case .sinceAfterNow(let s): return "--since '\(s)' is after today; nothing can have happened yet"
         case .unknownCompany(let id): return "no company with id \(id)"
+        case .badDay(let s): return "--day must be a date (YYYY-MM-DD), not '\(s)'"
+        case .dayAfterToday(let s): return "--day '\(s)' is after today; owner time can be logged only for a day that has begun"
+        case .badMinutes(let n):
+            return "--log-owner-minutes must be a whole number of minutes from 1 to \(MeasureRecorder.maxOwnerMinutesPerLog), not \(n)"
         }
     }
 }
@@ -157,17 +167,17 @@ public enum Measure {
         .revertRate: { try ReviewMetrics.revertRate($0, detector: RevertDetector(git: $0.git)) },
         .reviewCatch: { try ReviewMetrics.reviewCatch($0) },
         .escapeRate: { try ReviewMetrics.escapeRate($0) },
-        .usagePerLanded: notBuilt(.usagePerLanded),
-        .ownerTouches: notBuilt(.ownerTouches),
+        .usagePerLanded: { try UsageMetrics.usagePerLanded($0) },
+        .ownerTouches: { try UsageMetrics.ownerTouches($0) },
         .firstPass: { try LandingMetrics.firstPass($0) },
         .queueHealth: { try LandingMetrics.queueHealth($0) },
-        .safety: notBuilt(.safety),
-        .nonCode: notBuilt(.nonCode),
-        .modelRanking: notBuilt(.modelRanking),
-        .idleActionable: notBuilt(.idleActionable),
-        .itemsPerDollar: notBuilt(.itemsPerDollar),
-        .itemsPerPlanHour: notBuilt(.itemsPerPlanHour),
-        .ownerMinutes: notBuilt(.ownerMinutes),
+        .safety: { try UsageMetrics.safety($0) },
+        .nonCode: { try UsageMetrics.nonCode($0) },
+        .modelRanking: { try UsageMetrics.modelRanking($0) },
+        .idleActionable: { try UsageMetrics.idleActionable($0) },
+        .itemsPerDollar: { try UsageMetrics.itemsPerDollar($0) },
+        .itemsPerPlanHour: { try UsageMetrics.itemsPerPlanHour($0) },
+        .ownerMinutes: { try UsageMetrics.ownerMinutes($0) },
     ]
 
     /// The function that measures `id`; an id the table does not know is `not built yet`.

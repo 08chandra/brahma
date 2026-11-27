@@ -27,6 +27,15 @@ import Testing
         }
     }
 
+    /// `perItem` (Task 5: turns, tokens, touches, rework rounds per landed item): a rate over landed items, shown with its pair.
+    @Test func perItemShowsItsPair() throws {
+        let v = MetricValue.rate(.ownerTouches, numerator: 5, denominator: 20, unit: .perItem, basis: "")
+        #expect(v.status == .ok && v.display == "0.25 per landed item (5/20)")
+        #expect(MetricValue.rate(.ownerTouches, numerator: 5, denominator: 19, unit: .perItem, basis: "").status == .insufficient(n: 19))
+        #expect(MetricValue.rate(.ownerTouches, numerator: 5, denominator: 0, unit: .perItem, basis: "").display == "insufficient data (n=0)")
+        #expect(MetricUnit.perItem.isRate)
+    }
+
     /// A denominator of zero or less is `insufficient(n: 0)` for every rate unit, so the status always agrees with the display —
     /// even when the event count (the numerator for `perUSD`/`perHour`, or an explicit `events:`) is 20 or more.
     @Test func nonPositiveDenominatorIsInsufficientForEveryRateUnit() throws {

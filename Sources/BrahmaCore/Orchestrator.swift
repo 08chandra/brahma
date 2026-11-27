@@ -551,7 +551,7 @@ public actor Orchestrator {
         // backoff after failures); until then admission is held.
         let secretsPending = reloadSecretsIfDue()
         // Active time first, so everything below sees the same clock; then health, which may start or end a hold.
-        try store.accrueActiveTime(now: now)
+        let activeDelta = try store.accrueActiveTime(now: now)
         try healthTick(now: now)
         // Fail closed on secrets: until every secret's value is loaded into the redactor (`Store.secretsHeld`), nothing that
         // would let an agent write text starts: no turn, check, merge or dispatch. The reload logged which secret failed.
@@ -774,6 +774,11 @@ public actor Orchestrator {
             }
             dispatchTick(now: now, companies: companies, skipping: Set(reaped.map(\.itemId)), freeSlots: free, companyFree: companyFree)
         }
+
+        // 7. The measure recorder (Plan X6a, ruling R5), last: daily company-active and idle-while-actionable seconds for the
+        //    running companies, and the owner-wide reserve breaches. It logs its own failure and never stops the tick.
+        measureTick(companies: companies, decisions: decisions, paceClosed: paceClosed, paceStrict: paceStrict,
+                    activeDelta: activeDelta, ownerReserve: cfg.ownerReserve, now: now)
     }
 
     /// Starts the background redactor reload when one is due (never more than one at a time). Returns whether the redactor

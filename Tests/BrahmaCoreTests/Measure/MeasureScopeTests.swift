@@ -47,8 +47,8 @@ import Testing
                                    companyId: acme.id, window: window, now: now)
         #expect(r.metrics.map(\.id) == MetricId.all)
         #expect(r.metrics.map(\.label) == MetricId.all.map(\.label))
-        // Task 1 ships the frame: a metric not built yet says so, with its reason. Task 3's three and Task 4's three are built.
-        let built: Set<MetricId> = [.greenMain, .firstPass, .queueHealth, .revertRate, .reviewCatch, .escapeRate]
+        // Task 1 ships the frame: a metric not built yet says so, with its reason. Tasks 3, 4 and 5 built every metric.
+        let built = Set(MetricId.all)
         for m in r.metrics where !built.contains(m.id) {
             #expect(m.status == .notApplicable(reason: "not built yet"), "\(m.id.rawValue)")
             #expect(m.display == "not applicable: not built yet")

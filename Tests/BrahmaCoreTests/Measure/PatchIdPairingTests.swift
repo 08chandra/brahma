@@ -68,6 +68,26 @@ import Testing
         #expect(RevertDetector.Limits.standard == RevertDetector.Limits(maxItems: 2000, gitCallSeconds: 10, lookback: 30 * day))
     }
 
+    /// A scan that stopped at a bound after reading nothing (item 1 unreadable, item 2's git call timed out) is a stopped scan,
+    /// not an unavailable repository: the basis says where it stopped (Task 4 review minor, carried into Task 5).
+    @Test func stoppedScanIsNotUnavailable() throws {
+        let ranges = ["A", "B", "C"].enumerated().map { range($1, Double($0) * day) }
+        let aMerged = ranges[0].merged, bMerged = ranges[1].merged
+        let detector = RevertDetector(limits: RevertDetector.Limits(maxItems: 2000, gitCallSeconds: 10, lookback: 30 * day), source: { from, to in
+            if from.hasPrefix(aMerged) || to.hasPrefix(aMerged) { throw RevertDetector.SourceError.unreadable("bad object") }
+            if from.hasPrefix(bMerged) || to.hasPrefix(bMerged) { throw RevertDetector.SourceError.timedOut }
+            return nil
+        })
+        let scan = try detector.inversePairs(ranges)
+        #expect(scan.unreadable == ["A"])
+        #expect(scan.notScanned == ["B", "C"])
+        #expect(scan.basis == "revert scan stopped at a git call over 10 s")
+        #expect(scan.scanned.isEmpty)
+        // Every range read failing, with no bound reached, is still unavailable.
+        let broken = RevertDetector(limits: .standard, source: { _, _ in throw RevertDetector.SourceError.unreadable("bad object") })
+        #expect(throws: RevertDetector.SourceError.self) { try broken.inversePairs(ranges) }
+    }
+
     /// A revision is a commit id, optionally with `^1`, and nothing after it: a trailing newline is not a revision.
     @Test func revisionsAreStrict() {
         #expect(RevertDetector.isRevision("abc1234"))

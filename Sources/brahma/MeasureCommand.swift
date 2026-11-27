@@ -4,7 +4,8 @@ import BrahmaCore
 
 /// `brahma measure <company> [--since <YYYY-MM-DD|all>] [--format md|json]` (Plan X6a): the company's metrics over one window,
 /// every number with its denominator (`docs/measure/metrics.md`). Read-only, but it reads every agent's records, so it runs only
-/// from the owner's shell: never inside an agent turn.
+/// from the owner's shell: never inside an agent turn. The one write: `--log-owner-minutes <n> [--day YYYY-MM-DD]` adds the
+/// owner's own time to that day's counter (owner ruling R7(d)), the only source of the owner-minutes metric.
 struct MeasureCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "measure",
@@ -17,12 +18,27 @@ struct MeasureCommand: ParsableCommand {
     @Option(help: "Start of the window: a date (YYYY-MM-DD, midnight in the owner's time zone) or 'all' (since the company was created). Default: the last \(MeasureWindow.defaultDays) days.")
     var since: String?
     @Option(help: "md (a table) or json.") var format: Format = .md
+    @Option(name: .customLong("log-owner-minutes"),
+            help: "Log minutes of your own time spent on this company (1-\(MeasureRecorder.maxOwnerMinutesPerLog)), added to the day's total; prints no report.")
+    var logOwnerMinutes: Int?
+    @Option(help: "With --log-owner-minutes: the day the minutes belong to (YYYY-MM-DD in your time zone). Default: today.")
+    var day: String?
 
     func run() throws {
         try requireOwnerShell(quietly: false)
         let (store, _) = try openStore()
         let c = try resolveCompanyOrExplain(store, company)
         let now = Date()
+        if let minutes = logOwnerMinutes {
+            guard since == nil else { throw fail("--log-owner-minutes takes --day, not --since") }
+            do {
+                let dayKey = try MeasureRecorder.ownerLogDay(day, now: now, tz: store.ownerTimeZone())
+                try store.logOwnerMinutes(companyId: c.id, minutes: minutes, day: dayKey)
+                print(safe("Logged \(minutes) owner minute\(minutes == 1 ? "" : "s") for \(c.name) on \(dayKey)."))
+            } catch let error as MeasureError { throw fail("\(error)") }
+            return
+        }
+        guard day == nil else { throw fail("--day is only for --log-owner-minutes") }
         let window: MeasureWindow
         do {
             window = try MeasureWindow.parse(since, now: now, companyCreated: c.createdAt, tz: store.ownerTimeZone())

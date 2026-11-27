@@ -74,21 +74,28 @@ extension Store {
 
     /// Called first in every tick. Each company that is `running` while no hold is active gains the time since its
     /// last accrual, at most `CompanyClock.maxGap`; every company's `lastAccruedAt` moves to `now` regardless, so a
-    /// pause or a hold is never counted afterwards.
-    public func accrueActiveTime(now: Date) throws {
+    /// pause or a hold is never counted afterwards. Returns the seconds each company gained this tick (0 for one that did not
+    /// run): the measure recorder adds exactly these to its daily counter, so the two never disagree (Plan X6a, ruling R15).
+    @discardableResult
+    public func accrueActiveTime(now: Date) throws -> [String: TimeInterval] {
         try writer.write { db in
             // An engine hold or the owner's stop freezes every company's clock.
             let held = try EngineHold.fetchOne(db, key: 1) != nil || Store.engineStopped(db) != nil
+            var gained: [String: TimeInterval] = [:]
             for company in try Company.fetchAll(db) {
                 var row = try CompanyActivity.fetchOne(db, key: company.id)
                     ?? CompanyActivity(companyId: company.id, activeSeconds: 0, lastAccruedAt: nil)
+                var delta: TimeInterval = 0
                 if company.status == .running, !held {
                     let gap = now.timeIntervalSince(row.lastAccruedAt ?? now)
-                    row.activeSeconds += min(max(gap, 0), CompanyClock.maxGap)
+                    delta = min(max(gap, 0), CompanyClock.maxGap)
+                    row.activeSeconds += delta
                 }
+                gained[company.id] = delta
                 row.lastAccruedAt = now
                 try row.save(db)
             }
+            return gained
         }
     }
 
