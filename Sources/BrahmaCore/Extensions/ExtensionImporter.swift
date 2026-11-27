@@ -10,7 +10,7 @@ import Glibc
 // are kept, `bin/` helpers are renamed `<id>-*`, and every part Brahma does not run (MCP servers, hooks, LSP, monitors,
 // settings, output styles, themes, workflows, channels, userConfig, dependencies, a root CLAUDE.md) is dropped with a
 // notice, as is every top-level entry outside the allowlist. A zip is inventoried (central directory) and refused on any
-// limit before `/usr/bin/unzip` runs under the sandboxed runner. Brahma copies plugin folders itself; it never asks the
+// limit before `SandboxedUnzipReader` reads its members (unzip itself under the deny-default profile, no shell; Ruling 39). Brahma copies plugin folders itself; it never asks the
 // Claude CLI to install anything.
 
 /// Where a package comes from. The installer records the publisher and source from this, never from the package.
@@ -52,11 +52,6 @@ public enum ZipLimits {
 }
 
 public enum ExtensionImporter {
-    /// What the extraction script prints when the archive's real bytes pass the quota.
-    static let quotaMarker = "brahma-zip-quota-exceeded"
-    /// What it prints when `zipinfo -1` disagrees with the inventory.
-    static let listingMarker = "brahma-zip-listing-differs"
-
     static func mcpNotice(_ name: String) -> String { "This plugin's MCP server \(name) was not imported; connectors arrive in a later Brahma release." }
     static func hookNotice(_ event: String) -> String { "This plugin's \(event) hook will not run in Brahma." }
 
@@ -255,8 +250,12 @@ public enum ExtensionImporter {
 
     /// Inventories the archive (its central directory, never the entry data) and refuses more than `maxFiles` entries, more than
     /// `maxBytes` declared uncompressed, a compression ratio over `ZipLimits.maxRatio`, a symlink entry, an absolute name, a `..`
-    /// component, an unsafe name or zip64. Then `/usr/bin/unzip -q -n` runs under the sandboxed runner (writable: the unzip
-    /// directory only; network none; `ulimit -f` as the byte quota), and what came out is checked against the limits again.
+    /// component, an unsafe name, a duplicate name or zip64. Final wave B1, controller Ruling 39: no shell pipeline ever runs
+    /// over the archive. The members come out of `SandboxedUnzipReader` (unzip itself, no shell, no `head`, confined to unzip
+    /// under the deny-default profile, no network, its output capped at `maxBytes` and checked member by member against the
+    /// central directory's sizes and CRC-32s), at most `ArchiveLimits.maxMembers` per run; the engine writes them under the
+    /// returned directory itself. A file name the reader can't ask for literally (`SandboxedUnzipReader.isPlain`) refuses the
+    /// archive. What came out is checked against the limits again by `copyTree`.
     static func extractZip(_ zip: URL, under dir: URL, sandbox: any SandboxedRunner) async throws -> URL {
         var st = stat()
         guard stat(zip.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { throw ExtensionError.message("\(zip.path) is not a file") }
@@ -264,6 +263,7 @@ public enum ExtensionImporter {
         guard let data = FileManager.default.contents(atPath: zip.path) else { throw ExtensionError.message("cannot read \(zip.path)") }
         let entries = try ZipInventory.entries(of: data)
         var files = 0, uncompressed = 0, compressed = 0
+        var seen: Set<String> = []
         for e in entries {
             if e.isSymlink { throw ExtensionError.message("the zip holds a symbolic link entry (\(Store.flat(e.name, max: 80))); links are refused") }
             if e.name.hasPrefix("/") || e.name.hasPrefix("\\") || e.name.range(of: "^[A-Za-z]:", options: .regularExpression) != nil {
@@ -286,46 +286,68 @@ public enum ExtensionImporter {
         guard uncompressed <= ZipLimits.maxRatio * max(compressed, 1) else {
             throw ExtensionError.message("the zip's compression ratio (\(uncompressed) in \(compressed) bytes) is over \(ZipLimits.maxRatio):1")
         }
-        // The bytes inventoried are the bytes extracted: a private copy of the archive (the source may change under us).
-        let held = dir.appending(path: ".zip", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: held, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-        let archive = held.appending(path: "archive.zip")
-        guard FileManager.default.createFile(atPath: archive.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
-            throw ExtensionError.message("cannot hold a copy of the zip")
+        // Every file the reader can ask for literally, each name once (a name twice would make the output ambiguous).
+        var wanted: [ZipInventory.Entry] = [], directories: [String] = []
+        for e in entries {
+            let key = e.name.hasSuffix("/") ? String(e.name.dropLast()) : e.name
+            guard seen.insert(key).inserted else {
+                throw ExtensionError.message("the zip holds the name '\(Store.flat(e.name, max: 80))' twice; refused")
+            }
+            if e.isDirectory {
+                guard e.uncompressedSize == 0 else { throw ExtensionError.message("the zip holds a directory entry with data; refused") }
+                if !key.isEmpty { directories.append(key) }
+                continue
+            }
+            guard SandboxedUnzipReader.isPlain(e.name) else {
+                throw ExtensionError.message("the zip holds a file name Brahma can't extract safely ('\(Store.flat(e.name, max: 80))'): "
+                                             + "only letters, digits and . _ - / [ ] are allowed; rename it and zip again")
+            }
+            wanted.append(e)
         }
-        defer { try? FileManager.default.removeItem(at: held) }
         let unzipped = dir.appending(path: ".unzip", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: unzipped, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-        // The running byte quota over the whole archive: every entry's real (inflated) bytes are streamed through `head`, which
-        // stops after one byte over `maxBytes`; a central directory that under-declares its sizes is caught here, before
-        // anything is written. Then the extraction, with `ulimit -f` capping any one file at `maxBytes`.
-        let q = ExtensionValidator.shellQuote
-        let limit = ExtensionLimits.maxBytes
-        let blocks = (limit + 511) / 512   // `ulimit -f` counts 512-byte blocks
-        // I-2 (b): the extractor's own listing (`zipinfo -1`, Info-ZIP's reader) must equal the inventory exactly, names and
-        // order, before anything is extracted.
-        let expected = held.appending(path: "expected.txt")
-        guard FileManager.default.createFile(atPath: expected.path, contents: Data(entries.map { $0.name + "\n" }.joined().utf8),
-                                             attributes: [.posixPermissions: 0o600]) else { throw ExtensionError.message("cannot write the zip listing") }
-        let command = "\(q("/usr/bin/zipinfo")) -1 \(q(archive.path)) 2>/dev/null | /usr/bin/cmp -s - \(q(expected.path)) "
-            + "|| { echo \"\(listingMarker)\"; exit 4; }; "
-            + "total=$(\(q("/usr/bin/unzip")) -p \(q(archive.path)) 2>/dev/null | /usr/bin/head -c \(limit + 1) | /usr/bin/wc -c | /usr/bin/tr -d ' '); "
-            + "if [ \"$total\" -gt \(limit) ]; then echo \"\(quotaMarker)\"; exit 3; fi; "
-            + "ulimit -f \(blocks) && " + [q("/usr/bin/unzip"), "-q", "-n", q(archive.path), "-d", q(unzipped.path)].joined(separator: " ")
-        let env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
-        let policy = SandboxPolicy(writable: [unzipped], readable: [held], network: .none, toolchain: false)
-        let out = await sandbox.run(command: command, cwd: unzipped, environment: env, timeout: .seconds(120),
-                                    outputURL: dir.appending(path: ".unzip.log"), policy: policy)
-        try? FileManager.default.removeItem(at: dir.appending(path: ".unzip.log"))
-        guard out.exitCode == 0 else {
+        do {
+            let scratchRoot = dir.appending(path: ".zipread", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: scratchRoot, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            defer { try? FileManager.default.removeItem(at: scratchRoot) }
+            let reader = SandboxedUnzipReader(runner: sandbox, scratch: {
+                let d = scratchRoot.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+                try FileManager.default.createDirectory(at: d, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                return d
+            })
+            let limits = ArchiveLimits(bytes: ExtensionLimits.maxBytes, ratio: Double(ZipLimits.maxRatio))
+            for d in directories {
+                try FileManager.default.createDirectory(at: unzipped.appending(path: d, directoryHint: .isDirectory), withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+            }
+            for start in stride(from: 0, to: wanted.count, by: ArchiveLimits.maxMembers) {
+                let batch = Set(wanted[start..<min(start + ArchiveLimits.maxMembers, wanted.count)].map(\.name))
+                let members: [(name: String, data: Data)]
+                do { members = try reader.members(of: data, wanted: { batch.contains($0) }, limits: limits) } catch let e as ArchiveReadError {
+                    if e == .expands {
+                        throw ExtensionError.message("the zip inflates to more than \(ExtensionLimits.maxBytes) bytes (its central directory "
+                                                     + "under-declares the sizes); refused")
+                    }
+                    throw ExtensionError.message("the zip could not be extracted (\(e.message)); refused")
+                }
+                guard Set(members.map(\.name)) == batch, members.count == batch.count else {
+                    throw ExtensionError.message("the zip's entries as unzip read them differ from its directory; refused")
+                }
+                for m in members {
+                    let target = unzipped.appending(path: m.name)
+                    try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                            attributes: [.posixPermissions: 0o700])
+                    // A fresh directory the engine made: nothing in it is a link. O_EXCL refuses a name written twice.
+                    let fd = open(target.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                    guard fd >= 0 else { throw ExtensionError.message("cannot write \(Store.flat(m.name, max: 80))") }
+                    let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                    try handle.write(contentsOf: m.data)
+                    try handle.close()
+                }
+            }
+        } catch {
             try? FileManager.default.removeItem(at: unzipped)
-            if out.tail.contains(listingMarker) {
-                throw ExtensionError.message("the zip's entries as unzip lists them differ from its directory; refused")
-            }
-            if out.tail.contains(quotaMarker) {
-                throw ExtensionError.message("the zip inflates to more than \(limit) bytes (its central directory under-declares the sizes); refused")
-            }
-            throw ExtensionError.message("unzip failed: \(Store.flat(out.tail, max: 200))")
+            throw error
         }
         return unzipped
     }

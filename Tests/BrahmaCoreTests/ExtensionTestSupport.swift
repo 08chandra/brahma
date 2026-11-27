@@ -161,6 +161,31 @@ final class RecordingRunner: SandboxedRunner, @unchecked Sendable {
     func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
         throw SandboxError.unavailable
     }
+
+    /// Final wave B1, Ruling 39: the programs run as themselves (no shell), unsandboxed (tests only), with the output cap.
+    struct ProgramCall { var arguments: [String]; var policy: SandboxPolicy; var stdoutCap: Int }
+    private var _programCalls: [ProgramCall] = []
+    var programCalls: [ProgramCall] { lock.withLock { _programCalls } }
+
+    func runProgramBlocking(arguments: [String], cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+                            stdoutURL: URL, stdoutCap: Int, policy: SandboxPolicy) -> CheckOutcome {
+        lock.withLock { _programCalls.append(ProgramCall(arguments: arguments, policy: policy, stdoutCap: stdoutCap)) }
+        guard let program = arguments.first else { return CheckOutcome(exitCode: nil, timedOut: false, tail: "no program") }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: program)
+        p.arguments = Array(arguments.dropFirst())
+        p.currentDirectoryURL = cwd
+        p.environment = environment
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out; p.standardError = err; p.standardInput = FileHandle.nullDevice
+        do { try p.run() } catch { return CheckOutcome(exitCode: nil, timedOut: false, tail: "\(error)") }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        _ = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        if data.count > stdoutCap { return CheckOutcome(exitCode: nil, timedOut: false, tail: GroupRun.outputExceeded) }
+        FileManager.default.createFile(atPath: stdoutURL.path, contents: data)
+        return CheckOutcome(exitCode: p.terminationStatus, timedOut: false, tail: "")
+    }
 }
 
 /// Writes a zip of STORED entries with arbitrary names and attributes (what `zip` refuses to produce: `..`, absolute names,

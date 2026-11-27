@@ -148,6 +148,43 @@ import Foundation
         await #expect(throws: ExtensionError.self) { try await ExtensionImporter.stage(source: .folder(g.root), paths: try paths(), sandbox: RecordingRunner()) }
     }
 
+    /// Final wave B1, controller Ruling 39: an agent-supplied archive is never handed to a shell pipeline. The members come
+    /// out of `SandboxedUnzipReader` (unzip itself, no shell, confined to unzip, no network, output capped and checked against
+    /// the central directory's sizes and CRC-32s); the engine writes them. A name the reader can't ask for literally refuses.
+    @Test func zipExtractsThroughTheSandboxedReaderNoShell() async throws {
+        let p = try paths()
+        let f = try PluginFixture(files: ["README.md": "# demo", "assets/a-b_c.txt": "x"])
+        let zip = try tempDir().appending(path: "demo.zip")
+        try Self.zip(dir: f.root.deletingLastPathComponent(), name: "demo", to: zip)
+        let runner = RecordingRunner()
+        let staged = try await ExtensionImporter.stage(source: .zip(zip), paths: p, sandbox: runner)
+        #expect(staged.id == "demo")
+        #expect(FileManager.default.fileExists(atPath: staged.dir.appending(path: "README.md").path))
+        #expect(runner.calls.isEmpty, "no shell command ran: \(runner.calls.map(\.command))")
+        let call = try #require(runner.programCalls.first)
+        #expect(call.arguments.first == SandboxedUnzipReader.unzip); #expect(call.arguments.dropFirst().first == "-p")
+        #expect(call.policy.network == .none); #expect(!call.policy.toolchain)
+        #expect(call.policy.confined?.executables.map(\.path) == [SandboxedUnzipReader.unzip])
+        #expect(call.stdoutCap == ExtensionLimits.maxBytes)
+        #expect(!FileManager.default.fileExists(atPath: staged.dir.appending(path: ".unzip").path))
+        // A file name the reader can't take literally (a space) refuses the archive; nothing runs.
+        var z = ZipBuilder()
+        z.add("demo/.claude-plugin/plugin.json", PluginFixture.manifestJSON(id: "demo"))
+        z.add("demo/assets/two words.txt", "x")
+        let odd = try tempDir().appending(path: "odd.zip")
+        try z.write(to: odd)
+        let oddRunner = RecordingRunner()
+        let error = await errorOf { _ = try await ExtensionImporter.stage(source: .zip(odd), paths: p, sandbox: oddRunner) }
+        #expect((error as? ExtensionError)?.message.contains("name") == true, "\(String(describing: error))")
+        #expect(oddRunner.calls.isEmpty && oddRunner.programCalls.isEmpty)
+        // No shell pipeline over an archive anywhere in the importer.
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appending(path: "Sources/BrahmaCore/Extensions/ExtensionImporter.swift"), encoding: .utf8)
+        for token in ["/usr/bin/head", "/usr/bin/zipinfo", "| /usr/bin", "ulimit -f", "sandbox.run(command:"] {
+            #expect(!source.contains(token), "the importer still names \(token)")
+        }
+    }
+
     /// S10 / I2: the archive is enumerated before anything is extracted; the limits, link, absolute and `..` entries refuse it
     /// with nothing left in staging; extraction itself runs `/usr/bin/unzip` under the sandboxed runner with a byte quota.
     @Test func zipLimitsEnforcedBeforeExtraction() async throws {
@@ -162,7 +199,7 @@ import Foundation
             let runner = RecordingRunner()
             let error = await errorOf { _ = try await ExtensionImporter.stage(source: .zip(zip), paths: p, sandbox: runner) }
             #expect((error as? ExtensionError)?.message.contains(fragment) == true, "\(fragment): \(String(describing: error))")
-            #expect(runner.calls.isEmpty, "\(fragment): nothing was extracted")
+            #expect(runner.calls.isEmpty && runner.programCalls.isEmpty, "\(fragment): nothing was extracted")
             #expect(((try? FileManager.default.contentsOfDirectory(atPath: p.extensionsDir.staging.path)) ?? []).isEmpty, "\(fragment): staging is clean")
         }
         try await refused({ z in for n in 0..<ExtensionLimits.maxFiles { z.add("demo/assets/f\(n).txt", "x") } }, "entries")
@@ -179,20 +216,23 @@ import Foundation
         try await refused({ z in z.add("demo\\..\\..\\escape.md", "x") }, "'..'")   // m-5: `\` separates too
         try await refused({ z in z.add("demo/assets/evil\u{202E}txt.md", "x") }, "control, hidden or bidi")
         #expect(ZipLimits.maxRatio == 100)
-        // A real archive: the extraction runs /usr/bin/unzip under the runner, writable = the unzip dir only, no network, a byte quota.
+        // A real archive: the members come out of /usr/bin/unzip run as itself under the runner (Ruling 39: no shell), confined
+        // to unzip, writable = its own output dir only, no network, the output capped at the byte limit.
         let f = try PluginFixture(files: ["README.md": "# demo"])
         let zip = try tempDir().appending(path: "demo.zip")
         try Self.zip(dir: f.root.deletingLastPathComponent(), name: "demo", to: zip)
         let runner = RecordingRunner()
         let staged = try await ExtensionImporter.stage(source: .zip(zip), paths: p, sandbox: runner)
         #expect(staged.id == "demo")
-        let call = try #require(runner.calls.first)
-        #expect(call.command.contains("/usr/bin/unzip' -q -n ") || call.command.contains("/usr/bin/unzip -q -n "), "\(call.command)")
-        #expect(call.command.contains("ulimit -f"), "\(call.command)")
-        #expect(!call.command.contains(" -o ")); #expect(call.policy.network == .none); #expect(!call.policy.toolchain)
-        #expect(call.policy.writable.count == 1); #expect(call.policy.writable[0].lastPathComponent == ".unzip")
-        #expect(call.policy.writable[0].path.hasPrefix(p.extensionsDir.staging.path))
+        #expect(runner.calls.isEmpty)
+        let call = try #require(runner.programCalls.first)
+        #expect(call.arguments.first == "/usr/bin/unzip" && call.arguments.dropFirst().first == "-p", "\(call.arguments)")
+        #expect(call.policy.network == .none); #expect(!call.policy.toolchain)
+        #expect(call.policy.writable.count == 1); #expect(call.policy.writable[0].lastPathComponent == "out")
+        #expect(call.policy.writable[0].path.contains("/extensions/staging/"), "\(call.policy.writable[0].path)")
+        #expect(call.stdoutCap == ExtensionLimits.maxBytes)
         #expect(!FileManager.default.fileExists(atPath: staged.dir.appending(path: ".unzip").path))
+        #expect(!FileManager.default.fileExists(atPath: staged.dir.appending(path: ".zipread").path))
         // A zip bomb (6 MB of zeros, a few KB compressed) is refused by the ratio, before unzip runs.
         let zeros = try tempDir()
         try FileManager.default.createDirectory(at: zeros.appending(path: "demo/.claude-plugin"), withIntermediateDirectories: true)
@@ -204,7 +244,7 @@ import Foundation
         let bombRunner = RecordingRunner()
         let bombError = await errorOf { _ = try await ExtensionImporter.stage(source: .zip(bomb), paths: p, sandbox: bombRunner) }
         #expect((bombError as? ExtensionError)?.message.contains("ratio") == true, "\(String(describing: bombError))")
-        #expect(bombRunner.calls.isEmpty)
+        #expect(bombRunner.calls.isEmpty && bombRunner.programCalls.isEmpty)
     }
 
     /// S10: the running byte quota. A deflated archive whose central directory (and local headers) under-declare the sizes
@@ -249,7 +289,7 @@ import Foundation
             let runner = RecordingRunner()
             let error = await errorOf { _ = try await ExtensionImporter.stage(source: .zip(zip), paths: p, sandbox: runner) }
             #expect((error as? ExtensionError)?.message.contains(fragment) == true, "\(fragment): \(String(describing: error))")
-            #expect(runner.calls.isEmpty, "\(fragment): nothing was extracted or even listed")
+            #expect(runner.calls.isEmpty && runner.programCalls.isEmpty, "\(fragment): nothing was extracted or even listed")
             #expect(((try? FileManager.default.contentsOfDirectory(atPath: p.extensionsDir.staging.path)) ?? []).isEmpty)
         }
         func base() -> ZipBuilder {
@@ -284,16 +324,18 @@ import Foundation
         try await refused(base(), "not self-consistent") { b in
             if let i = (0..<(b.count - 30)).first(where: { b[$0] == 0x50 && b[$0 + 1] == 0x4b && b[$0 + 2] == 0x03 && b[$0 + 3] == 0x04 }) { b[i + 30] = UInt8(ascii: "x") }
         }
-        // A normal archive imports; the one sandboxed command lists with zipinfo and compares before unzip extracts.
+        // The same name twice is refused before anything runs (Ruling 39: the reader's output would be ambiguous).
+        var twice = base()
+        twice.add("demo/a.txt", "b")
+        try await refused(twice, "twice")
+        // A normal archive imports: one run of the sandboxed reader (unzip itself, no shell), whose output must match the
+        // inventory member by member (sizes and CRC-32s; Ruling 39).
         let f = try PluginFixture(files: ["README.md": "# demo"])
         let zip = try tempDir().appending(path: "demo.zip")
         try Self.zip(dir: f.root.deletingLastPathComponent(), name: "demo", to: zip)
         let runner = RecordingRunner()
         _ = try await ExtensionImporter.stage(source: .zip(zip), paths: p, sandbox: runner)
-        let command = try #require(runner.calls.first?.command)
-        let listAt = try #require(command.range(of: "/usr/bin/zipinfo' -1 ")), unzipAt = try #require(command.range(of: "/usr/bin/unzip' -q -n "))
-        #expect(listAt.lowerBound < unzipAt.lowerBound); #expect(command.contains("/usr/bin/cmp -s - "))
-        #expect(runner.calls.count == 1)
+        #expect(runner.calls.isEmpty && runner.programCalls.count == 1)
     }
 
     static func zip(dir: URL, name: String, to zip: URL) throws {
