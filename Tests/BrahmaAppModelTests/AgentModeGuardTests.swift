@@ -6,14 +6,15 @@ import GRDB
 
 /// C6 fix round 3, controller Rulings C6-3 (I-1) and C6-4: agent mode binds `mint` whatever its arguments, and every public owner
 /// entry point the final wave hasn't tokenised yet refuses in an agent process before any lookup (`ProcessRole.refuseInAgentProcess`).
-/// The role is read through a task-local override here, so the process-wide mode of the test process is never touched.
+/// Agent mode is simulated for the test's own task (`simulatingAgentProcess`), so the process-wide mode of the test process is never
+/// touched.
 @MainActor @Suite(.scratch) struct AgentModeGuardTests {
     nonisolated static let entryPoints = ["ownerDecide", "ownerAnswer", "ownerRescind", "acknowledge", "vouchFile(companyId)", "vouchFile(alertAskId)",
                                           "vouchResource", "purgeResource", "setResourceScope", "approveAccess", "provideSecret",
                                           "declineFileRequest", "answerFileRequest"]
 
     @Test func mintRefusesInAgentModeWhateverTheArguments() throws {
-        try OwnerPrincipal.$roleOverride.withValue(.agent) {
+        try OwnerPrincipal.simulatingAgentProcess {
             #expect(OwnerPrincipal.processRole == .agent)
             #expect(throws: OwnerPrincipalError.self) { try OwnerPrincipal.mint() }
             // I-1: the seam can't lift agent mode.
@@ -26,6 +27,42 @@ import GRDB
         try ProcessRole.refuseInAgentProcess()
         // The seam still simulates an agent role for a test of the refusal itself.
         #expect(throws: OwnerPrincipalError.self) { try OwnerPrincipal.mint(role: .agent, environment: [:], ancestors: [1], runningTurnPids: []) }
+    }
+
+    /// Round 4, N-1: the test override can only force agent mode, never lift it. A process whose stored role is `.agent` is an
+    /// agent's whatever the simulation says (`effectiveRole` is what `processRole`, `mint` and the guard read); a nested simulation
+    /// stays agent; and the override is a private `Bool` nothing outside `OwnerPrincipal.swift` names, so no code can bind it to
+    /// `.owner` (or to anything but agent mode).
+    @Test func overrideNeverLiftsAgentMode() throws {
+        for simulated in [false, true] {
+            #expect(OwnerPrincipal.effectiveRole(stored: .agent, simulatedAgent: simulated) == .agent, "stored agent, simulated \(simulated)")
+            for stored in [ProcessRole.unknown, .owner] {
+                #expect(OwnerPrincipal.effectiveRole(stored: stored, simulatedAgent: simulated) == (simulated ? .agent : stored), "\(stored), \(simulated)")
+            }
+        }
+        try OwnerPrincipal.simulatingAgentProcess {
+            try OwnerPrincipal.simulatingAgentProcess { #expect(OwnerPrincipal.processRole == .agent) }
+            #expect(OwnerPrincipal.processRole == .agent)
+            #expect(throws: OwnerPrincipalError.self) { try OwnerPrincipal.mint() }
+            for role: ProcessRole? in [.owner, .unknown, nil] {
+                #expect(throws: OwnerPrincipalError.self) { try OwnerPrincipal.mint(role: role, environment: [:], ancestors: [], runningTurnPids: []) }
+            }
+            #expect(throws: WorkError.self) { try ProcessRole.refuseInAgentProcess() }
+        }
+        // Test-scoped: no source file but `OwnerPrincipal.swift` names the override, and that file binds it only to `true`.
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let sources = root.appending(path: "Sources")
+        let walker = try #require(FileManager.default.enumerator(atPath: sources.path))
+        var owner = ""
+        for case let rel as String in walker where rel.hasSuffix(".swift") {
+            let text = try String(contentsOf: sources.appending(path: rel), encoding: .utf8)
+            if rel.hasSuffix("Collab/OwnerPrincipal.swift") { owner = text; continue }
+            for token in ["simulatedAgent", "simulatingAgentProcess", "roleOverride"] { #expect(!text.contains(token), "\(rel) names \(token)") }
+        }
+        #expect(!owner.contains("roleOverride"))
+        #expect(owner.contains("@TaskLocal private static var simulatedAgent = false"))
+        #expect(owner.components(separatedBy: "$simulatedAgent.withValue(").count == 2)
+        #expect(owner.contains("$simulatedAgent.withValue(true, operation: body)"))
     }
 
     @Test(arguments: entryPoints) func ownerEntryPointsRefuseInAgentMode(_ api: String) throws {
@@ -53,7 +90,7 @@ import GRDB
             }
         }
         // Agent mode: the generic refusal, before any lookup (the ids are bogus on purpose: a lookup would say so instead).
-        try OwnerPrincipal.$roleOverride.withValue(.agent) {
+        try OwnerPrincipal.simulatingAgentProcess {
             do {
                 try call()
                 Issue.record("\(api) ran in agent mode")

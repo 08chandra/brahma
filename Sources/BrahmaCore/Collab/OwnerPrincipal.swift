@@ -37,12 +37,33 @@ public struct OwnerPrincipal: Sendable, Equatable {
     private static let roleLock = NSLock()
     nonisolated(unsafe) private static var role: ProcessRole = .unknown
 
-    /// Tests only: a role scoped to the current task (`$roleOverride.withValue(.agent) { … }`), so a test of agent mode never
-    /// touches the process-wide role the other tests run under.
-    @TaskLocal static var roleOverride: ProcessRole?
+    #if DEBUG
+    /// Tests only (debug builds): forces agent mode for the current task, so a test of agent mode never touches the process-wide role
+    /// the other tests run under. Round 4, N-1: a `Bool` that only `simulatingAgentProcess` sets, and only to `true` — private, so no
+    /// code can bind it to `false` or to any role, and `effectiveRole` never lets it lift a process that is an agent's.
+    @TaskLocal private static var simulatedAgent = false
 
-    /// This process's role (the task-local override first).
-    public static var processRole: ProcessRole { roleOverride ?? roleLock.withLock { role } }
+    /// Tests only (debug builds): runs `body` as if this process were an agent's. It can only force agent mode, never lift it.
+    static func simulatingAgentProcess<R>(_ body: () throws -> R) rethrows -> R {
+        try $simulatedAgent.withValue(true, operation: body)
+    }
+    #endif
+
+    /// The role `mint` and the guard read: the sticky process-wide role, forced to `.agent` by a test's simulation. Narrow-only —
+    /// a stored `.agent` is `.agent` whatever else holds (round 4, N-1).
+    static func effectiveRole(stored: ProcessRole, simulatedAgent: Bool) -> ProcessRole {
+        (stored == .agent || simulatedAgent) ? .agent : stored
+    }
+
+    /// This process's role.
+    public static var processRole: ProcessRole {
+        let stored = roleLock.withLock { role }
+        #if DEBUG
+        return effectiveRole(stored: stored, simulatedAgent: simulatedAgent)
+        #else
+        return effectiveRole(stored: stored, simulatedAgent: false)
+        #endif
+    }
 
     /// An agent's process (`brahma mcp`, a turn's entry point): from here on `mint` throws. Sticky.
     public static func enterAgentProcess() { roleLock.withLock { role = .agent } }
