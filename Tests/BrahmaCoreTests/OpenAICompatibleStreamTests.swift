@@ -302,6 +302,42 @@ import Foundation
                                                as: UTF8.self)), "\(response.text)")
     }
 
+    /// Ruling 58 m2: `tool_use` exactly when the reply made tool calls (unless it stopped at `length`), whatever the finish
+    /// reason says; never `tool_use` without a call.
+    @Test func stopReasonFollowsToolCalls() {
+        let table: [(String?, Bool, String)] = [
+            ("stop", false, "end_turn"), ("stop", true, "tool_use"), ("tool_calls", true, "tool_use"), ("tool_calls", false, "end_turn"),
+            ("content_filter", true, "tool_use"), ("content_filter", false, "end_turn"), ("length", true, "max_tokens"),
+            ("length", false, "max_tokens"), ("weird", true, "tool_use"), ("weird", false, "end_turn"), (nil, false, "end_turn"),
+        ]
+        for (reason, calls, expected) in table {
+            #expect(OpenAICompatibleStream.stopReason(reason, hasToolCalls: calls) == expected, "\(String(describing: reason)) \(calls)")
+        }
+        let call = #"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"Read","arguments":"{}"}}]}}]}"#
+        let filtered = Self.run(Self.sse([call, #"{"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}"#])).events
+        #expect(Self.read(filtered).stopReason == "tool_use")
+        let noCall = Self.run(Self.sse([#"{"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"tool_calls"}]}"#])).events
+        #expect(Self.read(noCall).stopReason == "end_turn")
+    }
+
+    /// Ruling 58 m5: a delta without `index` is its position in the delta's list; a call without a plain name ends the
+    /// reply with an error (streamed) or a 502 (whole).
+    @Test func toolCallIndexAndNameChecks() async throws {
+        let twoAtOnce = #"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"a","function":{"name":"Read","arguments":"{\"p\":1}"}},{"id":"b","function":{"name":"Grep","arguments":"{\"q\":2}"}}]}}]}"#
+        let (events, _) = Self.run(Self.sse([twoAtOnce, #"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#]))
+        #expect(Self.read(events).tools == [.init(id: "a", name: "Read", input: #"{"p":1}"#), .init(id: "b", name: "Grep", input: #"{"q":2}"#)])
+        for name in ["", "Read file", "../x", String(repeating: "a", count: 65), "naïve"] {
+            let escaped = name.replacingOccurrences(of: "\"", with: "\\\"")
+            let call = #"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"\#(escaped)","arguments":"{}"}}]}}]}"#
+            let (bad, stream) = Self.run(Self.sse([call, #"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#]))
+            #expect(bad.last == .error(type: "api_error", message: OpenAICompatibleStream.invalidToolName), "\(name)")
+            #expect(Self.read(bad).tools.isEmpty && !stream.outcome.complete, "\(name)")
+            let whole = #"{"id":"c","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"\#(escaped)","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#
+            let answer = try await OpenAICompatibleAdapterTests.respond(Data(whole.utf8))
+            #expect(answer.error == .upstream(status: 502, message: OpenAICompatibleStream.invalidToolName), "\(name)")
+        }
+    }
+
     /// For every stream fixture, fed whole, one byte at a time or in 7-byte chunks: `message_start (content_block_start
     /// delta* content_block_stop)* message_delta message_stop` (X1-0). The checker itself rejects a broken order.
     @Test func streamEventsSatisfyClaudeOrdering() throws {

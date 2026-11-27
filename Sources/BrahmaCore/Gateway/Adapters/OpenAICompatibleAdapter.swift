@@ -21,8 +21,13 @@ import Foundation
 ///   `stream_options: {include_usage: true}` (the usage the meter needs).
 /// - Dropped, never invented: thinking blocks, `cache_control`, citations, `metadata`, and every other top-level key
 ///   (`thinking`, `context_management`, `output_config`, `safeguards`, `speed`, `inference_geo`, `service_tier`).
-/// - Anything else (a document, a server-tool block, a tool reference, a URL image) is refused with a reason: it has no
-///   Chat Completions form, and dropping it would change what the model is asked.
+/// - Tool search (Ruling 58): a `tool_reference` in a tool result becomes the text `Tool <name> loaded.`; a `tool_addition`
+///   / `tool_removal` in a `role: "system"` message is dropped, a removal leaving that function out of `tools` (a later
+///   addition brings it back). Each must reference, by a plain name, a tool in the request's own policy-checked `tools`
+///   — the only place a definition enters — and nothing but `{type: "tool_reference", name | tool_name}`; anything else is
+///   refused. The rest of the function list is sent as checked.
+/// - Anything else (a document, a server-tool block, a URL image) is refused with a reason: it has no Chat Completions form,
+///   and dropping it would change what the model is asked.
 ///
 /// The provider key goes only in `Authorization: Bearer <key>`; the upstream headers are exactly that and `content-type`,
 /// and the URL is the provider's `baseURL` (on its pinned host) + `/chat/completions`.
@@ -58,6 +63,14 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
 
     public func countTokensLocally(_ body: StrictJSON) -> Int? {
         Self.countEstimate(canonicalBytes: body.serialized().count)
+    }
+
+    /// Ruling 58 m3: the translation's refusals, decided before the gateway reads the key or reserves anything, so a
+    /// request this adapter cannot send is refused for that reason and never masked by a cap. `count_tokens` is answered
+    /// locally and needs no translation.
+    public func validate(_ body: StrictJSON, endpoint: GatewayEndpoint) throws(GatewayError) {
+        guard endpoint == .messages else { return }
+        _ = try Self.chatRequest(body, model: "")
     }
 
     /// Ruling 55: a 4xx bills nothing; a 5xx (an aggregator may have billed partial work) is charged the estimate.
@@ -107,9 +120,15 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
 
     /// The Chat Completions body for a checked Messages tree, routed to `model`.
     static func chatRequest(_ tree: StrictJSON, model: String) throws(GatewayError) -> StrictJSON {
+        var functions: [(name: String, function: StrictJSON)] = []
+        if let tools = tree["tools"] {
+            guard case .array(let list) = tools else { throw .policy("tools must be a list") }
+            for tool in list { functions.append(try function(tool)) }
+        }
+        var changes = ToolChanges(known: Set(functions.map(\.name)))
         var messages: [StrictJSON] = []
         if let system = tree["system"] {
-            let text = try systemText(system)
+            let text = try topLevelSystemText(system)
             if !text.isEmpty { messages.append(message("system", .string(text))) }
         }
         guard case .array(let list) = tree["messages"] else { throw .policy("messages must be a list") }
@@ -119,9 +138,11 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
             }
             switch role {
             case "system":
-                messages.append(message("system", .string(try systemText(content))))
+                // A system message holding only tool changes leaves nothing to send.
+                let text = try systemText(content, changes: &changes)
+                if !text.isEmpty { messages.append(message("system", .string(text))) }
             case "user":
-                messages += try userMessages(content)
+                messages += try userMessages(content, known: changes.known)
             case "assistant":
                 messages.append(try assistantMessage(content))
             default:
@@ -129,11 +150,11 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
             }
         }
         var out: [StrictJSON.Member] = [.init("model", .string(model)), .init("messages", .array(messages))]
-        if let tools = tree["tools"] {
-            guard case .array(let list) = tools else { throw .policy("tools must be a list") }
-            if !list.isEmpty {
-                out.append(.init("tools", .array(try list.map(function))))
-                if let choice = tree["tool_choice"] { out.append(.init("tool_choice", try toolChoice(choice))) }
+        let sent = functions.filter { !changes.removed.contains($0.name) }
+        if !sent.isEmpty {
+            out.append(.init("tools", .array(sent.map(\.function))))
+            if let choice = tree["tool_choice"] {
+                out.append(.init("tool_choice", try toolChoice(choice, offered: Set(sent.map(\.name)))))
             }
         }
         for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("stop_sequences", "stop")] {
@@ -176,21 +197,50 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
     /// Thinking is the provider's own; it is never sent to another.
     private static let droppedBlocks: Set<String> = ["thinking", "redacted_thinking"]
 
-    /// System content as one text: its text blocks, joined.
-    static func systemText(_ content: StrictJSON) throws(GatewayError) -> String {
+    /// Tool search's changes to the tool list (Ruling 58): the request's own tool names, and those removed so far.
+    struct ToolChanges {
+        let known: Set<String>
+        var removed: Set<String> = []
+    }
+
+    /// The tool a `{type: "tool_reference", name | tool_name}` names: exactly that shape, a plain name (`^[A-Za-z0-9_-]{1,64}$`)
+    /// of one of the request's tools; anything else is refused.
+    static func referencedTool(_ reference: StrictJSON?, known: Set<String>) throws(GatewayError) -> String {
+        let refused = GatewayError.policy("a tool reference must name one of the request's tools")
+        guard let reference, let members = reference.members, members.count == 2, reference["type"] == .string("tool_reference") else {
+            throw refused
+        }
+        let named = reference["name"] ?? reference["tool_name"]
+        guard let name = named?.stringValue, OpenAICompatibleStream.isToolName(name), known.contains(name) else { throw refused }
+        return name
+    }
+
+    /// System content as one text: its text blocks, joined. In a `role: "system"` message (`changes` given) a
+    /// `tool_addition` / `tool_removal` is applied to `changes` and dropped; at the top level it is refused.
+    static func systemText(_ content: StrictJSON, changes: inout ToolChanges) throws(GatewayError) -> String {
         if case .string(let s) = content { return s }
         var texts: [String] = []
         for block in try blocks(content) {
             let type = try type(of: block)
             if droppedBlocks.contains(type) { continue }
-            guard type == "text" else { throw unsupported("a \(GatewayPolicy.shown(type)) block in a system message") }
-            texts.append(try text(of: block))
+            switch type {
+            case "text": texts.append(try text(of: block))
+            case "tool_addition": changes.removed.remove(try referencedTool(block["tool"], known: changes.known))
+            case "tool_removal": changes.removed.insert(try referencedTool(block["tool"], known: changes.known))
+            default: throw unsupported("a \(GatewayPolicy.shown(type)) block in a system message")
+            }
         }
         return texts.joined(separator: "\n")
     }
 
+    /// Top-level system content, where no tool change belongs: with no request tools known, any reference is refused.
+    static func topLevelSystemText(_ content: StrictJSON) throws(GatewayError) -> String {
+        var none = ToolChanges(known: [])
+        return try systemText(content, changes: &none)
+    }
+
     /// One user message: its tool results first (`role: "tool"`, answering the assistant's calls), then its text and images.
-    static func userMessages(_ content: StrictJSON) throws(GatewayError) -> [StrictJSON] {
+    static func userMessages(_ content: StrictJSON, known: Set<String>) throws(GatewayError) -> [StrictJSON] {
         if case .string = content { return [message("user", content)] }
         var tools: [StrictJSON] = []
         var parts: [StrictJSON] = []
@@ -200,7 +250,7 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
             case "text": parts.append(textPart(try text(of: block)))
             case "image": parts.append(try imagePart(block))
             case "tool_result":
-                let (message, images) = try toolMessage(block)
+                let (message, images) = try toolMessage(block, known: known)
                 tools.append(message)
                 parts += images
             case _ where droppedBlocks.contains(type): continue
@@ -233,8 +283,9 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
             || (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(b) || b == UInt8(ascii: "+") || b == UInt8(ascii: "/") || b == UInt8(ascii: "=")
     }
 
-    /// A `tool_result` as a `role: "tool"` message (its text, `Error: `-prefixed when `is_error`), and its images as parts.
-    static func toolMessage(_ block: StrictJSON) throws(GatewayError) -> (message: StrictJSON, images: [StrictJSON]) {
+    /// A `tool_result` as a `role: "tool"` message (its text, `Error: `-prefixed when `is_error`; a `tool_reference` to one
+    /// of the request's tools as `Tool <name> loaded.`), and its images as parts.
+    static func toolMessage(_ block: StrictJSON, known: Set<String>) throws(GatewayError) -> (message: StrictJSON, images: [StrictJSON]) {
         guard let id = block["tool_use_id"]?.stringValue else { throw .policy("a tool_result needs its tool_use_id") }
         var texts: [String] = []
         var images: [StrictJSON] = []
@@ -244,6 +295,7 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
                 switch type {
                 case "text": texts.append(try text(of: item))
                 case "image": images.append(try imagePart(item))
+                case "tool_reference": texts.append("Tool \(try referencedTool(item, known: known)) loaded.")
                 default: throw unsupported("a \(GatewayPolicy.shown(type)) block in a tool result")
                 }
             }
@@ -282,8 +334,8 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
         return .object(members)
     }
 
-    /// A client tool as a function; any other tool type is refused (no provider-side tool is ever emitted).
-    static func function(_ tool: StrictJSON) throws(GatewayError) -> StrictJSON {
+    /// A client tool as a function (and its name); any other tool type is refused (no provider-side tool is ever emitted).
+    static func function(_ tool: StrictJSON) throws(GatewayError) -> (name: String, function: StrictJSON) {
         guard case .object = tool else { throw .policy("tools must be a list of objects") }
         if let type = tool["type"], type != .string(GatewayPolicy.clientToolType) {
             let name = type.stringValue.map(GatewayPolicy.shown) ?? "(unprintable)"
@@ -298,17 +350,19 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
             function.append(.init("description", description))
         }
         function.append(.init("parameters", schema))
-        return .object([.init("type", .string("function")), .init("function", .object(function))])
+        return (name, .object([.init("type", .string("function")), .init("function", .object(function))]))
     }
 
-    /// `tool_choice`: `auto` → `auto`, `any` → `required`, `none` → `none`, `tool` → that function.
-    static func toolChoice(_ choice: StrictJSON) throws(GatewayError) -> StrictJSON {
+    /// `tool_choice`: `auto` → `auto`, `any` → `required`, `none` → `none`, `tool` → that function (one of those `offered`).
+    static func toolChoice(_ choice: StrictJSON, offered: Set<String>) throws(GatewayError) -> StrictJSON {
         switch choice["type"]?.stringValue {
         case "auto": return .string("auto")
         case "any": return .string("required")
         case "none": return .string("none")
         case "tool":
-            guard let name = choice["name"]?.stringValue else { throw .policy("tool_choice tool needs a name") }
+            guard let name = choice["name"]?.stringValue, offered.contains(name) else {
+                throw .policy("tool_choice must name one of the tools sent")
+            }
             return .object([.init("type", .string("function")), .init("function", .object([.init("name", .string(name))]))])
         default:
             throw .policy("this tool_choice cannot be sent to an openai-compatible provider")
@@ -371,10 +425,13 @@ public struct OpenAICompatibleAdapter: ProviderAdapter {
             for call in calls {
                 guard case .object = call, let function = call["function"], case .object = function else { throw malformed }
                 let arguments = function["arguments"]?.stringValue ?? ""
+                guard let name = function["name"]?.stringValue, OpenAICompatibleStream.isToolName(name) else {
+                    throw .upstream(status: 502, message: OpenAICompatibleStream.invalidToolName)
+                }
                 content.append(.object([
                     .init("type", .string("tool_use")),
                     .init("id", .string(OpenAICompatibleStream.toolUseId(call["id"]?.stringValue ?? ""))),
-                    .init("name", .string(function["name"]?.stringValue ?? "")),
+                    .init("name", .string(name)),
                     .init("input", OpenAICompatibleStream.toolInput(arguments)),
                 ]))
             }

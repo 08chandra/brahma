@@ -91,6 +91,9 @@ public struct AnthropicAdapter: ProviderAdapter {
     /// The provider counts: `count_tokens` goes upstream.
     public func countTokensLocally(_ body: StrictJSON) -> Int? { nil }
 
+    /// The body goes upstream as the policy checked it: nothing more to refuse.
+    public func validate(_ body: StrictJSON, endpoint: GatewayEndpoint) throws(GatewayError) {}
+
     // MARK: Responses
 
     public func translate(status: Int, headers: [String: String], body: AsyncThrowingStream<Data, Error>, streamed: Bool,

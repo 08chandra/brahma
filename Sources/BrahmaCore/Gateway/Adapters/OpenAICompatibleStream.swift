@@ -5,11 +5,13 @@ import Foundation
 ///
 /// It emits `message_start` once (at the first chunk), then one content block per text run — streamed as it arrives — and one
 /// per tool call. Tool calls are accumulated by their `index` (their arguments arrive in pieces, possibly interleaved with
-/// other calls) and emitted whole when the finish reason arrives: `content_block_start` (`tool_use`, empty input), one
-/// `input_json_delta` holding the arguments as validated JSON, `content_block_stop`. Arguments that are not a JSON object
-/// (cut, malformed, repeated keys) become `{}`: the turn runs the tool with no input and `claude` answers its own validation
-/// error as a `tool_result` on the next request — never a crash. Then `message_delta` (stop reason and usage) and
-/// `message_stop`: the order `claude` requires (inventory (d)).
+/// other calls; a delta without an `index` is its position in the delta's list) and emitted whole when the finish reason
+/// arrives: `content_block_start` (`tool_use`, empty input), one `input_json_delta` holding the arguments as validated
+/// JSON, `content_block_stop`. Arguments that are not a JSON object (cut, malformed, repeated keys) become the marker
+/// `{"_brahma_invalid_arguments": true}` (Ruling 58 m1: never `{}`, which a tool whose parameters are all optional would
+/// run on): the tool's own validation refuses it and `claude` sends that error as a `tool_result` on the next request —
+/// never a crash. A call without a plain name (`^[A-Za-z0-9_-]{1,64}$`) ends the reply with an error. Then `message_delta`
+/// (stop reason and usage) and `message_stop`: the order `claude` requires (inventory (d)).
 ///
 /// The provider is untrusted, so every input is bounded (Review Focus 3) and a violated bound ends the reply with an `error`
 /// event (`overloaded_error`, "Brahma: provider stream exceeded <bound>"): one SSE line at most `maxLineBytes`, the tool
@@ -192,8 +194,8 @@ public struct OpenAICompatibleStream {
                 switch delta["tool_calls"] {
                 case .none, .some(.null): break
                 case .some(.array(let deltas)):
-                    for d in deltas {
-                        events += toolCall(d)
+                    for (position, d) in deltas.enumerated() {
+                        events += toolCall(d, position: position)
                         if isEnded { return events }
                     }
                 default: return events + malformed()
@@ -230,13 +232,13 @@ public struct OpenAICompatibleStream {
         return [.contentBlockStop(index: open)]
     }
 
-    /// One tool-call delta: `index` names the call; `id` and `function.name` are kept from their first appearance,
-    /// `function.arguments` pieces are appended.
-    private mutating func toolCall(_ d: StrictJSON) -> [CanonicalStreamEvent] {
+    /// One tool-call delta: `index` names the call (its `position` in the delta's list when absent); `id` and
+    /// `function.name` are kept from their first appearance, `function.arguments` pieces are appended.
+    private mutating func toolCall(_ d: StrictJSON, position: Int) -> [CanonicalStreamEvent] {
         guard case .object = d else { return malformed() }
         let index: Int
         switch d["index"] {
-        case .none: index = 0
+        case .none, .some(.null): index = position
         case .some(let value):
             guard let n = Self.integer(value), n >= 0 else { return malformed() }
             index = n
@@ -281,6 +283,9 @@ public struct OpenAICompatibleStream {
     /// The finish reason: the open text block closes, every tool call is emitted whole, in the order the calls began.
     private mutating func finish(_ reason: String) -> [CanonicalStreamEvent] {
         var events = closeText()
+        guard callOrder.allSatisfy({ Self.isToolName(calls[$0]?.name ?? "") }) else {
+            return events + error(type: "api_error", message: Self.invalidToolName)
+        }
         for index in callOrder {
             guard let call = calls[index] else { continue }
             let block = nextIndex
@@ -332,27 +337,34 @@ public struct OpenAICompatibleStream {
 
     static let zeroUsage = GatewayUsage(inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0)
 
-    /// `finish_reason` as a Messages `stop_reason`: `stop` → `end_turn` (`tool_use` when the reply made tool calls),
-    /// `length` → `max_tokens`, `tool_calls` → `tool_use`, `content_filter` and anything else → `end_turn`.
+    /// `finish_reason` as a Messages `stop_reason` (Ruling 58 m2): `length` → `max_tokens`; otherwise `tool_use` exactly when
+    /// the reply made tool calls (whatever the reason says: `stop`, `content_filter` or an unknown one with calls, and never
+    /// `tool_use` without one), else `end_turn`.
     static func stopReason(_ reason: String?, hasToolCalls: Bool) -> String {
-        switch reason {
-        case "length": "max_tokens"
-        case "tool_calls", "function_call": "tool_use"
-        case "stop": hasToolCalls ? "tool_use" : "end_turn"
-        default: "end_turn"
-        }
+        if reason == "length" { return "max_tokens" }
+        return hasToolCalls ? "tool_use" : "end_turn"
     }
 
-    /// A tool call's arguments as the `tool_use` input: the JSON object they hold (parsed strictly, numbers exact), or `{}`
-    /// when they hold anything else.
+    /// What a tool call whose arguments are not a JSON object is given instead: no tool takes it, so it fails validation.
+    static let invalidArguments: StrictJSON = .object([.init("_brahma_invalid_arguments", .bool(true))])
+
+    static let invalidToolName = "Brahma: the provider sent a tool call without a valid name"
+
+    /// A tool name as `claude` and Chat Completions both accept it: `^[A-Za-z0-9_-]{1,64}$`.
+    static func isToolName(_ name: String) -> Bool {
+        (1...64).contains(name.utf8.count) && name.utf8.allSatisfy(isIdByte)
+    }
+
+    /// A tool call's arguments as the `tool_use` input: the JSON object they hold (parsed strictly, numbers exact); `{}` for
+    /// no arguments at all (a call with no parameters); `invalidArguments` for anything else.
     static func toolInput(_ arguments: String) -> StrictJSON {
         guard !arguments.allSatisfy(\.isWhitespace) else { return .object([]) }
         do {
             let parsed = try StrictJSON.parse(Data(arguments.utf8))
             if case .object = parsed { return parsed }
-            return .object([])
+            return invalidArguments
         } catch {
-            return .object([])
+            return invalidArguments
         }
     }
 

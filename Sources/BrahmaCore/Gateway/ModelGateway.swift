@@ -132,6 +132,8 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
             return
         }
         if r.endpoint == .messages, canonical.maxTokens == nil { throw .policy("max_tokens is required") }
+        // The adapter's own refusals come before the key and the meter, so they are never masked by a cap (Ruling 58 m3).
+        try adapter.validate(tree, endpoint: r.endpoint)
         guard isLive(reply) else { return }
         guard acquireUpstreamSlot() else { throw Self.busy }
         defer { releaseUpstreamSlot() }

@@ -113,4 +113,10 @@ public protocol ProviderAdapter: Sendable {
     /// `anthropic`: nil (the provider counts). `openai-compatible` (Task 10): `ceil(canonicalBytes / 4)`, Chat Completions
     /// having no count endpoint.
     func countTokensLocally(_ body: StrictJSON) -> Int?
+
+    /// Refuses (throws) a request this adapter cannot send, without sending anything: pure, run by the gateway before it
+    /// reads the key or reserves anything (Ruling 58 m3), so the real reason is reported and never masked by a cap refusal.
+    /// `upstream` still refuses the same requests (it translates the same tree). `anthropic`: nothing to refuse (the body is
+    /// sent as checked). `openai-compatible`: the translation's refusals.
+    func validate(_ body: StrictJSON, endpoint: GatewayEndpoint) throws(GatewayError)
 }

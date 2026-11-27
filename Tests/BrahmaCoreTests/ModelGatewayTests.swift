@@ -449,6 +449,7 @@ import GRDB
         }
         func billsNothing(status: Int) -> Bool { status < 500 }
         func countTokensLocally(_ body: StrictJSON) -> Int? { nil }
+        func validate(_ body: StrictJSON, endpoint: GatewayEndpoint) throws(GatewayError) {}
     }
 
     /// Ruling 52(f): at most `GatewayLimits.maxUpstreamRequests` requests upstream at once; past it a 429 rate_limit_error

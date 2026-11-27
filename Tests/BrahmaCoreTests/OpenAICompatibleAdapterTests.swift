@@ -83,7 +83,7 @@ enum OpenAIFixture {
     /// Five request goldens: each Messages request (it passes the policy) becomes exactly its Chat Completions body —
     /// system text first, `role: "system"` entries in place, tool calls with exact arguments (2^63+1 and a long decimal
     /// survive), tool results as `role: "tool"`, images as data URLs.
-    @Test(arguments: ["text", "system", "tools", "tool-roundtrip", "image"])
+    @Test(arguments: ["text", "system", "tools", "tool-roundtrip", "image", "tool-search"])
     func requestGoldens(_ name: String) throws {
         let request = try OpenAIFixture.json("request-\(name)")
         let tree = try CanonicalRequest.tree(Data(request.utf8))
@@ -170,7 +170,6 @@ enum OpenAIFixture {
             #"[{"type":"image","source":{"type":"url","url":"https://x"}}]"#,
             #"[{"type":"image","source":{"type":"base64","media_type":"image/svg+xml","data":"PHN2Zz4="}}]"#,
             #"[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"a\"b"}}]"#,
-            #"[{"type":"tool_result","tool_use_id":"t","content":[{"type":"tool_reference","tool_name":"x"}]}]"#,
             #"[{"type":"server_tool_use","id":"s","name":"web_search","input":{}}]"#,
         ]
         for content in cases {
@@ -224,14 +223,16 @@ enum OpenAIFixture {
         #expect(try await Self.respond(try OpenAIFixture.data("stream-text", "sse"), contentType: "text/event-stream").error?.status == 502)
     }
 
-    /// Arguments that are not a JSON object (cut, an array, a repeated key, prose) become a `tool_use` with `{}`: the reply
-    /// is still relayed (the turn sees its tool fail on the next request), whole or streamed.
+    /// Arguments that are not a JSON object (cut, an array, a repeated key, prose) become a `tool_use` with the marker input
+    /// `{"_brahma_invalid_arguments": true}` (Ruling 58 m1: never `{}`, which a tool with only optional parameters would run
+    /// on): the reply is still relayed and the tool's validation refuses the marker, whole or streamed.
     @Test func unparsableToolArgumentsSurvive() async throws {
         for arguments in [#"{\"a\":"#, "[1,2]", #"{\"a\":1,\"a\":2}"#, "not json", #"\"x\""#] {
             let whole = #"{"id":"c","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read","arguments":"\#(arguments)"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#
             let (outcome, error, response) = try await Self.respond(Data(whole.utf8))
             #expect(error == nil && outcome?.complete == true, "\(arguments)")
-            #expect(response?.text.contains(#"{"type":"tool_use","id":"call_1","name":"Read","input":{}}"#) == true, "\(response?.text ?? "")")
+            #expect(response?.text.contains(#"{"type":"tool_use","id":"call_1","name":"Read","input":{"_brahma_invalid_arguments":true}}"#) == true,
+                    "\(response?.text ?? "")")
             #expect(response?.text.contains(#""stop_reason":"tool_use""#) == true)
 
             let sse = OpenAICompatibleStreamTests.sse([
@@ -241,7 +242,45 @@ enum OpenAIFixture {
             let streamed = try await Self.respond(sse, contentType: "text/event-stream", streamed: true)
             #expect(streamed.error == nil && streamed.outcome?.complete == true, "\(arguments)")
             let text = streamed.response?.text ?? ""
-            #expect(text.contains(#""partial_json":"{}""#) && text.hasSuffix("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), "\(text)")
+            #expect(text.contains(#""partial_json":"{\"_brahma_invalid_arguments\":true}""#) && text.hasSuffix("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), "\(text)")
+        }
+    }
+
+    /// Ruling 58: tool search maps by name. A `tool_reference` in a tool result becomes `Tool <name> loaded.`; a
+    /// `tool_addition` / `tool_removal` in a system message is dropped, a removal leaving that function out (a later
+    /// addition brings it back). Definitions enter only through the checked `tools`; any other reference shape, a name
+    /// that is not one of the request's tools, or a change outside a system message is refused (by the adapter alone).
+    @Test func toolSearchReferencesMapByName() throws {
+        let tools = #""tools":[{"name":"Search","input_schema":{"type":"object"}},{"name":"get_forecast","input_schema":{"type":"object"}}]"#
+        func body(_ messages: String, choice: String = "") -> String {
+            #"{"model":"m","max_tokens":5,\#(tools)\#(choice),"messages":[\#(messages)]}"#
+        }
+        func change(_ type: String, _ tool: String) -> String { #"{"role":"system","content":[{"type":"\#(type)","tool":\#(tool)}]}"# }
+        let reference = #"{"type":"tool_reference","name":"get_forecast"}"#
+        // Removed, then added again: sent; removed last: left out.
+        let readded = try Self.sentText(body(change("tool_removal", reference) + "," + change("tool_addition", reference)))
+        #expect(readded.contains(#""name":"get_forecast""#) && !readded.contains("tool_addition"), "\(readded)")
+        let removed = try Self.sentText(body(change("tool_addition", reference) + "," + change("tool_removal", reference)))
+        #expect(!removed.contains("get_forecast") && removed.contains(#""name":"Search""#), "\(removed)")
+        #expect(removed.contains(#""messages":[]"#), "a system message holding only tool changes sends nothing")
+
+        let refused: [String] = [
+            body(change("tool_addition", #"{"type":"custom","name":"get_forecast","input_schema":{"type":"object"}}"#)),
+            body(change("tool_addition", #"{"type":"tool_reference","name":"get_forecast","description":"x"}"#)),
+            body(change("tool_addition", #"{"type":"tool_reference","name":"get_forecast","tool_name":"Search"}"#)),
+            body(change("tool_addition", #"{"type":"tool_reference","name":"unknown_tool"}"#)),
+            body(change("tool_removal", #"{"type":"tool_reference","name":"get forecast"}"#)),
+            body(change("tool_addition", #""get_forecast""#)),
+            body(change("tool_addition", "null")),
+            body(#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"tool_reference","tool_name":"nope"}]}]}"#),
+            body(#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"tool_reference","tool_name":"Search","x":1}]}]}"#),
+            body(#"{"role":"user","content":[{"type":"tool_addition","tool":{"type":"tool_reference","name":"Search"}}]}"#),
+            #"{"model":"m","max_tokens":5,\#(tools),"system":[{"type":"tool_addition","tool":\#(reference)}],"messages":[]}"#,
+            body(change("tool_removal", reference), choice: #","tool_choice":{"type":"tool","name":"get_forecast"}"#),
+        ]
+        for request in refused {
+            let error = Self.refusal(request)
+            #expect(error?.status == 400, "\(request): \(String(describing: error))")
         }
     }
 
@@ -310,6 +349,38 @@ enum OpenAIFixture {
         let estimated = try rig.charges()[1]
         #expect(estimated.state == "estimated" && abs(estimated.usd - GatewayMeter.estimate(price, maxTokens: 64, body: Data(body.utf8))) < 1e-12,
                 "\(estimated)")
+    }
+
+    /// Ruling 58 m3: the adapter's refusal is decided before the key and the meter, so a company at its cap still hears
+    /// why its request cannot be sent (and a sendable one hears about the cap). Nothing goes upstream, nothing is charged.
+    @Test func translationRefusalBeforeTheCap() async throws {
+        let rig = try ModelGatewayRig([FakeUpstream.json(200, "{}")], providers: [OpenAIFixture.provider()], storeKey: false,
+                                      caps: ProviderCaps(monthlyUSD: 0), capped: ["openai"], adapters: [OpenAICompatibleAdapter()],
+                                      prices: [OpenAIFixture.price])
+        let token = rig.grant(aliases: OpenAIFixture.routes, serverTools: ["web_search"])
+        let document = #"{"model":"brahma-standard","max_tokens":5,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"x"}}]}]}"#
+        let untranslatable = try await rig.exchange(document, token: token)
+        #expect(untranslatable.status == 400 && untranslatable.text.contains("cannot be sent to an openai-compatible provider"), "\(untranslatable.text)")
+        let server = #"{"model":"brahma-standard","max_tokens":5,"messages":[],"tools":[{"type":"web_search","name":"web_search"}]}"#
+        let serverTool = try await rig.exchange(server, token: token)
+        #expect(serverTool.status == 403 && serverTool.text.contains("only function tools"), "\(serverTool.text)")
+        let sendable = try await rig.exchange(#"{"model":"brahma-standard","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}"#, token: token)
+        #expect(sendable.status == 400 && sendable.text.contains("cap of $0.00 reached"), "the rig is at its cap: \(sendable.text)")
+        #expect(rig.upstream.requests.isEmpty)
+        #expect(try rig.charges().isEmpty)
+    }
+
+    /// The tool-search pass case through the gateway: the policy and the adapter both accept it, and the provider gets the
+    /// golden body.
+    @Test func toolSearchTurnThroughTheGateway() async throws {
+        let rig = try ModelGatewayRig([FakeUpstream.json(200, try OpenAIFixture.json("response-text"))], providers: [OpenAIFixture.provider()],
+                                      capped: ["openai"], adapters: [OpenAICompatibleAdapter()], prices: [OpenAIFixture.price])
+        try rig.vault.set(companyId: rig.companyId, name: OpenAIFixture.keyName, value: OpenAIFixture.key)
+        let response = try await rig.exchange(try OpenAIFixture.json("request-tool-search"), token: rig.grant(aliases: OpenAIFixture.routes))
+        #expect(response.status == 200, "\(response.text)")
+        let sent = try #require(rig.upstream.requests.first)
+        let expected = try OpenAIFixture.json("chat-tool-search")
+        #expect(String(decoding: sent.body, as: UTF8.self) == expected)
     }
 
     /// An upstream 401 echoing the key: the client gets a 400 with `[redacted]`, and no log line holds the key.
