@@ -55,7 +55,8 @@ extension Store {
             if let wanted {
                 let slug = KBMarkdown.slug(wanted)
                 guard let loc = located.first(where: { $0.section.slug == slug }), visible(loc) else {
-                    throw WorkError.notFound("kb:\(page.path) has no section \"\(Store.flat(wanted, max: 80))\" you can read")
+                    // Final wave B1 item 9: the asked-for section is never echoed (it may be agent text, a guessed value).
+                    throw WorkError.notFound("kb:\(page.path) has no section by that name you can read")
                 }
                 text = lines[loc.lineRange].joined(separator: "\n")
                 slugs = [loc.section.slug]

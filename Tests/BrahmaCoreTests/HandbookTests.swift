@@ -153,9 +153,9 @@ import BrahmaKeychain
         #expect(try w.search(w.cfo, "otter").map(\.ref) == ["kb:Company/Board#comp"])
         // The section itself, asked for by slug, answers like a missing one.
         #expect(w.refusal { try w.read(w.eng1, "Company/Board", section: "comp") as Any }
-                == .notFound("kb:Company/Board has no section \"comp\" you can read"))
+                == .notFound("kb:Company/Board has no section by that name you can read"))
         #expect(w.refusal { try w.read(w.eng1, "Company/Board", section: "nothing-here") as Any }
-                == .notFound("kb:Company/Board has no section \"nothing-here\" you can read"))
+                == .notFound("kb:Company/Board has no section by that name you can read"))
     }
 
     @Test func nestedRestrictionHidesSubsection() throws {
@@ -267,8 +267,8 @@ import BrahmaKeychain
         }
         // Reading it answers exactly like a missing page.
         #expect(try w.read(w.eng1, "Board") == nil)
-        #expect(w.call(w.eng1, "kb_read", ["path": .string("Board")]).text == "No handbook page kb:Board you can read. Try search_kb.")
-        #expect(w.call(w.eng1, "kb_read", ["path": .string("Nowhere")]).text == "No handbook page kb:Nowhere you can read. Try search_kb.")
+        #expect(w.call(w.eng1, "kb_read", ["path": .string("Board")]).text == "No handbook page you can read at that path. Try search_kb.")
+        #expect(w.call(w.eng1, "kb_read", ["path": .string("Nowhere")]).text == "No handbook page you can read at that path. Try search_kb.")
         #expect(try w.store.kbPages(companyId: w.company.id, reader: .agent(w.eng1.id)).allSatisfy { $0.path != "Board" })
         #expect(try w.store.kbPages(companyId: w.company.id, reader: .agent(w.ceo.id)).contains { $0.path == "Board" })
     }
@@ -684,7 +684,7 @@ import BrahmaKeychain
         #expect(try a.read(a.eng1, "Secret/Plan") == nil)
         #expect(try a.read(nil, "Secret/Plan") == nil)
         #expect(a.call(a.eng1, "kb_read", ["path": .string("Secret/Plan")]).text
-                == "No handbook page kb:Secret/Plan you can read. Try search_kb.")
+                == "No handbook page you can read at that path. Try search_kb.")
         #expect(a.call(a.eng1, "search_kb", ["query": .string("yak")]).text.hasPrefix("No results"))
         #expect(try a.store.kbPages(companyId: a.company.id, reader: .owner).allSatisfy { $0.path != "Secret/Plan" })
         #expect(a.refusal { try a.store.kbRevisions(companyId: a.company.id, path: "Secret/Plan") } != nil)

@@ -92,14 +92,17 @@ extension CompanyTools {
 
     // MARK: kb_read
 
+    /// What `kb_read` answers for a path that names no page the agent can read (fixed text: the path is never echoed).
+    static let kbReadNotFound = "No handbook page you can read at that path. Try search_kb."
+
     private func kbRead(_ args: [String: JSONValue]) throws -> String {
         let rawPath = try string(args, "path")
         let section = try optionalString(args, "section")
         let revision = try positiveInteger(args, "revision")
         guard let view = try store.kbRead(companyId: companyId, reader: .agent(agentId), path: rawPath, section: section,
                                           revision: revision) else {
-            let shown = (try? HandbookPath.normalize(rawPath)) ?? Store.flat(rawPath, max: 80)
-            return "No handbook page kb:\(shown) you can read. Try search_kb."
+            // Final wave B1 item 9: the agent's path is never echoed (through the redactor it would confirm a guessed value).
+            return Self.kbReadNotFound
         }
         let page = view.page
         let labels = try MemoryLabels(store: store, companyId: companyId)

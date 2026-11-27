@@ -154,4 +154,32 @@ import GRDB
         #expect(recalled.contains("mem:") && !recalled.contains("    | "), "\(recalled)")
         #expect(try call("search_kb", "4821").hasPrefix("No results you can read"))
     }
+    /// Final wave B1 item 9 (Ruling on C4a r4 concern 2): `recall(ref:)` and `kb_read` never echo the agent's own text through
+    /// the redactor. A ref, path or section that equals a stored value answers exactly like a random one: no "[redacted NAME]"
+    /// confirms a guess.
+    @Test func missingRefAnswersNeverEchoAGuess() async throws {
+        let w = try Self.world()
+        let s = w.store, c = w.c, fx = w.fx
+        _ = try s.kbWrite(companyId: c.id, by: .owner, path: "Eng/Locker", body: "# Locker\n\n## Door\n\nlocker door\n", knownValues: [])
+        let vault = MemoryVault()
+        _ = try Self.store(w, Self.value, vault: vault)
+        _ = try s.reloadRedactorIfNeeded(vault: vault)
+        let tools = CompanyTools(store: s, companyId: c.id, agentId: fx.qa2.id, paths: w.cf.paths, vault: vault, diagnostics: { _ in })
+        func call(_ name: String, _ args: [String: JSONValue]) -> String {
+            do { return try tools.call(name: name, arguments: args) } catch { return "error: \(error)" }
+        }
+        let cases: [(String, (String) -> [String: JSONValue])] = [
+            ("recall", { ["ref": .string("mem:\($0)")] }),
+            ("recall", { ["ref": .string($0)] }),
+            ("recall", { ["ref": .string("kb:\($0)")] }),
+            ("kb_read", { ["path": .string($0)] }),
+            ("kb_read", { ["path": .string("Eng/\($0)")] }),
+            ("kb_read", { ["path": .string("Eng/Locker"), "section": .string($0)] }),
+        ]
+        for (name, args) in cases {
+            let guess = call(name, args(Self.value)), random = call(name, args(Self.control))
+            #expect(!guess.contains("[redacted") && !guess.contains(Self.value), "\(name): \(guess)")
+            #expect(guess == random, "\(name): \(guess) vs \(random)")
+        }
+    }
 }

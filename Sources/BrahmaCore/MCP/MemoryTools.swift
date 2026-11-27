@@ -171,6 +171,9 @@ extension CompanyTools {
 
     // MARK: recall
 
+    /// What `recall(ref:)` answers for a ref that names nothing the agent can read (fixed text: the ref is never echoed).
+    static let recallNotFound = "No memory you can read at that ref."
+
     private func recall(_ args: [String: JSONValue]) throws -> String {
         let query = try optionalString(args, "query"), ref = try optionalString(args, "ref")
         guard (query == nil) != (ref == nil) else { throw ToolError(message: "pass query or ref") }
@@ -180,7 +183,9 @@ extension CompanyTools {
         let raw = ref ?? ""
         let now = Store.now()
         if let answer = try resourceRecall(raw, now: now) { return answer }
-        let notFound = "No memory \(Store.flat(MemoryRefs.implied(raw).canonical, max: 80)) you can read."
+        // Final wave B1 item 9: never echo the agent's own text (a ref that equals a stored value would come back through the
+        // redactor as "[redacted NAME]", confirming the guess): one fixed answer for every ref that names nothing readable.
+        let notFound = Self.recallNotFound
         guard let doc = try MemoryIndex(store: store).document(companyId: companyId, scope: .agent(agentId), ref: raw, now: now) else {
             return notFound
         }

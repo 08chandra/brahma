@@ -297,7 +297,7 @@ import BrahmaKeychain
         #expect(w.call(w.eng1, "recall", ["ref": .string("mem:1")]).ok)
         try w.store.advanceActive(companyId: w.company.id, by: 2)
         #expect(w.call(w.eng1, "recall", ["query": .string("freeze week")]).text.hasPrefix("No results"))
-        #expect(w.call(w.eng1, "recall", ["ref": .string("mem:1")]).text == "No memory mem:1 you can read.")
+        #expect(w.call(w.eng1, "recall", ["ref": .string("mem:1")]).text == "No memory you can read at that ref.")
         // An expired entry is not confirmed: the same fact is new again.
         #expect(w.remember(w.eng1, "The freeze lasts this week").text == "Remembered mem:2 (mine).")
     }
@@ -394,9 +394,9 @@ import BrahmaKeychain
         #expect(w.remember(w.eng1, "My private plan for the kestrel").ok)
         let unreadable = w.call(w.eng2, "recall", ["ref": .string("mem:1")])
         let missing = w.call(w.eng2, "recall", ["ref": .string("mem:999")])
-        #expect(unreadable == (true, "No memory mem:1 you can read."))
-        #expect(missing == (true, "No memory mem:999 you can read."))
-        #expect(w.call(w.eng2, "recall", ["ref": .string("nonsense")]).text == "No memory nonsense you can read.")
+        #expect(unreadable == (true, "No memory you can read at that ref."))
+        #expect(missing == (true, "No memory you can read at that ref."))
+        #expect(w.call(w.eng2, "recall", ["ref": .string("nonsense")]).text == "No memory you can read at that ref.")
         #expect(try w.reads(w.eng2).isEmpty)
     }
 
@@ -405,7 +405,7 @@ import BrahmaKeychain
         #expect(w.remember(w.eng1, "Acme's kestrel launch code word", ["scope": .string("company")]).ok)
         let other = try W(store: w.store, name: "Globex")
         let outsider = other.eng1
-        #expect(other.call(outsider, "recall", ["ref": .string("mem:1")]).text == "No memory mem:1 you can read.")
+        #expect(other.call(outsider, "recall", ["ref": .string("mem:1")]).text == "No memory you can read at that ref.")
         #expect(other.call(outsider, "search_memory", ["query": .string("kestrel launch")]).text.hasPrefix("No results"))
         // Globex numbers its own entries from 1.
         #expect(other.remember(outsider, "Globex fact").text == "Remembered mem:1 (mine).")
@@ -426,7 +426,7 @@ import BrahmaKeychain
         let search = w.call(w.eng1, "search_memory", ["query": .string("narwhal linter")]).text
         #expect(search.contains("1. \(ask.ref) · ask · @eng-1 · "), "\(search)")
         // Not the requester: generic not found under either form.
-        #expect(w.call(w.eng3, "recall", ["ref": .string("ask:\(n)")]).text == "No memory \(ask.ref) you can read.")
+        #expect(w.call(w.eng3, "recall", ["ref": .string("ask:\(n)")]).text == "No memory you can read at that ref.")
     }
 
     @Test func readsRecordedForPurge() throws {
@@ -460,7 +460,7 @@ import BrahmaKeychain
         #expect(doc["body"] == ""); #expect((doc["removedAt"] as Date?) != nil)
         #expect(w.call(w.eng2, "search_memory", ["query": .string("moved")]).text.hasPrefix("No results"))
         #expect(!w.call(w.eng2, "search_memory", ["query": .string("puffin moved")]).text.contains("mem:2"))
-        #expect(w.call(w.eng1, "recall", ["ref": .string("mem:2")]).text == "No memory mem:2 you can read.")
+        #expect(w.call(w.eng1, "recall", ["ref": .string("mem:2")]).text == "No memory you can read at that ref.")
         #expect(try w.store.writer.read { db in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memoryFts WHERE memoryFts MATCH 'moved'")
         } == 0, "the text is out of the index")
@@ -473,7 +473,7 @@ import BrahmaKeychain
         #expect(throws: WorkError.self) { try w.store.ownerDeleteMemory(companyId: other.company.id, number: 1, now: Store.now()) }
         // Ingest never brings it back; the same fact is a new entry.
         try MemoryIngest.run(store: w.store, companyId: w.company.id, paths: w.paths, now: Store.now().addingTimeInterval(120))
-        #expect(w.call(w.eng1, "recall", ["ref": .string("mem:2")]).text == "No memory mem:2 you can read.")
+        #expect(w.call(w.eng1, "recall", ["ref": .string("mem:2")]).text == "No memory you can read at that ref.")
         #expect(w.remember(w.eng1, "The puffin hint moved", ["scope": .string("company")]).text == "Remembered mem:3 (company).")
         // Listing: removed rows only on request.
         #expect(try w.store.memoryEntries(companyId: w.company.id, filter: MemoryEntryFilter()).map(\.number).sorted() == [1, 3])

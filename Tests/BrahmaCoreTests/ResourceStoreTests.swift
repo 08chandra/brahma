@@ -97,7 +97,7 @@ import BrahmaKeychain
             try MemoryIndex(store: store).search(companyId: company.id, scope: .agent(a.id), query: query, now: Store.now())
         }
 
-        func notFound(_ ref: String) -> String { "No memory \(ref) you can read." }
+        func notFound(_ ref: String) -> String { "No memory you can read at that ref." }
 
         func vaultNames() -> [String] {
             ((try? FileManager.default.contentsOfDirectory(atPath: vaultFiles.path)) ?? []).sorted()

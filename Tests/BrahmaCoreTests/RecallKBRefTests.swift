@@ -28,15 +28,15 @@ import Foundation
                                                                          ref: "kb:engineering/environments", now: Store.now()))
         #expect(doc.hit.ref == "kb:Engineering/Environments")
         // A page that doesn't exist answers as before.
-        #expect(recall(w, w.eng1, "kb:engineering/nowhere") == "No memory kb:engineering/nowhere you can read.")
+        #expect(recall(w, w.eng1, "kb:engineering/nowhere") == "No memory you can read at that ref.")
     }
 
     @Test func caseFoldedRefToHiddenSectionStaysMissing() throws {
         let w = try W()
         try w.write(nil, "Company/Board", HandbookTests.boardBody)
         // eng-1 can't read the restricted section in any spelling; the answer is the generic one.
-        #expect(recall(w, w.eng1, "kb:company/board#comp") == "No memory kb:company/board#comp you can read.")
-        #expect(recall(w, w.eng1, "kb:company/board#nothing-here") == "No memory kb:company/board#nothing-here you can read.")
+        #expect(recall(w, w.eng1, "kb:company/board#comp") == "No memory you can read at that ref.")
+        #expect(recall(w, w.eng1, "kb:company/board#nothing-here") == "No memory you can read at that ref.")
         // The cfo can, through the same spelling.
         #expect(recall(w, w.cfo, "kb:company/board#comp").contains("salary bands otter"))
         // The page as a whole for eng-1: only what it can read.
