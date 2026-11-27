@@ -2,9 +2,9 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-/// Plan X1 Ruling 2: the runtime seam and the gateway never fail open. Under `Sources/BrahmaCore/Runtime` (must exist) and
-/// `Sources/BrahmaCore/Gateway` (tolerated absent until the gateway lands) no `try?`, no `?? true`, no `?? false` and no empty
-/// `catch {}`; comments and string literals blanked (`SourceLint.code`).
+/// Plan X1 Ruling 2: the runtime seam and the gateway never fail open. Under `Sources/BrahmaCore/Runtime` (must exist),
+/// `Sources/BrahmaCore/Gateway` and `Sources/BrahmaCore/Net` (the gateway's loopback listener, Ruling 40) no `try?`, no `?? true`,
+/// no `?? false` and no empty `catch {}`; comments and string literals blanked (`SourceLint.code`).
 ///
 /// Ruling 30: the Claude compiler and parser moved under `Runtime/Claude/` by Task 3's pure move keep today's fail-open sites
 /// (fixing them during a byte-identical move would risk behaviour drift). `legacyBaseline` records exactly those files and
@@ -12,7 +12,7 @@ import Foundation
 /// lowered to match). Every other file under the scopes, and every new file, has a baseline of zero.
 @Suite(.scratch) struct GatewayFailOpenLintTests {
     static let core = SourceLint.packageRoot.appending(path: "Sources/BrahmaCore", directoryHint: .isDirectory)
-    static let scopes = ["Runtime", "Gateway"]
+    static let scopes = ["Runtime", "Gateway", "Net"]
     static let patterns: [(name: String, regex: String)] = [
         ("try?", #"\btry\?"#),
         ("?? true", #"\?\?\s*true\b"#),
@@ -52,7 +52,9 @@ import Foundation
     }
 
     @Test func noFailOpenInRuntimeOrGateway() throws {
-        #expect(FileManager.default.fileExists(atPath: Self.core.appending(path: "Runtime").path), "Sources/BrahmaCore/Runtime must exist")
+        for scope in Self.scopes {
+            #expect(FileManager.default.fileExists(atPath: Self.core.appending(path: scope).path), "Sources/BrahmaCore/\(scope) must exist")
+        }
         let violations = try Self.violations(core: Self.core)
         #expect(violations.isEmpty, "fail-open forms in the runtime or gateway beyond the legacy baseline:\n\(violations.joined(separator: "\n"))")
     }
@@ -87,6 +89,7 @@ import Foundation
             func e() throws {}
             """, at: "Runtime/Planted.swift", under: copy)
         try SourceLint.plant("func g(_ f: Bool?) -> Bool { f ?? false }\n", at: "Gateway/Planted.swift", under: copy)
+        try SourceLint.plant("func j() { do { try e() } catch {} }\n", at: "Net/Planted.swift", under: copy)
         try SourceLint.plant("func h(_ f: Bool?) -> Bool { f ?? false }\n", at: "Sandbox/Planted.swift", under: copy)
         // One more site in a legacy file puts all of that file's sites over its baseline.
         let legacy = copy.appending(path: "Runtime/Claude/StreamParser.swift")
@@ -95,7 +98,7 @@ import Foundation
         let legacyHits = offenders.filter { $0.hasPrefix("Runtime/Claude/StreamParser.swift:") }
         #expect(legacyHits.count == (Self.legacyBaseline["Runtime/Claude/StreamParser.swift"] ?? 0) + 1, "\(legacyHits)")
         #expect(offenders.filter { !$0.hasPrefix("Runtime/Claude/StreamParser.swift:") }
-                    == ["Gateway/Planted.swift:1: ?? false", "Runtime/Planted.swift:3: try?", "Runtime/Planted.swift:4: ?? true",
+                    == ["Gateway/Planted.swift:1: ?? false", "Net/Planted.swift:1: empty catch", "Runtime/Planted.swift:3: try?", "Runtime/Planted.swift:4: ?? true",
                         "Runtime/Planted.swift:5: ?? false", "Runtime/Planted.swift:7: empty catch"], "\(offenders)")
     }
 }
