@@ -166,6 +166,13 @@ extension Store {
         case .commit:
             return try commitRowSource(companyId: companyId, sha: ref.rev ?? ref.id).map { (true, Self.sessionReason($0)) } ?? (false, nil)
         case .file, .diff:
+            // C5b: `diff:<sha>..<sha>` names no item: tainted when any uncleared tainted commit lies in its range (or the
+            // range can't be listed). `wt:@handle` is resolved to its item diff before it reaches here; unresolved, it is clean
+            // only in name (nothing opens for it).
+            if ref.kind == .diff, ref.id.isEmpty {
+                guard ref.params["wt"] == nil, let from = ref.params["from"], let to = ref.params["to"] else { return (false, nil) }
+                return try rangeSource(companyId: companyId, from: from, to: to).map { (true, Self.sessionReason($0)) } ?? (false, nil)
+            }
             if ref.kind == .file, ref.itemKey == nil {
                 guard let rev = ref.rev else {
                     if ref.id.hasPrefix(".brahma/") { return try onDiskBrahmaTaint(ref, companyId: companyId) }
@@ -421,6 +428,23 @@ extension Store {
             return try commitSource(committed, item: item)
         }
         return try commitSource(ref, item: item)
+    }
+
+    /// C5b: the source of the first uncleared tainted commit in `from..to` (full or abbreviated shas, verified by git), or the
+    /// generic reason when the range can't be listed (fail closed). Nil when the range is clean or there are no rows.
+    private func rangeSource(companyId: String, from: String, to: String) throws -> String? {
+        let rows = try unclearedCommits(companyId: companyId)
+        guard !rows.isEmpty else { return nil }
+        guard let company = try company(id: companyId) else { return "outside content" }
+        let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
+        let shas: [String]
+        do {
+            let refs = try reachabilityRefs(companyId: companyId)
+            shas = try git.revList(try git.verifyRev(from, reachableFrom: refs), try git.verifyRev(to, reachableFrom: refs))
+        } catch {
+            return "outside content"
+        }
+        return rows.first { row in shas.contains { $0.hasPrefix(row.sha) } }?.source
     }
 
     /// The company's uncleared tainted commits, sha → source.

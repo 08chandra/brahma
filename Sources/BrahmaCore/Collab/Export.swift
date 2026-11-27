@@ -76,7 +76,7 @@ extension Store {
         }
         guard r.resolved.state != .purged else { throw WorkError.invalid(Self.purgedText) }
         switch subject.record {
-        case .file, .diff, .commit, .item, .ask, .kb, .memory, .run, .message, .artifact:
+        case .file, .diff, .diffRange, .commit, .item, .ask, .kb, .memory, .run, .message, .artifact:
             break
         case .resource(let res):
             guard res.kind == .file else { throw WorkError.invalid("\(res.ref) is a \(res.kind.rawValue); export its files one by one") }

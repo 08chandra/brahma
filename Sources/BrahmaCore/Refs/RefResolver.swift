@@ -113,7 +113,11 @@ extension Store {
             let temp = try refTempDirectory()
             defer { try? FileManager.default.removeItem(at: temp) }
             let worktree = workspace.appending(path: ".brahma/wt/\(item.key)", directoryHint: .isDirectory)
-            let diff = try refGit(workspace).worktreeDiff(key: item.key, worktree: worktree, tempDir: temp, fs: fs)
+            // C5b: against the compare's base (`main` by default: the merge base with main), resolved from engine records.
+            let git = try refGit(workspace)
+            let base = try changesBases(companyId: companyId, item: item, compare: CompareMode(ref: ref) ?? .main, git: git).base
+            let diff = try git.worktreeDiff(key: item.key, worktree: worktree, against: base, tempDir: temp, fs: fs)
+            pinned.params["base"] = base
             // The gate (a stored value refuses), then only the redacted text is kept.
             let raw = Data(diff.patch.utf8)
             let verdict = try SecretGate.check(raw, ext: "patch", canonical: ref.canonical, archives: UnavailableArchiveReader(),
@@ -163,10 +167,17 @@ extension Store {
                                          canonical: Self.unpinned(ref).canonical, archives: UnavailableArchiveReader(),
                                          knownValues: knownValues, store: self, companyId: companyId)
             }
+        case .diffRange:
+            // C5b: two verified revs; the gate runs over the patch (nothing is written for it).
+            if let head = pinned.rev, let base = pinned.params["from"] {
+                let raw = try refGit(workspace).diff(base: base, head: head, path: nil).patch
+                _ = try SecretGate.check(Data(raw.utf8), ext: "patch", canonical: Self.unpinned(ref).canonical,
+                                         archives: UnavailableArchiveReader(), knownValues: knownValues, store: self, companyId: companyId)
+            }
         case .diff where !ref.isWorktree && paths == nil:
             if let head = pinned.rev {
                 let git = try refGit(workspace)
-                let raw = try git.diff(base: try git.mergeBase("main", head), head: head, path: ref.params["file"]).patch
+                let raw = try git.diff(base: try pinned.params["base"] ?? git.mergeBase("main", head), head: head, path: ref.params["file"]).patch
                 _ = try SecretGate.check(Data(raw.utf8), ext: "patch", canonical: Self.unpinned(ref).canonical,
                                          archives: UnavailableArchiveReader(), knownValues: knownValues, store: self, companyId: companyId)
             }
@@ -174,7 +185,7 @@ extension Store {
             // The patch as shared, kept in the vault's diff cache (verified by its hash when read).
             if let paths, let head = pinned.rev {
                 let git = try refGit(workspace)
-                _ = try cachedDiff(companyId: companyId, git: git, base: try git.mergeBase("main", head), head: head,
+                _ = try cachedDiff(companyId: companyId, git: git, base: try pinned.params["base"] ?? git.mergeBase("main", head), head: head,
                                    file: ref.params["file"], vault: Vault(paths: paths, companyId: companyId, content: ContentVault(paths: paths)),
                                    taint: try refTaint(pinned, companyId: companyId), knownValues: knownValues,
                                    canonical: Self.unpinned(ref).canonical)
@@ -234,6 +245,17 @@ extension Store {
 
     func resolveDetailed(_ ref: WorkRef, reader: Reader, companyId: String, messageRefId: String?) throws -> Resolution {
         let opaqueId = StableHash.fnv1a64("\(companyId)\u{0}\(messageRefId ?? UUID().uuidString)")
+        var ref = ref
+        // Plan C Task C5b: `wt:@handle` is that agent's current lease worktree, `<KEY>:diff@worktree`; `.missing` without one.
+        if ref.kind == .diff, ref.id.isEmpty, let handle = ref.params["wt"] {
+            guard let key = try writer.read({ db in try RefAccess.worktreeTarget(db, companyId, handle: handle)?.key }) else {
+                let r = ResolvedRef(ref: WorkRef(kind: ref.kind, id: ""), reader: reader, visibility: .missing, title: "", subtitle: "",
+                                    bytes: nil, provenance: .engine, tainted: false, taintReason: nil, accessClass: .ownerOnly,
+                                    newer: nil, state: .ok, opaqueId: opaqueId)
+                return Resolution(resolved: r, pinned: r.ref)
+            }
+            ref = CompareMode.main.ref(key: key)
+        }
         func blank(_ visibility: Visibility) -> Resolution {
             let r = ResolvedRef(ref: WorkRef(kind: ref.kind, id: ""), reader: reader, visibility: visibility, title: "", subtitle: "",
                                 bytes: nil, provenance: .engine, tainted: false, taintReason: nil, accessClass: .ownerOnly,
@@ -290,6 +312,19 @@ extension Store {
             return try fileDetails(ref, workspace: workspace, companyId: company.id, ownHandle: place ?? readerHandle)
         case .diff(let item):
             return try diffDetails(ref, item: item, workspace: workspace)
+        case .diffRange:
+            // C5b: `diff:<sha>..<sha>`, each rev verified reachable from engine records.
+            let git = try refGit(workspace)
+            let refs = try reachabilityRefs(companyId: company.id)
+            guard let from = ref.params["from"], let to = ref.params["to"] else { throw Outcome.missing }
+            let base = try git.verifyRev(from, reachableFrom: refs), head = try git.verifyRev(to, reachableFrom: refs)
+            let diff = try git.diff(base: base, head: head, path: nil)
+            var pinned = ref
+            pinned.params["from"] = base
+            pinned.params["to"] = head
+            pinned.rev = head
+            return Details(title: "diff \(base.prefix(7))..\(head.prefix(7))", subtitle: Self.diffStat(diff),
+                           state: diff.truncated ? .tooLarge : .ok, pinned: pinned)
         case .commit:
             let git = try refGit(workspace)
             let sha = try git.verifyRev(ref.id, reachableFrom: try reachabilityRefs(companyId: company.id))
@@ -438,17 +473,44 @@ extension Store {
                            tainted: snapshot.tainted, taintReason: snapshot.taintReason,
                            state: ref.params["redacted"] == "1" ? .redacted : .ok, pinned: ref)
         }
+        let git = try refGit(workspace)
         if ref.isWorktree {
+            // C5b: the base per compare mode (`main`: the merge base with main; `?vs=head`; `?vs=check`; `@r<n>..worktree`).
+            let compare = CompareMode(ref: ref) ?? .main
+            let base: String
+            do { base = try changesBases(companyId: item.companyId, item: item, compare: compare, git: git).base } catch is WorkError { throw Outcome.missing }
             let fs = try SafeFS(workspace: workspace, ownHandle: nil)
             let temp = try refTempDirectory()
             defer { try? FileManager.default.removeItem(at: temp) }
             let worktree = workspace.appending(path: ".brahma/wt/\(item.key)", directoryHint: .isDirectory)
-            let diff = try refGit(workspace).worktreeDiff(key: item.key, worktree: worktree, tempDir: temp, fs: fs)
+            let diff = try git.worktreeDiff(key: item.key, worktree: worktree, against: base, tempDir: temp, fs: fs)
             let files = diff.files.filter { file == nil || $0.path == file }
             let summary = Self.diffStat(files.map { (path: $0.path, added: $0.added, removed: $0.removed) })
-            return Details(title: Self.safe(title + " (uncommitted)"), subtitle: summary, state: diff.truncated ? .tooLarge : .ok, pinned: ref)
+            var pinned = ref
+            pinned.params["base"] = base
+            return Details(title: Self.safe(title + " (uncommitted)"), subtitle: summary, state: diff.truncated ? .tooLarge : .ok, pinned: pinned)
         }
-        let git = try refGit(workspace)
+        if let from = ref.params["from"], let to = ref.params["to"] {
+            // C5b: between two item revisions (engine records). A pin keeps the shas it was made with.
+            let base: String, head: String
+            if let rev = ref.rev, let pinnedBase = ref.params["base"] {
+                let refs = ["item/\(item.key)"] + (try pinShareRefs(ref, rev: rev, companyId: item.companyId))
+                head = try git.verifyRev(rev, reachableFrom: refs)
+                base = try git.verifyRev(pinnedBase, reachableFrom: refs + ["main"])
+            } else {
+                let bases: (base: String, target: String?)
+                do { bases = try changesBases(companyId: item.companyId, item: item, compare: .revisions(from: from, to: to), git: git) }
+                catch is WorkError { throw Outcome.missing }
+                guard let target = bases.target else { throw Outcome.missing }
+                (base, head) = (bases.base, target)
+            }
+            let diff = try git.diff(base: base, head: head, path: file)
+            var pinned = ref
+            pinned.rev = head
+            pinned.params["base"] = base
+            return Details(title: Self.safe("\(item.key) diff \(from)..\(to)" + (file.map { " · \($0)" } ?? "")), subtitle: Self.diffStat(diff),
+                           state: diff.truncated ? .tooLarge : .ok, pinned: pinned)
+        }
         let branch = "item/\(item.key)"
         // C3b: a pinned diff opens after its branch is merged and deleted (its share ref holds the commit).
         let current = try? git.head(branch)

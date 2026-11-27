@@ -137,6 +137,9 @@ public struct SafeGit: Sendable {
         /// The patch was cut at `maxDiffLines` (a patch past git's output cap is refused: `.outputTooLarge`, or in a worktree
         /// diff `.tooManyChanges`).
         public var truncated: Bool
+        /// Plan C Task C5b: changed paths whose hunks were left out of `patch` because the file is over the caller's size cap
+        /// (`patchSkipOver`); they are still in `stat`.
+        public var skipped: [String] = []
     }
 
     public struct WorktreeDiff: Sendable {
@@ -146,7 +149,12 @@ public struct SafeGit: Sendable {
         /// Path → blob id of the bytes `SafeFS` read (written to the repository), for every file present.
         public var blobShas: [String: String]
         public var truncated: Bool
+        /// Plan C Task C5b: changed paths whose hunks were left out of `patch` for size (`patchSkipOver`), listed in `files`.
+        public var skipped: [String] = []
     }
+
+    /// The most bytes of literal pathspecs one patch call is given (a restricted patch past it is made whole instead).
+    static let maxPathspecBytes = 200_000
 
     public let workspace: URL
     let runner: any GitProcessRunning
@@ -281,10 +289,32 @@ public struct SafeGit: Sendable {
         return (entries, false)
     }
 
-    /// The patch and numstat between two commits, `--no-textconv --no-ext-diff`, cut at `maxDiffLines`.
-    public func diff(base: String, head: String, path: String?) throws -> DiffText {
+    /// The patch and numstat between two commits, `--no-textconv --no-ext-diff`, cut at `maxDiffLines`. Plan C Task C5b:
+    /// with `patchSkipOver`, a changed file larger than that at either end (sizes by one `cat-file --batch-check` per end)
+    /// is listed in `stat` and `skipped` but keeps its hunks out of the patch, so it never eats the line budget.
+    public func diff(base: String, head: String, path: String?, patchSkipOver: Int? = nil) throws -> DiffText {
         let revs = ["--end-of-options", try Self.sha(base), try Self.sha(head), "--"] + (try path.map { [try Self.checkPath($0)] } ?? [])
-        return try diffText(["diff"] + Self.noDiffPrograms, revs)
+        guard let cap = patchSkipOver, path == nil else { return try diffText(["diff"] + Self.noDiffPrograms, revs) }
+        let names = try output(["diff", "--name-only", "-z"] + Self.noDiffPrograms + revs)
+            .split(separator: 0, omittingEmptySubsequences: true).map { String(decoding: $0, as: UTF8.self) }
+        let before = try blobSizes(rev: base, paths: names), after = try blobSizes(rev: head, paths: names)
+        let skipping = Set(names.filter { max(before[$0] ?? 0, after[$0] ?? 0) > cap })
+        return try diffText(["diff"] + Self.noDiffPrograms, revs, skipping: skipping)
+    }
+
+    /// The blob sizes of `paths` at `rev` (one `cat-file --batch-check`); a path that is not a blob there, or whose name
+    /// `SafeFS` refuses, has no entry.
+    public func blobSizes(rev: String, paths: [String]) throws -> [String: Int] {
+        let sha = try Self.sha(rev)
+        let usable = paths.filter { !$0.contains("\n") && (try? Self.checkPath($0)) != nil }
+        guard !usable.isEmpty else { return [:] }
+        var stdin = Data()
+        for p in usable { stdin.append(contentsOf: "\(sha):\(p)\n".utf8) }
+        let out = try output(["cat-file", "--batch-check=%(objectsize)"], stdin: stdin)
+        let lines = String(decoding: out, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false)
+        var sizes: [String: Int] = [:]
+        for (p, line) in zip(usable, lines) { if let n = Int(line) { sizes[p] = n } }
+        return sizes
     }
 
     public func show(commit: String) throws -> (subject: String, author: String, diff: DiffText) {
@@ -521,7 +551,7 @@ public struct SafeGit: Sendable {
     /// changed paths, `maxDiffBytes` changed bytes, `maxBinaryBytes` per file, git output at its cap — each refuses the whole
     /// diff with `.tooManyChanges`; one time budget (`timeout`) for the call. No agent-controlled or git-reported name reaches
     /// an error's text. The agent's own index is never read or written.
-    public func worktreeDiff(key: String, worktree: URL, against: String? = nil, tempDir: URL, fs: SafeFS) throws -> WorktreeDiff {
+    public func worktreeDiff(key: String, worktree: URL, against: String? = nil, tempDir: URL, fs: SafeFS, patchSkipOver: Int? = nil) throws -> WorktreeDiff {
         guard (try? GitWorkspace.validKey(key)) != nil else { throw SafeGitError.badRef }
         guard worktree.standardizedFileURL.path == GitWorkspace(root: workspace).worktreePath(key: key).standardizedFileURL.path else {
             throw SafeGitError.io("the worktree given is not .brahma/wt/\(key)")
@@ -688,8 +718,14 @@ public struct SafeGit: Sendable {
             statuses.append((String(decoding: names[i + 1], as: UTF8.self), String(decoding: names[i], as: UTF8.self)))
             i += 2
         }
+        // C5b: files over `patchSkipOver` at either end keep their hunks out of the patch (sizes known from the walk and the base tree).
+        var skipping: Set<String> = []
+        if let cap = patchSkipOver {
+            for copy in copies where copy.size > cap { skipping.insert(copy.path) }
+            for change in changed { if let size = baseEntries[change.path]?.size, size > cap { skipping.insert(change.path) } }
+        }
         let text: DiffText
-        do { text = try diffText(cached, ["--end-of-options", base, "--"], workTree: shadow, anchor: anchor, index: index, budget: budget) }
+        do { text = try diffText(cached, ["--end-of-options", base, "--"], workTree: shadow, anchor: anchor, index: index, budget: budget, skipping: skipping) }
         catch SafeGitError.outputTooLarge { throw SafeGitError.tooManyChanges(files: changed.count, bytes: total) }
         let counts = Dictionary(text.stat.map { ($0.path, ($0.added, $0.removed)) }, uniquingKeysWith: { a, _ in a })
         let sizes = Dictionary(copies.map { ($0.path, $0.size) }, uniquingKeysWith: { a, _ in a })
@@ -697,7 +733,7 @@ public struct SafeGit: Sendable {
         // A nested repository: one untracked entry `<dir>/`, as git lists it; nothing in it is read or diffed.
         files += repositories.map { (path: $0 + "/", status: "A", added: nil, removed: nil, bytes: 0) }
         files.sort { $0.path.utf8.lexicographicallyPrecedes($1.path.utf8) }
-        return WorktreeDiff(files: files, patch: text.patch, blobShas: blobShas, truncated: text.truncated)
+        return WorktreeDiff(files: files, patch: text.patch, blobShas: blobShas, truncated: text.truncated, skipped: text.skipped)
     }
 
     /// Git's blob id of the file's bytes (`blob <size>\0` + bytes), computed in the engine from the held descriptor in 64 KiB
@@ -834,7 +870,11 @@ public struct SafeGit: Sendable {
 
     // MARK: Running
 
-    private func diffText(_ command: [String], _ tail: [String], workTree: URL? = nil, anchor: Anchor? = nil, index: URL? = nil, budget: Budget? = nil) throws -> DiffText {
+    /// `skipping` (C5b): changed paths left out of the patch (not of the numstat) by naming every other changed path as a
+    /// literal pathspec (`GIT_LITERAL_PATHSPECS=1`); only when `tail` ends at `--` (no path given), every kept path passes
+    /// `checkPath`, and the pathspecs fit `maxPathspecBytes` — else the whole patch is taken as usual and nothing is skipped.
+    private func diffText(_ command: [String], _ tail: [String], workTree: URL? = nil, anchor: Anchor? = nil, index: URL? = nil, budget: Budget? = nil,
+                          skipping: Set<String> = []) throws -> DiffText {
         let numstat = try output(command + ["--numstat", "-z"] + tail, workTree: workTree, anchor: anchor, index: index, budget: budget)
         var stat: [(path: String, added: Int?, removed: Int?)] = []
         for record in numstat.split(separator: 0, omittingEmptySubsequences: true) {
@@ -842,12 +882,27 @@ public struct SafeGit: Sendable {
             guard fields.count == 3 else { continue }
             stat.append((String(fields[2]), Int(fields[0]), Int(fields[1])))
         }
-        let patch = Self.text(try output(command + ["-p"] + tail, workTree: workTree, anchor: anchor, index: index, budget: budget))
+        var patchTail = tail
+        var skipped: [String] = []
+        if !skipping.isEmpty, tail.last == "--" {
+            skipped = stat.map(\.path).filter { skipping.contains($0) }
+            if !skipped.isEmpty {
+                let kept = stat.map(\.path).filter { !skipping.contains($0) }
+                if kept.isEmpty { return DiffText(stat: stat, patch: "", truncated: false, skipped: skipped) }
+                let checked = kept.compactMap { try? Self.checkPath($0) }
+                if checked.count == kept.count, checked.reduce(0, { $0 + $1.utf8.count + 1 }) <= Self.maxPathspecBytes {
+                    patchTail += checked
+                } else {
+                    skipped = []
+                }
+            }
+        }
+        let patch = Self.text(try output(command + ["-p"] + patchTail, workTree: workTree, anchor: anchor, index: index, budget: budget))
         let lines = patch.split(separator: "\n", omittingEmptySubsequences: false)
         if lines.count > Self.maxDiffLines {
-            return DiffText(stat: stat, patch: lines.prefix(Self.maxDiffLines).joined(separator: "\n") + "\n", truncated: true)
+            return DiffText(stat: stat, patch: lines.prefix(Self.maxDiffLines).joined(separator: "\n") + "\n", truncated: true, skipped: skipped)
         }
-        return DiffText(stat: stat, patch: patch, truncated: false)
+        return DiffText(stat: stat, patch: patch, truncated: false, skipped: skipped)
     }
 
     /// Stdout of a successful call; a non-zero status is `.git`.

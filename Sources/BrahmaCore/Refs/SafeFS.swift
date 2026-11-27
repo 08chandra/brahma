@@ -44,10 +44,12 @@ public final class SafeFile: @unchecked Sendable {
     public let place: SafeFSPlace
     /// The owner's execute bit (for the git mode of a worktree file: `100755`, else `100644`).
     public let executable: Bool
+    /// The modification time `fstat` reported on the opened descriptor (Plan C Task C5b: a changes view's last edit).
+    public let modifiedAt: Date
     private let fd: Int32
 
-    fileprivate init(fd: Int32, size: Int, place: SafeFSPlace, executable: Bool) {
-        self.fd = fd; self.size = size; self.place = place; self.executable = executable
+    fileprivate init(fd: Int32, size: Int, place: SafeFSPlace, executable: Bool, modifiedAt: Date) {
+        self.fd = fd; self.size = size; self.place = place; self.executable = executable; self.modifiedAt = modifiedAt
     }
     deinit { close(fd) }
 
@@ -250,7 +252,12 @@ public final class SafeFS: @unchecked Sendable {
         guard st.st_uid == getuid() else { throw SafeFSError.notAllowed }
         guard st.st_size <= maxBytes else { throw SafeFSError.tooLarge(Int(st.st_size)) }
         keep = true
-        return SafeFile(fd: opened.fd, size: Int(st.st_size), place: place, executable: st.st_mode & S_IXUSR != 0)
+        #if canImport(Darwin)
+        let mtime = Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1e9)
+        #else
+        let mtime = Date(timeIntervalSince1970: TimeInterval(st.st_mtim.tv_sec) + TimeInterval(st.st_mtim.tv_nsec) / 1e9)
+        #endif
+        return SafeFile(fd: opened.fd, size: Int(st.st_size), place: place, executable: st.st_mode & S_IXUSR != 0, modifiedAt: mtime)
     }
 
     /// The state after entering `directory` (named `name` by the agent) from `state`: by its inode alone.

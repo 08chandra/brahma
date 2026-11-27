@@ -27,7 +27,8 @@ public enum CompanyToolNames {
     /// Plan 4a's design tool (registered by Task 6): the designer, the architect and every executive have it.
     public static let design = ["publish_artifact"]
     /// Review turns only, regardless of role. `create_work_item` files follow-ups instead of blocking on mechanical fixes.
-    public static let review = ["show_work_item", "comment_work_item", "create_work_item", "review"]
+    /// Plan C Task C5b adds `show`, so a reviewer can put the diff in front of the owner.
+    public static let review = ["show_work_item", "comment_work_item", "create_work_item", "review", "show"]
     /// Audit turns only (9c), regardless of role: the verdict on each auto-merge of the turn's batch.
     public static let audit = ["audit"]
     public static var all: [String] { base + work + lead + executive + ops + design + ["review"] + audit + concierge }

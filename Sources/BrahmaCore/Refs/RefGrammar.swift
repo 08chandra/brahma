@@ -43,6 +43,9 @@ enum RefGrammar {
         if let id = s.dropping("thread:") { return isRecordId(id) ? WorkRef(kind: .thread, id: id) : nil }
         if let h = s.dropping("@") { return isHandle(h) ? WorkRef(kind: .agent, id: h) : nil }
         if let c = s.dropping("#") { return isChannelName(c) ? WorkRef(kind: .channel, id: c) : nil }
+        // Plan C Task C5b: two hex revs, and an agent's current lease worktree.
+        if let r = s.dropping("diff:") { return shaRange(r) }
+        if let h = s.dropping("wt:@") { return isHandle(h) ? WorkRef(kind: .diff, id: "", params: ["wt": h]) : nil }
         if let n = s.dropping("AR-") { return number(n).map { WorkRef(kind: .artifact, id: $0) } }
         if let n = s.dropping("A-") { return number(n).map { WorkRef(kind: .ask, id: $0) } }
         if let n = s.dropping("F-") { return number(n).map { WorkRef(kind: .resource, id: $0) } }
@@ -68,6 +71,8 @@ enum RefGrammar {
 
     private static func afterKey(_ key: String, _ rest: String) -> WorkRef? {
         if rest == "run" { return WorkRef(kind: .run, id: "", params: ["item": key]) }
+        // Plan C Task C5b: `<KEY>:changes` is `<KEY>:diff@worktree` (live, vs main).
+        if rest == "changes" { return WorkRef(kind: .diff, id: key, branch: "worktree:\(key)") }
         let (body, suffix) = splitSuffix(rest)
         if body == "diff" || body.hasPrefix("diff/") {
             var ref = WorkRef(kind: .diff, id: key)
@@ -79,12 +84,32 @@ enum RefGrammar {
             switch suffix {
             case nil: break
             case "worktree"?: ref.branch = "worktree:\(key)"
+            case let s? where s.hasPrefix("worktree?vs="):
+                // C5b: `@worktree?vs=head` (vs the branch's last commit) or `?vs=check` (vs the last check run's commit).
+                let vs = String(s.dropFirst("worktree?vs=".count))
+                guard vs == "head" || vs == "check" else { return nil }
+                ref.branch = "worktree:\(key)"
+                ref.params["vs"] = vs
+            case let s? where s.contains(".."):
+                // C5b: `@r2..r5`, `@base..head`, `@r3..worktree` (item revisions; `r<n>` is the n-th check run's commit).
+                let parts = s.components(separatedBy: "..")
+                guard parts.count == 2, CompareMode.isFromLabel(parts[0]), CompareMode.isToLabel(parts[1]) else { return nil }
+                ref.params["from"] = parts[0]
+                ref.params["to"] = parts[1]
+                if parts[1] == "worktree" { ref.branch = "worktree:\(key)" }
             case let r? where isRev(r): ref.rev = r
             default: return nil
             }
             return ref
         }
         return fileRef(rest, key: key)
+    }
+
+    /// `diff:<sha>..<sha>`: two hex revs (7–40), verified reachable when resolved (C1a).
+    private static func shaRange(_ s: String) -> WorkRef? {
+        let parts = s.components(separatedBy: "..")
+        guard parts.count == 2, isRev(parts[0]), isRev(parts[1]) else { return nil }
+        return WorkRef(kind: .diff, id: "", params: ["from": parts[0], "to": parts[1]])
     }
 
     /// `<path>[:<range>][@worktree|@<rev>]`; `@worktree` only on an item.
@@ -161,9 +186,21 @@ enum RefGrammar {
             if r.isWorktree { s += "@worktree" } else if let rev = r.rev { s += "@\(rev)" }
             return s
         case .diff:
+            // C5b: the key-less forms.
+            if r.id.isEmpty {
+                if let handle = r.params["wt"] { return "wt:@\(handle)" }
+                return "diff:\(r.params["from"] ?? "")..\(r.params["to"] ?? "")"
+            }
             var s = "\(r.id):diff"
             if let file = r.params["file"] { s += "/\(file)" }
-            if r.isWorktree { s += "@worktree" } else if let rev = r.rev { s += "@\(rev)" }
+            if let from = r.params["from"], let to = r.params["to"] {
+                s += "@\(from)..\(to)"
+            } else if r.isWorktree {
+                s += "@worktree"
+                if let vs = r.params["vs"] { s += "?vs=\(vs)" }
+            } else if let rev = r.rev {
+                s += "@\(rev)"
+            }
             return s
         case .commit: return "commit:\(r.id)"
         case .item: return MemoryRefs.canonicalItemRef(r.id)

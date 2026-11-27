@@ -1997,6 +1997,27 @@ enum Migrations {
             // C5 fix round 1, ruling (1): where an owner export was saved, so a purge can list the copies outside Brahma.
             try db.alter(table: "refRead") { t in t.add(column: "exportPath", .text) }
         }
+        m.registerMigration("vC-changes") { db in
+            // Plan C Task C5b: the owner's inline review comments on an item's diff (owner-written; the app's path, never a tool).
+            try db.create(table: "diffComment") { t in
+                t.primaryKey("id", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("itemId", .text).notNull().references("workItem", onDelete: .cascade)
+                t.column("kind", .text).notNull()                  // comment|revertRequest
+                t.column("path", .text).notNull()
+                t.column("side", .text).notNull()                  // old|new
+                t.column("line", .integer).notNull()
+                t.column("lineHash", .text).notNull()
+                t.column("hunkHeader", .text).notNull()
+                t.column("compare", .text).notNull()               // canonical ref
+                t.column("baseSha", .text)
+                t.column("text", .text).notNull()
+                t.column("eventId", .text)
+                t.column("createdAt", .datetime).notNull()
+                t.column("resolvedAt", .datetime)
+            }
+            try db.create(index: "diffComment_item", on: "diffComment", columns: ["companyId", "itemId"])
+        }
     }
 }
 

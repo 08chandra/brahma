@@ -72,6 +72,8 @@ public enum RefAccess {
         /// A tracked path (main or an item branch) or a worktree path; `place` is the agent handle of a private `.brahma` place.
         case file(place: String?)
         case diff(WorkItem)
+        /// C5b's `diff:<sha>..<sha>` (company class, like a commit; both revs verified reachable when resolved).
+        case diffRange
         case commit
         case item(WorkItem, ownerHandle: String?)
         case ask(Ask)
@@ -102,7 +104,18 @@ public enum RefAccess {
                                                  arguments: [companyId, place]) else { return nil }
             return Subject(access: .agent(agent.id), readerSet: [agent.id], refusedWhenUnreadable: true, record: .file(place: place))
         case .diff:
-            return try item(db, companyId, ref.id).map { Subject(record: .diff($0)) }
+            // Plan C Task C5b: the key-less forms.
+            if ref.id.isEmpty {
+                if let handle = ref.params["wt"] {
+                    guard let item = try worktreeTarget(db, companyId, handle: handle) else { return nil }
+                    return try liveDiffSubject(db, companyId, item)
+                }
+                guard ref.params["from"] != nil, ref.params["to"] != nil else { return nil }
+                return Subject(record: .diffRange)
+            }
+            guard let item = try item(db, companyId, ref.id) else { return nil }
+            if ref.isWorktree, ref.params["snapshot"] == nil, ref.rev == nil { return try liveDiffSubject(db, companyId, item) }
+            return Subject(record: .diff(item))
         case .commit:
             return Subject(record: .commit)
         case .item:
@@ -237,6 +250,26 @@ public enum RefAccess {
         let rest = String(path.dropFirst(".brahma/".count))
         if SafeFS.brahmaAllowlist.contains(where: { rest.hasPrefix($0 + "/") }) { return false }
         return privatePlace(WorkRef(kind: .file, id: path)) == nil
+    }
+
+    /// Plan C Task C5b, the live worktree rule: an unpinned live diff (`@worktree`, `:changes`, `wt:`, `@r<n>..worktree`) is
+    /// readable by the owner, the concierge, the lease holder (else the assignee) and the item's reviewer; any other agent
+    /// is refused (never offered an approver). Pinned snapshots keep the company class.
+    static func liveDiffSubject(_ db: Database, _ companyId: String, _ item: WorkItem) throws -> Subject {
+        var readers: Set<String> = []
+        if let holder = try Store.leaseHolderId(db: db, itemId: item.id) { readers.insert(holder) }
+        if let assignee = item.ownerId { readers.insert(assignee) }
+        if let reviewer = item.reviewerId { readers.insert(reviewer) }
+        return Subject(readerSet: readers, refusedWhenUnreadable: true, record: .diff(item))
+    }
+
+    /// The item whose lease the agent `handle` of this company holds now (the most recent lease), for `wt:@handle`.
+    static func worktreeTarget(_ db: Database, _ companyId: String, handle: String) throws -> WorkItem? {
+        try WorkItem.fetchOne(db, sql: """
+            SELECT workItem.* FROM workLease JOIN agent ON agent.id = workLease.agentId JOIN workItem ON workItem.id = workLease.itemId
+            WHERE agent.companyId = ? AND agent.name = ? AND workLease.companyId = ? AND workItem.companyId = ?
+            ORDER BY workLease.acquiredAt DESC LIMIT 1
+            """, arguments: [companyId, handle, companyId, companyId])
     }
 
     static func item(_ db: Database, _ companyId: String, _ key: String) throws -> WorkItem? {

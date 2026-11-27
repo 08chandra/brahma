@@ -275,7 +275,7 @@ import GRDB
         let r = try R()
         let i = try r.item(), other = try r.item("other")
         let t = r.reviewTools(r.rev, i)
-        #expect(Set(t.specs().map(\.name)) == ["show_work_item", "comment_work_item", "create_work_item", "review"])
+        #expect(Set(t.specs().map(\.name)) == ["show_work_item", "comment_work_item", "create_work_item", "review", "show"])
         let reviewSpec = try #require(t.specs().first { $0.name == "review" })
         #expect(Set(try #require(reviewSpec.inputSchema.objectValue?["properties"]?.objectValue).keys) == ["key", "decision", "notes", "approve_flags"])
         // Only its own item.

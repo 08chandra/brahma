@@ -316,15 +316,28 @@ extension Store {
                 let temp = try refTempDirectory()
                 defer { try? FileManager.default.removeItem(at: temp) }
                 let worktree = workspace.appending(path: ".brahma/wt/\(item.key)", directoryHint: .isDirectory)
-                let diff = try refGit(workspace).worktreeDiff(key: item.key, worktree: worktree, tempDir: temp, fs: fs)
+                // C5b: against the compare's base (the merge base with main by default), from engine records.
+                let git = try refGit(workspace)
+                let base = try changesBases(companyId: company.id, item: item, compare: CompareMode(ref: ref) ?? .main, git: git).base
+                let diff = try git.worktreeDiff(key: item.key, worktree: worktree, against: base, tempDir: temp, fs: fs)
                 return Content(body: .text(diff.patch), rev: nil, makeCard: { _ in "[diff \(bare) · UNCOMMITTED · \(stat)]" }, ext: "patch")
             }
             guard let head = pinned.rev else { throw SafeGitError.badRev }
             let git = try refGit(workspace)
-            let patch = try cachedDiff(companyId: company.id, git: git, base: try git.mergeBase("main", head), head: head,
+            // C5b: a revision pair carries its base (`@r1..r2`); the item diff is the merge base with main.
+            let base = try pinned.params["base"] ?? git.mergeBase("main", head)
+            let patch = try cachedDiff(companyId: company.id, git: git, base: base, head: head,
                                        file: ref.params["file"], vault: Vault(paths: paths, companyId: company.id, content: ContentVault(paths: paths)),
                                        taint: (r.resolved.tainted, r.resolved.taintReason), knownValues: knownValues, canonical: bare)
             return Content(body: .text(patch), rev: head, makeCard: { _ in "[diff \(bare) @\(head.prefix(7)) · \(stat)]" }, ext: "patch")
+        case .diffRange:
+            // C5b: `diff:<sha>..<sha>` (both verified when resolved), through the diff cache like an item diff.
+            guard let head = pinned.rev, let base = pinned.params["from"] else { throw SafeGitError.badRev }
+            let git = try refGit(workspace)
+            let patch = try cachedDiff(companyId: company.id, git: git, base: base, head: head, file: nil,
+                                       vault: Vault(paths: paths, companyId: company.id, content: ContentVault(paths: paths)),
+                                       taint: (r.resolved.tainted, r.resolved.taintReason), knownValues: knownValues, canonical: bare)
+            return Content(body: .text(patch), rev: head, makeCard: { _ in "[diff \(bare) · \(stat)]" }, ext: "patch")
         case .commit:
             guard let sha = pinned.rev else { throw SafeGitError.badRev }
             let shown = try refGit(workspace).show(commit: sha)

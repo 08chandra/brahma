@@ -329,6 +329,19 @@ extension Store {
                 rows[i].params = String(decoding: try encoder.encode(params), as: UTF8.self)
             }
         }
+        // Plan C Task C5b: a live diff opens live; the answer keeps the patch hash it was shown at (`params["at"]`), so the card
+        // can say "changed since shown". Computed for the caller (its access was checked above); a failure leaves no `at`.
+        for i in rows.indices {
+            guard let live = rows[i].workRef, live.kind == .diff, live.isWorktree, live.params["snapshot"] == nil, !live.id.isEmpty,
+                  let compare = CompareMode(ref: live),
+                  let snapshot = try? changesSnapshot(companyId: companyId, key: live.id, compare: compare, reader: caller,
+                                                      knownValues: knownValues, now: now) else { continue }
+            var params = (try? JSONDecoder().decode([String: String].self, from: Data(rows[i].params.utf8))) ?? [:]
+            params["at"] = snapshot.patchHash
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            rows[i].params = String(decoding: try encoder.encode(params), as: UTF8.self)
+        }
         let verified = CitationCheck.verify(note: storedNote, refCount: rows.count).verified
         let router = MessageRouter(store: self)
         let opened = try writer.write { db -> Bool in

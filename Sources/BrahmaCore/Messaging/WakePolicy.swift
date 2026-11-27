@@ -63,6 +63,8 @@ public enum WakePolicy {
         case .handoffWritten: recipientRole == .recipient
         // Plan C Task C3b: a message named the item: an FYI for everyone.
         case .referenced: false
+        // Plan C Task C5b: the owner's inline review comment wakes whoever holds the work (the holder, else the assignee).
+        case .reviewComment: recipientRole == .holder
         default: false
         }
     }

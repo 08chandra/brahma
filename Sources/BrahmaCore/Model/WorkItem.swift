@@ -314,6 +314,9 @@ public enum WorkEventKind: String, Codable, CaseIterable, Sendable, DatabaseValu
     /// Plan C Task C3b: a message named the item (an inline chip or an attachment); `sourceMessageId` is that message. An FYI,
     /// never waking; its text names no conversation (backlinks are per reader, `Store.backlinks`).
     case referenced
+    /// Plan C Task C5b: the owner left an inline review comment (or a revert request) on the item's diff; the body is the
+    /// `commented` event beside it. Wakes the lease holder (else the assignee).
+    case reviewComment
 
     /// Events that count as an agent making progress (the watchdog resets on them).
     public static let progress: Set<WorkEventKind> = [
