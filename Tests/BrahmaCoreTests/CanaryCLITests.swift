@@ -70,6 +70,31 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(r.status == 1); #expect(r.stderr.contains("owner key missing or invalid"))
     }
 
+    /// B9 (S5 fix I1): the CLI's `claude` (doctor, canary run, mode gates, extension checks) comes from `ToolPaths`, never a
+    /// PATH walk of its own: one in a world-writable directory earlier on PATH is never the one it fingerprints or starts.
+    /// `BRAHMA_CLAUDE` must be absolute.
+    @Test func cliClaudeComesFromToolPaths() throws {
+        let owner = try OwnerTestHome()
+        let scratch = try tempDir()
+        func dir(_ name: String, mode: Int) throws -> URL {
+            let d = scratch.appending(path: name, directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+            let exe = d.appending(path: "claude")
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: exe)
+            try FakeTools.fixtureMode(0o755, at: exe)
+            chmod(d.path, mode_t(mode))  // exec-bit fixture: the directory mode is under test
+            return d
+        }
+        let open = try dir("open", mode: 0o777), safe = try dir("safe", mode: 0o755)
+        let r = try brahma(["mode", "gates"], home: owner.url, env: ["PATH": "\(open.path):\(safe.path):/usr/bin:/bin"])
+        #expect(r.status == 0, "\(r.stderr)")
+        #expect(r.stdout.contains("claude \(safe.appending(path: "claude").path) "), "\(r.stdout)")
+        #expect(!r.stdout.contains(open.path), "\(r.stdout)")
+        let relative = try brahma(["mode", "gates"], home: owner.url, env: ["BRAHMA_CLAUDE": "claude"])
+        #expect(relative.status != 0)
+        #expect(relative.stderr.contains("BRAHMA_CLAUDE must be an absolute path"), "\(relative.stderr)")
+    }
+
     @Test func helpListsBoth() throws {
         let owner = try OwnerTestHome()
         let r = try brahma(["canary", "--help"], home: owner.url)

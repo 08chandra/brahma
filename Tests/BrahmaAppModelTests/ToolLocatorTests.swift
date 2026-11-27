@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-import BrahmaCore
+@testable import BrahmaCore
 @testable import BrahmaAppModel
 
 @Suite(.scratch) struct ToolLocatorTests {
@@ -22,15 +22,43 @@ import BrahmaCore
 
     @Test func claudeOverrideWins() {
         let env = ["BRAHMA_CLAUDE": "/x/fake"]
-        #expect(ToolLocator.claude(environment: env, searchPath: "/usr/local/bin",
-                                   isExecutable: { $0 == "/x/fake" || $0 == "/usr/local/bin/claude" }) == "/x/fake")
-        #expect(ToolLocator.claude(environment: env, searchPath: "/usr/local/bin",
-                                   isExecutable: { $0 == "/usr/local/bin/claude" }) == nil)
+        #expect(ToolLocator.claude(environment: env, engineTool: { _ in "/usr/local/bin/claude" },
+                                   isExecutable: { $0 == "/x/fake" }) == .success("/x/fake"))
+        // A bad override never falls back to ToolPaths' claude.
+        #expect(ToolLocator.claude(environment: env, engineTool: { _ in "/usr/local/bin/claude" },
+                                   isExecutable: { _ in false }) == .failure(.claudeNotFound))
+        // B9: a relative override is refused with its own message, never looked up.
+        let relative = ToolLocator.claude(environment: ["BRAHMA_CLAUDE": "claude"], engineTool: { _ in "/usr/local/bin/claude" },
+                                          isExecutable: { _ in true })
+        #expect(relative == .failure(.claudeOverrideNotAbsolute("claude")))
+        #expect(EngineSetupError.claudeOverrideNotAbsolute("bin/claude").message.contains("BRAHMA_CLAUDE must be an absolute path"))
     }
 
-    @Test func claudeFoundOnSearchPath() {
-        #expect(ToolLocator.claude(environment: [:], searchPath: "/usr/bin:/opt/homebrew/bin",
-                                   isExecutable: { $0 == "/opt/homebrew/bin/claude" }) == "/opt/homebrew/bin/claude")
+    /// B9 (S5 fix I1): without an override the app hands the engine the bare name `claude`, which the runner resolves through
+    /// `ToolPaths`; a `claude` in a world-writable directory earlier on PATH is never the one started.
+    @Test func claudeComesFromToolPaths() throws {
+        let scratch = try tempDir()
+        func dir(_ name: String, mode: Int) throws -> URL {
+            let d = scratch.appending(path: name, directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+            let exe = d.appending(path: "claude")
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: exe)
+            try FakeTools.fixtureMode(0o755, at: exe)
+            chmod(d.path, mode_t(mode))  // exec-bit fixture: the directory mode is under test
+            return d
+        }
+        let open = try dir("open", mode: 0o777), safe = try dir("safe", mode: 0o755)
+        let path = "\(open.path):\(safe.path):/usr/bin:/bin"
+        let lookup: (String) -> String? = { ToolPaths.lookup($0, path: path, forbiddenRoots: []) }
+        let given = try ToolLocator.claude(environment: ["PATH": path], engineTool: lookup).get()
+        #expect(given == "claude", "the bare name, resolved at each start")
+        let started = try ClaudeProcessRunner.executable(given, engineTool: lookup)
+        #expect(started == safe.appending(path: "claude").path, "\(started)")
+        #expect(!started.hasPrefix(open.path))
+        // Only the world-writable one: no claude at all.
+        let none: (String) -> String? = { ToolPaths.lookup($0, path: open.path, forbiddenRoots: []) }
+        #expect(ToolLocator.claude(environment: ["PATH": open.path], engineTool: none) == .failure(.claudeNotFound))
+        #expect(throws: ToolPathsError.claudeMissing) { try ClaudeProcessRunner.executable("claude", engineTool: none) }
     }
 
     @Test func loginPathParsedBetweenMarkers() {

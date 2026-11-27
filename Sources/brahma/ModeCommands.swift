@@ -10,7 +10,7 @@ struct ModeGroup: AsyncParsableCommand {
 
     /// The installed CLI's fingerprint (a `stat`; the probe gates' key).
     static func fingerprint() throws -> (path: String, key: String) {
-        let path = ExtLint.claudePath() ?? "claude"
+        let path = try ExtLint.claudePath() ?? "claude"
         do { return (path, try CLIFingerprint.of(claudePath: path).key) } catch { throw fail("\(error)") }
     }
 

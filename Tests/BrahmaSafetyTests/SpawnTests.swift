@@ -64,4 +64,37 @@ import Foundation
                                  timeout: .milliseconds(300), outputCap: 1024)
         #expect(slow.timedOut && AwakeTime.uptime() - started < 10)
     }
+
+    /// M4: no descriptor of the engine reaches a child but the three streams, even one opened without close-on-exec.
+    @Test func childGetsOnlyItsThreeStreams() throws {
+        let opened = open("/dev/null", O_RDONLY)
+        try #require(opened >= 0)
+        let fd = fcntl(opened, F_DUPFD, 77)   // no FD_CLOEXEC on a F_DUPFD copy
+        close(opened)
+        try #require(fd >= 77)
+        defer { close(fd) }
+        #expect(fcntl(fd, F_GETFD) & FD_CLOEXEC == 0, "the descriptor is inheritable as far as exec goes")
+        let root = URL(fileURLWithPath: "/")
+        let leaked = try Spawn.run("/bin/sh", ["-c", "test -e /dev/fd/\(fd)"], cwd: root, env: [:], timeout: .seconds(10), outputCap: 0)
+        #expect(leaked.status != 0, "descriptor \(fd) reached the child")
+        let streams = try Spawn.run("/bin/sh", ["-c", "test -e /dev/fd/0 && test -e /dev/fd/1 && test -e /dev/fd/2"], cwd: root,
+                                    env: [:], timeout: .seconds(10), outputCap: 0)
+        #expect(streams.status == 0, "the three streams are there")
+    }
+
+    /// C1: a child that exits without reading its input. The bytes the engine still has to write fail with EPIPE; the engine
+    /// is never killed by SIGPIPE (the run ends normally, with the child's own status).
+    @Test func childThatIgnoresItsInputNeverKillsTheEngine() throws {
+        let root = URL(fileURLWithPath: "/")
+        let input = Data(repeating: 0x61, count: 4 << 20)
+        for _ in 0..<3 {
+            let out = try Spawn.run("/usr/bin/true", [], cwd: root, env: [:], stdin: .data(input), timeout: .seconds(20),
+                                    outputCap: 0)
+            #expect(out.status == 0 && !out.timedOut)
+            let child = try Spawn.start("/bin/sh", ["-c", "exit 4"], cwd: root, env: [:], stdin: .data(input))
+            #expect(ProcessGroupChild.exitCode(child.waitStatus()) == 4)
+        }
+        // The feeder's write fails after the child went away; give it time to do so (a SIGPIPE would end this process here).
+        Thread.sleep(forTimeInterval: 0.5)
+    }
 }

@@ -37,7 +37,7 @@ import GRDB
         child.standardError = FileHandle.nullDevice
         try child.run()
         defer { try? input.fileHandleForWriting.close(); child.terminate(); child.waitUntilExit() }
-        input.fileHandleForWriting.write(Data("SELECT count(*) FROM company;\n".utf8))
+        #expect(Data("SELECT count(*) FROM company;\n".utf8).withUnsafeBytes { Spawn.writeAll(input.fileHandleForWriting.fileDescriptor, $0) } == 0)
         let answer = output.fileHandleForReading.availableData       // it answered, so the connection is open
         #expect(String(decoding: answer, as: UTF8.self).contains("2"))
         let pids = try DBOpeners.pids(of: env.paths.database)

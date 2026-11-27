@@ -1427,8 +1427,7 @@ struct SeatbeltRunnerTests {
         p.standardInput = input == nil ? FileHandle.nullDevice : inPipe
         try p.run()
         if let input {
-            inPipe.fileHandleForWriting.write(Data(input.utf8))
-            try inPipe.fileHandleForWriting.close()
+            feedChildInput(inPipe, Data(input.utf8))
         }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()

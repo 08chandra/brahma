@@ -1581,6 +1581,22 @@ import Foundation
             #expect(!SandboxPath.isInside(SandboxPath.resolve(cwd), agentPlaces), "git ran in \(cwd)")
             #expect(!cwd.contains("/.brahma/wt/"), "git ran in \(cwd)")
         }
+        // A lab (`.brahma/labs/<handle>`, its own repository, agent-writable down to its `.git`): neither its creation nor
+        // the engine's provenance listing starts git inside it (M1).
+        let lab = f.root.appending(path: ".brahma/labs/eng", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: lab, withIntermediateDirectories: true)
+        let labSeen = Seen()
+        try Spawn.$observer.withValue({ s in labSeen.lock.withLock { labSeen.all.append(s) } }) {
+            try GitWorkspace.initStandaloneRepository(at: lab)
+            #expect(try GitWorkspace(root: lab).labCommits().isEmpty)
+        }
+        let labStarted = labSeen.lock.withLock { labSeen.all }
+        #expect(labStarted.count >= 2, "\(labStarted.count) spawns")
+        let labPlace = SandboxPath.resolve(lab.path)
+        for s in labStarted {
+            let cwd = try #require(s.cwd, "every engine git here starts in a named directory, not a descriptor")
+            #expect(!SandboxPath.isInside(SandboxPath.resolve(cwd), labPlace), "lab git ran in \(cwd)")
+        }
     }
 
     @Test func attrSourceNeedsGit243() throws {
@@ -1680,7 +1696,7 @@ import Foundation
         let input = Pipe(), out = Pipe()
         p.standardInput = input; p.standardOutput = out; p.standardError = FileHandle.nullDevice
         try p.run()
-        input.fileHandleForWriting.write(Data(stdin.utf8)); try input.fileHandleForWriting.close()
+        feedChildInput(input, Data(stdin.utf8))
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return String(decoding: data, as: UTF8.self)

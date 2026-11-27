@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 @testable import BrahmaCore
+import BrahmaSafety
 
 /// Doctor `mode-canary` (design §6.4): each mode's compiled argv is started with `--input-format stream-json` and asked
 /// `initialize`, `get_settings` and `get_usage` (no model call). Faked control responses here.
@@ -108,6 +109,15 @@ private final class CanaryRunner: TurnRunning, @unchecked Sendable {
         #expect(r.item.status == .fail); #expect(r.item.detail.contains("--max-turns"))
         // A runner that cannot run control sessions (the Plan 1 fakes) adds nothing.
         #expect(await ModeCanary.run(runner: NoControlRunner()) == nil)
+    }
+
+    /// M6: no `claude` to start is named as such, never "no control response".
+    @Test func missingClaudeIsNamed() async throws {
+        let runner = ClaudeProcessRunner(claudePath: "brahma-test-no-such-claude")
+        let r = try #require(await ModeCanary.run(runner: runner))
+        #expect(r.item.status == .fail)
+        #expect(r.item.detail.contains("claude was not found: \(ToolPathsError.claudeMissing)"), "\(r.item.detail)")
+        #expect(!r.item.detail.contains("no control response"), "\(r.item.detail)")
     }
 
     @Test func planTierMismatchWarnsOnly() async throws {

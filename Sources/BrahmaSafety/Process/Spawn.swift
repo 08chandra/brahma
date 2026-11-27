@@ -144,6 +144,15 @@ public enum Spawn {
             chdirStatus = posix_spawn_file_actions_addchdir_np(&actions, cwd.path)
         }
         guard chdirStatus == 0 else { throw Failure(message: "cannot set the working directory (\(String(cString: strerror(chdirStatus))))") }
+        #if os(Linux)
+        // Darwin closes every other descriptor through `POSIX_SPAWN_CLOEXEC_DEFAULT`; glibc 2.34+ has
+        // `posix_spawn_file_actions_addclosefrom_np`. Looked up at run time (an older glibc lacks it and keeps closing only
+        // the close-on-exec descriptors); queued after the dups and the chdir, which may still use descriptors >= 3.
+        if let closeFrom = Self.addCloseFrom {
+            let status = closeFrom(&actions, 3)
+            guard status == 0 else { throw Failure(message: "cannot close the inherited descriptors (\(String(cString: strerror(status))))") }
+        }
+        #endif
         var defaults = sigset_t(), mask = sigset_t()
         sigfillset(&defaults); sigemptyset(&mask)
         posix_spawnattr_setsigdefault(&attr, &defaults)
@@ -169,6 +178,17 @@ public enum Spawn {
         guard spawned == 0 else { throw Failure(message: String(cString: strerror(spawned))) }
         return pid
     }
+
+    #if os(Linux)
+    typealias AddCloseFrom = @convention(c) (UnsafeMutablePointer<posix_spawn_file_actions_t>, Int32) -> Int32
+    /// glibc's `posix_spawn_file_actions_addclosefrom_np` (2.34+), nil where this glibc has none.
+    static let addCloseFrom: AddCloseFrom? = {
+        guard let handle = dlopen(nil, RTLD_NOW), let symbol = dlsym(handle, "posix_spawn_file_actions_addclosefrom_np") else {
+            return nil
+        }
+        return unsafeBitCast(symbol, to: AddCloseFrom.self)
+    }()
+    #endif
 
     /// Starts `executable` (argv[0] = `executable`, then `arguments`) and hands back the running child. `group` (default):
     /// it leads a new process group, which its signals and its final sweep reach. `.data` input is fed by a thread of its own.
@@ -233,6 +253,39 @@ public enum Spawn {
         case .inherit: return .inherit
         case .descriptor(let fd): return fd >= 0 ? .fd(fd) : .null
         }
+    }
+
+    /// Writes all of `bytes` to `fd` (the engine's end of a pipe or socket to a child) and returns 0, or stops at the first
+    /// error and returns its errno. A reader that went away is EPIPE here, never a SIGPIPE to the engine (C1): Darwin turns
+    /// SIGPIPE off on the descriptor (`F_SETNOSIGPIPE`); elsewhere SIGPIPE is blocked on this thread while it writes and one
+    /// the write raised is consumed before the mask is restored.
+    public static func writeAll(_ fd: Int32, _ bytes: UnsafeRawBufferPointer) -> Int32 {
+        #if canImport(Darwin)
+        _ = fcntl(fd, F_SETNOSIGPIPE, 1)
+        #else
+        var pipeSignal = sigset_t(), previous = sigset_t()
+        sigemptyset(&pipeSignal); sigaddset(&pipeSignal, SIGPIPE)
+        pthread_sigmask(SIG_BLOCK, &pipeSignal, &previous)
+        defer {
+            var pending = sigset_t()
+            if sigpending(&pending) == 0, sigismember(&pending, SIGPIPE) == 1, sigismember(&previous, SIGPIPE) == 0 {
+                var now = timespec(tv_sec: 0, tv_nsec: 0)
+                _ = sigtimedwait(&pipeSignal, nil, &now)
+            }
+            pthread_sigmask(SIG_SETMASK, &previous, nil)
+        }
+        #endif
+        guard let base = bytes.baseAddress else { return 0 }
+        var offset = 0
+        while offset < bytes.count {
+            let n = write(fd, base + offset, bytes.count - offset)
+            if n < 0 {
+                if errno == EINTR || errno == EAGAIN { continue }
+                return errno
+            }
+            offset += n
+        }
+        return 0
     }
 
     /// A pipe whose two ends are close-on-exec (no other child ever holds them; the child's end is dup'ed onto 0, 1 or 2).
@@ -304,11 +357,8 @@ public enum Spawn {
             case .inherit: stream = .inherit; pipe = nil; data = Data()
             case .descriptor(let fd): stream = fd >= 0 ? .fd(fd) : .null; pipe = nil; data = Data()
             case .data(let bytes):
+                // A child that stops reading makes the write fail (EPIPE), never a SIGPIPE to the engine (`writeAll`).
                 let p = try Spawn.pipePair()
-                #if canImport(Darwin)
-                // A child that stops reading makes the write fail here (EPIPE), never a SIGPIPE to the engine.
-                _ = fcntl(p.write, F_SETNOSIGPIPE, 1)
-                #endif
                 stream = .fd(p.read); pipe = p; data = bytes
             }
         }
@@ -319,14 +369,8 @@ public enum Spawn {
             close(pipe.read)
             let (fd, bytes) = (pipe.write, data)
             Thread.detachNewThread {
-                bytes.withUnsafeBytes { raw in
-                    var offset = 0
-                    while offset < raw.count {
-                        let n = write(fd, raw.baseAddress! + offset, raw.count - offset)
-                        if n < 0 { if errno == EINTR || errno == EAGAIN { continue }; break }
-                        offset += n
-                    }
-                }
+                // A child that exits without reading all of it: the rest is dropped (EPIPE), as before.
+                _ = bytes.withUnsafeBytes { Spawn.writeAll(fd, $0) }
                 close(fd)
             }
         }

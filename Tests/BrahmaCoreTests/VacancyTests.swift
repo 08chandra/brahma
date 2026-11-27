@@ -19,7 +19,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
     let inp = Pipe()
     if stdin == nil { p.standardInput = FileHandle.nullDevice } else { p.standardInput = inp }
     try p.run()
-    if let stdin { inp.fileHandleForWriting.write(Data(stdin.utf8)); try inp.fileHandleForWriting.close() }
+    if let stdin { feedChildInput(inp, Data(stdin.utf8)) }
     let o = out.fileHandleForReading.readDataToEndOfFile(), r = err.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
     return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: r, as: UTF8.self))

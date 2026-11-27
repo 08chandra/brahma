@@ -358,8 +358,7 @@ func endToEndBinary() throws {
         #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
         #"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"post_message","arguments":{"channel":"general","text":"from binary"}}}"#,
     ]
-    inPipe.fileHandleForWriting.write(Data((requests.joined(separator: "\n") + "\n").utf8))
-    try inPipe.fileHandleForWriting.close()
+    feedChildInput(inPipe, Data((requests.joined(separator: "\n") + "\n").utf8))
     let out = String(decoding: outPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
     p.waitUntilExit()
     #expect(p.terminationStatus == 0)
@@ -384,8 +383,7 @@ private func binaryPosts(_ bin: URL, dbPath: String, _ w: MCPWorld, agent: Agent
     let requests = (0..<posts).map { i in
         #"{"jsonrpc":"2.0","id":\#(i + 1),"method":"tools/call","params":{"name":"post_message","arguments":{"channel":"general","text":"p\#(i)"}}}"#
     }
-    inPipe.fileHandleForWriting.write(Data((requests.joined(separator: "\n") + "\n").utf8))
-    try inPipe.fileHandleForWriting.close()
+    feedChildInput(inPipe, Data((requests.joined(separator: "\n") + "\n").utf8))
     let out = String(decoding: outPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
     p.waitUntilExit()
     #expect(p.terminationStatus == 0)

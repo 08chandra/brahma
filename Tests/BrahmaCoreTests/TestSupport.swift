@@ -15,9 +15,31 @@ let keychainTrapArmed: Bool = {
 
 /// A directory for this test case under the process root (`TestScratch.swift`), removed when the case ends.
 func tempDir() throws -> URL {
+    _ = sigpipeTrapArmed
     _ = keychainTrapArmed
     return try Scratch.dir()
 }
+
+/// S5 fix C1: writes `data` to a child's standard input and closes it. A child that exited without reading it fails its own
+/// test (its status, its output), never the whole test process with SIGPIPE (`Spawn.writeAll`: EPIPE instead).
+func feedChildInput(_ pipe: Pipe, _ data: Data) {
+    _ = data.withUnsafeBytes { Spawn.writeAll(pipe.fileHandleForWriting.fileDescriptor, $0) }
+    try? pipe.fileHandleForWriting.close()
+}
+
+/// S5 fix C1 (diagnosis): a SIGPIPE that still reaches this test process prints the writing thread's stack to stderr before
+/// the process ends exactly as it would have (default action, signal 13), so a full run's log names the writer.
+let sigpipeTrapArmed: Bool = {
+    signal(SIGPIPE) { _ in
+        let banner = "\nbrahma tests: SIGPIPE; the writing thread's stack:\n"
+        _ = banner.withCString { write(2, $0, strlen($0)) }
+        var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 64)
+        backtrace_symbols_fd(&frames, backtrace(&frames, 64), 2)
+        signal(SIGPIPE, SIG_DFL)
+        raise(SIGPIPE)   // blocked while this handler runs: delivered, with the default action, when it returns
+    }
+    return true
+}()
 
 // MARK: owner key helpers for CLI subprocess tests
 

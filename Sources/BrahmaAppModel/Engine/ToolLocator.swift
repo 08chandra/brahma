@@ -1,4 +1,5 @@
 import Foundation
+import BrahmaCore
 
 /// Finds the helper binaries the embedded engine needs, and the login-shell PATH that a Finder launch lacks.
 public enum ToolLocator {
@@ -10,17 +11,19 @@ public enum ToolLocator {
         return isExecutable(sibling) ? sibling : nil
     }
 
-    /// `BRAHMA_CLAUDE` wins, and a bad override does not fall back to the search path.
-    public static func claude(environment: [String: String], searchPath: String,
-                              isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) -> String? {
+    /// The `claude` the engine is given (B9). `BRAHMA_CLAUDE` is the owner's override: it must be an absolute path (a relative
+    /// one is refused) to an executable, and a bad one never falls back. Without it, the bare name `claude`, which
+    /// `ClaudeProcessRunner` resolves through `ToolPaths` (the safe absolute PATH directories) at each start; `engineTool`
+    /// (that same lookup) only says whether there is one now. No PATH walk of its own.
+    public static func claude(environment: [String: String],
+                              engineTool: (String) -> String? = { ToolPaths.engineTool(named: $0) },
+                              isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) })
+        -> Result<String, EngineSetupError> {
         if let override = environment["BRAHMA_CLAUDE"], !override.isEmpty {
-            return isExecutable(override) ? override : nil
+            guard override.hasPrefix("/") else { return .failure(.claudeOverrideNotAbsolute(override)) }
+            return isExecutable(override) ? .success(override) : .failure(.claudeNotFound)
         }
-        for dir in searchPath.split(separator: ":", omittingEmptySubsequences: true) {
-            let candidate = "\(dir)/claude"
-            if isExecutable(candidate) { return candidate }
-        }
-        return nil
+        return engineTool("claude") == nil ? .failure(.claudeNotFound) : .success("claude")
     }
 
     /// Asks the user's login shell for its PATH. Output goes to a temp file, not a pipe: a grandchild (such as

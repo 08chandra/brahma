@@ -59,7 +59,9 @@ public enum ModeCanary {
             guard let transcript = await runner.control(request, messages: messages, timeout: timeout) else { return nil }
             let responses = parse(transcript.lines)
             guard !responses.isEmpty else {
-                if let status = transcript.exitStatus, status != 0 {
+                if let failure = transcript.failure {
+                    problems.append("\(name): \(failure)")
+                } else if let status = transcript.exitStatus, status != 0 {
                     problems.append("\(name): the CLI exited \(status) before answering (an unknown flag such as the hidden --max-turns?)")
                 } else {
                     problems.append("\(name): no control response")

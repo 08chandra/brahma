@@ -30,12 +30,16 @@ public struct EngineTools: Equatable, Sendable {
 
 public enum EngineSetupError: Error, Equatable {
     case claudeNotFound
+    /// `BRAHMA_CLAUDE` holds a path that is not absolute (B9: never looked up on PATH or in a working directory).
+    case claudeOverrideNotAbsolute(String)
     case helperMissing(path: String)
 
     public var message: String {
         switch self {
         case .claudeNotFound:
             "Can't find the claude CLI. Install Claude Code, or set BRAHMA_CLAUDE to its path, then relaunch Brahma."
+        case .claudeOverrideNotAbsolute(let value):
+            "BRAHMA_CLAUDE must be an absolute path to the claude CLI; '\(String(value.prefix(300)))' is not. Fix it, then relaunch Brahma."
         case .helperMissing(let path):
             "Brahma's helper tool is missing at \(path). Rebuild the app with scripts/make-app.sh."
         }

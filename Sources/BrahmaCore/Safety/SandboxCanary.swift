@@ -26,17 +26,10 @@ public struct CLIFingerprint: Equatable, Sendable {
         public var description: String { "can't find the claude CLI '\(Store.flat(claudePath, max: 300))' to fingerprint it" }
     }
 
-    /// `claudePath` as given when it holds a `/`, else the first executable of that name on `PATH`; resolved, then `stat`ed.
-    public static func of(claudePath: String, environment: [String: String] = ProcessInfo.processInfo.environment) throws -> CLIFingerprint {
-        var candidate: String?
-        if claudePath.contains("/") {
-            candidate = claudePath
-        } else {
-            for dir in (environment["PATH"] ?? "/usr/bin:/bin").split(separator: ":") where !dir.isEmpty {
-                let path = "\(dir)/\(claudePath)"
-                if FileManager.default.isExecutableFile(atPath: path) { candidate = path; break }
-            }
-        }
+    /// `claudePath` as given when it holds a `/`, else the one the runner starts for that bare name (`ToolPaths`, B9: the safe
+    /// absolute PATH directories, never a PATH walk of its own); resolved, then `stat`ed.
+    public static func of(claudePath: String) throws -> CLIFingerprint {
+        let candidate = claudePath.contains("/") ? claudePath : ToolPaths.engineTool(named: claudePath)
         guard let candidate, let real = realpath(candidate, nil) else { throw Unavailable(claudePath: claudePath) }
         let resolved = String(cString: real)
         free(real)

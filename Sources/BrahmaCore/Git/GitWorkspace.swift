@@ -344,25 +344,17 @@ struct GitCommand: Sendable {
     }
 
     /// The write end of git's stdin for `Stdin.stream`. `write` sends every byte or throws (git went away, the timeout killed
-    /// it); `SIGPIPE` is turned off on the descriptor so a broken pipe is an error here, never a signal to the engine.
+    /// it); a broken pipe is an error here, never a SIGPIPE to the engine (`Spawn.writeAll`, C1).
     final class StdinPipe: @unchecked Sendable {
         private let fd: Int32
-        fileprivate init(fd: Int32) {
-            self.fd = fd
-            _ = fcntl(fd, F_SETNOSIGPIPE, 1)
-        }
+        fileprivate init(fd: Int32) { self.fd = fd }
         func write(_ data: Data) throws {
             try data.withUnsafeBytes { try write($0) }
         }
         func write(_ bytes: UnsafeRawBufferPointer) throws {
-            var offset = 0
-            while offset < bytes.count {
-                let n = Foundation.write(fd, bytes.baseAddress! + offset, bytes.count - offset)
-                if n < 0 {
-                    if errno == EINTR || errno == EAGAIN { continue }
-                    throw GitError.failed(command: "stdin", status: -1, stderr: "git stopped reading its input (\(String(cString: strerror(errno))))")
-                }
-                offset += n
+            let failed = Spawn.writeAll(fd, bytes)
+            guard failed == 0 else {
+                throw GitError.failed(command: "stdin", status: -1, stderr: "git stopped reading its input (\(String(cString: strerror(failed))))")
             }
         }
         fileprivate func finish() { close(fd) }
@@ -405,14 +397,16 @@ struct GitCommand: Sendable {
         (path ?? "").split(separator: ":", omittingEmptySubsequences: true).filter { $0.hasPrefix("/") }.joined(separator: ":")
     }
 
-    /// The directory every engine git starts in (B9, spec §6.5): an engine-owned one, the repository's common dir (its git
-    /// dir for the workspace itself), never an agent's worktree; `/` while that directory does not exist yet (`init`). git
-    /// still works on the work tree it is told (`-C`, `GIT_WORK_TREE`) and reads nothing from where it starts.
+    /// The directory every engine git starts in (B9, spec §6.5): the repository's common dir when the command names one (an
+    /// agent worktree's), otherwise `/` — never an agent's worktree, nor a repository's own `.git` (a lab's is agent-writable,
+    /// M1); `/` too while the common dir does not exist. git still works on the repository and work tree it is told (`-C`,
+    /// `GIT_DIR`, `GIT_WORK_TREE`) and reads nothing from where it starts.
     var engineDirectory: URL {
-        let dir = commonDir ?? gitDir
+        let root = URL(fileURLWithPath: "/", isDirectory: true)
+        guard let dir = commonDir else { return root }
         var st = stat()
         if stat(dir.path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR { return dir }
-        return URL(fileURLWithPath: "/", isDirectory: true)
+        return root
     }
 
     /// `args` are git's arguments after argv[0].

@@ -762,8 +762,7 @@ extension PushTests {
         let out = Pipe(), err = Pipe(), inp = Pipe()
         p.standardOutput = out; p.standardError = err; p.standardInput = inp
         try p.run()
-        if let stdin { inp.fileHandleForWriting.write(Data(stdin.utf8)) }
-        try inp.fileHandleForWriting.close()
+        feedChildInput(inp, Data((stdin ?? "").utf8))
         let o = out.fileHandleForReading.readDataToEndOfFile(), e = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: e, as: UTF8.self))

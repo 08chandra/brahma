@@ -13,7 +13,8 @@ struct Doctor: AsyncParsableCommand {
         let (store, paths) = try openStore()
         let hook = Bundle.main.executablePath ?? CommandLine.arguments[0]
         let sandbox = Orchestrator.ownerSandboxRunner(store: store, paths: paths)
-        let report = await BrahmaCore.Doctor.run(claudePath: ExtLint.claudePath() ?? "claude", runner: ClaudeProcessRunner(),
+        let claude = try ExtLint.claudePath() ?? "claude"
+        let report = await BrahmaCore.Doctor.run(claudePath: claude, runner: ClaudeProcessRunner(),
                                                  hookExecutable: hook, sandbox: sandbox,
                                                  canary: SandboxCanary(environment: .owner, sandbox: sandbox, hookExecutable: hook,
                                                                        baseline: Orchestrator.ownerSandboxBaseline(store: store, paths: paths)),
@@ -29,7 +30,7 @@ struct Doctor: AsyncParsableCommand {
             print("\(item.status.rawValue.uppercased().padding(toLength: 4, withPad: " ", startingAt: 0))  \(item.name)  \(safe(item.detail))")
         }
         // F9 (Task 14u): why Ultra cannot run, per running company (informational; never fails the doctor).
-        let fingerprint = try? CLIFingerprint.of(claudePath: ExtLint.claudePath() ?? "claude").key
+        let fingerprint = try? CLIFingerprint.of(claudePath: claude).key
         for company in (try? store.companies()) ?? [] where company.status == .running {
             let reasons = store.ultraStatus(companyId: company.id, fingerprint: fingerprint)
             if !reasons.isEmpty { print("INFO  ultra  \(safe(company.slug)): \(safe(reasons.joined(separator: "; ")))") }

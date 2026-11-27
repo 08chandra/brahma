@@ -29,8 +29,12 @@ extension TurnRunning {
 public struct ControlTranscript: Equatable, Sendable {
     public var exitStatus: Int32?
     public var lines: [String]
+    /// Why the session never started (no `claude` to start), as the doctor names it; nil when it ran.
+    public var failure: String?
 
-    public init(exitStatus: Int32?, lines: [String]) { self.exitStatus = exitStatus; self.lines = lines }
+    public init(exitStatus: Int32?, lines: [String], failure: String? = nil) {
+        self.exitStatus = exitStatus; self.lines = lines; self.failure = failure
+    }
 }
 
 public enum TurnError: Error, Equatable {
@@ -174,9 +178,13 @@ public struct ClaudeProcessRunner: TurnRunning {
         return await Task.detached { () -> ControlTranscript? in
             // `claude` by its absolute path (a bare name: `ToolPaths.claude`), as argv[0], through `Spawn`; it leads its own
             // process group, as Foundation's `Process` made it too. No `claude` to start: a failed session (it was `env`'s
-            // exit 127 before), never a skipped one.
+            // exit 127 before), never a skipped one, and it says why (M6).
             let executable: String
-            do { executable = try Self.executable(claude) } catch { return ControlTranscript(exitStatus: nil, lines: []) }
+            do { executable = try Self.executable(claude) } catch let missing as ToolPathsError {
+                return ControlTranscript(exitStatus: nil, lines: [], failure: "claude was not found: \(missing)")
+            } catch {
+                return ControlTranscript(exitStatus: nil, lines: [], failure: "claude could not be started: \(error)")
+            }
             let stdin: (read: Int32, write: Int32), stdout: (read: Int32, write: Int32), child: Spawn.Child
             do {
                 stdin = try Spawn.pipePair()
@@ -204,18 +212,8 @@ public struct ClaudeProcessRunner: TurnRunning {
                 close(stdout.read)
             }
             reader.start()
-            #if canImport(Darwin)
-            _ = fcntl(stdin.write, F_SETNOSIGPIPE, 1)
-            #endif
-            let input = Data(input.utf8)
-            input.withUnsafeBytes { raw in
-                var offset = 0
-                while offset < raw.count {
-                    let n = write(stdin.write, raw.baseAddress! + offset, raw.count - offset)
-                    if n < 0 { if errno == EINTR || errno == EAGAIN { continue }; break }
-                    offset += n
-                }
-            }
+            // A CLI that exits before reading it all: EPIPE, never a SIGPIPE to the engine (C1).
+            _ = Data(input.utf8).withUnsafeBytes { Spawn.writeAll(stdin.write, $0) }
             let deadline = AwakeTime.uptime() + seconds
             while AwakeTime.uptime() < deadline, child.isAlive(), !collected.done { usleep(20_000) }
             let exitedByItself = !child.isAlive()
@@ -233,12 +231,14 @@ public struct ClaudeProcessRunner: TurnRunning {
     /// The executable a configured `claudePath` names: an absolute path as is; a bare name (`claude`) the engine's
     /// `ToolPaths.claude` (B9: resolved once at engine start from the safe absolute PATH directories); anything else is
     /// refused (`Spawn.validate`). Never `/usr/bin/env`.
-    static func executable(_ claudePath: String) throws -> String {
+    /// `engineTool` is `ToolPaths.engineTool(named:)` (a seam for tests).
+    static func executable(_ claudePath: String,
+                           engineTool: (String) -> String? = { ToolPaths.engineTool(named: $0) }) throws -> String {
         if claudePath.hasPrefix("/") { return claudePath }
         if claudePath.isEmpty || claudePath.contains("/"), case .deny(let why) = Spawn.validate(claudePath) {
             throw Spawn.Failure(message: why)
         }
-        guard let found = ToolPaths.engineTool(named: claudePath) else { throw ToolPathsError.claudeMissing }
+        guard let found = engineTool(claudePath) else { throw ToolPathsError.claudeMissing }
         return found
     }
 
@@ -372,17 +372,13 @@ public struct ClaudeProcessRunner: TurnRunning {
             }
         }
 
-        // Write the prompt off-thread: a large prompt can fill the pipe before the child starts reading.
-        #if canImport(Darwin)
-        // If the child exits without reading stdin, the write must fail with EPIPE, not kill us with SIGPIPE.
-        // Linux has no per-fd equivalent; a Linux host must ignore SIGPIPE process-wide.
-        _ = fcntl(input.fileDescriptor, F_SETNOSIGPIPE, 1)
-        #endif
+        // Write the prompt off-thread: a large prompt can fill the pipe before the child starts reading. If the child exits
+        // without reading stdin, the write fails with EPIPE, never a SIGPIPE to the engine (`Spawn.writeAll`, C1).
         // A turn stopped because it could not be recorded never gets its prompt (Task 9c fix round 4): it is booked as not
         // launched, so it must not do any work in the grace before its kill lands.
         let prompt = unrecorded == nil && !startUnreadable ? Data(request.prompt.utf8) : Data()
         DispatchQueue.global().async {
-            if !prompt.isEmpty { try? input.write(contentsOf: prompt) }
+            if !prompt.isEmpty { _ = prompt.withUnsafeBytes { Spawn.writeAll(input.fileDescriptor, $0) } }
             try? input.close()
         }
 

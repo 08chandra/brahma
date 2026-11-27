@@ -29,12 +29,15 @@ public enum ToolPathsError: Error, Equatable, Sendable, CustomStringConvertible 
 /// The engine's tools by absolute path (Plan S, spec §6.5, B9), resolved once at engine start: a later `PATH` change takes
 /// effect at the next start. Every child the engine starts names its executable from here (`Spawn` refuses anything else).
 ///
-/// - Candidate directories are the engine's own `PATH` entries that are absolute, exist, belong to root or this user, are
-///   neither group- nor world-writable, and lie inside no company workspace or data home (resolved paths, `SandboxPath`).
+/// - Candidate directories are the engine's own `PATH` entries that are absolute, safe to name in a profile, exist, belong to
+///   root or this user, are not world-writable, are not group-writable unless the group is `trustedWriterGroup` (macOS
+///   `admin`: Homebrew, Ruling S5-1), and lie inside no company workspace or data home (resolved paths, `SandboxPath`).
 /// - `git`, `claude` and `curl` are the first regular executable of that name there (`curl` prefers `/usr/bin/curl`: LibreSSL
-///   with a file CA bundle). An executable that resolves into a forbidden root is skipped.
-/// - The macOS `/usr/bin/git` shim is replaced by its real target (`xcrun --find git`, asked once per process), which must
-///   pass the same rules; inside a sandbox the shim would need xcrun's cache writes.
+///   with a file CA bundle). The executable is judged where it resolves: that file meets the same owner and mode rule, and
+///   the directory it lies in is a candidate directory too (so a link out of a safe directory into a workspace or a shared
+///   writable directory is skipped).
+/// - The macOS `/usr/bin/git` shim (any spelling that resolves to it) is replaced by its real target (`xcrun --find git`,
+///   asked once per process), which must pass the same rules; inside a sandbox the shim would need xcrun's cache writes.
 /// - `sandbox-exec`, `/bin/sh`, `unzip` and `tar` are fixed absolute paths.
 /// - git must be 2.43 or newer.
 public struct ToolPaths: Sendable, Equatable {
@@ -70,7 +73,15 @@ public struct ToolPaths: Sendable, Equatable {
     public static let probeTimeout: Duration = .seconds(30)
 
     /// The rule a candidate directory meets, as the errors and the doctor say it.
-    public static let safeDirectoryRule = "absolute, owned by root or you, not group- or world-writable, outside every company workspace and data home"
+    public static let safeDirectoryRule = "absolute, owned by root or you, not world-writable, not group-writable unless the group is admin (Homebrew), outside every company workspace and data home"
+
+    /// macOS `admin` (gid 80): Homebrew's prefix is group-writable by it; its members can already sudo (Ruling S5-1). A
+    /// constant (no group lookup); membership is not required. None elsewhere.
+    #if os(macOS)
+    public static let trustedWriterGroup: gid_t? = 80
+    #else
+    public static let trustedWriterGroup: gid_t? = nil
+    #endif
 
     /// The `claude` to start, or `ToolPathsError.claudeMissing`.
     public func requireClaude() throws -> String {
@@ -81,30 +92,32 @@ public struct ToolPaths: Sendable, Equatable {
     // MARK: Resolution
 
     /// The candidate directories of `path` (see the type's comment), in `PATH` order, each once.
-    public static func candidateDirectories(path: String, forbiddenRoots: [URL]) -> [String] {
+    public static func candidateDirectories(path: String, forbiddenRoots: [URL],
+                                            trustedGroup: gid_t? = ToolPaths.trustedWriterGroup) -> [String] {
         let forbidden = forbiddenRoots.map { SandboxPath.resolve($0.path) }
         var seen: Set<String> = []
         var out: [String] = []
         for entry in path.split(separator: ":", omittingEmptySubsequences: true).map(String.init)
-        where seen.insert(entry).inserted && isSafeDirectory(entry, forbidden: forbidden) {
+        where seen.insert(entry).inserted && isSafeDirectory(entry, forbidden: forbidden, trustedGroup: trustedGroup) {
             out.append(entry)
         }
         return out
     }
 
     /// Resolves the tools from `path` (the engine's `PATH`). `xcrunFind` answers `xcrun --find <name>` (the shim's target);
-    /// `gitVersion` answers the version number of a git (`git --version`). Both are seams for tests.
+    /// `gitVersion` answers the version number of a git (`git --version`). Both are seams for tests, as is `trustedGroup`.
     public static func resolve(path: String, forbiddenRoots: [URL], xcrunFind: (String) -> String?,
-                               gitVersion: (String) -> String? = ToolPaths.probeGitVersion) -> Result<ToolPaths, ToolPathsError> {
+                               gitVersion: (String) -> String? = ToolPaths.probeGitVersion,
+                               trustedGroup: gid_t? = ToolPaths.trustedWriterGroup) -> Result<ToolPaths, ToolPathsError> {
         let forbidden = forbiddenRoots.map { SandboxPath.resolve($0.path) }
-        let dirs = candidateDirectories(path: path, forbiddenRoots: forbiddenRoots)
+        let dirs = candidateDirectories(path: path, forbiddenRoots: forbiddenRoots, trustedGroup: trustedGroup)
+        func usable(_ path: String) -> Bool { isUsableExecutable(path, forbidden: forbidden, trustedGroup: trustedGroup) }
         var found: String?
         for dir in dirs {
             let candidate = dir + "/git"
-            guard isUsableExecutable(candidate, forbidden: forbidden) else { continue }
-            if candidate == gitShim {
-                if let real = xcrunFind("git"), real != gitShim, isUsableExecutable(real, forbidden: forbidden),
-                   isSafeDirectory(parent(of: real), forbidden: forbidden) {
+            guard usable(candidate) else { continue }
+            if isShim(candidate) {
+                if let real = xcrunFind("git"), !isShim(real), usable(real) {
                     found = real
                     break
                 }
@@ -118,37 +131,66 @@ public struct ToolPaths: Sendable, Equatable {
         guard let git = found else { return .failure(.gitMissing) }
         let asked = gitVersion(git)
         guard let version = asked, isSupportedGit(version) else { return .failure(.gitTooOld(asked ?? "unknown")) }
-        let curl = isUsableExecutable(preferredCurl, forbidden: forbidden) ? preferredCurl
-            : (find("curl", in: dirs, forbidden: forbidden) ?? preferredCurl)
-        return .success(ToolPaths(git: git, claude: find("claude", in: dirs, forbidden: forbidden), curl: curl, gitVersion: version))
+        let curl = usable(preferredCurl) ? preferredCurl
+            : (find("curl", in: dirs, forbidden: forbidden, trustedGroup: trustedGroup) ?? preferredCurl)
+        return .success(ToolPaths(git: git, claude: find("claude", in: dirs, forbidden: forbidden, trustedGroup: trustedGroup),
+                                  curl: curl, gitVersion: version))
+    }
+
+    /// The first usable executable `name` (a bare name) in the candidate directories of `path`, under the same rules as
+    /// `resolve`; nil when there is none or `name` is not a bare name.
+    public static func lookup(_ name: String, path: String, forbiddenRoots: [URL],
+                              trustedGroup: gid_t? = ToolPaths.trustedWriterGroup) -> String? {
+        find(name, in: candidateDirectories(path: path, forbiddenRoots: forbiddenRoots, trustedGroup: trustedGroup),
+             forbidden: forbiddenRoots.map { SandboxPath.resolve($0.path) }, trustedGroup: trustedGroup)
     }
 
     /// The first usable executable `name` in `dirs`; nil when none (or `name` is not a bare name).
-    static func find(_ name: String, in dirs: [String], forbidden: [String]) -> String? {
+    static func find(_ name: String, in dirs: [String], forbidden: [String], trustedGroup: gid_t?) -> String? {
         guard !name.isEmpty, !name.contains("/") else { return nil }
-        return dirs.lazy.map { $0 + "/" + name }.first { isUsableExecutable($0, forbidden: forbidden) }
+        return dirs.lazy.map { $0 + "/" + name }.first { isUsableExecutable($0, forbidden: forbidden, trustedGroup: trustedGroup) }
     }
 
-    /// An absolute directory that exists, belongs to root or this user, is neither group- nor world-writable, and resolves
-    /// inside no forbidden root (already resolved).
-    static func isSafeDirectory(_ dir: String, forbidden: [String]) -> Bool {
-        guard dir.hasPrefix("/") else { return false }
+    /// The one owner and mode rule (Ruling S5-1), for a directory and an executable alike: owned by root or this user, never
+    /// world-writable, group-writable only when its group is `trustedGroup`.
+    static func isTrustedOwnerAndMode(_ st: stat, trustedGroup: gid_t?) -> Bool {
+        guard st.st_uid == 0 || st.st_uid == getuid() else { return false }
+        guard st.st_mode & S_IWOTH == 0 else { return false }
+        guard st.st_mode & S_IWGRP == 0 else {
+            guard let trustedGroup else { return false }
+            return st.st_gid == trustedGroup
+        }
+        return true
+    }
+
+    /// An absolute directory, safe to name in a profile, that exists (links followed), meets the owner and mode rule, and
+    /// resolves inside no forbidden root (already resolved).
+    static func isSafeDirectory(_ dir: String, forbidden: [String], trustedGroup: gid_t?) -> Bool {
+        guard dir.hasPrefix("/"), !SandboxPath.isUnsafe(dir) else { return false }
         var st = stat()
         guard stat(dir, &st) == 0, st.st_mode & S_IFMT == S_IFDIR else { return false }
-        guard st.st_uid == 0 || st.st_uid == getuid() else { return false }
-        guard st.st_mode & (S_IWGRP | S_IWOTH) == 0 else { return false }
+        guard isTrustedOwnerAndMode(st, trustedGroup: trustedGroup) else { return false }
         let real = SandboxPath.resolve(dir)
         return !forbidden.contains { SandboxPath.isInside(real, $0) }
     }
 
-    /// A regular file this process may execute, whose resolved path lies inside no forbidden root (a link out of a safe
-    /// directory into a workspace is refused).
-    static func isUsableExecutable(_ path: String, forbidden: [String]) -> Bool {
-        guard path.hasPrefix("/") else { return false }
-        var st = stat()
-        guard stat(path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, access(path, X_OK) == 0 else { return false }
+    /// An executable judged where it resolves: a regular file this process may execute, meeting the owner and mode rule,
+    /// lying inside no forbidden root, in a directory that is itself safe (a link out of a safe directory into a workspace
+    /// or a shared writable directory is refused).
+    static func isUsableExecutable(_ path: String, forbidden: [String], trustedGroup: gid_t?) -> Bool {
+        guard path.hasPrefix("/"), !SandboxPath.isUnsafe(path) else { return false }
         let real = SandboxPath.resolve(path)
-        return !forbidden.contains { SandboxPath.isInside(real, $0) }
+        guard real.hasPrefix("/") else { return false }
+        var st = stat()
+        guard stat(real, &st) == 0, st.st_mode & S_IFMT == S_IFREG, access(real, X_OK) == 0 else { return false }
+        guard isTrustedOwnerAndMode(st, trustedGroup: trustedGroup) else { return false }
+        guard !forbidden.contains(where: { SandboxPath.isInside(real, $0) }) else { return false }
+        return isSafeDirectory(parent(of: real), forbidden: forbidden, trustedGroup: trustedGroup)
+    }
+
+    /// `path` names the macOS git shim, in whatever spelling (`/usr/bin//git`, `/usr/../usr/bin/git`, a link to it).
+    static func isShim(_ path: String) -> Bool {
+        SandboxPath.key(SandboxPath.resolve(path)) == SandboxPath.key(gitShim)
     }
 
     static func parent(of path: String) -> String {
@@ -254,13 +296,13 @@ public struct ToolPaths: Sendable, Equatable {
     public static var isResolved: Bool { slot.lock.withLock { slot.result != nil } }
 
     /// A tool named by its bare name (an owner-configured `claude`, the doctor's `npm`), found in the engine's candidate
-    /// directories under the same rules; nil when there is none or `name` is not a bare name.
+    /// directories under the same rules; nil when there is none or `name` is not a bare name. The forbidden roots are the ones
+    /// known at the last `install` (a company created since is not among them until the next engine start).
     public static func engineTool(named name: String) -> String? {
         let resolved = engine()
         if name == "claude", case .success(let tools) = resolved, let claude = tools.claude { return claude }
         let (path, forbiddenRoots) = slot.lock.withLock { (slot.path, slot.forbidden) }
-        return find(name, in: candidateDirectories(path: path, forbiddenRoots: forbiddenRoots),
-                    forbidden: forbiddenRoots.map { SandboxPath.resolve($0.path) })
+        return lookup(name, path: path, forbiddenRoots: forbiddenRoots)
     }
 
     /// The git paths the helper accepts in a request: the resolved one.

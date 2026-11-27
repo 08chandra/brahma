@@ -58,7 +58,7 @@ struct CanaryGroup: ParsableCommand {
             signal(SIGPIPE, SIG_IGN)
             let (store, paths) = try openStore()
             let hook = Bundle.main.executablePath ?? CommandLine.arguments[0]
-            let claude = ExtLint.claudePath() ?? "claude"
+            let claude = try ExtLint.claudePath() ?? "claude"
             let canary = SandboxCanary(environment: .owner, sandbox: Orchestrator.ownerSandboxRunner(store: store, paths: paths),
                                        hookExecutable: hook, baseline: Orchestrator.ownerSandboxBaseline(store: store, paths: paths))
             // The shapes the engine asks for: each running sandboxed company's standard work turn (its network), else the

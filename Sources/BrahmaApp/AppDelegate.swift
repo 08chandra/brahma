@@ -25,9 +25,11 @@ struct Booted {
 enum EngineSetup {
     @MainActor
     static func resolveTools() -> Result<EngineTools, EngineSetupError> {
-        let env = ProcessInfo.processInfo.environment
-        guard let claude = ToolLocator.claude(environment: env, searchPath: env["PATH"] ?? "") else {
-            return .failure(.claudeNotFound)
+        // B9: the bare name `claude` (resolved through ToolPaths at each start) or the owner's absolute BRAHMA_CLAUDE.
+        let claude: String
+        switch ToolLocator.claude(environment: ProcessInfo.processInfo.environment) {
+        case .success(let found): claude = found
+        case .failure(let problem): return .failure(problem)
         }
         let bundle = Bundle.main.bundleURL
         guard let helper = ToolLocator.mcpHelper(appBundle: bundle, executable: Bundle.main.executableURL ?? bundle) else {

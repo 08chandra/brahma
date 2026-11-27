@@ -256,7 +256,7 @@
     "Sources/BrahmaCore/Turns/StreamParser.swift" : 5,
     "Sources/BrahmaCore/Turns/TurnDigest.swift" : 7,
     "Sources/BrahmaCore/Turns/TurnProcess.swift" : 7,
-    "Sources/BrahmaCore/Turns/TurnRunner.swift" : 9,
+    "Sources/BrahmaCore/Turns/TurnRunner.swift" : 8,
     "Sources/BrahmaCore/Util/OwnerKey.swift" : 8,
     "Sources/BrahmaCore/Verify/CheckScripts.swift" : 1,
     "Sources/BrahmaCore/Work/Liveness.swift" : 1,
@@ -328,7 +328,7 @@
     "Sources/BrahmaCore/Release/ReleaseExecutor.swift" : 1,
     "Sources/BrahmaCore/Release/UploadStager.swift" : 1,
     "Sources/BrahmaCore/Resources/ContentVault.swift" : 2,
-    "Sources/BrahmaCore/Safety/SandboxCanary.swift" : 7,
+    "Sources/BrahmaCore/Safety/SandboxCanary.swift" : 6,
     "Sources/BrahmaCore/Safety/Secrets.swift" : 3,
     "Sources/BrahmaCore/Safety/Taint.swift" : 1,
     "Sources/BrahmaCore/Sandbox/SandboxScope.swift" : 1,
@@ -362,7 +362,7 @@
     "Sources/brahma/CLISupport.swift" : 1,
     "Sources/brahma/CompanyCommands.swift" : 1,
     "Sources/brahma/DevCommands.swift" : 3,
-    "Sources/brahma/ExtCommands.swift" : 12,
+    "Sources/brahma/ExtCommands.swift" : 11,
     "Sources/brahma/RunCommand.swift" : 1
   },
   "loopbackHTTP" : {

@@ -81,7 +81,7 @@ struct ExtLint: AsyncParsableCommand {
         do { try ExtensionImporter.copyTree(from: source, to: staged) } catch let e as ExtensionError { throw fail(e.message) }
         var result = ExtensionValidator.validate(staged: staged)
         // I1: Claude's own checks run only on a package the validator passed.
-        if !noClaude, let claude = Self.claudePath(), result.errors.isEmpty, result.manifest != nil {
+        if !noClaude, let claude = try Self.claudePath(), result.errors.isEmpty, result.manifest != nil {
             let runner: any SandboxedRunner
             if let (store, p) = try? openStore(lazySecrets: true) { runner = Orchestrator.ownerSandboxRunner(store: store, paths: p) }
             else { runner = UnavailableSandboxRunner() }
@@ -105,14 +105,15 @@ struct ExtLint: AsyncParsableCommand {
         if !result.warnings.isEmpty { throw ExitCode(2) }
     }
 
-    /// `claude` as the owner's shell would find it (`BRAHMA_CLAUDE` overrides, for tests and unusual installs).
-    static func claudePath() -> String? {
-        if let p = ProcessInfo.processInfo.environment["BRAHMA_CLAUDE"] { return FileManager.default.isExecutableFile(atPath: p) ? p : nil }
-        for dir in (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":") {
-            let candidate = "\(dir)/claude"
-            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+    /// The `claude` the CLI starts (B9), by absolute path: `BRAHMA_CLAUDE` (the owner's override, for tests and unusual
+    /// installs) must be an absolute path (a relative one is refused) to an executable (else none); otherwise the engine's
+    /// `ToolPaths` claude, from the safe absolute PATH directories. Nil when there is none. No PATH walk of its own.
+    static func claudePath() throws -> String? {
+        if let p = ProcessInfo.processInfo.environment["BRAHMA_CLAUDE"], !p.isEmpty {
+            guard p.hasPrefix("/") else { throw fail("BRAHMA_CLAUDE must be an absolute path to the claude CLI; '\(p)' is not") }
+            return FileManager.default.isExecutableFile(atPath: p) ? p : nil
         }
-        return nil
+        return ToolPaths.engineTool(named: "claude")
     }
 }
 
@@ -129,7 +130,7 @@ private func proposeInstall(source: ExtensionSource, company: String, roles: [St
     } catch let e as ExtensionError { throw fail(e.message) }
     for n in staged.notices { FileHandle.standardError.write(Data("note: \(safe(n))\n".utf8)) }
     var claude: ClaudeCheck?
-    if let path = ExtLint.claudePath() {
+    if let path = try ExtLint.claudePath() {
         claude = ClaudeCheck(runner: Orchestrator.ownerSandboxRunner(store: store, paths: paths), claudePath: path,
                              scratch: try paths.ensureTmpDir().appending(path: "ext-check-\(UUID().uuidString)", directoryHint: .isDirectory))
     } else {
