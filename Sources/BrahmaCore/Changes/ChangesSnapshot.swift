@@ -111,6 +111,9 @@ public struct ChangesSnapshot: Equatable, Sendable {
     /// Changes when the shown patch or the file list changes.
     public var patchHash: String
     public var computedAt: Date
+    /// Ruling C6b-2: the path of every `diff --git` section of `patch`, in order (`ChangesPatch.parse` over the shown patch). A diff
+    /// parser's result must agree with it, section for section, before anything is drawn; `ChangedFile.patchIndex` indexes it.
+    public var sectionPaths: [String] = []
 }
 
 /// A revision of an item: `base` (the merge base with `main`), `r<n>` (the commit of its n-th check run, oldest first),
@@ -351,10 +354,12 @@ extension Store {
         }
         let listing = files.map { "\($0.status) \($0.path) \($0.oldPath ?? "") +\($0.added) -\($0.removed) \($0.summary ?? "")" }.joined(separator: "\n")
         let hash = SHA256.hex(Data((patch + "\u{0}" + listing + "\u{0}" + raw.base + "\u{0}" + raw.target).utf8))
+        // C6b-2: the sections as the shown (redacted) patch has them; a withheld patch has none.
+        let sectionPaths = patch == Self.withheldPatch ? [] : ChangesPatch.parse(patch).map(\.path)
         return ChangesSnapshot(key: raw.key, compare: raw.compare, base: raw.base, target: raw.target, files: files,
                                added: files.reduce(0) { $0 + $1.added }, removed: files.reduce(0) { $0 + $1.removed }, patch: patch,
                                truncated: raw.truncated, tainted: raw.tainted, taintReason: raw.taintReason, lastEdit: raw.lastEdit,
-                               patchHash: hash, computedAt: now)
+                               patchHash: hash, computedAt: now, sectionPaths: sectionPaths)
     }
 
     static let withheldPatch = "[patch withheld: it still looks like it holds a stored secret after redaction]\n"
@@ -380,8 +385,7 @@ public enum ChangesPatch {
         var current: Section?
         var inHunks = false
         func close() { if let s = current { sections.append(s) }; current = nil; inHunks = false }
-        for raw in patch.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = String(raw)
+        for line in lines(patch) {
             if line.hasPrefix("diff --git ") {
                 close()
                 current = Section(path: Self.pathFromGitLine(line), status: "M", binary: false, header: [line], hunks: [])
@@ -411,6 +415,26 @@ public enum ChangesPatch {
         for i in sections.indices where sections[i].hunks.last == "" { sections[i].hunks.removeLast() }
         for i in sections.indices where sections[i].hunks.isEmpty && sections[i].header.last == "" { sections[i].header.removeLast() }
         return sections
+    }
+
+    /// Ruling C6b-2: the one line-boundary rule both the engine and the app's `DiffModel` use — split on U+000A by scalar (a `\r\n`
+    /// is one `Character`, so `split(separator:)` on a String would glue a CRLF line to the next file's `diff --git` and shift every
+    /// later section). Every other scalar, a trailing U+000D included, stays in the line: it is content the patch carries (the app's
+    /// parser shows one trailing CR as the line ending; `DiffAnchoring` hashes the shown form). A trailing newline yields a last
+    /// empty line.
+    public static func lines(_ text: String) -> [String] {
+        var out: [String] = []
+        var current = String.UnicodeScalarView()
+        for s in text.unicodeScalars {
+            if s == "\n" {
+                out.append(String(current))
+                current = String.UnicodeScalarView()
+            } else {
+                current.append(s)
+            }
+        }
+        out.append(String(current))
+        return out
     }
 
     /// `diff --git a/<p> b/<p>` → `<p>` (the two halves agree without renames; a path holding ` b/` is settled by `+++`). A

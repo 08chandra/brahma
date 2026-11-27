@@ -21,8 +21,11 @@ import BrahmaCore
     public static let modeKeyPrefix = "brahma.changes.mode."
     /// `"The stored secrets can't be read, so no changes are shown."`
     public static let refusedText = "The stored secrets can't be read, so no changes are shown."
-    /// Stream ends in a row (no yield between them) before the model gives up with the generic refusal.
-    public static let maxRetries = 3
+    /// Ruling C6b-2: the parse disagreed with the engine's sections; nothing of the diff is drawn.
+    public static let unverifiedText = "diff couldn't be verified"
+    /// Stream ends in a row (no yield between them) before the model gives up with the generic refusal (with `backoff`, about 15 s
+    /// of patience: a git call that timed out or was starved under load recovers; a refusal costs no git work per attempt).
+    public static let maxRetries = 5
     /// The board's reload cadence while the model runs: the engine's idle cadence (one diff per worktree per 10 s, within the
     /// "≤ 1 recompute per 2 s per (item, compare)" cap).
     public static let boardInterval: Duration = ChangesLimits.idleInterval
@@ -202,8 +205,10 @@ import BrahmaCore
         resubscribe()
         boardTask?.cancel()
         boardTask = Task { [weak self] in
-            while let self, self.isRunning, !Task.isCancelled {
-                await self.refreshBoard()
+            // N-5: the model is held only around its reload, never across the sleep (a dropped model ends the loop).
+            while !Task.isCancelled {
+                guard let model = self, model.isRunning else { return }
+                await model.refreshBoard()
                 try? await Task.sleep(for: Self.boardInterval)
             }
         }
@@ -294,13 +299,27 @@ import BrahmaCore
     /// flag, the chips and the markers.
     private func apply(_ snapshot: ChangesSnapshot, _ parsed: DiffModel, gen: Int) {
         guard gen == generation else { return }
+        isLive = true
+        retryAttempt = 0
+        // Ruling C6b-2: the parse must agree with the engine's sections before anything of it is drawn.
+        if let problem = Self.verify(parsed, against: snapshot) {
+            self.snapshot = snapshot
+            diff = nil
+            files = []
+            changeStops = []
+            stopIndex = nil
+            markers = [:]
+            outdated = [:]
+            changedSinceShown = shownAt.map { $0 != snapshot.patchHash } ?? false
+            error = problem
+            rebuildChips()
+            return
+        }
         let previous: (DiffStop, DiffModel)? = currentStop.flatMap { stop in diff.map { (stop, $0) } }
         self.snapshot = snapshot
         diff = parsed
         files = ChangesFiles.rows(snapshot, diff: parsed)
         changeStops = parsed.changeStops
-        isLive = true
-        retryAttempt = 0
         error = nil
         if let (stop, old) = previous {
             stopIndex = DiffStops.relocate(stop, from: old, in: parsed).flatMap { moved in changeStops.firstIndex(of: moved) }
@@ -310,6 +329,12 @@ import BrahmaCore
         changedSinceShown = shownAt.map { $0 != snapshot.patchHash } ?? false
         rebuildChips()
         placeMarkers()
+    }
+
+    /// Ruling C6b-2: nil when `diff`'s sections are the engine's (`sectionPaths`: the same count, the same path at every index),
+    /// else `unverifiedText`.
+    public static func verify(_ diff: DiffModel, against snapshot: ChangesSnapshot) -> String? {
+        diff.files.map(\.path) == snapshot.sectionPaths ? nil : unverifiedText
     }
 
     // MARK: Chips

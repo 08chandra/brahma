@@ -304,7 +304,9 @@ public enum DiffAnchoring {
             }
             guard var h = current else { continue }
             h.lines.append(line)
-            let text = String(line.dropFirst())
+            // The line as the app shows it (C6b-2): its marker dropped, one trailing CR read as the line ending — the hash both sides agree on.
+            var text = String(line.unicodeScalars.dropFirst())
+            if text.unicodeScalars.last == "\r" { text.unicodeScalars.removeLast() }
             if line.hasPrefix("+") { h.numbered.append(Numbered(old: nil, new: new, text: text)); new += 1 }
             else if line.hasPrefix("-") { h.numbered.append(Numbered(old: old, new: nil, text: text)); old += 1 }
             else if line.hasPrefix("\\") { h.numbered.append(Numbered(old: nil, new: nil, text: text)) }

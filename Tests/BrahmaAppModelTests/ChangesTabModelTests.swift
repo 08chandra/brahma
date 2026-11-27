@@ -467,7 +467,8 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
     @Test func endedStreamIsNotLive() async throws {
         #expect(ChangesTabModel.backoff(1) == .milliseconds(500) && ChangesTabModel.backoff(2) == .seconds(1) && ChangesTabModel.backoff(3) == .seconds(2))
         #expect(ChangesTabModel.backoff(0) == .milliseconds(500) && ChangesTabModel.backoff(40) <= .seconds(30))
-        #expect(ChangesTabModel.maxRetries == 3)
+        #expect(ChangesTabModel.backoff(4) == .seconds(4) && ChangesTabModel.backoff(5) == .seconds(8))
+        #expect(ChangesTabModel.maxRetries == 5)
         let cw = try ChangesWorld()
         let (m, live) = try cw.model()
         m.start()
@@ -531,19 +532,31 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
     /// CHARACTERS chip, and the chips follow the stream.
     @Test func taintedLiveDiffShowsGatedChips() async throws {
         let cw = try ChangesWorld()
-        let secret = "sk_" + "live_" + String(repeating: "q", count: 24)
+        // M-8 (core case): a stored value that matches no secret pattern — built at runtime (C5b-4) — is withheld only because the
+        // subscription's known values reached the gate.
+        let secret = ["plum", "orchard", String(UInt64.random(in: 1_000_000...9_999_999))].joined(separator: "-")
         try cw.write("src/a.ts", "one\nTWO\nthree\nkey = \(secret)\n")
         try cw.write("win.txt", "a\r\r\nb\rc\r\n")
         let git = SafeGit(workspace: cw.w.workspace)
         try cw.w.store.recordTaintedCommits(companyId: cw.w.company.id, itemId: cw.w.item.id, agentId: cw.w.eng1.id, turnId: nil, headBefore: cw.r1,
                                             headAfter: cw.r2, source: "docs.example.com token \(secret)", git: git, now: cw.w.now)
-        let (m, _) = try cw.model(known: [(name: "STRIPE", value: secret)])
+        // The control: with no known values the value is plain text and shows (no pattern catches it).
+        let (control, _) = try cw.model(known: [])
+        control.start()
+        control.select(cw.key)
+        try await eventually { control.isLive }
+        #expect(control.snapshot?.patch.contains(secret) == true)
+        #expect(control.diff?.files.flatMap(\.hunks).flatMap(\.lines).contains { $0.text.contains(secret) } == true)
+        #expect(control.chips.contains { $0.text == "TAINTED · from a session that read docs.example.com token \(secret)" })
+        control.stop()
+        let (m, _) = try cw.model(known: [(name: "PLUM", value: secret)])
         m.start()
         m.select(cw.key)
         try await eventually { m.isLive }
         let snapshot = try #require(m.snapshot), diff = try #require(m.diff)
-        #expect(snapshot.tainted && !snapshot.patch.contains(secret))
+        #expect(snapshot.tainted && !snapshot.patch.contains(secret), "the known value is redacted from the patch")
         #expect(!diff.files.flatMap(\.hunks).flatMap(\.lines).contains { $0.text.contains(secret) }, "a stored value never reaches a shown line")
+        #expect(diff.files.flatMap(\.hunks).flatMap(\.lines).contains { $0.text.hasPrefix("key = ") && !$0.text.contains(secret) })
         let texts = m.chips.map(\.text)
         #expect(texts == ["UNCOMMITTED", "LIVE", "TAINTED", "HIDDEN CHARACTERS"], "\(texts)")
         #expect(m.chips.first { $0.text == "TAINTED" }?.tone == .warn)
@@ -554,14 +567,15 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         let rows = diff.highlighted(file: win)
         #expect(rows.count == 2 && rows[0].last?.text == "⟦U+000D⟧" && rows[0].last?.hidden == true, "\(rows)")
         #expect(rows[1].contains { $0.text == "⟦U+000D⟧" && $0.hidden } && rows[1].first?.text == "b" && rows[1].last?.text == "c")
-        // A reason with no secret in it shows, gated as one string; a secret-shaped token withholds it (the gate's patterns, with or
-        // without known values).
+        // The pure builder: a reason with no stored value in it shows, gated as one string; the known value withholds it.
         let gate = GlobalSearch.TextGate(knownValues: [])
         var taintedSnapshot = snapshot
         taintedSnapshot.taintReason = "from a session that read docs.example.com"
         #expect(ChangesTabModel.chips(for: taintedSnapshot, diff: nil, live: true, gate: gate).map(\.text)
                 == ["UNCOMMITTED", "LIVE", "TAINTED · from a session that read docs.example.com"])
-        #expect(ChangesTabModel.chips(for: snapshot, diff: nil, live: true, gate: gate).map(\.text) == ["UNCOMMITTED", "LIVE", "TAINTED"])
+        #expect(ChangesTabModel.chips(for: snapshot, diff: nil, live: true, gate: gate).map(\.text).contains { $0.hasSuffix(secret) })
+        #expect(ChangesTabModel.chips(for: snapshot, diff: nil, live: true, gate: GlobalSearch.TextGate(knownValues: [(name: "PLUM", value: secret)])).map(\.text)
+                == ["UNCOMMITTED", "LIVE", "TAINTED"])
         // The pure builder: no taint, no hidden, not live.
         let plain = ChangesSnapshot(key: "ENG-1", compare: .head, base: "b", target: "worktree", files: [], added: 0, removed: 0, patch: "", truncated: true,
                                     tainted: false, taintReason: nil, lastEdit: nil, patchHash: "h", computedAt: cw.w.now)
@@ -571,6 +585,124 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         committed.target = "abc"
         committed.truncated = false
         #expect(ChangesTabModel.chips(for: committed, diff: nil, live: true, gate: GlobalSearch.TextGate(knownValues: [])).map(\.text) == ["LIVE"])
+        m.stop()
+    }
+
+    // MARK: Fix round 2 (Rulings C6b-1, C6b-2)
+
+    /// Ruling C6b-1: the OPENED header of a tainted live diff never shows less than the static TAINTED warning — before the first
+    /// snapshot, while live (exactly one chip, the model's), and after the stream ends.
+    @Test func taintedChipNeverDrops() async throws {
+        let cw = try ChangesWorld()
+        try cw.w.store.recordTaintedCommits(companyId: cw.w.company.id, itemId: cw.w.item.id, agentId: cw.w.eng1.id, turnId: nil, headBefore: cw.r1,
+                                            headAfter: cw.r2, source: "docs.example.com", git: SafeGit(workspace: cw.w.workspace), now: cw.w.now)
+        let app = await cw.w.app()
+        let changes = try #require(app.changes)
+        // The static render carries the resolver's TAINTED chip; with no snapshot yet the pane keeps it as it is.
+        let body = try await RefBodies.body(for: try cw.w.resolve("\(cw.key):diff@worktree"), store: cw.w.store, companyId: cw.w.company.id,
+                                            context: try cw.w.renderContext())
+        #expect(body.content == .changes(key: cw.key, compare: .main))
+        #expect(body.header.chips.filter { $0.text.hasPrefix("TAINTED") }.count == 1 && body.header.chips.contains { $0.text == "UNCOMMITTED" })
+        #expect(changes.snapshot == nil && app.liveOpenedBody(body).header.chips == body.header.chips)
+        changes.show(key: cw.key, compare: .main)
+        #expect(changes.snapshot == nil && app.liveOpenedBody(body).header.chips == body.header.chips, "selected, no snapshot yet: the static chips")
+        func tainted() -> [String] {
+            guard case .ref(let b) = app.previewBody(forTab: PreviewTabID.ref) else { return [] }
+            return b.header.chips.filter { $0.text.hasPrefix("TAINTED") }.map(\.text)
+        }
+        await app.openRef(WorkRef(kind: .diff, id: cw.key, branch: "worktree:\(cw.key)"), origin: .owner)
+        try await eventually { app.openedBody != nil }
+        #expect(tainted().count == 1, "\(tainted())")
+        try await eventually { changes.snapshot != nil }
+        #expect(tainted() == ["TAINTED · from a session that read docs.example.com"], "exactly one, the model's, with the gated reason")
+        guard case .ref(let live) = app.previewBody(forTab: PreviewTabID.ref) else { Issue.record("no ref body"); return }
+        #expect(live.header.chips.filter { $0.text == "UNCOMMITTED" }.count == 1 && live.header.chips.contains { $0.text == "LIVE" })
+        // The stream ends: STALE, and still TAINTED — while retrying and once the model gave up.
+        try RefWorld.git(["worktree", "remove", "--force", cw.wt.path], in: cw.w.workspace)
+        try await eventually { !changes.isLive }
+        #expect(tainted().count == 1)
+        guard case .ref(let stale) = app.previewBody(forTab: PreviewTabID.ref) else { Issue.record("no ref body"); return }
+        #expect(stale.header.chips.contains { $0.text == "STALE" } && !stale.header.chips.contains { $0.text == "LIVE" })
+        try await eventually { !changes.isRunning }
+        #expect(tainted().count == 1 && changes.error == Store.refUnavailable)
+        // A model whose snapshot carries no taint never removes a static TAINTED chip either (the static warning is a floor).
+        var untainted = body
+        untainted.header.chips = [RefChip(text: "TAINTED · outside content", tone: .warn)]
+        #expect(app.liveOpenedBody(untainted).header.chips.contains { $0.text.hasPrefix("TAINTED") })
+        app.closeOpened()
+    }
+
+    /// Ruling C6b-2: the engine and the app split the patch the same way (by scalar, one trailing CR a line ending), the snapshot
+    /// names the sections the engine emitted, and the app refuses to render a parse that disagrees with them.
+    @Test func sectionsAreVerified() async throws {
+        #expect(ChangesTabModel.unverifiedText == "diff couldn't be verified")
+        // The engine splits on scalars: CRLF lines are lines of their own, their CR kept as content (the app's parser shows one
+        // trailing CR as the line ending).
+        let crlf = "diff --git a/w.txt b/w.txt\nindex 1..2 100644\n--- a/w.txt\n+++ b/w.txt\n@@ -1,2 +1,2 @@\n-a\r\n+b\r\r\n c\r\n"
+        let sections = ChangesPatch.parse(crlf)
+        #expect(sections.count == 1 && sections[0].hunks == ["@@ -1,2 +1,2 @@", "-a\r", "+b\r\r", " c\r"], "\(sections.map(\.hunks))")
+        #expect(ChangesPatch.lines("x\r\ny\r\r\n") == ["x\r", "y\r\r", ""])
+        #expect(DiffModel.parse(patch: crlf).files[0].hunks[0].lines.map(\.text) == ["a", "b\r", "c"])
+        // N-1: a CR-terminated line right before the next file's `diff --git` never swallows it — the engine and the app see the same
+        // three sections, in the same order, with the same paths.
+        let glued3 = "diff --git a/A.txt b/A.txt\nnew file mode 100644\nindex 0..1\n--- /dev/null\n+++ b/A.txt\n@@ -0,0 +1 @@\n+x\r\n"
+            + DiffPresentationTests.file("B.txt", ["+b"]) + DiffPresentationTests.file("C.txt", ["+c"])
+        let engineSections = ChangesPatch.parse(glued3), appSections = DiffModel.parse(patch: glued3)
+        #expect(engineSections.map(\.path) == ["A.txt", "B.txt", "C.txt"] && appSections.files.map(\.path) == ["A.txt", "B.txt", "C.txt"])
+        #expect(engineSections[0].hunks == ["@@ -0,0 +1 @@", "+x\r"] && engineSections[1].hunks.count == 2 && appSections.files[0].hunks[0].lines.count == 1)
+        // A real snapshot names its sections, in the patch's order; the parse agrees and every file finds its section.
+        let cw = try ChangesWorld()
+        try cw.write("A.txt", "x\r\n")   // sorts first: its CR-terminated last line precedes Sources/App.swift's `diff --git` (N-1)
+        try cw.write("win.txt", "a\r\nb\r\n")
+        try cw.write("src/caf\u{E9}.ts", "x\n")
+        let (m, _) = try cw.model()
+        m.start()
+        m.select(cw.key)
+        try await eventually { m.diff != nil }
+        let snapshot = try #require(m.snapshot), diff = try #require(m.diff)
+        #expect(snapshot.sectionPaths == ["A.txt", "Sources/App.swift", "src/a.ts", "src/caf\u{E9}.ts", "win.txt"], "\(snapshot.sectionPaths)")
+        #expect(snapshot.sectionPaths == diff.files.map(\.path))
+        #expect(snapshot.files.compactMap(\.patchIndex).sorted() == [0, 1, 2, 3, 4] && m.files.allSatisfy { $0.fileIndex != nil })
+        // Every file's section is its own: the engine's gated path is the gate of the parser's decoded one.
+        let gate = GlobalSearch.TextGate(knownValues: [])
+        for f in snapshot.files { #expect(gate.final(diff.files[try #require(f.patchIndex)].path, max: 512) == f.path, "\(f.path)") }
+        let appSwift = try #require(snapshot.files.first { $0.path == "Sources/App.swift" }?.patchIndex)
+        #expect(diff.files[appSwift].hunks[0].lines.contains { $0.kind == .del && $0.text == "let b = 2" }, "App.swift's hunks are App.swift's")
+        #expect(ChangesTabModel.verify(diff, against: snapshot) == nil && m.error == nil)
+        // A parse that disagrees with the engine's sections (count or path) is refused with the plain message.
+        var forged = snapshot
+        forged.sectionPaths = Array(snapshot.sectionPaths.dropLast())
+        #expect(ChangesTabModel.verify(diff, against: forged) == ChangesTabModel.unverifiedText)
+        forged.sectionPaths = snapshot.sectionPaths.map { $0 + "x" }
+        #expect(ChangesTabModel.verify(diff, against: forged) == ChangesTabModel.unverifiedText)
+        forged.sectionPaths = [snapshot.sectionPaths[1], snapshot.sectionPaths[0]] + snapshot.sectionPaths.dropFirst(2)
+        #expect(ChangesTabModel.verify(diff, against: forged) == ChangesTabModel.unverifiedText)
+        // A withheld patch has no sections on either side.
+        var withheld = snapshot
+        withheld.patch = "[patch withheld]\n"
+        withheld.sectionPaths = []
+        #expect(ChangesTabModel.verify(DiffModel.parse(patch: withheld.patch), against: withheld) == nil)
+        // Hand-made patches with a combining-character path and a ZWSP path: each section lands on its own file, through the
+        // engine's section identity, or the diff is refused.
+        let combining = "src/cafe\u{301}.ts", zwsp = "src/zw\u{200B}sp.ts"
+        let patch = DiffPresentationTests.file(combining, ["+one"]) + DiffPresentationTests.file(zwsp, ["+two"])
+        let parsed = DiffModel.parse(patch: patch)
+        #expect(parsed.files.map(\.path) == [combining, zwsp] && ChangesPatch.parse(patch).map(\.path) == [combining, zwsp])
+        let ok = ChangesSnapshot(key: "ENG-1", compare: .main, base: "b", target: "worktree",
+                                 files: [ChangedFile(path: "src/caf\u{E9}.ts", status: "A", added: 1, removed: 0, patchIndex: 0),
+                                         ChangedFile(path: "src/zwsp.ts", status: "A", added: 1, removed: 0, patchIndex: 1)],
+                                 added: 2, removed: 0, patch: patch, truncated: false, tainted: false, taintReason: nil, lastEdit: nil, patchHash: "h",
+                                 computedAt: cw.w.now, sectionPaths: [combining, zwsp])
+        #expect(ChangesTabModel.verify(parsed, against: ok) == nil)
+        let rows = ChangesFiles.rows(ok, diff: parsed)
+        #expect(rows.map(\.fileIndex) == [0, 1] && parsed.files[1].hunks[0].lines.first?.text == "two")
+        var bad = ok
+        bad.sectionPaths = [zwsp, combining]
+        #expect(ChangesTabModel.verify(parsed, against: bad) == ChangesTabModel.unverifiedText)
+        // A CRLF patch glued the old way (one Character "\r\n") still parses to the same sections on both sides.
+        let glued = DiffPresentationTests.file("w.txt", ["-a\r", "+b\r"]) + DiffPresentationTests.file("z.txt", ["+z"])
+        #expect(DiffModel.parse(patch: glued).files.map(\.path) == ChangesPatch.parse(glued).map(\.path))
+        #expect(DiffModel.parse(patch: glued).files[0].hunks[0].lines.map(\.text) == ["a", "b"])
         m.stop()
     }
 }

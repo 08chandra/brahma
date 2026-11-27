@@ -96,6 +96,13 @@ import Foundation
         let q = DiffModel.parse(patch: quoted)
         #expect(q.files.count == 1 && q.files[0].path == "src/caf\u{E9} \"q\".ts" && q.files[0].oldPath == nil && q.files[0].hunks.count == 1)
         #expect(ChangesPatch.pathFromGitLine("diff --git a/x y b/x y") == "x y")
+        // N-4: a C-escaped bidi or control character decodes into the path and flags the model (never shown raw: the engine's path is).
+        let bidi = "diff --git \"a/src/\\342\\200\\256evil.ts\" \"b/src/\\342\\200\\256evil.ts\"\nindex 1..2 100644\n--- \"a/src/\\342\\200\\256evil.ts\"\n+++ \"b/src/\\342\\200\\256evil.ts\"\n@@ -1 +1 @@\n-a\n+b\n"
+        let b = DiffModel.parse(patch: bidi)
+        #expect(b.files[0].path == "src/\u{202E}evil.ts" && b.hasHidden)
+        let esc = "diff --git \"a/x\\033y\" \"b/x\\033y\"\nrename from \"x\\033y\"\nrename to \"x\\033y\"\n"
+        #expect(DiffModel.parse(patch: esc).hasHidden)
+        #expect(!DiffModel.parse(patch: quoted).hasHidden)
         #expect(ChangesPatch.prefixedPath("b/a b.txt\t", "b/") == "a b.txt")
         // A rename still names both paths.
         let renamed = DiffModelTests.patch(adds: [1], dels: [0], rename: true)

@@ -193,12 +193,17 @@ extension AppModel {
     }
 
     /// I-4: the OPENED tab's body for a live item diff, its header carrying the changes model's chips (UNCOMMITTED, LIVE/STALE,
-    /// TAINTED with the gated reason, TRUNCATED, HIDDEN CHARACTERS), rebuilt on every yield; the static render keeps only the
-    /// chips the model does not own (LEASED BY, AS SHARED).
+    /// TAINTED with the gated reason, TRUNCATED, HIDDEN CHARACTERS), rebuilt on every yield. Ruling C6b-1: the static render's
+    /// chips stand until the model has a snapshot of this key and compare; only then are its UNCOMMITTED and TAINTED chips replaced
+    /// by the model's — and a static TAINTED chip is never dropped unless the model shows one (the warning is a floor).
     func liveOpenedBody(_ body: RefBody) -> RefBody {
-        guard case .changes(let key, let compare) = body.content, let changes, changes.selectedKey == key, changes.compare == compare else { return body }
+        guard case .changes(let key, let compare) = body.content, let changes, changes.selectedKey == key, changes.compare == compare,
+              changes.snapshot != nil else { return body }
         var live = body
-        live.header.chips = body.header.chips + changes.chips
+        let staticTainted = body.header.chips.first { $0.text.hasPrefix("TAINTED") }
+        var chips = body.header.chips.filter { $0.text != "UNCOMMITTED" && !$0.text.hasPrefix("TAINTED") } + changes.chips
+        if let staticTainted, !chips.contains(where: { $0.text.hasPrefix("TAINTED") }) { chips.append(staticTainted) }
+        live.header.chips = chips
         return live
     }
 

@@ -142,11 +142,10 @@ public enum RefBodies {
                 // and cards keep a one-shot render.
                 if via == Store.tabReadVia, !ref.id.isEmpty, let compare = CompareMode(ref: ref), compare.isLive {
                     try read()
-                    // I-4 / M-3: UNCOMMITTED, LIVE, TAINTED and HIDDEN CHARACTERS are the model's, per yield (`AppModel.liveOpenedBody`);
-                    // the static header keeps the rest (LEASED BY, AS SHARED).
-                    var h = header()
-                    h.chips.removeAll { $0.text == "UNCOMMITTED" || $0.text.hasPrefix("TAINTED") }
-                    return RefBody(header: h, content: .changes(key: ref.id, compare: compare))
+                    // I-4 / M-3 / Ruling C6b-1: the static header keeps the resolver's UNCOMMITTED and TAINTED chips (never less than
+                    // that warning); once the model has a snapshot, `AppModel.liveOpenedBody` replaces them with the model's per yield
+                    // (LIVE/STALE, TAINTED with the gated reason, TRUNCATED, HIDDEN CHARACTERS).
+                    return RefBody(header: header(), content: .changes(key: ref.id, compare: compare))
                 }
                 let r = try render()
                 let live = ref.isWorktree && ref.params["snapshot"] == nil

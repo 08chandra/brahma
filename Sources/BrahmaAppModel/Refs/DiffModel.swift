@@ -23,8 +23,11 @@ public struct DiffHunk: Equatable, Sendable {
 }
 
 public struct DiffFile: Equatable, Sendable {
+    /// The path as the patch spells it, C-quoting decoded (N-4: it may hold bidi or control characters, flagged in `hasHidden`). It
+    /// is the file's identity against the engine's sections (`ChangesSnapshot.sectionPaths`) and is NEVER rendered raw: a view
+    /// shows the engine's gated display path (`ChangedFile.path`, `ChangedFileRow.path`).
     public var path: String
-    /// Set for a rename.
+    /// Set for a rename (decoded like `path`; never rendered raw).
     public var oldPath: String?
     public var added: Int
     public var removed: Int
@@ -83,27 +86,37 @@ public struct DiffModel: Equatable, Sendable {
         for line in CodeHighlighter.splitLines(patch) {
             if line.hasPrefix("diff --git ") {
                 closeFile()
-                // C6b I-1: the path exactly as the engine's `ChangesPatch` reads it (C-quoting decoded, a space never a rename).
-                file = DiffFile(path: ChangesPatch.pathFromGitLine(line))
+                // C6b I-1: the path exactly as the engine's `ChangesPatch` reads it (C-quoting decoded, a space never a rename). N-4: the
+                // DECODED path is what is checked for hidden characters (an escape may spell a bidi or control character).
+                let path = ChangesPatch.pathFromGitLine(line)
+                file = DiffFile(path: path)
                 noteHidden(line)
+                noteHidden(path)
                 continue
             }
             guard file != nil else { continue }
             if line.hasPrefix("rename from ") {
-                file?.oldPath = Self.gitName(String(line.dropFirst("rename from ".count)))
+                let old = Self.gitName(String(line.dropFirst("rename from ".count)))
+                file?.oldPath = old
                 noteHidden(line)
+                noteHidden(old)
                 continue
             }
             if line.hasPrefix("rename to ") {
-                file?.path = Self.gitName(String(line.dropFirst("rename to ".count)))
+                let new = Self.gitName(String(line.dropFirst("rename to ".count)))
+                file?.path = new
                 noteHidden(line)
+                noteHidden(new)
                 continue
             }
             if line.hasPrefix("--- ") || line.hasPrefix("+++ ") {
                 if hunk == nil {
                     // `+++ b/<path>` names the new path (a `/dev/null` keeps the header's); git's trailing tab after a path with a
                     // space and its C-quoting are the engine's to read (`prefixedPath`).
-                    if line.hasPrefix("+++ "), let p = ChangesPatch.prefixedPath(String(line.dropFirst(4)), "b/") { file?.path = p }
+                    if line.hasPrefix("+++ "), let p = ChangesPatch.prefixedPath(String(line.dropFirst(4)), "b/") {
+                        file?.path = p
+                        noteHidden(p)
+                    }
                     noteHidden(line)
                     continue
                 }
