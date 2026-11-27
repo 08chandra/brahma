@@ -948,6 +948,143 @@ CLI refuses `BRAHMA_SECRET_STORE=memory`; that store is only for in-process test
 stores and seeds Initech's handbook, memory, resources and replay. Its developer hooks (`brahma dev …`, with
 `BRAHMA_DEV=1`) act as an agent, or as you dropping a file in a DM.
 
+## Sharing and the preview
+
+Plan C lets you and the agents point at the work itself instead of pasting it: a file and its line range, a diff, an
+item, an ask, a resource, a message. Everything below is built from **refs**. A ref is pinned when it is shared and is
+opened only through Brahma's tools, never pasted into a prompt.
+
+### Refs
+
+| Form | What it names |
+|---|---|
+| `INITE-12`, `item:INITE-12` | a work item |
+| `INITE-12:diff[/<path>][@worktree\|@<rev>]`, `INITE-12:changes` | an item's diff (`:changes` is its live, uncommitted diff vs main) |
+| `INITE-12:<path>[:<a-b>][@worktree\|@<rev>]`, `<path>[:<a-b>][@<rev>]` | a file, on the item's branch or `main`, with a line range |
+| `diff:<sha>..<sha>`, `wt:@handle` | two revisions; an agent's current leased worktree |
+| `commit:<rev>` | a commit |
+| `A-<n>` (`ask:<n>`), `AR-<n>`, `F-<n>` | an ask, an artifact, a resource |
+| `kb:<page>[#<section>]`, `mem:<n>` | a Handbook page or section, a memory entry |
+| `INITE-12:run`, `run:<id>`, `rel:<n>`, `sprint:<n>` | a check run, a release, a sprint |
+| `preview:<surface>[/<path>][@<viewport>]` | a preview surface, e.g. `preview:web@iphone` |
+| `msg:<id>`, `thread:<id>`, `@handle`, `#channel` | a message (sharing one is a quote), a thread, an agent, a channel |
+
+A leading `:` (`:diff`, `:<path>`) means the current item. A shared file or diff is pinned to the commit it was shared at
+(`index.html:1-20 @503148f`). A worktree file or diff is pinned to a snapshot, so the share opens the same bytes after the
+branch is merged or the worktree is gone, with "view latest" when newer content exists. Ranges are 1-based and at most 2000
+lines. Words that only look like refs ("UTF-8", "GPT-4") stay plain text: only a token that resolves for its reader
+becomes a chip.
+
+### The Show bar and ⌘K
+
+The search-and-ask bar sits above the PREVIEW tab strip; ⌘K opens the same bar as an overlay anywhere in the app. Typing
+searches, with plain code and no model, what you can read: items, asks, files on `main` and on leased item branches,
+commits, artifacts and resources, Handbook pages, memory, messages, people, releases, sprints, previews and activity. Hits
+are grouped (TOP HIT, ANSWER, ITEMS, FILES, …), at most 5 per group.
+
+- **Filters:** `kind:<k>` (`item`, `msg`, `file`, `commit`, `kb`, `mem`, `rel`, …), a status word or `is:<status>`
+  (`blocked`, `failing`, `pending`, `open`, `done`, `in review`), a window (`today`, `this week`, `last 7 days`,
+  `since 2026-11-01`, `this sprint`), an actor (`by @eng-1`, `@eng-1's`) and `in:#channel`. Each filter shows as a chip
+  you can remove.
+- **Keys:** Enter opens the selected row in the OPENED tab; ⌥Enter opens the top candidates as steps; ⌘Enter or the ASK
+  row asks; Tab cycles who is asked; Esc closes. A direct ref (`INITE-1`, `src/index.html`, `AR-1`, `A-1`, `@devops-1`,
+  `run:1`) opens without any turn.
+- **Fact answers, zero turns:** "what's blocked", "what shipped this week", "how's the sprint going", "who is on
+  checkout", "failing checks", "pending asks" and "usage this week" get an ANSWER card computed from the database (at most
+  12 lines). No agent runs and no request is filed. Usage and pending asks are answered only to you.
+- **Ask:** when nothing answers, the last row asks. It goes to Brahma by default (the concierge: haiku, at most 4 turns
+  and 60 s, one run at a time, stopped at 1 % of the five-hour window) and shows its estimated cost, e.g.
+  `Ask Brahma · quick · ~0.1% of 5H`. Tab routes it to an agent instead (`~1% of 5H`, plus "busy: answers after its current
+  turn" when it is working). A waiting chip shows until the answer arrives; the answer opens in the OPENED tab with its
+  steps. Budget shows one `OWNER REQUESTS · …% 5H · …% 7D` line.
+- **Cited answers:** Brahma's answers, and every `show` an agent sends you, end each claim with the sources it relies on
+  (`[1]`). Plain code checks the note: an answer where any claim of three or more words has no valid source is shown
+  **UNVERIFIED**. A source is a ref already resolved for you, so a citation can't point at something you can't open.
+
+### The CHANGES tab
+
+CHANGES is a live board of every leased item worktree: KEY, TITLE, AGENT, FILES, +/−, EDITED and CHECK, newest edit
+first. It refreshes every 2 s while you watch it (10 s while the holder isn't running), and a file-system event nudges it
+sooner. Opening a row shows its diff:
+
+- **Compare:** VS MAIN, VS LAST COMMIT, VS LAST CHECK, or REVISIONS… (`r1..worktree`, any two rounds). The header reads
+  `LIVE · UNCOMMITTED` and "updated n s ago" on a live worktree diff.
+- **Views:** UNIFIED or SPLIT (⌘⇧D, remembered per company), ‹ › or ⌘↓/⌘↑ between changes, a file list with per-file
+  stats. Diff text is never clickable, and invisible or bidi characters show as markers.
+- **Inline review:** hover a line or hunk and click "+" to comment, or "Ask to revert this hunk". The comment goes to the
+  holder as an item comment and a DM with the quoted hunk (`Sent to @<holder> as an item comment. Brahma never edits their
+  files.`). The review never touches the agent's worktree. The hunk quote goes only to the live reader set (below); the
+  item event every item reader sees carries only your words and the compare mode.
+
+Context folds can't appear yet, because the engine's patches carry git's default 3 lines of context (final wave).
+
+### Sharing, quotes, threads and file asks
+
+- **Shares:** agents call `share` (1–6 refs, a note of at most 600 characters) to `@handle`, `@owner` or `#channel`, and
+  may attach refs to `post_message`/`send_dm`. You share from a ref's header or context menu (Share to…). A DM share is
+  refused when the recipient couldn't read a ref ("ask the owner to widen it"). Each reader sees a card resolved for
+  them: a ref they can't read is a locked kind chip, never its content. Agents read shared content only with `open_ref`
+  (at most 400 lines or 40 KB at a time; `copy: true` copies it into their own lab), and every read is recorded.
+- **Quotes:** sharing `msg:<id>` quotes a message. Readers who can read the source see its text as stored now; others see
+  `[locked message · ask the owner]`. A message in your DM with an agent is quoted only in that DM.
+- **Threads:** `reply_to: "msg:<id>"` replies in a message's thread; `read_channel {thread}` reads at most 30 replies. A
+  thread of agents alone caps at 8 replies within an active hour; your reply lifts the cap.
+- **File asks:** ask an agent for a file from the app; it lands in its DM and it answers with a share in that thread. An
+  agent asks you with `request_from_owner {wants_file: true}`, which reaches your Inbox; answer with a drop, or decline.
+  Drops into a DM, channel, thread, item or request go through the Resources drop pipeline above.
+
+### What protects shared content
+
+- **The secret gate on every read.** Everything an agent reads through Brahma (`open_ref`, a share, search snippets,
+  fact answers, the concierge's reads) and everything rendered for you, exported or copied passes the secret gate with
+  the company's stored secret values. A stored value refuses the read or share, naming the line, never the value; a
+  secret pattern is redacted in what is shown and copied; an archive, Office file or PDF is scanned by a sandboxed helper
+  the engine runs, never inside a turn, and one that can't be scanned is refused. If the stored values can't be read,
+  nothing is shown (fail closed).
+- **Reader sets.** Shares, quotes and cards resolve for each reader with the access rules of the thing they point at
+  (scopes, restricted Handbook sections, private labs, DMs). A live diff or live worktree file is readable only by you,
+  the concierge, the item's lease holder (else its assignee) and its reviewer; every other agent is refused. Pinned
+  snapshots keep the company's access class.
+- **The vault.** Scoped, tainted, private and redacted bytes live only in the vault under the data home
+  (`<data home>/vault/<company id>/`) and in copies in the reader's own lab. Sandboxed turns can't read the data home.
+- **Taint chips.** A share carries the taint of the session that made it. A reader that opens tainted content is marked
+  tainted before any byte is shown; it reads the content as an untrusted block, and its high-risk tools (decisions among
+  them) are refused until a fresh session. Tainted refs show a TAINTED chip with the reason, and a tainted artifact,
+  resource or page shows as `(untrusted)` instead of its agent-written title. Only you clear taint: **Vouch** (I vouch) on
+  a ref, resource or Handbook page.
+- **PDFs.** A PDF whose structure can't be verified is refused, with a `brahma vouch file <co> --id <file id> --sha256
+  <full hash>` command and an Inbox action. Vouch only for a file you trust. A vouched PDF is shared, shown and exported
+  only as a flattened copy, never the original.
+- **Owner-only actions.** Rendering a ref for you, your shares and thread replies, review comments and revert requests,
+  View original, vouching an item and purging a shared ref take the owner principal. Only the app and the owner CLI can
+  mint one; `brahma mcp` and every agent turn run as agent processes and can't. No agent tool reaches Save As or purge.
+  The older owner decisions (asks, resource and file vouches, resource purge, access approvals, secrets, file requests)
+  refuse in an agent process through an interim guard; passing the principal through them is final-wave work.
+- **Save As.** Exports go only to a folder you choose outside the data home, the vault, the workspaces and every `.brahma`
+  folder. The bytes pass the gate again (a vouched PDF as its flattened copy), the file is marked downloaded
+  (`com.apple.quarantine`, so Gatekeeper asks before opening anything), and the export is recorded.
+- **Purge.** Purge… on a ref (`brahma resource <co> purge F-<n>` for a resource) removes the content from the vault,
+  its share refs and pinned git objects (never while a turn of the company runs), and turns every card that carried it
+  into a PURGED tombstone. You get a notice for each backup, transcript or exported copy that may still hold it, and for
+  content that is still in the company's git history. A purge that couldn't remove everything says so and can be run
+  again.
+
+**Profile caveat (Workspace and Full profiles):** "Resource scopes and lab privacy are enforced only by Brahma's tools;
+an agent's shell can read them." Reader sets, private labs and live diffs are Brahma's rules for its own tools; on these
+profiles an agent's Bash can still read the workspace, other items' worktrees and the vault. On the Sandboxed profile
+the data home, and so the vault, is denied to agents. Denying agents reads of other items' worktrees and progress files on
+the Sandboxed profile is final-wave work.
+
+**Not built yet (final wave):** the SHARED / MENTIONED / READ BY footer on a ref, the Handbook revision picker in the
+preview, diff folds, the concierge citing PDFs, short-secret protection, and Word-style hybrid PDFs (still refused).
+
+**The seed.** `scripts/seed-demo.sh` gives Initech one of each: @devops-1's share of `index.html:1-20` in #general,
+@mgr-1's share of `INITE-5:diff` with a three-message thread under it, your file ask to @devops-1, a company resource
+(`launch-checklist.md`), and an uncommitted edit in INITE-5's leased worktree, which is a live row in CHANGES.
+
+**Live end-to-end tests** (your Claude plan, haiku, Balanced mode, tier `max5x`, aborted at $5):
+`BRAHMA_LIVE=1 swift test --filter "LiveShowBarTests|LiveCollabTests|VaultTests/vaultNotReadableFromSandbox"`.
+
 ## Backups
 
 Backups live under `<data home>/backups/` and are made by the engine (the app, or `brahma run`) while it runs:

@@ -176,8 +176,9 @@ BRAHMA_DEV=1 "$B" dev tool Initech share --by devops-1 \
 # 2. A diff share: @mgr-1 shares INITE-5's committed diff (the item the merge queue bounced, still leased by @mgr-1).
 BRAHMA_DEV=1 "$B" dev tool Initech share --by mgr-1 \
   --args '{"refs":["INITE-5:diff"],"to":"#general","note":"INITE-5 bounced on streak.txt; here is its diff"}' >/dev/null
-# 3. A three-message thread: the diff share is its root (its msg:<id> read back the way an agent reads it), two replies.
-ROOT="$(BRAHMA_DEV=1 "$B" dev tool Initech read_channel --by mgr-1 --args '{"channel":"general"}' 2>/dev/null \
+# 3. A three-message thread: the diff share is its root, two replies. Its msg:<id> is read back the way an agent reads it,
+#    the newest message only (`limit: 1`): reading @eng-1's tainted post above would taint @mgr-1's session.
+ROOT="$(BRAHMA_DEV=1 "$B" dev tool Initech read_channel --by mgr-1 --args '{"channel":"general","limit":1}' 2>/dev/null \
   | python3 -c 'import json,sys; print([m["id"] for m in json.load(sys.stdin) if m["sender"] == "@mgr-1"][-1])')"
 BRAHMA_DEV=1 "$B" dev tool Initech post_message --by devops-1 \
   --args "{\"channel\":\"general\",\"reply_to\":\"$ROOT\",\"text\":\"streak.txt conflicts with the counter from INITE-2; rebase on main first?\"}" >/dev/null
