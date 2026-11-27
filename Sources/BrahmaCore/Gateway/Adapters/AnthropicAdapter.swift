@@ -88,6 +88,9 @@ public struct AnthropicAdapter: ProviderAdapter {
     /// Ruling 55: Anthropic bills no errored request.
     public func billsNothing(status: Int) -> Bool { status >= 400 }
 
+    /// The provider counts: `count_tokens` goes upstream.
+    public func countTokensLocally(_ body: StrictJSON) -> Int? { nil }
+
     // MARK: Responses
 
     public func translate(status: Int, headers: [String: String], body: AsyncThrowingStream<Data, Error>, streamed: Bool,

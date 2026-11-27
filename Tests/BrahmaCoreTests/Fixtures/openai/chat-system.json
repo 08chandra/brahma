@@ -1,0 +1,1 @@
+{"model":"gpt-5.5","messages":[{"role":"system","content":"You are Claude Code.\nBe brief."},{"role":"user","content":"Read hello.txt"},{"role":"system","content":"Mode: work."},{"role":"assistant","content":"Done."},{"role":"user","content":"go"}],"max_tokens":32000}

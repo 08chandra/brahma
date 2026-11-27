@@ -91,6 +91,20 @@ import GRDB
         #expect(GatewayMeter.estimatedInputTokens(Data("abc中".utf8)) == 3)
         #expect(GatewayMeter.estimatedInputTokens(Data([0x61, 0xFF, 0xFE])) == 5, "bytes that are not UTF-8 count as U+FFFD")
         #expect(GatewayMeter.estimatedInputTokens(Data()) == 0)
+        // Ruling 57 fix-in: counted from the bytes without a copy, the same count a decoded string gives — for valid text,
+        // overlong, truncated, surrogate and stray continuation bytes, and a slice whose indices do not start at zero.
+        func reference(_ d: Data) -> Int {
+            let scalars = String(decoding: d, as: UTF8.self).unicodeScalars
+            let ascii = scalars.filter(\.isASCII).count
+            return (ascii + 2) / 3 + 2 * (scalars.count - ascii)
+        }
+        let samples: [[UInt8]] = [Array("héllo 中文 😀 ok".utf8), [0xC0, 0xAF, 0x61], [0xE0, 0x80, 0x80], [0xE2, 0x82], [0xED, 0xA0, 0x80],
+                                  [0x80, 0x80, 0x41, 0xBF], [0xF4, 0x90, 0x80, 0x80], [0xF0, 0x9F, 0x98], Array("ab".utf8) + [0xF8, 0x61]]
+        for sample in samples {
+            #expect(GatewayMeter.estimatedInputTokens(Data(sample)) == reference(Data(sample)), "\(sample)")
+        }
+        let slice = Data("xxxx中文".utf8).dropFirst(2)
+        #expect(slice.startIndex == 2 && GatewayMeter.estimatedInputTokens(slice) == reference(slice))
         // Never negative; output bounded by the most any usage is metered for.
         #expect(GatewayMeter.estimate(Self.opus, maxTokens: -5, inputTokens: -7) == 0)
         #expect(GatewayMeter.estimate(Self.opus, maxTokens: .max, body: Data()) == Double(GatewayUsage.maxTokens) * 20 / 1e6)

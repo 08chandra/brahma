@@ -1,0 +1,1 @@
+{"id":"chatcmpl-l1","object":"chat.completion","model":"gpt-5.5","choices":[{"index":0,"message":{"role":"assistant","content":"Once upon a"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}

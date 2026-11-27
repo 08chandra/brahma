@@ -448,6 +448,7 @@ import GRDB
             try await base.translate(status: status, headers: headers, body: body, streamed: streamed, into: reply, redact: redact)
         }
         func billsNothing(status: Int) -> Bool { status < 500 }
+        func countTokensLocally(_ body: StrictJSON) -> Int? { nil }
     }
 
     /// Ruling 52(f): at most `GatewayLimits.maxUpstreamRequests` requests upstream at once; past it a 429 rate_limit_error

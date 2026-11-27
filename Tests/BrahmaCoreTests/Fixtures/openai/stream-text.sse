@@ -1,0 +1,14 @@
+data: {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":1764000000,"model":"gpt-5.5","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":1764000000,"model":"gpt-5.5","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}],"usage":null}
+
+: OPENROUTER PROCESSING
+
+data: {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":1764000000,"model":"gpt-5.5","choices":[{"index":0,"delta":{"content":"lo."},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":1764000000,"model":"gpt-5.5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}
+
+data: {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":1764000000,"model":"gpt-5.5","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":3,"total_tokens":53,"prompt_tokens_details":{"cached_tokens":20}}}
+
+data: [DONE]
+

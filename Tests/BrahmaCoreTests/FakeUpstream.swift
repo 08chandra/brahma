@@ -159,17 +159,18 @@ final class ModelGatewayRig: @unchecked Sendable {
     private let recorder = Recorder()
 
     init(_ script: [FakeUpstream.Reply], providers: [Provider] = [AnthropicFixture.provider()], storeKey: Bool = true,
-         caps: ProviderCaps? = ProviderCaps(monthlyUSD: 1000), maxUpstream: Int = GatewayLimits.maxUpstreamRequests,
-         adapters: [any ProviderAdapter] = [AnthropicAdapter()]) throws {
+         caps: ProviderCaps? = ProviderCaps(monthlyUSD: 1000), capped: [String] = ["anthropic"],
+         maxUpstream: Int = GatewayLimits.maxUpstreamRequests, adapters: [any ProviderAdapter] = [AnthropicAdapter()],
+         prices: [PriceRow] = []) throws {
         upstream = FakeUpstream(script)
         store = try Store.inMemory()
         companyId = try store.createCompany(name: "Co", goal: "g", workspacesRoot: tempDir()).id
-        if let caps { try store.setProviderCaps(caps, companyId: companyId, provider: "anthropic") }
+        if let caps { for provider in capped { try store.setProviderCaps(caps, companyId: companyId, provider: provider) } }
         if storeKey { try vault.set(companyId: companyId, name: Provider.anthropicKeyName, value: AnthropicFixture.key) }
         let byId = Dictionary(uniqueKeysWithValues: providers.map { ($0.id, $0) })
         let recorder = self.recorder
         let log: @Sendable (String) -> Void = { line in recorder.lock.withLock { recorder.lines.append(line) } }
-        meter = GatewayMeter(store: store, prices: { PriceBook(owner: []) }, clock: { Date() }, log: log)
+        meter = GatewayMeter(store: store, prices: { PriceBook(owner: prices) }, clock: { Date() }, log: log)
         gateway = ModelGateway(registry: registry, providers: { id in
             let hook: (@Sendable () -> Void)? = recorder.lock.withLock { recorder.lookups += 1; return recorder.onLookup }
             hook?()

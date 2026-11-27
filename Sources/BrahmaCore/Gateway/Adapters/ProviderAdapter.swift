@@ -107,4 +107,10 @@ public protocol ProviderAdapter: Sendable {
     /// spend on every `claude` retry). `openai-compatible` (Task 10): 4xx bills nothing, 5xx charges the estimate
     /// (aggregators may bill partial work).
     func billsNothing(status: Int) -> Bool
+
+    /// The `count_tokens` answer when the gateway gives it itself, or nil when the request goes to the provider. A local
+    /// answer sends nothing upstream and costs nothing: the gateway neither reads the key nor reserves anything for it.
+    /// `anthropic`: nil (the provider counts). `openai-compatible` (Task 10): `ceil(canonicalBytes / 4)`, Chat Completions
+    /// having no count endpoint.
+    func countTokensLocally(_ body: StrictJSON) -> Int?
 }

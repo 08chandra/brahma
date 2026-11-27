@@ -76,11 +76,20 @@ public final class GatewayMeter: Sendable {
 
     /// The input tokens a body is reserved for (Ruling 54): `ceil(asciiBytes / 3)` plus two per Unicode scalar at or above
     /// U+0080 — a per-byte count would reserve one token per 3-byte CJK character, which can undercount (undercount fails
-    /// open). Bytes that are not UTF-8 count as U+FFFD (two tokens each).
+    /// open). Bytes that are not UTF-8 count as U+FFFD (two tokens each), exactly as `String(decoding:as:)` would read them.
+    /// Counted straight from the bytes, with no copy of the body (Ruling 57's Task 9 fix-in).
     public static func estimatedInputTokens(_ body: Data) -> Int {
         var ascii = 0, other = 0
-        for scalar in String(decoding: body, as: UTF8.self).unicodeScalars {
-            if scalar.isASCII { ascii += 1 } else { other += 1 }
+        body.withUnsafeBytes { raw in
+            var bytes = raw.makeIterator()
+            var decoder = UTF8()
+            while true {
+                switch decoder.decode(&bytes) {
+                case .scalarValue(let scalar): if scalar.isASCII { ascii += 1 } else { other += 1 }
+                case .error: other += 1
+                case .emptyInput: return
+                }
+            }
         }
         return ascii / 3 + (ascii % 3 == 0 ? 0 : 1) + 2 * other
     }

@@ -1,0 +1,1 @@
+{"id":"chatcmpl-abc123","type":"message","role":"assistant","model":"gpt-5.5-2026-08-01","content":[{"type":"text","text":"Hello there."}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":0}}

@@ -1,0 +1,1 @@
+{"model":"brahma-standard","max_tokens":1024,"messages":[{"role":"user","content":"Say hi"}],"temperature":0.70,"top_p":0.9,"stop_sequences":["\n\nHuman:"],"stream":true}

@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl-s4","object":"chat.completion.chunk","created":1764000000,"model":"gpt-5.5","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-s4","object":"chat.completion.chunk","created":1764000000,"model":"gpt-5.5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

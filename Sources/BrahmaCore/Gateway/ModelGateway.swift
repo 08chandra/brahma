@@ -14,7 +14,9 @@ import Foundation
 /// Metering (Task 9): a request that never left the gateway is released (Ruling 23); one handed to the transport is charged
 /// its final usage, or at least its estimate when there is none — usage missing (Ruling 52(a)) or a response that ended
 /// early (Ruling X1-37) — except an error answer its adapter says the provider does not bill (`billsNothing(status:)`,
-/// Ruling 55: settled at zero), and `count_tokens`, which costs nothing. At most `GatewayLimits.maxUpstreamRequests`
+/// Ruling 55: settled at zero), and `count_tokens`, which costs nothing. An adapter that answers `count_tokens` itself
+/// (`countTokensLocally`: `openai-compatible`) is answered before the key is read and before the meter: nothing is sent, so
+/// nothing is reserved or charged (Task 10). At most `GatewayLimits.maxUpstreamRequests`
 /// requests are upstream at once; past it a request gets a 429 (Ruling 52(f): transient, so `claude` backs off and retries).
 public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     public let registry: TurnTokenRegistry
@@ -33,7 +35,8 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     /// `providers` looks a provider up by id (the store's `provider(id:)`); `log` gets one line per refused, failed or served
     /// request (never a key); `meter` reserves and settles every request sent upstream.
     public convenience init(registry: TurnTokenRegistry, providers: @escaping @Sendable (String) throws -> Provider?,
-                            adapters: [any ProviderAdapter] = [AnthropicAdapter()], upstream: any UpstreamTransport, vault: any SecretVault,
+                            adapters: [any ProviderAdapter] = [AnthropicAdapter(), OpenAICompatibleAdapter()], upstream: any UpstreamTransport,
+                            vault: any SecretVault,
                             meter: GatewayMeter, log: @escaping @Sendable (String) -> Void = { _ in }) {
         self.init(registry: registry, providers: providers, adapters: adapters, upstream: upstream, vault: vault, meter: meter,
                   maxUpstream: GatewayLimits.maxUpstreamRequests, log: log)
@@ -46,6 +49,9 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         self.maxUpstream = maxUpstream; self.log = log
         self.adapters = Dictionary(adapters.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     }
+
+    /// The adapters this gateway serves providers with.
+    var adapterIds: Set<AdapterId> { Set(adapters.keys) }
 
     /// Starts serving on `127.0.0.1:<ephemeral>` and returns the port (the same port while running). A stopped gateway does
     /// not start again. Before the first start serves anything, reservations a dead gateway left open are charged at their
@@ -117,6 +123,13 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         }
         guard let secret = provider.keySecret, Provider.isKeyName(secret) else {
             throw .unavailable("provider \(provider.id) has no key secret")
+        }
+        if r.endpoint == .countTokens, let count = adapter.countTokensLocally(tree) {
+            // Answered here: nothing goes upstream, so no key is read and nothing is reserved or charged (it costs nothing).
+            guard isLive(reply) else { return }
+            await reply.send(status: 200, json: Data(#"{"input_tokens":\#(count)}"#.utf8))
+            log("gateway: turn \(grant.turnId) \(provider.id)/\(target.model) count_tokens answered locally (\(count))")
+            return
         }
         if r.endpoint == .messages, canonical.maxTokens == nil { throw .policy("max_tokens is required") }
         guard isLive(reply) else { return }
