@@ -14,6 +14,9 @@ import GRDB
                                           "declineFileRequest", "answerFileRequest"]
 
     @Test func mintRefusesInAgentModeWhateverTheArguments() throws {
+        // The simulation exists only in debug builds (round 5, R4-1): a release test build (`swift test -c release -Xswiftc
+        // -enable-testing`, the perf command) compiles this test without it and still runs the owner-mode half.
+        #if DEBUG
         try OwnerPrincipal.simulatingAgentProcess {
             #expect(OwnerPrincipal.processRole == .agent)
             #expect(throws: OwnerPrincipalError.self) { try OwnerPrincipal.mint() }
@@ -22,6 +25,7 @@ import GRDB
             #expect(throws: OwnerPrincipalError.self) { try OwnerPrincipal.mint(role: .unknown, environment: [:], ancestors: [1], runningTurnPids: []) }
             #expect(throws: WorkError.self) { try ProcessRole.refuseInAgentProcess() }
         }
+        #endif
         // An owner surface: both work.
         _ = try OwnerPrincipal.mint()
         try ProcessRole.refuseInAgentProcess()
@@ -40,6 +44,7 @@ import GRDB
                 #expect(OwnerPrincipal.effectiveRole(stored: stored, simulatedAgent: simulated) == (simulated ? .agent : stored), "\(stored), \(simulated)")
             }
         }
+        #if DEBUG
         try OwnerPrincipal.simulatingAgentProcess {
             try OwnerPrincipal.simulatingAgentProcess { #expect(OwnerPrincipal.processRole == .agent) }
             #expect(OwnerPrincipal.processRole == .agent)
@@ -49,6 +54,7 @@ import GRDB
             }
             #expect(throws: WorkError.self) { try ProcessRole.refuseInAgentProcess() }
         }
+        #endif
         // Test-scoped: no source file but `OwnerPrincipal.swift` names the override, and that file binds it only to `true`.
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let sources = root.appending(path: "Sources")
@@ -90,6 +96,8 @@ import GRDB
             }
         }
         // Agent mode: the generic refusal, before any lookup (the ids are bogus on purpose: a lookup would say so instead).
+        // Debug builds only, where the simulation exists (round 5, R4-1).
+        #if DEBUG
         try OwnerPrincipal.simulatingAgentProcess {
             do {
                 try call()
@@ -100,6 +108,7 @@ import GRDB
                 Issue.record("\(api) failed in agent mode with \(error), not the generic refusal")
             }
         }
+        #endif
         // Owner mode: the guard is silent; the call fails on its bogus id (never with the generic refusal) or works.
         do { try call() } catch let e as WorkError { #expect(e.message != Store.refUnavailable, "\(api)") } catch {}
     }
