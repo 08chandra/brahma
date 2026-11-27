@@ -325,7 +325,9 @@ import GRDB
         }
         for (record, why) in [
             (provider("http://api.anthropic.com", host: "api.anthropic.com"), "provider anthropic: a provider's base URL must be https"),
-            (provider("https://evil.example.com", host: "api.anthropic.com"), "provider anthropic's host does not match its base URL"),
+            (provider("https://evil.example.com", host: "api.anthropic.com"),
+             "provider anthropic: ANTHROPIC_API_KEY is sent only to api.anthropic.com through the anthropic adapter"),
+            (provider("https://api.anthropic.com", host: "evil.example.com"), "provider anthropic's host does not match its base URL"),
             (provider("https://127.0.0.1", host: "127.0.0.1"), "provider anthropic: a provider's base URL must name its host"),
             (provider("https://api.anthropic.com?x=1", host: "api.anthropic.com"), "provider anthropic: a provider's base URL must not hold a query"),
             (provider("https://api.anthropic.com", host: "api.anthropic.com", lan: true), "provider anthropic: LAN providers arrive with local servers in X1b"),
@@ -335,6 +337,46 @@ import GRDB
             #expect(r.status == 400 && r.text.contains("Brahma: unavailable: \(why)"), "\(record.baseURL): \(r.text)")
             #expect(rig.upstream.requests.isEmpty)
         }
+    }
+
+    /// Ruling X1-38: the key-to-host binding runs on every request, before any key is read. A row written below the store —
+    /// the Anthropic key name on a non-Anthropic base URL — is refused (400 unavailable), the vault is never read, nothing
+    /// goes upstream, and the owner gets one engine alert (repeats are not raised again).
+    @Test func keyBoundToItsHostPerRequest() async throws {
+        let rows = [
+            Provider(id: "anthropic", adapter: "anthropic", baseURL: URL(string: "https://collector.example.com")!, host: "collector.example.com",
+                     keySecret: Provider.anthropicKeyName, builtin: true, createdAt: Date(timeIntervalSince1970: 0)),
+            Provider(id: "anthropic", adapter: "openai-compatible", baseURL: URL(string: "https://api.anthropic.com")!, host: "api.anthropic.com",
+                     keySecret: Provider.anthropicKeyName, builtin: true, createdAt: Date(timeIntervalSince1970: 0)),
+            Provider(id: "anthropic", adapter: "anthropic", baseURL: URL(string: "https://api.anthropic.com")!, host: "api.anthropic.com",
+                     keySecret: "BRAHMA_KEY_OPENAI", builtin: true, createdAt: Date(timeIntervalSince1970: 0)),
+        ]
+        for row in rows {
+            let rig = try ModelGatewayRig([Self.ok], providers: [row])
+            for _ in 0..<3 {
+                let r = try await rig.exchange(Self.body("claude-opus-5-5"), token: rig.grant())
+                #expect(r.status == 400 && r.errorType == "invalid_request_error", "\(row.baseURL): \(r.text)")
+                #expect(r.text.contains("Brahma: unavailable: provider anthropic: ") && r.text.contains(" is sent only to "), "\(r.text)")
+            }
+            #expect(rig.upstream.requests.isEmpty, "no request was sent")
+            #expect(rig.vaultReads.reads.isEmpty, "the vault was never read")
+            #expect(try rig.charges().isEmpty)
+            let alerts = try Self.engineAlerts(rig.store)
+            #expect(alerts.count == 1, "\(alerts.map(\.title))")
+            #expect(alerts.first?.subjectId == EngineAlerts.askSubject(reason: EngineAlerts.providerRecordReason))
+            #expect(alerts.first?.summary.contains("The gateway refused provider anthropic") == true, "\(alerts.first?.summary ?? "")")
+            #expect(rig.logLines.filter { $0.contains("engine alert raised") }.count == 1, "\(rig.logLines)")
+        }
+        // The same request on the true binding reads the key once and is served.
+        let good = try ModelGatewayRig([Self.ok])
+        #expect(try await good.exchange(Self.body("claude-opus-5-5"), token: good.grant()).status == 200)
+        #expect(good.vaultReads.reads == [Provider.anthropicKeyName])
+        #expect(try Self.engineAlerts(good.store).isEmpty)
+    }
+
+    /// Every engine-alert ask in `store` (synchronous: GRDB's async read would be chosen inside an async test).
+    static func engineAlerts(_ store: Store) throws -> [Ask] {
+        try store.writer.read { db in try Ask.filter(Column("kind") == AskKind.engineAlert).fetchAll(db) }
     }
 
     /// A transport failure, an upstream that answers with a redirect, or a broken body are errors the client sees — never an

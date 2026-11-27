@@ -22,6 +22,9 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     public let registry: TurnTokenRegistry
     private let providers: @Sendable (String) throws -> Provider?
     private let isTestSecret: @Sendable (_ companyId: String, _ name: String) throws -> Bool
+    private let alert: @Sendable (_ companyId: String, _ text: String) -> Void
+    /// `companyId|provider|reason` of every provider-record alert raised: each is raised once per gateway, not per request.
+    private var alerted: Set<String> = []
     private let adapters: [AdapterId: any ProviderAdapter]
     private let upstream: any UpstreamTransport
     private let vault: any SecretVault
@@ -34,22 +37,25 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     private var upstreamInFlight = 0
 
     /// `providers` looks a provider up by id (the store's `provider(id:)`); `isTestSecret` says whether a company's secret is
-    /// flagged test (the store's `isTestSecret(companyId:name:)`; a provider key so flagged is refused, Task 11); `log` gets
-    /// one line per refused, failed or served request (never a key); `meter` reserves and settles every request sent upstream.
+    /// flagged test (the store's `isTestSecret(companyId:name:)`; a provider key so flagged is refused, Task 11); `alert` puts a
+    /// refused provider record in front of the owner (`ModelGateway.engineAlerts(store:log:)`, Ruling X1-38); `log` gets one
+    /// line per refused, failed or served request (never a key); `meter` reserves and settles every request sent upstream.
     public convenience init(registry: TurnTokenRegistry, providers: @escaping @Sendable (String) throws -> Provider?,
                             isTestSecret: @escaping @Sendable (String, String) throws -> Bool,
+                            alert: @escaping @Sendable (_ companyId: String, _ text: String) -> Void,
                             adapters: [any ProviderAdapter] = [AnthropicAdapter(), OpenAICompatibleAdapter()], upstream: any UpstreamTransport,
                             vault: any SecretVault,
                             meter: GatewayMeter, log: @escaping @Sendable (String) -> Void = { _ in }) {
-        self.init(registry: registry, providers: providers, isTestSecret: isTestSecret, adapters: adapters, upstream: upstream, vault: vault, meter: meter,
+        self.init(registry: registry, providers: providers, isTestSecret: isTestSecret, alert: alert, adapters: adapters, upstream: upstream, vault: vault, meter: meter,
                   maxUpstream: GatewayLimits.maxUpstreamRequests, log: log)
     }
 
     init(registry: TurnTokenRegistry, providers: @escaping @Sendable (String) throws -> Provider?,
-         isTestSecret: @escaping @Sendable (String, String) throws -> Bool, adapters: [any ProviderAdapter],
+         isTestSecret: @escaping @Sendable (String, String) throws -> Bool,
+         alert: @escaping @Sendable (_ companyId: String, _ text: String) -> Void, adapters: [any ProviderAdapter],
          upstream: any UpstreamTransport, vault: any SecretVault, meter: GatewayMeter, maxUpstream: Int,
          log: @escaping @Sendable (String) -> Void) {
-        self.registry = registry; self.providers = providers; self.isTestSecret = isTestSecret
+        self.registry = registry; self.providers = providers; self.isTestSecret = isTestSecret; self.alert = alert
         self.upstream = upstream; self.vault = vault; self.meter = meter
         self.maxUpstream = maxUpstream; self.log = log
         self.adapters = Dictionary(adapters.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -122,11 +128,19 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         } catch {
             throw .unavailable("provider \(target.provider) could not be read")
         }
-        // The record is checked again on every request (Task 11, defence in depth): a row written below the store's rules
-        // (LAN, a base URL off the pinned-host rules, a host that is not the URL's) never reaches upstream.
-        switch ProviderHost.validate(baseURL: provider.baseURL, adapter: AdapterId(rawValue: provider.adapter), lan: provider.lan) {
-        case .failure(let refusal): throw .unavailable("provider \(provider.id): \(refusal.reason)")
-        case .success(let pinned): guard pinned == provider.host else { throw .unavailable("provider \(provider.id)'s host does not match its base URL") }
+        // The record, with its key-to-host binding, is checked again on every request before any key is read (Task 11;
+        // Ruling X1-38): a row written below the store's rules (by a restore, a direct write, a migration bug or an older
+        // version) — LAN, a base URL off the pinned-host rules, a host that is not the URL's, a key bound to another host —
+        // sends nothing, and the owner is alerted.
+        let recordRefusal: String?
+        switch ProviderHost.validate(baseURL: provider.baseURL, adapter: AdapterId(rawValue: provider.adapter), lan: provider.lan,
+                                     keySecret: provider.keySecret) {
+        case .failure(let refusal): recordRefusal = "provider \(provider.id): \(refusal.reason)"
+        case .success(let pinned): recordRefusal = pinned == provider.host ? nil : "provider \(provider.id)'s host does not match its base URL"
+        }
+        if let recordRefusal {
+            raiseRecordAlert(companyId: grant.companyId, provider: provider.id, reason: recordRefusal)
+            throw .unavailable(recordRefusal)
         }
         guard let adapter = adapters[AdapterId(rawValue: provider.adapter)] else {
             throw .unavailable("no adapter \(provider.adapter) for provider \(provider.id)")
@@ -250,6 +264,30 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         let counts = outcome.usage.map { "in=\($0.inputTokens) out=\($0.outputTokens) cacheRead=\($0.cacheReadTokens) cacheWrite=\($0.cacheWriteTokens)" }
         log("gateway: turn \(grant.turnId) \(provider.id)/\(target.model) \(response.status) " + (counts ?? "no usage")
             + (outcome.complete ? "" : " (ended early)") + (reply.isCut ? " (cut)" : ""))
+    }
+
+    /// Ruling X1-38: a provider record the rules refuse is an engine alert for the turn's company, raised once per
+    /// (company, provider, reason) for this gateway's life — `claude` retries a refusal, and the owner needs one alert.
+    private func raiseRecordAlert(companyId: String, provider: String, reason: String) {
+        let first = lock.withLock { alerted.insert("\(companyId)|\(provider)|\(reason)").inserted }
+        guard first else { return }
+        alert(companyId, "The gateway refused provider \(provider): \(reason). Its record breaks the provider rules "
+              + "`brahma providers add` enforces, so it was changed outside Brahma (a restore, a direct write or an older version). "
+              + "No request was sent and its key was not read. Check `brahma providers` and fix or remove it.")
+    }
+
+    /// The production `alert`: `EngineAlerts.raise` for the company (an owner DM, an activity error and one `engineAlert` ask,
+    /// reason `EngineAlerts.providerRecordReason`). An alert that cannot be written is logged; the refusal stands either way.
+    public static func engineAlerts(store: Store, log: @escaping @Sendable (String) -> Void) -> @Sendable (String, String) -> Void {
+        { companyId, text in
+            do {
+                try EngineAlerts.raise(store: store, text: text, now: Store.now(), reason: EngineAlerts.providerRecordReason,
+                                       companyId: companyId)
+                log("gateway: engine alert raised for \(companyId): \(text)")
+            } catch {
+                log("gateway: the engine alert for \(companyId) could not be raised (\(error)): \(text)")
+            }
+        }
     }
 
     /// Whether the request should go on: false once the reply was cut (revocation, stop, grace over) or the task was

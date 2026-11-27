@@ -45,6 +45,19 @@ public struct Provider: Codable, Equatable, Sendable {
         return bytes.allSatisfy { (0x61...0x7A).contains($0) || (0x30...0x39).contains($0) || $0 == 0x2D }
     }
 
+    /// The four providers Brahma ships (seeded by the `"vX1-gateway"` migration, which keeps its own copy of these values;
+    /// `StoreGatewayTests.builtinsMatchTheSeed` holds them equal). A restore reconciles built-in rows to exactly these
+    /// (Ruling X1-38: a restore never rebinds a built-in's host, key, adapter or LAN flag).
+    public static let builtins: [Provider] = [
+        ("anthropic", "anthropic", "https://api.anthropic.com", "api.anthropic.com", "ANTHROPIC_API_KEY"),
+        ("openai", "openai-compatible", "https://api.openai.com/v1", "api.openai.com", "BRAHMA_KEY_OPENAI"),
+        ("openrouter", "openai-compatible", "https://openrouter.ai/api/v1", "openrouter.ai", "BRAHMA_KEY_OPENROUTER"),
+        ("groq", "openai-compatible", "https://api.groq.com/openai/v1", "api.groq.com", "BRAHMA_KEY_GROQ"),
+    ].map { id, adapter, baseURL, host, key in
+        Provider(id: id, adapter: adapter, baseURL: URL(string: baseURL)!, host: host, keySecret: key, builtin: true,
+                 createdAt: Date(timeIntervalSince1970: 0))
+    }
+
     /// Why `id` is refused as a provider id.
     public static let idRule = "a provider id is 2-32 of a-z, 0-9 and -, starting with a letter"
 }

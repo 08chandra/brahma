@@ -76,6 +76,9 @@ import GRDB
                            ("https://127.0.0.1/v1", "a provider's base URL must name its host, never an IP address or localhost"),
                            ("https://u:p@x.example.com/v1", "a provider's base URL must not hold a user name or password"),
                            ("https://x.example.com:8443/v1", "a provider's base URL must use port 443 (or none)"),
+                           ("https://x.example.com:00443/v1", "a provider's base URL must use port 443 (or none)"),
+                           ("https://llm.internal/v1", "a provider's base URL must name its host, never an IP address or localhost"),
+                           ("https://exa%6Dple.com/v1", "a provider's base URL must not percent-encode its host"),
                            ("not a url", "--base-url is not a URL")] {
             let r = try brahma(["providers", "add", "xx", "--adapter", "openai-compatible", "--base-url", url], home: home)
             #expect(r.status == 1 && r.stderr == "brahma: \(why)\n", "\(url): \(r.stderr)")
@@ -114,7 +117,12 @@ import GRDB
         let r = try add("OPENROUTER_API_KEY")
         #expect(r.status == 1, "\(r.stdout)")
         #expect(r.stderr == "brahma: --key-secret must be ANTHROPIC_API_KEY or BRAHMA_KEY_<PROVIDER>: use BRAHMA_KEY_OPENROUTER\n", "\(r.stderr)")
-        #expect(try add("GROQ_TOKEN").stderr.contains("use BRAHMA_KEY_GROQ"))
+        // A stem naming another built-in provider's key would be refused for this host (Ruling X1-38): the id's name instead.
+        #expect(try add("GROQ_TOKEN").stderr.contains("use BRAHMA_KEY_OPENROUTER_EU"))
+        #expect(try add("ACME_TOKEN").stderr.contains("use BRAHMA_KEY_ACME"))
+        // The built-in OpenRouter key may serve an OpenRouter subdomain; another built-in key may not.
+        let foreign = try add("BRAHMA_KEY_GROQ", id: "groq-eu")
+        #expect(foreign.status == 1 && foreign.stderr == "brahma: BRAHMA_KEY_GROQ is sent only to groq.com and its subdomains\n", "\(foreign.stderr)")
         #expect(try add("MY_SECRET_THING").stderr.contains("use BRAHMA_KEY_MY_SECRET_THING"))
         // No usable stem: the hint names the provider id.
         #expect(try add("API_KEY").stderr.contains("use BRAHMA_KEY_OPENROUTER_EU"))
@@ -135,6 +143,7 @@ import GRDB
         #expect(tainted.stderr.contains("BRAHMA_KEY_TAINTED is a test key in Acme"), "\(tainted.stderr)")
         let ok = try add("BRAHMA_KEY_OPENROUTER_EU")
         #expect(ok.status == 0, "\(ok.stderr)")
+        #expect(try add("BRAHMA_KEY_OPENROUTER", id: "openrouter-eu2").status == 0)
         let list = try brahma(["providers"], home: home).stdout
         #expect(list.contains("openrouter-eu  openai-compatible  eu.openrouter.ai  BRAHMA_KEY_OPENROUTER_EU  added\n"), "\(list)")
         #expect(!list.contains("TAINTED"))

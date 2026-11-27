@@ -79,28 +79,19 @@ extension Store {
         try writer.read { db in try Row.fetchOne(db, sql: "SELECT * FROM provider WHERE id = ?", arguments: [id]).map(Self.provider(from:)) }
     }
 
-    /// Adds an owner provider (never built-in, whatever `p.builtin` says). Makes no network call. Refused (fail closed, Ruling
-    /// 60): an id outside `Provider.isValidId` or taken; a record `ProviderHost.validate` refuses (LAN, a base URL that is not
-    /// `https://<host name>` on 443 without user info, query or fragment, an unknown adapter) or whose `host` is not the
-    /// host its base URL pins; a key name that is not a provider key name (`Provider.isKeyName`); the Anthropic key for any
-    /// host but Anthropic's; and a key name that is a test key in any company (test keys reach agents).
+    /// Adds an owner provider (never built-in, whatever `p.builtin` says). Makes no network call. Refused (fail closed, Rulings
+    /// 60 and X1-38): an id outside `Provider.isValidId` or taken; a record `ProviderHost.validate` refuses — LAN, a base URL
+    /// that is not `https://<host name>` on 443 without user info, query or fragment, an unknown adapter, or a key not bound
+    /// to that host (the Anthropic key anywhere but Anthropic's, a non-provider key name, …) — or whose `host` is not the host
+    /// its base URL pins; and a key name that is a test key in any company (test keys reach agents).
     public func addProvider(_ p: Provider) throws {
         try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
         guard Provider.isValidId(p.id) else { throw WorkError.invalid(Provider.idRule) }
-        switch ProviderHost.validate(baseURL: p.baseURL, adapter: AdapterId(rawValue: p.adapter), lan: p.lan) {
+        switch ProviderHost.validate(baseURL: p.baseURL, adapter: AdapterId(rawValue: p.adapter), lan: p.lan, keySecret: p.keySecret) {
         case .failure(let refusal):
             throw WorkError.invalid(refusal.reason)
         case .success(let pinned):
             guard p.host == pinned else { throw WorkError.invalid("provider \(p.id)'s host must be its base URL's host (\(pinned))") }
-        }
-        if let key = p.keySecret {
-            guard Provider.isKeyName(key) else {
-                throw WorkError.invalid("a provider key is named \(Provider.anthropicKeyName) or \(Provider.keyNamePrefix)<PROVIDER>")
-            }
-            guard key != Provider.anthropicKeyName || p.host == ProviderHost.anthropicHost else {
-                throw WorkError.invalid("\(Provider.anthropicKeyName) is sent only to \(ProviderHost.anthropicHost); name this provider's key "
-                                        + "\(Provider.keyNamePrefix)<PROVIDER>")
-            }
         }
         try writer.write { db in
             guard try Row.fetchOne(db, sql: "SELECT 1 FROM provider WHERE id = ?", arguments: [p.id]) == nil else {

@@ -165,4 +165,18 @@ private let turnToken = String(repeating: "0123456789abcdef", count: 4)
             }
         }
     }
+
+    /// Ruling 61 m4: the engine's `BRAHMA_*` pass-through from `extra` never carries a provider key name, whatever the caller
+    /// put there; the engine's own variables still pass.
+    @Test func extraNeverPassesAProviderKeyName() {
+        let providerKey = ["sk", "ant", "provider"].joined(separator: "-")
+        let extra = ["BRAHMA_AGENT_ID": "a1", "BRAHMA_KEY_OPENROUTER": providerKey, "BRAHMA_KEY_" + String(repeating: "B", count: 40): providerKey,
+                     "BRAHMA_KEYS": "plain"]
+        for purpose in [ChildEnvironment.Purpose.claude, .general, .check] {
+            let env = ChildEnvironment.make(base: ["PATH": "/bin"], extra: extra, purpose: purpose)
+            #expect(!env.keys.contains { Provider.isKeyName($0) }, "\(purpose): \(env.keys.sorted())")
+            #expect(!env.values.contains(providerKey))
+            #expect(env["BRAHMA_AGENT_ID"] == "a1" && env["BRAHMA_KEYS"] == "plain", "\(purpose)")
+        }
+    }
 }

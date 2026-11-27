@@ -151,7 +151,7 @@ struct RestoreCarry {
     static func apply(_ live: Live, to db: Database, snapshot: String, now: Date, gitTempRoot: URL? = nil) throws -> [String] {
         var notes: [String] = []
         // What the restore rolled back of what the owner had turned off (F2), read before anything is written.
-        let rolledBack: [String]
+        var rolledBack: [String]
         switch live {
         case .none: rolledBack = []
         case .read(let c): rolledBack = Settings.rolledBack(live: c.settings, restored: try Settings.read(db))
@@ -159,6 +159,8 @@ struct RestoreCarry {
             rolledBack = ["the previous database could not be read, so what this restore rolled back is unknown: review every "
                 + "company's agents, profiles, network and access settings, extensions, auto-merge and secrets"]
         }
+        // Ruling X1-38: whatever the live database said, built-in providers keep the bindings Brahma ships.
+        rolledBack += try reconcileBuiltinProviders(db)
         let summary = rolledBack.isEmpty
             ? "nothing you had turned off was rolled back"
             : "differs from the snapshot (review before resuming): " + rolledBack.joined(separator: "; ")
@@ -269,6 +271,40 @@ struct RestoreCarry {
                            Column("summary").set(to: Store.stripControls(text, keepNewlines: true)), Column("updatedAt").set(to: now))
             try Store.fileEngineAlert(db, company: company, reason: restoreAlertReason, text: text, now: now)
         }
+    }
+
+    /// Ruling X1-38: a restore may only narrow host bindings, so the built-in providers are reconciled to `Provider.builtins`
+    /// — a snapshot that rebound one (base URL, host, key name, adapter, LAN, or held it as an added row) takes the shipped
+    /// values back — and a row marked built-in that Brahma does not ship is removed with the routes and caps naming it. A
+    /// built-in absent from the snapshot is not added. Returns one line per change. Nothing without a `provider` table.
+    static func reconcileBuiltinProviders(_ db: Database) throws -> [String] {
+        guard try db.tableExists("provider") else { return [] }
+        let shipped = Dictionary(uniqueKeysWithValues: Provider.builtins.map { ($0.id, $0) })
+        var lines: [String] = []
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT id, adapter, baseURL, host, keySecret, lan, builtin FROM provider WHERE builtin = 1 OR id IN (\(
+                shipped.keys.map { _ in "?" }.joined(separator: ", "))) ORDER BY id
+            """, arguments: StatementArguments(shipped.keys.sorted()))
+        for row in rows {
+            let id: String = row["id"]
+            let had = Settings.ProviderEndpoint(baseURL: row["baseURL"], host: row["host"], keySecret: row["keySecret"],
+                                                adapter: row["adapter"], lan: row["lan"])
+            guard let b = shipped[id] else {
+                try db.execute(sql: "DELETE FROM modelRoute WHERE provider = ?", arguments: [id])
+                try db.execute(sql: "DELETE FROM providerCap WHERE provider = ?", arguments: [id])
+                try db.execute(sql: "DELETE FROM provider WHERE id = ?", arguments: [id])
+                lines.append("provider \(id), marked built-in in the snapshot but not one Brahma ships, removed with the routes and caps naming it")
+                continue
+            }
+            let want = Settings.ProviderEndpoint(baseURL: b.baseURL.absoluteString, host: b.host, keySecret: b.keySecret,
+                                                 adapter: b.adapter, lan: false)
+            let builtin: Bool = row["builtin"]
+            guard had != want || !builtin else { continue }
+            try db.execute(sql: "UPDATE provider SET baseURL = ?, host = ?, keySecret = ?, adapter = ?, lan = 0, builtin = 1 WHERE id = ?",
+                           arguments: [want.baseURL, want.host, want.keySecret, want.adapter, id])
+            lines.append("built-in provider \(id) kept at \(want.shown) (the snapshot had \(had.shown)\(builtin ? "" : " as an added provider"))")
+        }
+        return lines
     }
 
     /// S35: every security-relevant company setting (`CompanySecurity.fields`) and the owner-wide auto-merge and provider-policy
@@ -550,6 +586,9 @@ extension RestoreCarry {
             var keySecret: String?
             var adapter: String
             var lan: Bool
+
+            /// How a restore line shows it.
+            var shown: String { "\(baseURL) (host \(host), key \(keySecret ?? "none"), adapter \(adapter)\(lan ? ", LAN" : ""))" }
         }
 
         /// Every `ownerSettings` column, classified for restores (S36; `OwnerSettingsSecurityTests` fails on a new column in
@@ -581,10 +620,7 @@ extension RestoreCarry {
                 case .removed(let id):
                     return "provider \(id), removed after the snapshot, stays removed with the routes and caps naming it"
                 case .changed(let id, let live, let restored):
-                    func show(_ e: ProviderEndpoint) -> String {
-                        "\(e.baseURL) (host \(e.host), key \(e.keySecret ?? "none"), adapter \(e.adapter)\(e.lan ? ", LAN" : ""))"
-                    }
-                    return "provider \(id) kept at \(show(live)) (the snapshot had \(show(restored)))"
+                    return "provider \(id) kept at \(live.shown) (the snapshot had \(restored.shown))"
                 }
             }
         }
@@ -633,7 +669,10 @@ extension RestoreCarry {
             }
             if try db.tableExists("provider") {
                 var providers: [String: ProviderEndpoint] = [:]
-                for row in try Row.fetchAll(db, sql: "SELECT id, baseURL, host, keySecret, adapter, lan FROM provider WHERE builtin = 0") {
+                // The built-in ids are never in the live-follow set: `reconcileBuiltinProviders` holds them to the shipped rows.
+                let shipped = Set(Provider.builtins.map(\.id))
+                for row in try Row.fetchAll(db, sql: "SELECT id, baseURL, host, keySecret, adapter, lan FROM provider WHERE builtin = 0")
+                    where !shipped.contains(row["id"]) {
                     providers[row["id"]] = ProviderEndpoint(baseURL: row["baseURL"], host: row["host"], keySecret: row["keySecret"],
                                                             adapter: row["adapter"], lan: row["lan"])
                 }

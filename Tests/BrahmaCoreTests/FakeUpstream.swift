@@ -150,6 +150,8 @@ final class ModelGatewayRig: @unchecked Sendable {
     let registry = TurnTokenRegistry(clock: ManualAwakeClock())
     let upstream: FakeUpstream
     let vault = MemoryVault()
+    /// What the gateway holds: `vault`, with every read recorded (`vaultReads.reads`).
+    let vaultReads: ScriptedVault
     /// The meter's store: one company, `companyId`, with caps for `anthropic` unless the rig was made without them.
     let store: Store
     let companyId: String
@@ -163,6 +165,7 @@ final class ModelGatewayRig: @unchecked Sendable {
          maxUpstream: Int = GatewayLimits.maxUpstreamRequests, adapters: [any ProviderAdapter] = [AnthropicAdapter()],
          prices: [PriceRow] = [], isTestSecret: (@Sendable (String, String) throws -> Bool)? = nil) throws {
         upstream = FakeUpstream(script)
+        vaultReads = ScriptedVault(inner: vault)
         store = try Store.inMemory()
         companyId = try store.createCompany(name: "Co", goal: "g", workspacesRoot: tempDir()).id
         if let caps { for provider in capped { try store.setProviderCaps(caps, companyId: companyId, provider: provider) } }
@@ -176,7 +179,8 @@ final class ModelGatewayRig: @unchecked Sendable {
             hook?()
             return byId[id]
         }, isTestSecret: isTestSecret ?? { [store] companyId, name in try store.isTestSecret(companyId: companyId, name: name) },
-           adapters: adapters, upstream: upstream, vault: vault, meter: meter, maxUpstream: maxUpstream, log: log)
+           alert: ModelGateway.engineAlerts(store: store, log: log),
+           adapters: adapters, upstream: upstream, vault: vaultReads, meter: meter, maxUpstream: maxUpstream, log: log)
         // Connection deadlines on a clock that stands still: no load can time a connection out (Ruling 44).
         server = GatewayServer(registry: registry, handler: gateway, timing: .pinned, clock: ManualAwakeClock(), beforeDispatch: nil)
     }

@@ -26,6 +26,10 @@ public enum EngineAlerts {
         try store.writer.write { db in try raise(store: store, db: db, text: text, now: now, reason: reason, companyId: companyId) }
     }
 
+    /// The reason that keys the alert the model gateway raises when a provider record breaks the provider rules
+    /// (`ProviderHost.validate`, Ruling X1-38): a key bound to another host, a base URL off the pinned-host rules.
+    public static let providerRecordReason = "provider-record"
+
     /// The reason that keys the alert about an engine file under `.brahma/` that was a link or not a regular file.
     public static let engineFileReason = "engine-file"
 

@@ -6,13 +6,14 @@ import Foundation
 /// (never an IP literal or `localhost`), no user info, no query or fragment, port 443 or none; LAN providers wait for X1b.
 /// The gateway never follows a redirect away from the pinned host.
 @Suite(.scratch, .serialized) struct ProviderHostTests {
-    static func validate(_ url: String, adapter: AdapterId = .openAICompatible, lan: Bool = false) -> Result<String, ProviderHost.Refusal> {
+    static func validate(_ url: String, adapter: AdapterId = .openAICompatible, lan: Bool = false, key: String? = nil)
+        -> Result<String, ProviderHost.Refusal> {
         guard let parsed = URL(string: url) else { return .failure(ProviderHost.Refusal("unparsable test URL \(url)")) }
-        return ProviderHost.validate(baseURL: parsed, adapter: adapter, lan: lan)
+        return ProviderHost.validate(baseURL: parsed, adapter: adapter, lan: lan, keySecret: key)
     }
 
-    static func refusal(_ url: String, adapter: AdapterId = .openAICompatible, lan: Bool = false) -> String? {
-        switch validate(url, adapter: adapter, lan: lan) {
+    static func refusal(_ url: String, adapter: AdapterId = .openAICompatible, lan: Bool = false, key: String? = nil) -> String? {
+        switch validate(url, adapter: adapter, lan: lan, key: key) {
         case .success: nil
         case .failure(let refusal): refusal.reason
         }
@@ -41,11 +42,65 @@ import Foundation
         #expect(Self.refusal("https://api.example.com/v1", adapter: AdapterId(rawValue: "local"))
                 == "no adapter local: X1 has anthropic and openai-compatible")
         #expect(ProviderHost.remoteAdapters == [.anthropic, .openAICompatible])
-        // The built-in providers all pass.
-        for (url, host) in [("https://api.anthropic.com", "api.anthropic.com"), ("https://api.openai.com/v1", "api.openai.com"),
-                            ("https://openrouter.ai/api/v1", "openrouter.ai"), ("https://api.groq.com/openai/v1", "api.groq.com")] {
-            #expect(Self.validate(url) == .success(host), "\(url)")
+        // The built-in providers all pass, with their keys.
+        #expect(Provider.builtins.map(\.id) == ["anthropic", "openai", "openrouter", "groq"])
+        for b in Provider.builtins {
+            #expect(ProviderHost.validate(baseURL: b.baseURL, adapter: AdapterId(rawValue: b.adapter), lan: b.lan, keySecret: b.keySecret)
+                    == .success(b.host), "\(b.id)")
         }
+    }
+
+    /// Ruling 61 m1: a percent-encoded host is refused (it would decode to a different name than the one checked).
+    @Test func percentEncodedHostRefused() {
+        for url in ["https://exa%6Dple.com/v1", "https://%61pi.example.com/", "https://api.example%2Ecom/v1"] {
+            #expect(Self.refusal(url) == "a provider's base URL must not percent-encode its host", "\(url)")
+        }
+        #expect(Self.validate("https://api.example.com/v1%20x") == .success("api.example.com"), "a path may be encoded")
+    }
+
+    /// Ruling 61 m2: private and local names (and single labels) are refused, and so are odd port spellings — only `:443`
+    /// exactly, or no port.
+    @Test func privateSuffixesAndOddPortsRefused() {
+        let notAName = "a provider's base URL must name its host, never an IP address or localhost"
+        for url in ["https://localhost/v1", "https://a.localhost/v1", "https://printer.local/v1", "https://llm.internal/v1",
+                    "https://nas.home.arpa/v1", "https://box.lan/v1", "https://wiki.intranet/v1", "https://ai.corp/v1",
+                    "https://LLM.Internal/v1", "https://gpu.localdomain/v1", "https://llm/v1"] {
+            #expect(Self.refusal(url) == notAName, "\(url)")
+        }
+        #expect(Self.validate("https://local.example.com/v1") == .success("local.example.com"), "only the suffix counts")
+        #expect(Self.validate("https://api.corporate.com/v1") == .success("api.corporate.com"))
+        for url in ["https://api.example.com:00443/v1", "https://api.example.com:/v1", "https://api.example.com:0443"] {
+            #expect(Self.refusal(url) == "a provider's base URL must use port 443 (or none)", "\(url)")
+        }
+        #expect(Self.validate("https://api.example.com:443") == .success("api.example.com"))
+    }
+
+    /// Ruling X1-38: one key-to-host binding, shared by the store, the CLI and the gateway. `ANTHROPIC_API_KEY` goes only to
+    /// `api.anthropic.com` through the `anthropic` adapter; a built-in provider's `BRAHMA_KEY_*` only to its provider's domain
+    /// (`ProviderHost.keyDomains`, subdomains included); any other `BRAHMA_KEY_<X>` (the owner's own) to the provider it is
+    /// named on. A name that is not a provider key name is refused.
+    @Test func keyToHostBinding() {
+        let anthropicOnly = "ANTHROPIC_API_KEY is sent only to api.anthropic.com through the anthropic adapter"
+        #expect(Self.validate("https://api.anthropic.com", adapter: .anthropic, key: "ANTHROPIC_API_KEY") == .success("api.anthropic.com"))
+        #expect(Self.refusal("https://proxy.example.com", adapter: .anthropic, key: "ANTHROPIC_API_KEY") == anthropicOnly)
+        #expect(Self.refusal("https://api.anthropic.com", adapter: .openAICompatible, key: "ANTHROPIC_API_KEY") == anthropicOnly)
+        #expect(Self.refusal("https://eu.api.anthropic.com", adapter: .anthropic, key: "ANTHROPIC_API_KEY") == anthropicOnly)
+        #expect(ProviderHost.keyDomains == ["BRAHMA_KEY_OPENAI": "openai.com", "BRAHMA_KEY_OPENROUTER": "openrouter.ai", "BRAHMA_KEY_GROQ": "groq.com"])
+        #expect(Self.validate("https://eu.openrouter.ai/api/v1", key: "BRAHMA_KEY_OPENROUTER") == .success("eu.openrouter.ai"))
+        #expect(Self.validate("https://openrouter.ai/api/v1", key: "BRAHMA_KEY_OPENROUTER") == .success("openrouter.ai"))
+        for (url, key, domain) in [("https://openrouter.ai.evil.com/v1", "BRAHMA_KEY_OPENROUTER", "openrouter.ai"),
+                                   ("https://evilopenrouter.ai/v1", "BRAHMA_KEY_OPENROUTER", "openrouter.ai"),
+                                   ("https://api.groq.com.example.com/v1", "BRAHMA_KEY_GROQ", "groq.com"),
+                                   ("https://api.anthropic.com", "BRAHMA_KEY_OPENAI", "openai.com")] {
+            #expect(Self.refusal(url, adapter: .openAICompatible, key: key) == "\(key) is sent only to \(domain) and its subdomains", "\(url)")
+        }
+        #expect(Self.validate("https://llm.example.com/v1", key: "BRAHMA_KEY_ACME") == .success("llm.example.com"))
+        #expect(Self.validate("https://llm.example.com/v1", key: nil) == .success("llm.example.com"))
+        for key in ["OPENAI_API_KEY", "BRAHMA_KEY_", "ANTHROPIC_AUTH_TOKEN"] {
+            #expect(Self.refusal("https://llm.example.com/v1", key: key) == "a provider key is named ANTHROPIC_API_KEY or BRAHMA_KEY_<PROVIDER>", "\(key)")
+        }
+        // The URL rules come first: a bad URL is refused for its URL whatever the key.
+        #expect(Self.refusal("http://api.anthropic.com", adapter: .anthropic, key: "ANTHROPIC_API_KEY") == "a provider's base URL must be https")
     }
 
     @Test func ipLiteralRefused() {

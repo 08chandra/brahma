@@ -272,7 +272,13 @@ import GRDB
              "provider upper-host's host must be its base URL's host (llm.example.com)"),
             (provider("local", "https://llm.example.com/v1", host: "llm.example.com", adapter: "local"), "no adapter local"),
             (provider("proxy", "https://proxy.example.com", host: "proxy.example.com", adapter: "anthropic", key: "ANTHROPIC_API_KEY"),
-             "ANTHROPIC_API_KEY is sent only to api.anthropic.com"),
+             "ANTHROPIC_API_KEY is sent only to api.anthropic.com through the anthropic adapter"),
+            (provider("wrong-adapter", "https://api.anthropic.com", host: "api.anthropic.com", key: "ANTHROPIC_API_KEY"),
+             "ANTHROPIC_API_KEY is sent only to api.anthropic.com through the anthropic adapter"),
+            (provider("router-copy", "https://router.example.com/v1", host: "router.example.com", key: "BRAHMA_KEY_OPENROUTER"),
+             "BRAHMA_KEY_OPENROUTER is sent only to openrouter.ai and its subdomains"),
+            (provider("encoded", "https://ll%6D.example.com/v1", host: "llm.example.com"), "must not percent-encode its host"),
+            (provider("internal", "https://llm.internal/v1", host: "llm.internal"), "must name its host"),
             (provider("a", "https://llm.example.com/v1", host: "llm.example.com"), "a provider id is 2-32 of a-z, 0-9 and -, starting with a letter"),
             (provider("9lives", "https://llm.example.com/v1", host: "llm.example.com"), "a provider id is 2-32"),
             (provider("long-key", "https://llm.example.com/v1", host: "llm.example.com", key: "BRAHMA_KEY_" + String(repeating: "A", count: 41)),
@@ -517,6 +523,61 @@ import GRDB
         #expect(outcome.warnings.contains { $0.contains("provider gone, removed after the snapshot, stays removed with the routes and caps naming it") },
                 "\(outcome.warnings)")
         #expect(outcome.warnings.contains { $0.contains("provider edge kept at https://b.example.com/v1 (host b.example.com") }, "\(outcome.warnings)")
+    }
+
+    /// The seeded built-in providers are exactly `Provider.builtins` (what a restore reconciles built-in rows to).
+    @Test func builtinsMatchTheSeed() throws {
+        let (store, _, _) = try store()
+        let seeded = try store.providers().filter(\.builtin)
+        func fields(_ p: Provider) -> String { "\(p.id) \(p.adapter) \(p.baseURL.absoluteString) \(p.host) \(p.keySecret ?? "-") \(p.lan)" }
+        #expect(seeded.map(fields).sorted() == Provider.builtins.map(fields).sorted())
+        #expect(Provider.builtins.allSatisfy { $0.builtin && !$0.lan })
+    }
+
+    /// Ruling X1-38: a restore may only narrow host bindings. A snapshot whose built-in rows were rebound (base URL, host, key
+    /// name, adapter, LAN) is reconciled back to the built-in values; a row marked built-in that Brahma does not ship is removed
+    /// with the routes and caps naming it; a built-in id held as an added row is made the built-in again. Each gets a line.
+    @Test func restoreReconcilesBuiltinProviders() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        try env.store.writer.write { db in
+            try db.execute(sql: """
+                UPDATE provider SET baseURL = 'https://collector.example.com', host = 'collector.example.com' WHERE id = 'anthropic'
+                """)
+            try db.execute(sql: "UPDATE provider SET keySecret = 'BRAHMA_KEY_EVIL', adapter = 'anthropic', lan = 1 WHERE id = 'groq'")
+            try db.execute(sql: "UPDATE provider SET builtin = 0, baseURL = 'https://or.example.com/v1', host = 'or.example.com' WHERE id = 'openrouter'")
+            try db.execute(sql: """
+                INSERT INTO provider (id, adapter, baseURL, host, keySecret, lan, builtin, createdAt)
+                VALUES ('shadow', 'openai-compatible', 'https://shadow.example.com/v1', 'shadow.example.com', 'BRAHMA_KEY_SHADOW', 0, 1, ?)
+                """, arguments: [Date()])
+        }
+        try env.store.setRoute(ModelRoute(companyId: acme.id, scope: .company, subject: "", modelClass: "fast", provider: "shadow", model: "m"))
+        try env.store.setProviderCaps(ProviderCaps(monthlyUSD: 10), companyId: acme.id, provider: "shadow")
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        // Live is put back to the shipped rows (the tampering lives only in the snapshot).
+        try env.store.writer.write { db in
+            try db.execute(sql: "DELETE FROM modelRoute"); try db.execute(sql: "DELETE FROM providerCap WHERE provider = 'shadow'")
+            try db.execute(sql: "DELETE FROM provider WHERE id IN ('anthropic', 'groq', 'openrouter', 'shadow')")
+            for b in Provider.builtins where ["anthropic", "groq", "openrouter"].contains(b.id) {
+                try db.execute(sql: """
+                    INSERT INTO provider (id, adapter, baseURL, host, keySecret, lan, builtin, createdAt) VALUES (?, ?, ?, ?, ?, 0, 1, ?)
+                    """, arguments: [b.id, b.adapter, b.baseURL.absoluteString, b.host, b.keySecret, Date()])
+            }
+        }
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        func fields(_ p: Provider) -> String { "\(p.id) \(p.adapter) \(p.baseURL.absoluteString) \(p.host) \(p.keySecret ?? "-") \(p.lan) \(p.builtin)" }
+        let now = try restored.providers().map(fields)
+        #expect(now == Provider.builtins.sorted { $0.id < $1.id }.map(fields), "\(now)")
+        #expect(try restored.routes(companyId: acme.id).isEmpty)
+        #expect(try restored.providerCaps(companyId: acme.id, provider: "shadow") == nil)
+        let lines = outcome.warnings.joined(separator: "\n")
+        #expect(lines.contains("built-in provider anthropic kept at https://api.anthropic.com (host api.anthropic.com, key ANTHROPIC_API_KEY, adapter anthropic) (the snapshot had https://collector.example.com (host collector.example.com"), "\(lines)")
+        #expect(lines.contains("built-in provider groq kept at https://api.groq.com/openai/v1 (host api.groq.com, key BRAHMA_KEY_GROQ, adapter openai-compatible) (the snapshot had https://api.groq.com/openai/v1 (host api.groq.com, key BRAHMA_KEY_EVIL, adapter anthropic, LAN))"), "\(lines)")
+        #expect(lines.contains("built-in provider openrouter kept at https://openrouter.ai/api/v1"), "\(lines)")
+        #expect(lines.contains("provider shadow, marked built-in in the snapshot but not one Brahma ships, removed with the routes and caps naming it"), "\(lines)")
     }
 
     /// Ruling 60 (Task 5 minor, fixed in Task 11): a restore follows the live set for `adapter` too, and for `lan` the stricter

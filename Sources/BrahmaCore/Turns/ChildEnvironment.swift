@@ -70,8 +70,10 @@ public enum ChildEnvironment {
         for (name, value) in base where (allowed.contains(name) || name.hasPrefix("LC_")) && !isSecretName(name) {
             env[name] = value
         }
-        // Never the MCP server's per-turn token: it lives only in that server's env block (fix round 1, I2(d)).
-        for (name, value) in extra where name.hasPrefix("BRAHMA_") && name != "BRAHMA_DEV" && name != MCPConfig.tokenVariable {
+        // Never the MCP server's per-turn token: it lives only in that server's env block (fix round 1, I2(d)). Never a
+        // provider key name either (Plan X1 Ruling 61 m4): `BRAHMA_KEY_*` is the gateway's, whatever the caller put in `extra`.
+        for (name, value) in extra where name.hasPrefix("BRAHMA_") && name != "BRAHMA_DEV" && name != MCPConfig.tokenVariable
+            && !Provider.isKeyName(name) {
             env[name] = value
         }
         if purpose == .claude {

@@ -65,9 +65,10 @@ struct ProvidersGroup: ParsableCommand {
             discussion: """
                 The base URL must be https://<host name> (never an IP address or localhost) on port 443, with no user name, \
                 password, query or fragment; its host is the only one the gateway reaches for this provider, and a redirect \
-                away from it is refused. The key secret is ANTHROPIC_API_KEY (sent only to api.anthropic.com) or \
-                BRAHMA_KEY_<PROVIDER>; set its value per company with `brahma secret set <company> <NAME>`, never --test. \
-                LAN providers arrive with local servers in X1b.
+                away from it is refused. The key secret is ANTHROPIC_API_KEY (sent only to api.anthropic.com, through the \
+                anthropic adapter) or BRAHMA_KEY_<PROVIDER>; a built-in provider's key (BRAHMA_KEY_OPENAI, \
+                BRAHMA_KEY_OPENROUTER, BRAHMA_KEY_GROQ) goes only to that provider's domain. Set its value per company with \
+                `brahma secret set <company> <NAME>`, never --test. LAN providers arrive with local servers in X1b.
 
                 EXAMPLES:
                   brahma providers add openrouter-eu --adapter openai-compatible --base-url https://eu.openrouter.ai/api/v1 --key-secret BRAHMA_KEY_OPENROUTER_EU
@@ -88,7 +89,7 @@ struct ProvidersGroup: ParsableCommand {
             guard Provider.isValidId(id) else { throw fail(Provider.idRule) }
             guard let url = URL(string: baseURL, encodingInvalidCharacters: false) else { throw fail("--base-url is not a URL") }
             let host: String
-            switch ProviderHost.validate(baseURL: url, adapter: AdapterId(rawValue: adapter), lan: false) {
+            switch ProviderHost.validate(baseURL: url, adapter: AdapterId(rawValue: adapter), lan: false, keySecret: nil) {
             case .failure(let refusal): throw fail(refusal.reason)
             case .success(let pinned): host = pinned
             }
@@ -96,7 +97,11 @@ struct ProvidersGroup: ParsableCommand {
                 guard SecretName.isValid(keySecret) else { throw fail(SecretError.invalidName.message) }
                 guard ProviderHost.isProviderKeyName(keySecret) else {
                     throw fail("--key-secret must be \(Provider.anthropicKeyName) or \(Provider.keyNamePrefix)<PROVIDER>: "
-                               + "use \(Self.suggestedKeyName(for: keySecret, id: id))")
+                               + "use \(Self.suggestedKeyName(for: keySecret, id: id, host: host, adapter: AdapterId(rawValue: adapter)))")
+                }
+                // The key-to-host binding (Ruling X1-38), the same rule the store and the gateway apply.
+                if let why = ProviderHost.bindingRefusal(keySecret: keySecret, host: host, adapter: AdapterId(rawValue: adapter)) {
+                    throw fail(why)
                 }
             }
             try requireOwnerShell()
@@ -113,15 +118,16 @@ struct ProvidersGroup: ParsableCommand {
         }
 
         /// The provider key name to suggest for a refused `--key-secret`: its stem (`OPENROUTER_API_KEY` → `OPENROUTER`) under
-        /// `BRAHMA_KEY_`, or the provider id's when the name gives none.
-        static func suggestedKeyName(for name: String, id: String) -> String {
+        /// `BRAHMA_KEY_` when that name may go to `host` (the key-to-host binding), else the provider id's.
+        static func suggestedKeyName(for name: String, id: String, host: String, adapter: AdapterId) -> String {
             var stem = name
             for suffix in ["_API_KEY", "_API_TOKEN", "_KEY", "_TOKEN", "_SECRET"] where stem.hasSuffix(suffix) {
                 stem.removeLast(suffix.count)
                 break
             }
             let fromName = Provider.keyNamePrefix + stem
-            if !["", "API"].contains(stem), !name.hasPrefix("BRAHMA_"), !name.hasPrefix("ANTHROPIC_"), Provider.isKeyName(fromName) {
+            if !["", "API"].contains(stem), !name.hasPrefix("BRAHMA_"), !name.hasPrefix("ANTHROPIC_"), Provider.isKeyName(fromName),
+               ProviderHost.bindingRefusal(keySecret: fromName, host: host, adapter: adapter) == nil {
                 return fromName
             }
             return Provider.keyNamePrefix + id.uppercased().replacingOccurrences(of: "-", with: "_")
