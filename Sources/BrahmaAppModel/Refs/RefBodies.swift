@@ -421,20 +421,30 @@ public enum RefBodies {
     }
 
     /// Fix round 1 (I-1): a static diff or commit parsed for drawing only when the engine's identity of the same text
-    /// (`ChangesPatch.identity`: section paths, hunk starts and counts) agrees with the parse; nil (refused) otherwise.
-    public static func verifiedDiff(patch: String, gate: GlobalSearch.TextGate) -> DiffModel? {
-        let model = DiffModel.parse(patch: patch, gate: gate)
+    /// (`ChangesPatch.identity`: section paths, hunk starts and counts) agrees with the parse; nil (refused) otherwise. A parse
+    /// cut at `maxLines` is checked by `verifiedTruncated` (Ruling C7a-2) and shown marked truncated.
+    public static func verifiedDiff(patch: String, gate: GlobalSearch.TextGate, maxLines: Int = DiffModel.defaultMaxLines) -> DiffModel? {
+        let model = DiffModel.parse(patch: patch, gate: gate, maxLines: maxLines)
         let engine = ChangesPatch.identity(patch)
-        if model.truncated {
-            // A parse cut at its line cap covers a prefix of the sections: those must still be the engine's.
-            let n = model.files.count
-            let paths = Array(engine.paths.prefix(n)), hunks = Array(engine.hunks.prefix(n))
-            guard model.files.map(\.path) == paths else { return nil }
-            // The last (cut) section's hunks can't match in full; the earlier ones must.
-            guard n == 0 || ChangesTabModel.spans(model).dropLast() == hunks.dropLast() else { return nil }
-            return model
-        }
+        if model.truncated { return verifiedTruncated(model, paths: engine.paths, hunks: engine.hunks) ? model : nil }
         return ChangesTabModel.verify(model, paths: engine.paths, hunks: engine.hunks) == nil ? model : nil
+    }
+
+    /// Ruling C7a-2 (fail closed): a parse cut at its line cap covers a prefix of the engine's sections. Every section before the
+    /// cut must be the engine's whole (path, hunk starts and counts); in the cut section the path must be the engine's, every
+    /// hunk but the last must equal the engine's hunk at that index, and the last (partial) hunk must start on the engine's
+    /// lines with counts no greater than the engine's. Anything else is refused.
+    public static func verifiedTruncated(_ model: DiffModel, paths: [String], hunks: [[HunkSpan]]) -> Bool {
+        let n = model.files.count
+        guard n > 0, n <= paths.count, n <= hunks.count, model.files.map(\.path) == Array(paths.prefix(n)) else { return false }
+        let parsed = ChangesTabModel.spans(model)
+        guard Array(parsed.prefix(n - 1)) == Array(hunks.prefix(n - 1)) else { return false }
+        let cut = parsed[n - 1], engine = hunks[n - 1]
+        guard !cut.isEmpty else { return true }
+        guard cut.count <= engine.count, Array(cut.dropLast()) == Array(engine.prefix(cut.count - 1)) else { return false }
+        let last = cut[cut.count - 1], reference = engine[cut.count - 1]
+        return last.oldStart == reference.oldStart && last.newStart == reference.newStart
+            && last.old <= reference.old && last.new <= reference.new && last.shown <= reference.shown
     }
 
     /// Fix round 1 (M-3): the name Save As… suggests: the gated display title's last component, with every separator, control,

@@ -216,5 +216,27 @@ import Foundation
         let after = try #require(try w.store.ask(id: ask.id))
         #expect(after.status != .pendingOwner && after.ownerAnswer == "declined: no logo yet")
     }
+
+    /// Ruling C7a-2: a truncated static diff fails closed — its cut (last) section's hunks are checked too: every complete one
+    /// against the engine's, the partial one's start lines exactly and its counts within the engine's; anything else is refused.
+    @Test func truncatedDiffChecksItsCutSection() {
+        let gate = GlobalSearch.TextGate(knownValues: [])
+        let patch = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n"
+            + "@@ -10,3 +10,3 @@ func x() {\n ten\n-eleven\n+ELEVEN\n twelve\n"
+        // Cut inside the second hunk: verified against the engine's own reading, marked truncated.
+        let cut = RefBodies.verifiedDiff(patch: patch, gate: gate, maxLines: 5)
+        #expect(cut?.truncated == true && cut?.files.first?.hunks.count == 2)
+        // The same cut parse against an engine whose cut section reads a complete hunk elsewhere (the N3-1 pattern): refused.
+        let model = DiffModel.parse(patch: patch, gate: gate, maxLines: 5)
+        let engine = ChangesPatch.identity(patch)
+        var shifted = engine.hunks
+        shifted[0][0] = HunkSpan(oldStart: 13, newStart: 13, old: shifted[0][0].old, new: shifted[0][0].new, shown: shifted[0][0].shown)
+        #expect(!RefBodies.verifiedTruncated(model, paths: engine.paths, hunks: shifted))
+        // …or whose partial hunk starts elsewhere: refused.
+        var moved = engine.hunks
+        moved[0][1] = HunkSpan(oldStart: 11, newStart: 11, old: moved[0][1].old, new: moved[0][1].new, shown: moved[0][1].shown)
+        #expect(!RefBodies.verifiedTruncated(model, paths: engine.paths, hunks: moved))
+        #expect(RefBodies.verifiedTruncated(model, paths: engine.paths, hunks: engine.hunks))
+    }
 }
 
