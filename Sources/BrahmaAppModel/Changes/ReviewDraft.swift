@@ -65,3 +65,37 @@ extension AppModel {
         return true
     }
 }
+
+extension AppModel {
+    /// C7c fix round 1 (I-1, m-5): posts the CHANGES model's review in progress (`ChangesTabModel.review`) as a comment or a revert
+    /// request, against the key and compare it was started on, through `submitReview` (the owner principal's path). A problem or
+    /// refusal stays on the draft with every typed character kept; the window's alert is put back only when the refusal is the
+    /// one this post raised (an alert another task raised stays). Posted: the draft is done.
+    @discardableResult
+    public func postReview(isRevert: Bool) async -> Bool {
+        guard let changes, var session = changes.review, !session.posting else { return false }
+        session.draft.isRevert = isRevert
+        if let problem = session.draft.validate() {
+            changes.reviewFailed(problem)
+            return false
+        }
+        changes.setReviewPosting(true)
+        let before = errorMessage
+        let posted = await submitReview(session.draft, key: session.key, compare: session.compare)
+        if posted {
+            if changes.review?.draft.anchor == session.draft.anchor { changes.review = nil }
+            return true
+        }
+        let current = errorMessage
+        let message = current.flatMap { $0 != before ? $0 : nil } ?? "Couldn't post the review"
+        if current != before { errorMessage = Self.alertAfterReview(current: current, ours: message, before: before) }
+        changes.reviewFailed(message)
+        return false
+    }
+
+    /// m-5: the alert after a refused review post — what was there before when the current alert is the one the post raised,
+    /// else the current one untouched.
+    public nonisolated static func alertAfterReview(current: String?, ours: String, before: String?) -> String? {
+        current == ours ? before : current
+    }
+}

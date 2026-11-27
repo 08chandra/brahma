@@ -54,6 +54,9 @@ public struct BoardRowView: Equatable, Identifiable, Sendable {
     public var tainted: Bool
 
     public var id: String { key }
+
+    /// C7c fix round 1 (m-6): the row's chips as the board draws them (TAINTED `warning` when the live diff carries outside content).
+    public var chips: [RefChip] { tainted ? [RefChip(text: "TAINTED", tone: .warn)] : [] }
 }
 
 public enum BoardRows {
@@ -127,5 +130,39 @@ public enum ChangesFiles {
             return ChangedFileRow(path: f.path, oldPath: f.oldPath, status: f.status, stats: "+\(f.added) \u{2212}\(f.removed)", summary: f.summary,
                                   fileIndex: index)
         }
+    }
+}
+
+/// C7c fix round 1 (m-6): a diff comment as the marker's thread draws it — its kind and its chips come from here, not the view.
+public enum DiffThread {
+    public static func chips(for comment: DiffComment) -> [RefChip] {
+        comment.tainted ? [RefChip(text: "TAINTED", tone: .warn)] : []
+    }
+
+    /// `COMMENT` or `REVERT REQUEST`.
+    public static func kindText(_ comment: DiffComment) -> String {
+        comment.kind == DiffComment.revertRequest ? "REVERT REQUEST" : "COMMENT"
+    }
+}
+
+/// C7c fix round 1 (m-2): the worktree the app's FSEvents nudger may watch, re-checked right before the stream is made: a real
+/// directory named for the key directly in a real `.brahma/wt` (no component a link, no `.`/`..`, never a file or a missing path).
+/// The nudger only asks the engine for an early recompute; this keeps a swapped-in link from pointing its stream elsewhere.
+public enum WorktreeWatchRoot {
+    public static func isSafe(path: String, key: String) -> Bool {
+        guard !key.isEmpty, !key.contains("/"), key != ".", key != "..", path.hasPrefix("/") else { return false }
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard !parts.contains("."), !parts.contains(".."), parts.count >= 3,
+              parts[parts.count - 1] == key, parts[parts.count - 2] == "wt", parts[parts.count - 3] == ".brahma" else { return false }
+        let leaf = URL(fileURLWithPath: path)
+        let wt = leaf.deletingLastPathComponent()
+        let brahma = wt.deletingLastPathComponent()
+        return [leaf, wt, brahma].allSatisfy { isRealDirectory($0.path) }
+    }
+
+    /// `lstat`: a directory, not a link to one.
+    static func isRealDirectory(_ path: String) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else { return false }
+        return (attributes[.type] as? FileAttributeType) == .typeDirectory
     }
 }

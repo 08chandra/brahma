@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import BrahmaCore
 import BrahmaAppModel
 
@@ -22,6 +23,10 @@ struct ChangesDiffView: View {
 
     @State private var jump: String?
     @State private var listWidth: CGFloat = 140
+    /// m-4: the CHANGES diff has keyboard focus (clicked into, or just opened from the board): ⌘↓/⌘↑/⌘⇧D act only then.
+    @FocusState private var focused: Bool
+    /// The owner clicked away from a popover with text in it: the draft is kept (the model's) and a DRAFT chip reopens it.
+    @State private var draftHidden = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,6 +34,11 @@ struct ChangesDiffView: View {
             Hairline()
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // I-1: the review popover hangs off this stable container (present whatever a live yield does to the rows) and
+                // edits the model's draft, so a yield, a refused yield or a row that goes away never loses what the owner typed.
+                .popover(isPresented: reviewShown, attachmentAnchor: .point(UnitPoint(x: 0.5, y: 0.2)), arrowEdge: .top) {
+                    reviewPopover
+                }
         }
         .background(BrahmaTheme.bg0)
         .environment(\.timeZone, app.ownerTimeZone)
@@ -36,7 +46,33 @@ struct ChangesDiffView: View {
             guard let target = nudgeTarget else { return }
             await WorktreeNudger.watch(target, live: app.liveChanges)
         }
-        .focusedSceneValue(\.changesCommands, embedded ? nil : ChangesCommands(model: model))
+        .focusable()
+        .focusEffectDisabled()
+        .focused($focused)
+        .focusedValue(\.changesCommands, ChangesCommands(model: model, enabled: !embedded))
+        .simultaneousGesture(TapGesture().onEnded { if !embedded { focused = true } })
+        .onAppear { if !embedded { focused = true } }
+    }
+
+    private var reviewShown: Binding<Bool> {
+        Binding(get: { model.review != nil && !draftHidden }, set: { shown in
+            guard !shown else { return }
+            // Closed with nothing typed: the review ends; with text: kept for the DRAFT chip.
+            if model.review?.draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+                model.cancelReview()
+            } else {
+                draftHidden = true
+            }
+        })
+    }
+
+    @ViewBuilder private var reviewPopover: some View {
+        if let session = model.review {
+            ReviewPopover(session: session, holder: row?.agent, canPost: model.canPostReview,
+                          text: Binding(get: { model.review?.draft.text ?? "" }, set: { model.setReviewText($0) }),
+                          post: { revert in Task { await app.postReview(isRevert: revert) } },
+                          cancel: { model.cancelReview() })
+        }
     }
 
     private var row: BoardRowView? { model.rows.first { $0.key == model.selectedKey } }
@@ -96,9 +132,17 @@ struct ChangesDiffView: View {
                 }
                 .frame(height: 24)
             }
-            if !chips.isEmpty {
+            if !chips.isEmpty || (model.review != nil && draftHidden) {
                 FlowLayout(spacing: BrahmaTheme.spaceXS) {
                     ForEach(Array(chips.enumerated()), id: \.offset) { _, chip in RefChipView(chip: chip) }
+                    if let session = model.review, draftHidden {
+                        Button { draftHidden = false } label: {
+                            Label("Draft on \(session.draft.anchor.path):\(session.draft.anchor.line)", systemImage: "square.and.pencil")
+                                .lineLimit(1)
+                        }
+                        .buttonStyle(.brahma)
+                        .help("Reopen the comment you were writing")
+                    }
                 }
             }
         }
@@ -156,8 +200,9 @@ struct ChangesDiffView: View {
                 HStack(spacing: 0) {
                     fileList(snapshot).frame(width: listWidth)
                     SplitDivider(width: $listWidth, range: 110...360)
-                    DiffPane(diff: diff, mode: model.mode, stop: model.currentStop, version: snapshot.patchHash, markers: markerIndex,
-                             review: reviewContext, jump: $jump)
+                    DiffPane(diff: diff, mode: model.mode, stop: model.currentStop, stopMoves: model.stopMoves,
+                             rescrollsOnYield: model.rescrollsOnYield, version: snapshot.patchHash, markers: markerIndex,
+                             review: reviewContext, onOwnerScroll: { model.ownerScrolled() }, jump: $jump)
                 }
             }
         } else if model.selectedKey == nil {
@@ -173,7 +218,12 @@ struct ChangesDiffView: View {
                 ForEach(Array(model.files.enumerated()), id: \.offset) { i, file in
                     let numbers = snapshot.files.indices.contains(i) ? snapshot.files[i] : nil
                     let outdated = model.outdated[file.path] ?? 0
-                    Button { if let f = file.fileIndex { jump = "file-\(f)" } } label: {
+                    Button {
+                        guard let f = file.fileIndex else { return }
+                        // A jump to a file is the owner moving off the current stop: yields leave it there.
+                        model.ownerScrolled()
+                        jump = "file-\(f)"
+                    } label: {
                         VStack(alignment: .leading, spacing: 2) {
                             HStack(spacing: 6) {
                                 Text(verbatim: file.status)
@@ -240,19 +290,16 @@ struct ChangesDiffView: View {
         return out
     }
 
-    /// The gutter's anchor builder (`ChangesTabModel.anchor`) and post action (`AppModel.submitReview`, the owner principal's
-    /// path); the refusal text shows in the popover instead of the window's alert.
+    /// The gutter's anchor builder (`ChangesTabModel.anchor`) and the start of a review (`ChangesTabModel.beginReview`); posting is
+    /// `AppModel.postReview` from the popover (the owner principal's path).
     private var reviewContext: DiffReviewContext? {
-        guard verified, let key = model.selectedKey else { return nil }
-        let compare = model.compare
-        let (model, app) = (self.model, self.app)
+        guard verified, model.selectedKey != nil else { return nil }
+        let model = self.model
         return DiffReviewContext(holder: row?.agent, anchor: { f, h, i, side in model.anchor(fileIndex: f, hunk: h, index: i, side: side) },
-                                 submit: { draft in
-                                     let before = app.errorMessage
-                                     if await app.submitReview(draft, key: key, compare: compare) { return nil }
-                                     let message = app.errorMessage ?? "Couldn't post the review"
-                                     app.errorMessage = before
-                                     return message
+                                 begin: { anchor in
+                                     // A draft with text in it is never replaced by another line's "+": it is reopened instead.
+                                     model.beginReview(anchor)
+                                     draftHidden = false
                                  })
     }
 
@@ -270,9 +317,11 @@ struct ChangesDiffView: View {
 
 // MARK: - Commands (⌘↓ / ⌘↑ / ⌘⇧D while the CHANGES tab shows a diff)
 
-/// What the Go menu's change commands act on: the CHANGES tab's model, published while its diff is on screen.
+/// What the Go menu's change commands act on: the CHANGES tab's model, published (`focusedValue`) only while its diff has
+/// keyboard focus (m-4); `enabled` is false for the OPENED tab's embedded diff.
 struct ChangesCommands {
     let model: ChangesTabModel
+    var enabled = true
 }
 
 private struct ChangesCommandsKey: FocusedValueKey {
@@ -286,10 +335,12 @@ extension FocusedValues {
     }
 }
 
-/// Next/previous change and unified ⇄ split, enabled only while the CHANGES tab shows a diff (so the keys stay the text
-/// fields' everywhere else).
+/// Next/previous change and unified ⇄ split, enabled only while the CHANGES tab's diff has focus (so the keys stay the text
+/// fields' — the composer's, the review popover's — everywhere else).
 struct ChangesMenuItems: View {
-    @FocusedValue(\.changesCommands) private var changes
+    @FocusedValue(\.changesCommands) private var focusedChanges
+
+    private var changes: ChangesCommands? { focusedChanges?.enabled == true ? focusedChanges : nil }
 
     var body: some View {
         Button("Next Change") { changes?.model.nextChange() }
@@ -321,17 +372,25 @@ struct DiffPane: View {
     var mode: DiffViewMode = .unified
     /// The current change stop (`ChangesTabModel.currentStop`): marked with the accent bar and kept in view.
     var stop: DiffStop?
-    /// Changes on every live yield (the snapshot's patch hash): the pane scrolls back to `stop` so a live update never moves the
-    /// view off the current change stop.
+    /// Explicit ⌘↓/⌘↑ moves (`ChangesTabModel.stopMoves`): the pane scrolls to `stop` on each.
+    var stopMoves = 0
+    /// I-1: a live yield brings the pane back to `stop` only while the owner follows it and no review is open
+    /// (`ChangesTabModel.rescrollsOnYield`); otherwise the pane stays where the owner left it.
+    var rescrollsOnYield = false
+    /// Changes on every live yield (the snapshot's patch hash).
     var version: String = ""
     /// Comment markers by file index, side (`old`/`new`) and line number (the model's `markers`).
     var markers: DiffMarkerIndex = [:]
     /// Inline review (the CHANGES tab only); nil draws no gutter "+".
     var review: DiffReviewContext?
+    /// The owner scrolled the pane (scroll wheel or trackpad over it): `ChangesTabModel.ownerScrolled`.
+    var onOwnerScroll: (() -> Void)?
     /// A row id to scroll to (the file list's clicks); cleared once scrolled.
     @Binding var jump: String?
 
     @State private var closedFiles: Set<Int> = []
+    @State private var hovered = false
+    @State private var scrollWatch: ScrollWheelWatch?
     @State private var expanded: Set<DiffRowItem> = []
     /// The highlighted spans and the diff they were made for: spans of an older yield are never drawn over a newer one.
     @State private var cache: HighlightCache?
@@ -359,14 +418,16 @@ struct DiffPane: View {
                     // A two-axis scroll view centers narrower content: pin the rows to the leading edge, at least the pane wide.
                     .frame(minWidth: geo.size.width, alignment: .leading)
                 }
-                .onChange(of: stopId) { _, id in
-                    guard let id, let stop else { return }
+                .onChange(of: stopMoves) { _, _ in
+                    // ⌘↓/⌘↑: to the stop the owner asked for.
+                    guard let stopId, let stop else { return }
                     closedFiles.remove(stop.file)
-                    withAnimation(BrahmaTheme.fast) { proxy.scrollTo(id, anchor: .center) }
+                    withAnimation(BrahmaTheme.fast) { proxy.scrollTo(stopId, anchor: .center) }
                 }
                 .onChange(of: version) { _, _ in
-                    // A live yield: back to the current change stop (no animation, no focus change).
-                    if let stopId { proxy.scrollTo(stopId, anchor: .center) }
+                    // A live yield: back to the followed stop only (no animation, no focus change); never while a review is open
+                    // or after the owner scrolled away.
+                    if rescrollsOnYield, let stopId { proxy.scrollTo(stopId, anchor: .center) }
                 }
                 .onChange(of: jump) { _, target in
                     guard let target else { return }
@@ -377,6 +438,15 @@ struct DiffPane: View {
             }
         }
         .background(BrahmaTheme.bg0)
+        .onHover { hovered = $0 }
+        .onAppear {
+            guard onOwnerScroll != nil, scrollWatch == nil else { return }
+            scrollWatch = ScrollWheelWatch { if hovered { onOwnerScroll?() } }
+        }
+        .onDisappear {
+            scrollWatch?.stop()
+            scrollWatch = nil
+        }
         .task(id: diff) {
             let d = diff
             let made = await Task.detached(priority: .userInitiated) { Self.highlight(d) }.value
@@ -623,8 +693,8 @@ struct DiffReviewContext {
     let holder: String?
     /// `ChangesTabModel.anchor(fileIndex:hunk:index:side:)`: the engine's display path, the header as numbers, the shown text.
     let anchor: @MainActor (_ file: Int, _ hunk: Int, _ index: Int, _ side: String) -> DiffAnchor?
-    /// Posts through `AppModel.submitReview` (the owner principal's path); returns the error text, nil once posted.
-    let submit: @MainActor (ReviewDraft) async -> String?
+    /// Starts the review on the clicked line (`ChangesTabModel.beginReview`); the popover is the CHANGES view's.
+    let begin: @MainActor (DiffAnchor) -> Void
 }
 
 struct ReviewTarget {
@@ -656,11 +726,10 @@ private struct HunkHeaderRow: View {
     let text: String
     let review: ReviewTarget?
     @State private var hovered = false
-    @State private var reviewing = false
 
     var body: some View {
         HStack(spacing: 0) {
-            ReviewGutter(review: review, hovered: hovered, comments: [], reviewing: $reviewing)
+            ReviewGutter(review: review, hovered: hovered, comments: [])
             Text(verbatim: text)
                 .font(BrahmaTheme.monoSmall)
                 .foregroundStyle(BrahmaTheme.accent)
@@ -687,11 +756,10 @@ struct DiffLineView: View {
     var wraps = false
     var isStop = false
     @State private var hovered = false
-    @State private var reviewing = false
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 0) {
-            ReviewGutter(review: review, hovered: hovered, comments: comments, reviewing: $reviewing)
+            ReviewGutter(review: review, hovered: hovered, comments: comments)
             if numbers != .new { number(line.oldNo) }
             if numbers != .old { number(line.newNo) }
             Text(verbatim: sign)
@@ -759,15 +827,13 @@ struct DiffLineView: View {
     }
 }
 
-/// The 16 pt gutter: an `accent` dot for a line with comments (click shows the thread), else the review "+" while hovered.
+/// The 16 pt gutter: an `accent` dot for a line with comments (click shows the thread), else the review "+" while hovered. The "+"
+/// only starts the review (the anchor is taken at the click); the popover is the CHANGES view's, never this row's (I-1).
 private struct ReviewGutter: View {
     let review: ReviewTarget?
     let hovered: Bool
     let comments: [DiffComment]
-    @Binding var reviewing: Bool
     @State private var showingThread = false
-    /// The anchor taken when "+" is clicked: a live yield while the popover is open never moves the comment to another line.
-    @State private var pinned: DiffAnchor?
 
     var body: some View {
         ZStack {
@@ -779,10 +845,9 @@ private struct ReviewGutter: View {
                 .help(comments.count == 1 ? "1 comment" : "\(comments.count) comments")
                 .accessibilityLabel(Text(verbatim: comments.count == 1 ? "Show 1 comment" : "Show \(comments.count) comments"))
                 .popover(isPresented: $showingThread, arrowEdge: .leading) { DiffThreadPopover(comments: comments) }
-            } else if let review, hovered || reviewing {
+            } else if let review, hovered {
                 Button {
-                    pinned = review.anchor
-                    reviewing = true
+                    if let anchor = review.anchor { review.context.begin(anchor) }
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 8, weight: .bold))
@@ -795,11 +860,27 @@ private struct ReviewGutter: View {
                 .buttonStyle(.plain)
                 .help("Comment on this line")
                 .accessibilityLabel(Text("Comment on this line"))
-                .popover(isPresented: $reviewing, arrowEdge: .leading) {
-                    ReviewPopover(anchor: pinned, holder: review.context.holder, submit: review.context.submit) { reviewing = false }
-                }
             }
         }
         .frame(width: 16)
+    }
+}
+
+/// I-1: the owner's own scrolling (scroll wheel or trackpad) over the diff pane, seen through a local event monitor; the
+/// monitor never consumes the event.
+@MainActor final class ScrollWheelWatch {
+    private var monitor: Any?
+
+    init(_ scrolled: @escaping @MainActor () -> Void) {
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+            // Momentum after the fingers lift is the same gesture; only a gesture the owner makes counts.
+            if event.momentumPhase == [] { MainActor.assumeIsolated { scrolled() } }
+            return event
+        }
+    }
+
+    func stop() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
     }
 }

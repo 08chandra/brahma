@@ -72,6 +72,23 @@ import BrahmaCore
     /// The engine's words when the board or the stream can't be read (never a value), or nil.
     public private(set) var error: String?
 
+    /// C7c fix round 1 (I-1): the inline review the owner is writing, held here (not in a diff row) so live yields, a refused
+    /// yield or a row that goes away never lose it. It posts against the key and compare it was started on.
+    public struct ReviewSession: Equatable, Sendable {
+        public var draft: ReviewDraft
+        public let key: String
+        public let compare: CompareMode
+        /// The refusal or validation problem of the last post (shown on the draft, never in the window's alert).
+        public var error: String?
+        public var posting = false
+    }
+
+    public internal(set) var review: ReviewSession?
+    /// The owner moved to the current stop with ⌘↓/⌘↑ and has not scrolled away since.
+    public private(set) var followsStop = false
+    /// Explicit stop moves (⌘↓/⌘↑): the pane scrolls on each.
+    public private(set) var stopMoves = 0
+
     private var modeStorage: DiffViewMode
     @ObservationIgnored private var watchTask: Task<Void, Never>?
     @ObservationIgnored private var retryTask: Task<Void, Never>?
@@ -114,6 +131,8 @@ import BrahmaCore
     public func select(_ key: String?) {
         guard key != selectedKey else { return }
         reset()
+        review = nil
+        followsStop = false
         selectedKey = key
         compare = .main
         shownAt = nil
@@ -130,6 +149,8 @@ import BrahmaCore
             return
         }
         reset()
+        if key != selectedKey { review = nil }
+        followsStop = false
         selectedKey = key
         self.compare = compare
         resubscribe()
@@ -139,6 +160,7 @@ import BrahmaCore
     public func setCompare(_ m: CompareMode) {
         guard m != compare else { return }
         compare = m
+        followsStop = false
         clearShown()
         resubscribe()
     }
@@ -172,8 +194,66 @@ import BrahmaCore
         return changeStops[i]
     }
 
-    public func nextChange() { stopIndex = DiffStops.next(stopIndex, count: changeStops.count) }
-    public func previousChange() { stopIndex = DiffStops.previous(stopIndex, count: changeStops.count) }
+    public func nextChange() {
+        stopIndex = DiffStops.next(stopIndex, count: changeStops.count)
+        movedToStop()
+    }
+
+    public func previousChange() {
+        stopIndex = DiffStops.previous(stopIndex, count: changeStops.count)
+        movedToStop()
+    }
+
+    private func movedToStop() {
+        guard stopIndex != nil else { return }
+        followsStop = true
+        stopMoves += 1
+    }
+
+    /// C7c fix round 1 (I-1): the owner scrolled (or jumped to a file) away from the current stop: live yields leave the pane
+    /// where it is until the next ⌘↓/⌘↑.
+    public func ownerScrolled() { followsStop = false }
+
+    /// A live yield may bring the pane back to the current stop only while the owner follows it and no review is open.
+    public var rescrollsOnYield: Bool { followsStop && review == nil }
+
+    // MARK: Inline review in progress (C7c fix round 1, I-1)
+
+    /// Starts a review on `anchor` of the selected item in the shown compare. A draft with text in it is never replaced by
+    /// another line's "+" (false); the same line keeps its draft.
+    @discardableResult
+    public func beginReview(_ anchor: DiffAnchor) -> Bool {
+        guard let key = selectedKey else { return false }
+        if let review {
+            if review.draft.anchor == anchor && review.key == key { return true }
+            if !review.draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+        }
+        review = ReviewSession(draft: ReviewDraft(anchor: anchor), key: key, compare: compare)
+        return true
+    }
+
+    public func setReviewText(_ text: String) {
+        review?.draft.text = text
+        review?.error = nil
+    }
+
+    public func cancelReview() { review = nil }
+
+    /// The draft can be posted: its item and compare are the ones shown, and a verified diff of them is on screen.
+    public var canPostReview: Bool {
+        guard let review, !review.posting else { return false }
+        return review.key == selectedKey && review.compare == compare && diff != nil && error == nil
+    }
+
+    func setReviewPosting(_ posting: Bool) {
+        review?.posting = posting
+        if posting { review?.error = nil }
+    }
+
+    func reviewFailed(_ message: String) {
+        review?.posting = false
+        review?.error = message
+    }
 
     // MARK: Anchors
 

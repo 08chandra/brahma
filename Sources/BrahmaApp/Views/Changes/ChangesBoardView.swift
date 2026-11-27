@@ -111,7 +111,8 @@ struct ChangesBoardView: View {
                         .foregroundStyle(BrahmaTheme.text0)
                         .lineLimit(1)
                         .truncationMode(.tail)
-                    if row.tainted { RefChipView(chip: RefChip(text: "TAINTED", tone: .warn)).fixedSize() }
+                    // m-6: the model's chips (TAINTED `warning`).
+                    ForEach(Array(row.chips.enumerated()), id: \.offset) { _, chip in RefChipView(chip: chip).fixedSize() }
                     Spacer(minLength: BrahmaTheme.spaceXS)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
