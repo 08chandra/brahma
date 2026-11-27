@@ -58,7 +58,9 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         #expect(Doctor.toolPathsItem(.failure(.gitMissing)).status == .fail)
         let old = Doctor.toolPathsItem(.failure(.gitTooOld("2.39.5")))
         #expect(old.status == .fail && old.detail.contains("2.39.5") && old.detail.contains("2.43"))
-        // The engine's own resolution on this machine: git found, by absolute path, at least 2.43.
+        // The engine's own resolution on this machine: git found, by absolute path, at least 2.43. The test process's one
+        // install comes first (Ruling F2-7): this test asks for no temp dir, so run alone nothing else would have installed it.
+        _ = toolPathsInstalled
         let live = Doctor.toolPathsItem()
         #expect(live.status != .fail && live.detail.hasPrefix("git /"), "\(live.detail)")
     }

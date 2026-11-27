@@ -179,10 +179,18 @@ struct RestoreCommand: ParsableCommand {
         if list { printSnapshots(service.list()); return }
         let snapshot: URL
         var walDate: Date?
+        var earlyToolsNote: String?
         if latest {
             guard let info = service.latestGood() else { throw fail("no snapshot passes its integrity check (see: brahma restore --list)") }
             snapshot = info.url
         } else if let at, let when = parseISO8601(at) {
+            // Ruling S5-7: litestream is one of the engine's tools, so they are installed before it is looked for, outside
+            // every workspace the current database and the snapshot a failed rebuild falls back to list (Ruling S5-8: or not
+            // at all; litestream is then unavailable and the snapshots are used).
+            if !dryRun, WALShipping.configuredReplica(paths: paths) != nil {
+                earlyToolsNote = service.installRestoreTools(paths: paths, snapshot: service.snapshot(atOrBefore: when)?.url)
+                if let earlyToolsNote { print(safe("warning: \(earlyToolsNote)")) }
+            }
             if let walFile = walRestore(paths: paths, at: when, dryRun: dryRun) {
                 snapshot = walFile
                 walDate = when
@@ -196,16 +204,16 @@ struct RestoreCommand: ParsableCommand {
             snapshot = URL(fileURLWithPath: path ?? "")
         }
         // B9 (Ruling S-c1, S5 fix 3): restore never opens the store, but it runs engine git (the commits after the snapshot, the
-        // restore epoch's listing): its tools are installed first, outside every workspace the snapshot or (not in a dry run,
-        // which must not touch the live database's files) the current database lists; with none listed, none are, and the
-        // note says the git checks were skipped.
-        let toolsNote = service.installRestoreTools(paths: paths, snapshot: snapshot, includeLive: !dryRun)
+        // restore epoch's listing): its tools are installed first, outside every workspace the snapshot and the current
+        // database list (read without touching it, so in a dry run too). Ruling S5-8: when a list cannot be read, or none
+        // lists a workspace, nothing is installed and the note says the git checks were skipped, and why.
+        let toolsNote = service.installRestoreTools(paths: paths, snapshot: snapshot)
         let plan: RestorePlan
         do { plan = try service.planRestore(snapshot: snapshot, date: walDate) } catch {
             if walDate != nil { try? FileManager.default.removeItem(at: snapshot) }
             throw fail("\(error)")
         }
-        if let toolsNote { print(safe("warning: \(toolsNote)")) }
+        if let toolsNote, toolsNote != earlyToolsNote { print(safe("warning: \(toolsNote)")) }
         for warning in plan.warnings { print(safe("warning: \(warning)")) }
         if withFiles && plan.homeSnapshot == nil {
             throw fail("there is no data-home snapshot at or before \(plan.snapshotDate.map(stamp) ?? "that snapshot"); nothing was changed "

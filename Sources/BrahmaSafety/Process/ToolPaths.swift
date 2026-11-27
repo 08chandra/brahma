@@ -46,6 +46,8 @@ public enum ToolPathsError: Error, Equatable, Sendable, CustomStringConvertible 
 /// - The macOS `/usr/bin/git` shim (any spelling that resolves to it) is replaced by its real target (`xcrun --find git`,
 ///   asked once per process), which must pass the same rules; inside a sandbox the shim would need xcrun's cache writes.
 /// - `sandbox-exec`, `/bin/sh`, `unzip` and `tar` are fixed absolute paths.
+/// - rclone, litestream and zstd are found by `engineTool(named:path:preferring:)` under the same rules (Ruling S5-7); no
+///   caller walks `PATH` itself.
 /// - git must be 2.43 or newer.
 public struct ToolPaths: Sendable, Equatable {
     public let git: String
@@ -379,10 +381,22 @@ public struct ToolPaths: Sendable, Equatable {
     /// the process installed its tools (Ruling S-c1). The forbidden roots are the ones known at the last `install` (a company
     /// created since is not among them until the next engine start).
     public static func engineTool(named name: String) throws -> String? {
-        let (known, path, forbiddenRoots) = slot.lock.withLock { (slot.result, slot.path, slot.forbidden) }
+        try engineTool(named: name, path: nil, preferring: [])
+    }
+
+    /// `engineTool(named:)` for the engine's other tools: rclone, litestream, zstd (Ruling S5-7; no caller walks `PATH`
+    /// itself). `preferring` are directories searched first, as `path` entries (a tool's usual places: zstd's Homebrew and
+    /// /usr/local dirs). `path` replaces the `PATH` of the last install (a test seam: `BackupTools(searchPath:)`). Every
+    /// directory and file meets the same rules, against the forbidden roots of the last install. Throws `.notInstalled`
+    /// before the process installed its tools (Ruling S-c1), whatever `path` says.
+    public static func engineTool(named name: String, path override: String?, preferring: [String]) throws -> String? {
+        let (known, installedPath, forbiddenRoots) = slot.lock.withLock { (slot.result, slot.path, slot.forbidden) }
         guard let known else { throw ToolPathsError.notInstalled }
-        if name == "claude", case .success(let tools) = known, let claude = tools.claude { return claude }
-        return lookup(name, path: path, forbiddenRoots: forbiddenRoots)
+        if name == "claude", override == nil, preferring.isEmpty, case .success(let tools) = known, let claude = tools.claude {
+            return claude
+        }
+        let searched = (preferring + [override ?? installedPath]).joined(separator: ":")
+        return lookup(name, path: searched, forbiddenRoots: forbiddenRoots)
     }
 
     /// The git paths the helper accepts in a request: the resolved one.

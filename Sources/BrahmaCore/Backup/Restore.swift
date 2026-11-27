@@ -334,12 +334,54 @@ extension BackupService {
         try Self.companyWorkspacePaths(in: try Self.openForReading(snapshot))
     }
 
-    /// The same, from the current database, opened `SQLITE_OPEN_READONLY`: it creates nothing and its close checkpoints
-    /// nothing. A reader still takes a read mark in the `-shm`, so a dry run does not call it. No database: it throws.
+    /// The same, from the current database, read without touching it (Ruling S5-8; a dry run reads it too). Its file and its
+    /// WAL are copied into a private directory outside the data home (the WAL first), and the copy is read. SQLite never
+    /// opens the live files, so no read mark lands in their `-shm` and no close checkpoints their WAL. Rows that are only in
+    /// the WAL (an engine that was killed) are read too, which `?mode=ro&immutable=1` would miss. If either file changed while
+    /// it was copied, the copy is made again, at most `liveCopyAttempts` times. No current database (a fresh home): nothing
+    /// to list. Throws when it cannot be read: not a regular file, a WAL with no database, a copy that keeps changing, or a
+    /// file SQLite cannot read.
     public func liveWorkspacePaths() throws -> [String] {
-        var config = Configuration()
-        config.readonly = true
-        return try Self.companyWorkspacePaths(in: try DatabaseQueue(path: database.path, configuration: config))
+        let db = database.path, wal = database.path + "-wal"
+        let fm = FileManager.default
+        guard let dbStamp = try Self.fileStamp(db, fm) else {
+            if try Self.fileStamp(wal, fm) != nil { throw BackupError.io("\(database.lastPathComponent)-wal is there without its database") }
+            return []
+        }
+        var stamps = (dbStamp, try Self.fileStamp(wal, fm))
+        for _ in 0..<Self.liveCopyAttempts {
+            let dir = fm.temporaryDirectory.appending(path: "brahma-restore-live-\(UUID().uuidString)", directoryHint: .isDirectory)
+            try fm.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            defer { bestEffort("remove the copy of the current database read for its workspaces") { try fm.removeItem(at: dir) } }
+            let copy = dir.appending(path: "live.sqlite")
+            if stamps.1 != nil { try fm.copyItem(atPath: wal, toPath: copy.path + "-wal") }
+            try fm.copyItem(atPath: db, toPath: copy.path)
+            let now = (try Self.fileStamp(db, fm), try Self.fileStamp(wal, fm))
+            guard now.0 == stamps.0, now.1 == stamps.1 else {
+                guard let changed = now.0 else { throw BackupError.io("\(database.lastPathComponent) went away while it was read") }
+                stamps = (changed, now.1)
+                continue
+            }
+            return try Self.companyWorkspacePaths(in: try DatabaseQueue(path: copy.path))
+        }
+        throw BackupError.io("\(database.lastPathComponent) kept changing while it was copied to be read")
+    }
+
+    /// How many times `liveWorkspacePaths` copies a database that changed while it was copied.
+    static let liveCopyAttempts = 3
+
+    /// What says a file changed: inode, size and modification time. Nil when there is no such file. Throws when it is not a
+    /// regular file (a link is never followed: `attributesOfItem` describes the link itself) or cannot be read.
+    private static func fileStamp(_ path: String, _ fm: FileManager) throws -> String? {
+        let attributes: [FileAttributeKey: Any]
+        do { attributes = try fm.attributesOfItem(atPath: path) } catch CocoaError.fileReadNoSuchFile { return nil } catch {
+            throw BackupError.io("\(path) cannot be read: \(error)")
+        }
+        guard attributes[.type] as? FileAttributeType == .typeRegular else { throw BackupError.io("\(path) is not a regular file") }
+        let inode = attributes[.systemFileNumber].map { "\($0)" } ?? "?"
+        let size = attributes[.size].map { "\($0)" } ?? "?"
+        let mtime = (attributes[.modificationDate] as? Date).map { "\($0.timeIntervalSinceReferenceDate)" } ?? "?"
+        return "\(inode) \(size) \(mtime)"
     }
 
     private static func companyWorkspacePaths(in queue: DatabaseQueue) throws -> [String] {
@@ -347,26 +389,33 @@ extension BackupService {
         return try queue.read { db in try String.fetchAll(db, sql: "SELECT workspacePath FROM company ORDER BY createdAt, rowid") }
     }
 
-    /// Ruling S-c1 for `brahma restore` (S5 fix 3, R1): it runs engine git (`reposAhead`, the restore epoch's listing) without
-    /// opening the store, so it installs the engine's tools here first, from `path`, with the data home, the workspaces
-    /// directory and the workspace of every company the snapshot and (with `includeLive`) the current database (read-only,
-    /// best effort) list as forbidden roots. A dry run passes `includeLive: false`: it must not change a byte of the data home,
-    /// and only the snapshot's repos are counted. When none is listed, the real roots are unknown: nothing is installed (every
-    /// git then refuses with `notInstalled`) and the returned note says the git checks were skipped. Nil when installed.
-    public func installRestoreTools(paths: BrahmaPaths, snapshot: URL, includeLive: Bool = true,
+    /// Ruling S-c1 for `brahma restore` (S5 fix 3, R1): it runs engine git (`reposAhead`, the restore epoch's listing) and,
+    /// with WAL shipping, litestream, without opening the store, so it installs the engine's tools here first, from `path`.
+    /// The forbidden roots are the data home, the workspaces directory and the workspace of every company that the current
+    /// database (`liveWorkspacePaths`, which never touches it, so a dry run reads it too) and `snapshot` list.
+    /// Ruling S5-8: never against a partial list. When either list cannot be read, or neither lists a workspace, the real
+    /// roots are unknown: nothing is installed (every git then refuses with `notInstalled`), and the returned note says the
+    /// git checks were skipped and why. Nil when installed.
+    public func installRestoreTools(paths: BrahmaPaths, snapshot: URL?,
                                     path: String = ProcessInfo.processInfo.environment["PATH"] ?? "") -> String? {
         var workspaces: [String] = []
-        var reads: [() throws -> [String]] = [{ try workspacePaths(snapshot: snapshot) }]
-        if includeLive { reads.append { try liveWorkspacePaths() } }
-        for read in reads {
-            do { workspaces += try read() } catch { continue }   // unreadable: it lists nothing (the note below if none does)
+        var lists: [(what: String, read: () throws -> [String])] = [("the current database", { try liveWorkspacePaths() })]
+        if let snapshot { lists.append(("the snapshot", { try workspacePaths(snapshot: snapshot) })) }
+        for list in lists {
+            do { workspaces += try list.read() } catch {
+                let why = "\(error)".split(whereSeparator: \.isNewline).joined(separator: " ")
+                return Self.toolsSkipped("the company workspaces \(list.what) lists could not be read (\(why))")
+            }
         }
         guard !workspaces.isEmpty else {
-            return "git checks were skipped: neither the current database nor the snapshot lists a company workspace, so Brahma "
-                + "did not resolve its tools (it resolves them only outside every workspace it knows)"
+            return Self.toolsSkipped("neither the current database nor the snapshot lists a company workspace")
         }
         ToolPaths.installForEngine(paths: paths, workspacePaths: Array(Set(workspaces)).sorted(), path: path)
         return nil
+    }
+
+    static func toolsSkipped(_ why: String) -> String {
+        "git checks were skipped: \(why), so Brahma did not resolve its tools (it resolves them only outside every workspace it knows)"
     }
 
     // MARK: Restore

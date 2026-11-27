@@ -26,10 +26,15 @@ public enum BackupTargetError: Error, Equatable, CustomStringConvertible, Sendab
     public var description: String { if case .invalid(let text) = self { return text }; return "" }
 }
 
-/// Where `rclone` and `litestream` are looked for. Neither is bundled: each degrades to "unavailable" when it is missing. Tests inject
-/// a `searchPath` holding fake executables.
+/// Where `rclone` and `litestream` are looked for. Neither is bundled: each degrades to "unavailable" when it is missing. Both are
+/// found through `ToolPaths` under its rules (Ruling S5-7): a safe directory, the owner and mode rule on the file and its
+/// resolved parent, and never inside a company workspace or data home. Nothing is looked up before the process installed its
+/// tools (Ruling S-c1). Tests inject a `searchPath` holding fake executables, searched under the same rules.
 public struct BackupTools: Sendable {
+    /// The `PATH` the tools run with.
     public var searchPath: String
+    /// The `PATH` they are looked for in, when it is not the engine's (`ToolPaths` install): the `searchPath` a caller gave.
+    private var lookupPath: String?
     /// Other variables the tools may need (`HOME` for rclone's config, `RCLONE_CONFIG`...). Everything else is left out.
     public var passthrough: [String: String]
     /// Replica credentials, for litestream only (`litestreamEnvironment`): `AWS_*`, `LITESTREAM_*` and `SSH_AUTH_SOCK`. Brahma
@@ -39,6 +44,7 @@ public struct BackupTools: Sendable {
 
     public init(searchPath: String? = nil, environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.searchPath = searchPath ?? environment["PATH"] ?? "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
+        self.lookupPath = searchPath
         var kept: [String: String] = [:], credentials: [String: String] = [:]
         for (key, value) in environment {
             if Self.passedThrough(key) { kept[key] = value }
@@ -67,18 +73,20 @@ public struct BackupTools: Sendable {
         return env
     }
 
-    public func find(_ name: String) -> String? {
-        for dir in searchPath.split(separator: ":") {
-            let candidate = String(dir) + "/" + name
-            var isDir: ObjCBool = false
-            if FileManager.default.isExecutableFile(atPath: candidate),
-               FileManager.default.fileExists(atPath: candidate, isDirectory: &isDir), !isDir.boolValue { return candidate }
-        }
-        return nil
+    /// The tool `name` by absolute path (`ToolPaths.engineTool`), nil when there is none. Throws `ToolPathsError.notInstalled`
+    /// before the process installed its tools: nothing is looked up without the real forbidden roots.
+    public func find(_ name: String) throws -> String? {
+        try ToolPaths.engineTool(named: name, path: lookupPath, preferring: [])
     }
 
-    public var rclone: String? { find("rclone") }
-    public var litestream: String? { find("litestream") }
+    /// Nil when there is none, and also before the process installed its tools (then nothing was looked up): each caller says
+    /// the tool is unavailable, as it does when the tool is missing.
+    public var rclone: String? { available("rclone") }
+    public var litestream: String? { available("litestream") }
+
+    private func available(_ name: String) -> String? {
+        do { return try find(name) } catch { return nil }
+    }
 }
 
 /// A finished external command.

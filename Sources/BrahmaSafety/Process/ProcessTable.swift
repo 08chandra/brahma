@@ -91,6 +91,38 @@ public enum ProcessTable {
         return sid < 0 ? nil : sid
     }
 
+    /// `proc_pidinfo`'s `PROC_PIDUNIQIDENTIFIERINFO` flavor (`<sys/proc_info.h>`), which answers with a
+    /// `struct proc_uniqidentifierinfo`.
+    public static let uniqueIdentifierFlavor: Int32 = 17
+    /// The size of that struct: `p_uuid[16]`, `p_uniqueid` (UInt64, offset 16), `p_puniqueid` (UInt64, offset 24),
+    /// `p_idversion`, `p_orig_ppidversion` (Int32 each) and two reserved UInt64s.
+    private static let uniqueIdentifierInfoSize = 56
+    private static let uniqueIdOffset = 16
+    private static let parentUniqueIdOffset = 24
+
+    /// A process's lineage, as the kernel recorded it at fork: its own unique id (Darwin `p_uniqueid`) and its parent's
+    /// (`p_puniqueid`). A unique id is never reused while the machine runs, unlike a pid. `p_puniqueid` keeps naming the
+    /// process that forked it after that parent exits and XNU reparents the child to launchd (ppid 1). A `setsid`'d child of
+    /// a turn whose parent exited between two polls is therefore still known to be the turn's (Ruling S5-5), while its ppid,
+    /// group and session say nothing.
+    /// Nil when it cannot be read: the process is gone or another user's, or this is not Darwin (Linux has no such id).
+    public static func lineage(_ pid: pid_t) -> (unique: UInt64, parent: UInt64)? {
+        #if canImport(Darwin)
+        guard pid > 0 else { return nil }
+        var buffer = [UInt8](repeating: 0, count: uniqueIdentifierInfoSize)
+        let n = buffer.withUnsafeMutableBytes { raw in
+            proc_pidinfo(pid, uniqueIdentifierFlavor, 0, raw.baseAddress, Int32(raw.count))
+        }
+        guard n == Int32(uniqueIdentifierInfoSize) else { return nil }
+        return buffer.withUnsafeBytes { raw in
+            (raw.loadUnaligned(fromByteOffset: uniqueIdOffset, as: UInt64.self),
+             raw.loadUnaligned(fromByteOffset: parentUniqueIdOffset, as: UInt64.self))
+        }
+        #else
+        return nil
+        #endif
+    }
+
     /// Its environment (`NAME=value` strings) as it was given at exec, or nil when it cannot be read.
     public static func environment(_ pid: pid_t) -> [String]? {
         #if canImport(Darwin)

@@ -140,6 +140,39 @@ private let perl = "/usr/bin/perl"
         #expect(await gone(escapee), "a descendant without the marker outlived its turn")
     }
 
+    /// Ruling S5-5 (S5 fix 4): a setsid'd escapee whose parent exits before any poll saw it. Once its parent is gone, XNU
+    /// reparents it to launchd (ppid 1), and it is in neither the turn's group nor its session, so nothing visible in the
+    /// process table ties it to the turn. Its lineage still does: `p_puniqueid` survives the reparenting. Nothing polls here
+    /// (no `startWatching`), so the watcher can never win the race it may lose under load, and the test does not depend on
+    /// the machine's load.
+    @Test func escapeeWhoseParentExitedBetweenPollsIsSwept() async throws {
+        let dir = try tempDir()
+        let pidFile = dir.appending(path: "escapee.pid")
+        let since = ProcessTable.startStamp(slack: 1)
+        // The pause comes first, so the containment is built while its leader still runs, as `TurnChild.spawn` builds it.
+        let script = """
+            sleep 0.3
+            \(perl) -e 'use POSIX; POSIX::setsid(); open(F, ">", $ARGV[0]); print F "$$\\n"; close F; exec "/bin/sleep", "300"' '\(pidFile.path)' &
+            while [ ! -s '\(pidFile.path)' ]; do sleep 0.05; done
+            """
+        let leader = try ProcessGroupChild.spawn(executable: "/bin/sh", arguments: ["sh", "-c", script],
+                                                 environment: ["PATH": "/usr/bin:/bin"], workingDirectory: dir, output: -1, newSession: true)
+        let containment = TurnContainment(leader: leader.pid, markerValue: "m", since: since)
+        let escapee = try await pid(in: pidFile)
+        let escapeeStart = ProcessTable.entry(escapee)?.start
+        defer {
+            // Never a pid that is someone else's by now.
+            if let escapeeStart, ProcessTable.entry(escapee)?.start == escapeeStart { kill(escapee, SIGKILL) }
+            _ = leader.finish()
+        }
+        _ = leader.waitForExit()
+        let row = try #require(ProcessTable.entry(escapee), "the escapee is running")
+        #expect(row.ppid == 1, "reparented to launchd once the shell exited")
+        #expect(row.pgid == escapee && ProcessTable.session(row) == escapee, "out of the turn's group and session")
+        #expect(containment.sweep() == [])
+        #expect(await gone(escapee), "a setsid'd escapee whose parent exited between polls outlived its turn")
+    }
+
     /// The escape every other channel misses: a double fork into a new session, faster than any poll, with the turn's marker
     /// variable removed. On a sandboxed turn its sandbox still gives it away: it allows the turn's unique mach name (Task 2's
     /// unremovable marker). It also deletes the agent's home first (the old write-shape probe's blind spot, B-I2).
@@ -458,6 +491,22 @@ private let perl = "/usr/bin/perl"
         #expect(me.pid == getpid()); #expect(me.ppid == getppid()); #expect(me.uid == getuid())
         #expect(ProcessTable.snapshot()?.contains { $0.pid == getpid() } == true)
         #expect(ProcessTable.entry(-5) == nil)
+    }
+
+    /// Ruling S5-5: a child's `p_puniqueid` is this process's `p_uniqueid`, and two processes never share a unique id.
+    @Test func processTableReadsLineage() throws {
+        #if canImport(Darwin)
+        let mine = try #require(ProcessTable.lineage(getpid()))
+        let child = try ProcessGroupChild.spawn(executable: "/bin/sleep", arguments: ["sleep", "30"], environment: ["PATH": "/usr/bin:/bin"],
+                                                workingDirectory: try tempDir(), output: -1)
+        defer { child.signalGroup(SIGKILL); _ = child.finish() }
+        let ids = try #require(ProcessTable.lineage(child.pid))
+        #expect(ids.parent == mine.unique)
+        #expect(ids.unique != mine.unique)
+        #expect(ProcessTable.lineage(-5) == nil)
+        #else
+        #expect(ProcessTable.lineage(getpid()) == nil)
+        #endif
     }
 }
 

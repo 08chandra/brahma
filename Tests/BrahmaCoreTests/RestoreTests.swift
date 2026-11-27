@@ -153,11 +153,15 @@ import GRDB
             #expect(note?.contains("git checks were skipped") == true)
             #expect(!ToolPaths.isInstalled)
         }
-        // Only the live database lists one: a restore installs; a dry run (which never opens the live database) does not.
+        // S5-8: a snapshot whose list cannot be read (no company table) leaves the roots partial, even though the live
+        // database lists a workspace, so nothing is installed. With no snapshot to read (`restore --at`'s install before
+        // litestream), the live database's list alone installs.
         ToolPaths.withIsolatedSlot {
-            #expect(service.installRestoreTools(paths: env.paths, snapshot: empty, includeLive: false)?.contains("git checks were skipped") == true)
+            let note = service.installRestoreTools(paths: env.paths, snapshot: empty)
+            #expect(note?.hasPrefix("git checks were skipped: the company workspaces the snapshot lists could not be read") == true,
+                    "note: \(note ?? "nil")")
             #expect(!ToolPaths.isInstalled)
-            #expect(service.installRestoreTools(paths: env.paths, snapshot: empty) == nil)
+            #expect(service.installRestoreTools(paths: env.paths, snapshot: nil) == nil)
             #expect(ToolPaths.isInstalled)
         }
     }
@@ -177,6 +181,90 @@ import GRDB
         #expect(result.status == 0, "stderr: \(result.stderr)")
         #expect(result.stdout.contains("git checks were skipped"), "stdout: \(result.stdout)")
         #expect(result.stdout.contains("nothing was changed"))
+    }
+
+    /// Ruling S5-8 (S5 fix 4): a dry run reads the current database's workspaces too, without touching a byte of it. A company
+    /// only the live database knows, with its workspace outside BRAHMA_WORKSPACES, is a forbidden root, so a git planted
+    /// there and first on PATH is never resolved (resolving runs `git --version`). The live database here is the way an
+    /// engine that was killed leaves it: the later company's row only in its WAL, with a `-shm` beside it. Neither file
+    /// changes: not its bytes, not its mtime.
+    @Test func dryRunForbidsALiveOnlyWorkspaceAndTouchesNoLiveFile() throws {
+        let home = try OwnerTestHome()
+        let paths = ownerPaths(home.url)
+        let elsewhere = try tempDir()
+        let marks = try tempDir()
+        let side = try tempDir().appending(path: "brahma.sqlite")
+        let snapshot: URL
+        let later: Company
+        do {
+            let store = try Store(path: side.path, backupsDir: paths.backupsDir)
+            _ = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: paths.workspaces)
+            snapshot = try BackupService(paths: paths, writer: store.writer).snapshot(reason: .manual)
+            later = try store.createCompany(name: "Later", goal: "g", workspacesRoot: elsewhere)
+            // Copied while the connection is still open: the copy is a database nobody has open, with its WAL and -shm.
+            try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+            for suffix in ["", "-wal", "-shm"] {
+                try FileManager.default.copyItem(atPath: side.path + suffix, toPath: paths.database.path + suffix)
+            }
+            try store.close()
+        }
+        let walSize = try #require(try FileManager.default.attributesOfItem(atPath: paths.database.path + "-wal")[.size] as? Int)
+        #expect(walSize > 0, "the later company is only in the WAL")
+        let plantedDir = URL(fileURLWithPath: later.workspacePath, isDirectory: true).appending(path: "bin")
+        try FakeTools.install(at: plantedDir.appending(path: "git"), "touch '\(marks.path)/planted-ran'\necho 'git version 2.99.0'")
+        func stamp(_ suffix: String) throws -> String {
+            let a = try FileManager.default.attributesOfItem(atPath: paths.database.path + suffix)
+            return "\(a[.size] ?? "") \((a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
+        }
+        let liveBefore = try ["", "-wal", "-shm"].map(stamp)
+        let before = try snapshotOfTree(paths.home)
+        let result = try runBrahma(["restore", "--dry-run", snapshot.path], home: home.url,
+                                   extra: ["PATH": plantedDir.path + ":/usr/bin:/bin"])
+        #expect(result.status == 0, "stdout: \(result.stdout)\nstderr: \(result.stderr)")
+        #expect(!FileManager.default.fileExists(atPath: marks.appending(path: "planted-ran").path),
+                "the git planted in the live-only workspace was resolved: \(result.stdout)")
+        #expect(!result.stdout.contains("git checks were skipped"), "stdout: \(result.stdout)")
+        #expect(result.stdout.contains("nothing was changed"))
+        #expect(try ["", "-wal", "-shm"].map(stamp) == liveBefore, "the live database, its WAL or its -shm changed")
+        let after = try snapshotOfTree(paths.home)
+        #expect(after == before, "changed: \(Set(after).symmetricDifference(Set(before)).sorted())")
+        // The same read in this process: the live-only workspace is listed, and the install never takes the planted git.
+        let service = BackupService(paths: paths)
+        #expect(try service.liveWorkspacePaths().contains(later.workspacePath))
+        try ToolPaths.withIsolatedSlot { () throws in
+            #expect(service.installRestoreTools(paths: paths, snapshot: snapshot, path: plantedDir.path + ":/usr/bin:/bin") == nil)
+            let git = try ToolPaths.engine().get().git
+            #expect(!git.hasPrefix(plantedDir.path), "resolved \(git)")
+        }
+        #expect(!FileManager.default.fileExists(atPath: marks.appending(path: "planted-ran").path))
+        #expect(try ["", "-wal", "-shm"].map(stamp) == liveBefore)
+    }
+
+    /// Ruling S5-8 (S5 fix 4): a workspace list that cannot be read leaves the forbidden roots incomplete, so no tools are
+    /// installed at all (never a resolution against a partial list) and the restore says its git checks were skipped and why.
+    @Test func unreadableLiveDatabaseInstallsNoTools() throws {
+        let home = try OwnerTestHome()
+        let paths = ownerPaths(home.url)
+        let snapshot: URL
+        do {
+            let store = try Store(path: paths.database.path, backupsDir: paths.backupsDir)
+            _ = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: paths.workspaces)
+            snapshot = try BackupService(paths: paths, writer: store.writer).snapshot(reason: .manual)
+            try store.close()
+        }
+        for suffix in ["-wal", "-shm"] { unlink(paths.database.path + suffix) }
+        try Data("not a database at all, just text".utf8).write(to: paths.database)
+        let service = BackupService(paths: paths)
+        ToolPaths.withIsolatedSlot {
+            let note = service.installRestoreTools(paths: paths, snapshot: snapshot)
+            #expect(note?.hasPrefix("git checks were skipped: ") == true, "note: \(note ?? "nil")")
+            #expect(note?.contains("current database") == true, "note: \(note ?? "nil")")
+            #expect(!ToolPaths.isInstalled)
+        }
+        let result = try runBrahma(["restore", "--dry-run", snapshot.path], home: home.url)
+        #expect(result.status == 0, "stdout: \(result.stdout)\nstderr: \(result.stderr)")
+        #expect(result.stdout.contains("warning: git checks were skipped: "), "stdout: \(result.stdout)")
+        #expect(result.stdout.contains("current database"), "stdout: \(result.stdout)")
     }
 
     @Test func restoreIsAtomicRename() async throws {

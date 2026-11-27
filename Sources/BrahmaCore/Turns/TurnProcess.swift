@@ -28,6 +28,17 @@ final class TurnContainment: @unchecked Sendable {
     private let lock = NSLock()
     /// pid → start time of every descendant seen (a pid whose start time changed is someone else's now).
     private var tracked: [pid_t: Double] = [:]
+    /// The unique ids (`ProcessTable.lineage`) of the leader and of every tracked process. A process whose parent's unique id
+    /// is here was forked by the turn, even after that parent exited and it was reparented to launchd (Ruling S5-5). Never
+    /// pruned: unique ids are never reused.
+    private var lineage: Set<UInt64> = []
+    /// Lineage reads by (pid, start), so a process is asked once rather than at every poll. An entry goes when its process
+    /// leaves the table. A read that failed is not kept (it is asked again).
+    private var lineageReads: [ProcessKey: (unique: UInt64, parent: UInt64)] = [:]
+    private struct ProcessKey: Hashable {
+        let pid: pid_t
+        let start: Double
+    }
     private var stopFlag = false
     private var watching = false
     private let watcherDone = DispatchSemaphore(value: 0)
@@ -40,6 +51,8 @@ final class TurnContainment: @unchecked Sendable {
         self.marker = "\(Self.markerVariable)=\(markerValue)"
         self.since = since
         self.probe = probe
+        // Built right after the spawn, while the leader is unreaped: its pid is still its own.
+        if let ids = ProcessTable.lineage(leader) { lineage.insert(ids.unique) }
     }
 
     func startWatching() {
@@ -62,23 +75,44 @@ final class TurnContainment: @unchecked Sendable {
         if wait { watcherDone.wait() }
     }
 
-    /// Adds every process descended from the leader or a tracked one (or in the leader's group or session) to the tracked set.
+    /// Adds to the tracked set every process descended from the leader or a tracked one (or in the leader's group or
+    /// session). Descent is read two ways: the current ppid, and, for a process started no earlier than the turn, the
+    /// unique id of the process that forked it (`ProcessTable.lineage`). The second still holds once the parent has exited
+    /// and the process was reparented to launchd, which is what a `setsid`'d escapee looks like when its parent exited
+    /// between two polls (Ruling S5-5).
     func observe(_ table: [ProcessEntry]) {
         lock.withLock {
             var starts: [pid_t: Double] = [:]
             for p in table where starts[p.pid] == nil { starts[p.pid] = p.start }
             tracked = tracked.filter { starts[$0.key] == $0.value }
+            lineageReads = lineageReads.filter { starts[$0.key.pid] == $0.key.start }
             var changed = true
             while changed {
                 changed = false
                 for p in table where p.uid == uid && p.pid != leader && p.pid != me && tracked[p.pid] == nil && !p.isZombie {
-                    if p.ppid == leader || tracked[p.ppid] != nil || p.pgid == leader || ProcessTable.session(p) == leader {
+                    let ids = p.start >= since ? lineageOf(p) : nil
+                    var forkedByTheTurn = false
+                    if let ids, lineage.contains(ids.parent) { forkedByTheTurn = true }
+                    if forkedByTheTurn || p.ppid == leader || tracked[p.ppid] != nil || p.pgid == leader
+                        || ProcessTable.session(p) == leader {
                         tracked[p.pid] = p.start
+                        if let ids { lineage.insert(ids.unique) }
                         changed = true
                     }
                 }
             }
         }
+    }
+
+    /// `p`'s lineage, read once per (pid, start). The caller holds `lock`.
+    private func lineageOf(_ p: ProcessEntry) -> (unique: UInt64, parent: UInt64)? {
+        let key = ProcessKey(pid: p.pid, start: p.start)
+        if let known = lineageReads[key] { return known }
+        guard let ids = ProcessTable.lineage(p.pid) else { return nil }
+        // Read after the ids. The same start time means the pid was still `p` when they were read, not a reuse.
+        guard ProcessTable.entry(p.pid)?.start == p.start else { return nil }
+        lineageReads[key] = ids
+        return ids
     }
 
     /// The processes of the turn alive in `table` (never the leader, which the caller reaps, nor this process).

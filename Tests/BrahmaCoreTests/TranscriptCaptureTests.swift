@@ -5,7 +5,11 @@ import GRDB
 
 /// Task 13a: per-turn transcript capture. The source directory is always a temp dir: the owner's real `~/.claude` is never read.
 @Suite(.scratch) struct TranscriptCaptureTests {
-    static let zstdPath: String? = Compressor.findZstd()
+    /// The machine's zstd (the test process's tools, installed once from `PATH`; Ruling S5-7), nil when there is none.
+    static let zstdPath: String? = {
+        _ = toolPathsInstalled
+        do { return try Compressor.findZstd() } catch { return nil }
+    }()
 
     struct Rig {
         let root: URL
@@ -268,6 +272,38 @@ import GRDB
         #expect(try FileManager.default.contentsOfDirectory(atPath: work.path).isEmpty)
         // Empty input.
         #expect(try Compressor.gzip.decompress(try Compressor.gzip.compress(Data(), workDir: work), workDir: work) == Data())
+    }
+
+    /// Ruling S5-7 (S5 fix 4): zstd is found through `ToolPaths` under its rules, never by a PATH walk of its own. One
+    /// planted in a company workspace (a forbidden root) is never used, even first on PATH. The safe one after it is used;
+    /// with only the planted one there is none (gzip). Before the process installed its tools with the real roots, nothing is
+    /// looked up at all (Ruling S-c1): `forCodec("zst")` refuses, and new captures use gzip. Its usual places are left out
+    /// here (`preferring: []`) so the machine's own zstd does not decide the outcome; the default keeps them first.
+    @Test func plantedZstdUnderAForbiddenRootIsNeverUsed() throws {
+        let marks = try tempDir()
+        let workspace = try tempDir()
+        let planted = workspace.appending(path: "bin")
+        let plantedZstd = planted.appending(path: "zstd").path
+        try FakeTools.install(at: planted.appending(path: "zstd"), "touch '\(marks.path)/planted-ran'\ncat")
+        let safe = try FakeTools.bin(["zstd": "cat"])
+        ToolPaths.withIsolatedSlot {
+            #expect(throws: ToolPathsError.notInstalled) { try Compressor.findZstd(searchPath: planted.path, preferring: []) }
+            #expect(throws: ToolPathsError.notInstalled) { try Compressor.findZstd() }
+            #expect(throws: CompressorError.self) { try Compressor.forCodec("zst") }
+            #expect(Compressor.platformDefault == .gzip)
+        }
+        try ToolPaths.withIsolatedSlot { () throws in
+            ToolPaths.install(forbiddenRoots: [workspace], path: planted.path + ":" + safe.path)
+            let safeZstd = safe.appending(path: "zstd").path
+            #expect(try Compressor.findZstd(searchPath: planted.path + ":" + safe.path, preferring: []) == safeZstd)
+            #expect(try Compressor.findZstd(searchPath: planted.path, preferring: []) == nil)
+            #expect(try Compressor.findZstd(preferring: []) == safeZstd, "the install's own PATH")
+            #expect(try Compressor.findZstd(preferring: [planted.path]) == safeZstd, "a preferred directory meets the same rules")
+            #expect(try Compressor.findZstd() != plantedZstd)
+            #expect(try Compressor.forCodec("zst") != .zstd(path: plantedZstd))
+            #expect(Compressor.platformDefault != .zstd(path: plantedZstd))
+        }
+        #expect(!FileManager.default.fileExists(atPath: marks.appending(path: "planted-ran").path), "a planted zstd ran")
     }
 
     @Test(.enabled(if: TranscriptCaptureTests.zstdPath != nil))

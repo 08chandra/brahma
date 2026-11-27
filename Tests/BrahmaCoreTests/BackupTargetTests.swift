@@ -194,6 +194,44 @@ import GRDB
         #expect(BackupTargets.sync(.rclone(remote: "secret"), paths: env.paths, tools: none) == .unavailable("rclone is not installed"))
     }
 
+    /// Ruling S5-7 (S5 fix 4): rclone and litestream are found through `ToolPaths` under its rules, never by a PATH walk of
+    /// their own. One planted in a company workspace (a forbidden root) is never used, even first on PATH. The safe one
+    /// after it is used, and with only the planted one the caller says the tool is not installed. Before the process
+    /// installed its tools with the real roots, nothing is looked up at all (Ruling S-c1).
+    @Test func plantedRcloneUnderAForbiddenRootIsNeverUsed() throws {
+        let env = try BackupEnv()
+        let marks = try tempDir()
+        let workspace = try tempDir()
+        let crypt = "printf '[secret]\\ntype = crypt\\n'"
+        for name in ["rclone", "litestream"] {
+            try FakeTools.install(at: workspace.appending(path: "bin/\(name)"), "touch \"$TMPDIR/planted-ran\"\n" + crypt)
+        }
+        let safe = try FakeTools.bin(["rclone": crypt, "litestream": "exit 0"])
+        let planted = workspace.appending(path: "bin").path
+        let tools = BackupTools(searchPath: planted + ":" + safe.path + ":/usr/bin:/bin", environment: ["TMPDIR": marks.path])
+        let onlyPlanted = BackupTools(searchPath: planted + ":/usr/bin:/bin", environment: ["TMPDIR": marks.path])
+        ToolPaths.withIsolatedSlot {
+            #expect(throws: ToolPathsError.notInstalled) { try tools.find("rclone") }
+            #expect(tools.rclone == nil)
+            #expect(tools.litestream == nil)
+        }
+        try ToolPaths.withIsolatedSlot { () throws in
+            ToolPaths.install(forbiddenRoots: [workspace], path: "/usr/bin:/bin")
+            #expect(tools.rclone == safe.appending(path: "rclone").path)
+            #expect(tools.litestream == safe.appending(path: "litestream").path)
+            #expect(onlyPlanted.rclone == nil)
+            #expect(onlyPlanted.litestream == nil)
+            #expect(throws: BackupTargetError.invalid("rclone is not installed (it is not on PATH)")) {
+                try BackupTargets.validate(.rclone(remote: "secret"), paths: env.paths, tools: onlyPlanted)
+            }
+            #expect(throws: WALShippingError.unavailable) {
+                try WALShipping.restoreFile(paths: env.paths, replica: "/x", timestamp: Date(), tools: onlyPlanted)
+            }
+            #expect(try BackupTargets.validate(.rclone(remote: "secret"), paths: env.paths, tools: tools) == .rclone(remote: "secret"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: marks.appending(path: "planted-ran").path), "a planted tool ran")
+    }
+
     @Test func rcloneSyncRunsWithTheExactArguments() throws {
         let env = try BackupEnv()
         _ = try env.service().snapshot(reason: .manual)

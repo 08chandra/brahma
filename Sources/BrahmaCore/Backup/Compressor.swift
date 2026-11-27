@@ -28,27 +28,35 @@ public enum Compressor: Sendable, Equatable {
     /// The codec name stored with a capture.
     public var codec: String { fileExtension }
 
-    static let zstdCandidates = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd", "/usr/local/opt/zstd/bin/zstd"]
+    /// zstd's usual places, searched before `PATH`.
+    public static let zstdDirectories = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/usr/local/opt/zstd/bin"]
 
-    /// The first executable zstd among the usual places and `PATH`.
-    public static func findZstd(environment: [String: String] = ProcessInfo.processInfo.environment) -> String? {
-        let onPath = (environment["PATH"] ?? "").split(separator: ":").map { "\($0)/zstd" }
-        return (zstdCandidates + onPath).first { FileManager.default.isExecutableFile(atPath: $0) }
+    /// The first usable zstd in its usual places (`preferring`), then on the engine's `PATH`. It is found through `ToolPaths`
+    /// under its rules (Ruling S5-7): a safe directory, the owner and mode rule on the file and its resolved parent, and never
+    /// inside a company workspace or data home. Throws `ToolPathsError.notInstalled` before the process installed its tools
+    /// (Ruling S-c1). `searchPath` replaces the engine's `PATH` (a test seam).
+    public static func findZstd(searchPath: String? = nil, preferring: [String] = zstdDirectories) throws -> String? {
+        try ToolPaths.engineTool(named: "zstd", path: searchPath, preferring: preferring)
     }
 
     public static func zstdOrGzip(zstdPath: String?) -> Compressor {
         zstdPath.map { .zstd(path: $0) } ?? .gzip
     }
 
-    /// zstd when it is installed, otherwise gzip.
-    public static var platformDefault: Compressor { zstdOrGzip(zstdPath: findZstd()) }
+    /// zstd when it is installed, otherwise gzip. Before the process installed its tools nothing is looked up, so gzip
+    /// (`/usr/bin/gzip`, a fixed path).
+    public static var platformDefault: Compressor {
+        do { return zstdOrGzip(zstdPath: try findZstd()) } catch { return .gzip }
+    }
 
     /// The compressor that reads a stored file of `codec` (`zst` needs the tool installed).
     public static func forCodec(_ codec: String) throws -> Compressor {
         switch codec {
         case "gz": return .gzip
         case "zst":
-            guard let path = findZstd() else { throw CompressorError.failed("zstd is not installed; it is needed to read this transcript") }
+            let found: String?
+            do { found = try findZstd() } catch { throw CompressorError.failed("zstd was not looked up: \(error)") }
+            guard let path = found else { throw CompressorError.failed("zstd is not installed; it is needed to read this transcript") }
             return .zstd(path: path)
         default: throw CompressorError.failed("unknown transcript codec '\(codec)'")
         }
