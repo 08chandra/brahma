@@ -76,6 +76,8 @@ struct ChatView: View {
                     markReadIfKey()
                 }
                 .onChange(of: controlActiveState) { markReadIfKey() }
+                // Plan C C7a: cards load after the messages and grow the rows; keep the newest in view.
+                .onChange(of: chat.attachments.count) { if highlightedId == nil { scrollToEnd(proxy) } }
             }
             Hairline()
             Composer(chat: chat, model: model)

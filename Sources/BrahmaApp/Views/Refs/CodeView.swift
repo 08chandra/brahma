@@ -20,6 +20,7 @@ struct CodeView: View {
     var body: some View {
         VStack(spacing: 0) {
             if hasHidden || highlight != nil { strip; Hairline() }
+            GeometryReader { geo in
             ScrollViewReader { proxy in
                 ScrollView([.vertical, .horizontal]) {
                     LazyVStack(alignment: .leading, spacing: 0) {
@@ -28,9 +29,12 @@ struct CodeView: View {
                         }
                     }
                     .padding(.vertical, BrahmaTheme.spaceXS)
+                    // Pinned to the leading edge (a two-axis scroll view centers narrower content), at least the pane wide.
+                    .frame(minWidth: geo.size.width, alignment: .leading)
                 }
                 .onAppear { scrollToRange(proxy) }
                 .onChange(of: highlight) { _, _ in scrollToRange(proxy) }
+            }
             }
         }
         .background(BrahmaTheme.bg0)

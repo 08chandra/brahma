@@ -31,7 +31,7 @@ struct DiffView: View {
             } else {
                 ScrollViewReader { proxy in
                     HStack(spacing: 0) {
-                        fileList(proxy).frame(width: 210)
+                        fileList(proxy).frame(width: 170)
                         Hairline(axis: .vertical)
                         hunks
                     }
@@ -112,6 +112,7 @@ struct DiffView: View {
     // MARK: Hunks
 
     private var hunks: some View {
+        GeometryReader { geo in
         ScrollView([.vertical, .horizontal]) {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(diff.files.enumerated()), id: \.offset) { f, file in
@@ -131,6 +132,9 @@ struct DiffView: View {
                     }
                 }
             }
+            // A two-axis scroll view centers narrower content: pin the rows to the leading edge, at least the pane wide.
+            .frame(minWidth: geo.size.width, alignment: .leading)
+        }
         }
         .background(BrahmaTheme.bg0)
     }
