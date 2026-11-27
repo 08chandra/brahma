@@ -32,10 +32,11 @@ public indirect enum StrictJSON: Equatable, Sendable {
     public static let maxDepth = 64
     /// The longest path a refusal shows; a longer one keeps its end, after an ellipsis.
     public static let maxPathLength = 256
-    /// The most values and keys one body may hold (Ruling 49 m2). Each becomes a node, so a 32 MiB `[0,0,…]` (16M values)
-    /// would cost about a gigabyte per connection; a real `claude` request — a long conversation, a dozen tool schemas,
-    /// base64 images (one string each) — holds tens of thousands at most.
-    public static let maxSteps = 2_000_000
+    /// The most values and keys one body may hold (Ruling 49 m2, lowered by Ruling 52(b)). Each becomes a node, so a 32 MiB
+    /// `[0,0,…]` (16M values) would cost about a gigabyte per connection; a real `claude` request — a long conversation, a
+    /// dozen tool schemas, base64 images (one string each) — holds tens of thousands at most, so 500 000 is still more than
+    /// 25× a realistic request while bounding peak memory (the `JSONDecoder` second pass included).
+    public static let maxSteps = 500_000
 
     /// How much work a parse did (Ruling 47's deterministic seam: a test proves growth is linear by counting, not timing).
     struct Work: Equatable {

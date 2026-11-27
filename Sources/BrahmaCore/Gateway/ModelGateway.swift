@@ -1,40 +1,60 @@
 import Foundation
 
 /// The engine's model gateway (Plan X1 Task 8): the handler behind `GatewayServer`. For each admitted request it decodes the
-/// body, routes the model by the turn's grant, applies the policy refusals, reads the provider key from the vault, and sends the
-/// request upstream through the provider's adapter. The meter is wired in Task 9.
+/// body, routes the model by the turn's grant, applies the policy refusals, reserves the request's estimate with the meter
+/// (Task 9: refused at a cap, unpriced or uncapped), reads the provider key from the vault, sends the request upstream through
+/// the provider's adapter, and settles the reservation with the usage the adapter read.
 ///
 /// Every request first passes `GatewayPolicy` (no provider-side network, only metered fields and betas; Ruling X1-34).
 /// Routing: `grant.aliases[model]` names the provider and upstream model; otherwise `model` is served as sent, by the grant's
 /// provider, only when it is one of `grant.passThroughFamilies` (exact ids); anything else is refused. The key is read per
 /// request with `vault.nonInteractive()` and lives only in the local scope of that request's `forward`: never stored, logged
 /// or echoed — upstream text is redacted with its value before it is relayed or logged.
+///
+/// Metering (Task 9): a request that never left the gateway is released (Ruling 23); one handed to the transport is charged
+/// its usage, or its estimate when the usage is missing (Ruling 52(a)) — except an answer with an error status, which the
+/// provider does not bill (settled at zero), and `count_tokens`, which costs nothing. At most `GatewayLimits.maxUpstreamRequests`
+/// requests are upstream at once; past it a request gets a 429 (Ruling 52(f): transient, so `claude` backs off and retries).
 public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     public let registry: TurnTokenRegistry
     private let providers: @Sendable (String) throws -> Provider?
     private let adapters: [AdapterId: any ProviderAdapter]
     private let upstream: any UpstreamTransport
     private let vault: any SecretVault
+    private let meter: GatewayMeter
+    private let maxUpstream: Int
     private let log: @Sendable (String) -> Void
     private let lock = NSLock()
     private var server: GatewayServer?
     private var stopped = false
+    private var upstreamInFlight = 0
 
     /// `providers` looks a provider up by id (the store's `provider(id:)`); `log` gets one line per refused, failed or served
-    /// request (never a key).
-    public init(registry: TurnTokenRegistry, providers: @escaping @Sendable (String) throws -> Provider?,
-                adapters: [any ProviderAdapter] = [AnthropicAdapter()], upstream: any UpstreamTransport, vault: any SecretVault,
-                log: @escaping @Sendable (String) -> Void = { _ in }) {
-        self.registry = registry; self.providers = providers; self.upstream = upstream; self.vault = vault; self.log = log
+    /// request (never a key); `meter` reserves and settles every request sent upstream.
+    public convenience init(registry: TurnTokenRegistry, providers: @escaping @Sendable (String) throws -> Provider?,
+                            adapters: [any ProviderAdapter] = [AnthropicAdapter()], upstream: any UpstreamTransport, vault: any SecretVault,
+                            meter: GatewayMeter, log: @escaping @Sendable (String) -> Void = { _ in }) {
+        self.init(registry: registry, providers: providers, adapters: adapters, upstream: upstream, vault: vault, meter: meter,
+                  maxUpstream: GatewayLimits.maxUpstreamRequests, log: log)
+    }
+
+    init(registry: TurnTokenRegistry, providers: @escaping @Sendable (String) throws -> Provider?, adapters: [any ProviderAdapter],
+         upstream: any UpstreamTransport, vault: any SecretVault, meter: GatewayMeter, maxUpstream: Int,
+         log: @escaping @Sendable (String) -> Void) {
+        self.registry = registry; self.providers = providers; self.upstream = upstream; self.vault = vault; self.meter = meter
+        self.maxUpstream = maxUpstream; self.log = log
         self.adapters = Dictionary(adapters.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     }
 
     /// Starts serving on `127.0.0.1:<ephemeral>` and returns the port (the same port while running). A stopped gateway does
-    /// not start again.
+    /// not start again. Before the first start serves anything, reservations a dead gateway left open are charged at their
+    /// estimates (`GatewayMeter.recover`); a meter that cannot do that keeps the gateway from starting (fail closed).
     public func start() throws -> UInt16 {
         let server: GatewayServer = try lock.withLock {
             guard !stopped else { throw LoopbackListenerError.setup(step: "start after stop", errno: 0) }
             if let server = self.server { return server }
+            let recovered = try meter.recover()
+            if recovered > 0 { log("gateway: \(recovered) reservation(s) left open by an earlier gateway charged at their estimates") }
             let made = GatewayServer(registry: registry, handler: self)
             self.server = made
             return made
@@ -91,14 +111,56 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         guard let secret = provider.keySecret, Provider.isKeyName(secret) else {
             throw .unavailable("provider \(provider.id) has no key secret")
         }
+        if r.endpoint == .messages, canonical.maxTokens == nil { throw .policy("max_tokens is required") }
         guard isLive(reply) else { return }
+        guard acquireUpstreamSlot() else { throw Self.busy }
+        defer { releaseUpstreamSlot() }
+        // The reservation is in the database before anything goes upstream; it is settled however the request ends.
+        let reservation = try meter.reserve(grant, model: canonical.model, maxTokens: canonical.maxTokens ?? 0, inputBytes: r.body.count)
+        var settlement = Settlement.release
+        defer { settle(reservation, settlement) }
         try await forward(canonical, tree: tree, request: r, target: target, provider: provider, adapter: adapter, secret: secret, grant: grant,
-                          reply: reply)
+                          reply: reply, settlement: &settlement)
+    }
+
+    /// How a reserved request is settled.
+    enum Settlement: Equatable {
+        /// Nothing reached the provider: the reservation is dropped (Ruling 23).
+        case release
+        /// The provider may have served it: charged this usage, or the estimate when nil (Ruling 52(a)).
+        case charge(GatewayUsage?)
+    }
+
+    /// Nothing billed: an error answer, or `count_tokens`.
+    static let noUsage = GatewayUsage(inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0)
+
+    /// Ruling 52(f): more than `maxUpstream` requests upstream at once.
+    static let busy = GatewayError.refused(status: 429, type: "rate_limit_error", message: "Brahma: gateway busy")
+
+    private func settle(_ reservation: GatewayMeter.Reservation, _ settlement: Settlement) {
+        switch settlement {
+        case .release: meter.release(reservation)
+        case .charge(let usage): meter.settle(reservation, usage: usage)
+        }
+    }
+
+    private func acquireUpstreamSlot() -> Bool {
+        lock.withLock {
+            guard upstreamInFlight < maxUpstream else { return false }
+            upstreamInFlight += 1
+            return true
+        }
+    }
+
+    private func releaseUpstreamSlot() {
+        lock.withLock { upstreamInFlight -= 1 }
     }
 
     /// The one scope the provider key lives in: read, swapped into the upstream request, used to redact, dropped on return.
+    /// `settlement` says how the reservation is settled: it moves to a charge the moment the request is handed to the transport.
     private func forward(_ canonical: CanonicalRequest, tree: StrictJSON, request r: GatewayRequest, target: TurnGrant.RoutedTarget, provider: Provider,
-                         adapter: any ProviderAdapter, secret: String, grant: TurnGrant, reply: GatewayReply) async throws(GatewayError) {
+                         adapter: any ProviderAdapter, secret: String, grant: TurnGrant, reply: GatewayReply,
+                         settlement: inout Settlement) async throws(GatewayError) {
         let key: String
         do {
             guard let value = try vault.nonInteractive().value(companyId: grant.companyId, name: secret), !value.isEmpty else {
@@ -114,16 +176,22 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         let outgoing = try adapter.upstream(canonical, body: tree, model: target.model, endpoint: r.endpoint, headers: r.headers,
                                             provider: provider, key: key)
         guard isLive(reply) else { return }
+        settlement = .charge(nil)
         let response: UpstreamResponse
         do {
             response = try await upstream.send(outgoing)
         } catch {
+            // `unavailable` is the transport's refusal before anything was sent (`UpstreamTransport`); any other failure may
+            // have reached the provider, so it is charged the estimate.
+            if case .unavailable = error { settlement = .release }
             throw Self.redacted(error, redact)
         }
         guard (200...299).contains(response.status) || response.status >= 400 else {
             // A redirect (never followed) or an informational answer: the provider is not where it is configured to be.
             throw .upstream(status: 502, message: "Brahma: the provider answered HTTP \(response.status); redirects are refused")
         }
+        // The provider bills neither an error answer nor a token count.
+        if response.status >= 400 || r.endpoint == .countTokens { settlement = .charge(Self.noUsage) }
         let streamed = r.endpoint == .messages && canonical.stream == true
         let usage: GatewayUsage?
         do {
@@ -132,6 +200,7 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         } catch {
             throw Self.redacted(error, redact)
         }
+        if r.endpoint == .messages { settlement = .charge(usage) }
         let counts = usage.map { "in=\($0.inputTokens) out=\($0.outputTokens) cacheRead=\($0.cacheReadTokens) cacheWrite=\($0.cacheWriteTokens)" }
         log("gateway: turn \(grant.turnId) \(provider.id)/\(target.model) \(response.status) " + (counts ?? "no usage")
             + (reply.isCut ? " (cut)" : ""))

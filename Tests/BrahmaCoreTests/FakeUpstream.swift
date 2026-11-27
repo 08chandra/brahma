@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import GRDB
 #if canImport(Darwin)
 import Darwin
 #else
@@ -13,28 +14,36 @@ final class FakeUpstream: UpstreamTransport, @unchecked Sendable {
     enum Reply: Sendable {
         case respond(status: Int, headers: [String: String], chunks: [Data], hold: Bool)
         case fail(GatewayError)
+        /// A response whose body the test feeds (`UpstreamFeed`) while the gateway relays it.
+        case feed(status: Int, headers: [String: String], UpstreamFeed)
     }
 
     private let lock = NSLock()
     private var script: [Reply]
     private var recorded: [UpstreamRequest] = []
     private var terminations = 0
+    private var sendHook: (@Sendable () -> Void)?
 
     /// `script` is replayed in order; the last reply repeats.
     init(_ script: [Reply]) { self.script = script }
 
     var requests: [UpstreamRequest] { lock.withLock { recorded } }
+    /// Runs inside every `send`, before the reply (a test inspects what the gateway did before sending).
+    func onSend(_ hook: @escaping @Sendable () -> Void) { lock.withLock { sendHook = hook } }
     /// How many response streams ended because their consumer stopped (cancelled or dropped), not by finishing.
     var cancelledStreams: Int { lock.withLock { terminations } }
 
     func send(_ r: UpstreamRequest) async throws(GatewayError) -> UpstreamResponse {
-        let reply: Reply = lock.withLock {
+        let (reply, hook): (Reply, (@Sendable () -> Void)?) = lock.withLock {
             recorded.append(r)
-            return script.count > 1 ? script.removeFirst() : script[0]
+            return (script.count > 1 ? script.removeFirst() : script[0], sendHook)
         }
+        hook?()
         switch reply {
         case .fail(let error):
             throw error
+        case .feed(let status, let headers, let feed):
+            return UpstreamResponse(status: status, headers: headers, body: feed.stream)
         case .respond(let status, let headers, let chunks, let hold):
             let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
             continuation.onTermination = { [weak self] end in
@@ -62,6 +71,17 @@ final class FakeUpstream: UpstreamTransport, @unchecked Sendable {
         }
         return .respond(status: 200, headers: ["content-type": "text/event-stream"], chunks: chunks, hold: hold)
     }
+}
+
+/// An upstream body a test writes while the gateway reads it.
+final class UpstreamFeed: Sendable {
+    let stream: AsyncThrowingStream<Data, Error>
+    private let continuation: AsyncThrowingStream<Data, Error>.Continuation
+
+    init() { (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream() }
+
+    func send(_ text: String) { continuation.yield(Data(text.utf8)) }
+    func finish() { continuation.finish() }
 }
 
 /// Fixtures under `Fixtures/anthropic/`.
@@ -128,20 +148,30 @@ final class ModelGatewayRig: @unchecked Sendable {
     let registry = TurnTokenRegistry(clock: ManualAwakeClock())
     let upstream: FakeUpstream
     let vault = MemoryVault()
+    /// The meter's store: one company, `companyId`, with caps for `anthropic` unless the rig was made without them.
+    let store: Store
+    let companyId: String
+    let meter: GatewayMeter
     let gateway: ModelGateway
     let server: GatewayServer
     private let recorder = Recorder()
 
-    init(_ script: [FakeUpstream.Reply], providers: [Provider] = [AnthropicFixture.provider()], storeKey: Bool = true) throws {
+    init(_ script: [FakeUpstream.Reply], providers: [Provider] = [AnthropicFixture.provider()], storeKey: Bool = true,
+         caps: ProviderCaps? = ProviderCaps(monthlyUSD: 1000), maxUpstream: Int = GatewayLimits.maxUpstreamRequests) throws {
         upstream = FakeUpstream(script)
-        if storeKey { try vault.set(companyId: "co-1", name: Provider.anthropicKeyName, value: AnthropicFixture.key) }
+        store = try Store.inMemory()
+        companyId = try store.createCompany(name: "Co", goal: "g", workspacesRoot: tempDir()).id
+        if let caps { try store.setProviderCaps(caps, companyId: companyId, provider: "anthropic") }
+        if storeKey { try vault.set(companyId: companyId, name: Provider.anthropicKeyName, value: AnthropicFixture.key) }
         let byId = Dictionary(uniqueKeysWithValues: providers.map { ($0.id, $0) })
         let recorder = self.recorder
+        let log: @Sendable (String) -> Void = { line in recorder.lock.withLock { recorder.lines.append(line) } }
+        meter = GatewayMeter(store: store, prices: { PriceBook(owner: []) }, clock: { Date() }, log: log)
         gateway = ModelGateway(registry: registry, providers: { id in
             let hook: (@Sendable () -> Void)? = recorder.lock.withLock { recorder.lookups += 1; return recorder.onLookup }
             hook?()
             return byId[id]
-        }, upstream: upstream, vault: vault, log: { line in recorder.lock.withLock { recorder.lines.append(line) } })
+        }, adapters: [AnthropicAdapter()], upstream: upstream, vault: vault, meter: meter, maxUpstream: maxUpstream, log: log)
         // Connection deadlines on a clock that stands still: no load can time a connection out (Ruling 44).
         server = GatewayServer(registry: registry, handler: gateway, timing: .pinned, clock: ManualAwakeClock(), beforeDispatch: nil)
     }
@@ -154,8 +184,34 @@ final class ModelGatewayRig: @unchecked Sendable {
 
     func grant(aliases: [String: TurnGrant.RoutedTarget] = ["brahma-standard": .init(provider: "anthropic", model: "claude-sonnet-5-5")],
                passThrough: Set<String> = ["claude-opus-5-5"], textOnly: Set<String> = [], serverTools: Set<String> = []) -> GatewayToken {
-        registry.mint(TurnGrant(turnId: "turn-1", companyId: "co-1", agentId: "agent-1", provider: "anthropic", aliases: aliases,
+        registry.mint(TurnGrant(turnId: "turn-1", companyId: companyId, agentId: "agent-1", provider: "anthropic", aliases: aliases,
                                 passThroughFamilies: passThrough, textOnlyModels: textOnly, serverTools: serverTools))
+    }
+
+    /// One `gatewayCharge` row as the tests read it.
+    struct ChargeRow: Equatable {
+        var state: String
+        var usd: Double
+        var estimated: Bool
+        var inputTokens: Int
+        var outputTokens: Int
+        var cacheReadTokens: Int
+        var cacheWriteTokens: Int
+        var provider: String
+        var model: String
+    }
+
+    /// Every charge, oldest first.
+    func charges() throws -> [ChargeRow] { try ModelGatewayRig.charges(store) }
+
+    static func charges(_ store: Store) throws -> [ChargeRow] {
+        try store.writer.read { db in
+            try Row.fetchAll(db, sql: "SELECT * FROM gatewayCharge ORDER BY id").map {
+                ChargeRow(state: $0["state"], usd: $0["usd"], estimated: $0["estimated"], inputTokens: $0["inputTokens"],
+                          outputTokens: $0["outputTokens"], cacheReadTokens: $0["cacheReadTokens"], cacheWriteTokens: $0["cacheWriteTokens"],
+                          provider: $0["provider"], model: $0["model"])
+            }
+        }
     }
 
     func connect() -> (peer: TestPeer, served: Task<Void, Never>) {

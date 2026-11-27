@@ -27,7 +27,9 @@ public struct UpstreamResponse: Sendable {
     }
 }
 
-/// Sends gateway requests to providers.
+/// Sends gateway requests to providers. `send` throws `GatewayError.unavailable` only when nothing was sent (a refused URL, a
+/// missing proxy, a cancelled task, no transport on this platform): the meter releases that request's reservation. Any
+/// other failure may have reached the provider, and the request is charged its estimate.
 public protocol UpstreamTransport: Sendable {
     func send(_ r: UpstreamRequest) async throws(GatewayError) -> UpstreamResponse
 }

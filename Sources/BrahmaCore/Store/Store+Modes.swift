@@ -65,7 +65,7 @@ extension Store {
             priority: EffectiveSpec.priority(stored: item.priority, confirmedBy: item.specConfirmedBy, holderId: holder),
             riskTags: EffectiveSpec.riskTags(item, holderId: holder),
             blockingCount: try Store.blockingDependentCount(db: db, item: item),
-            budgetLeftLE: budget.maxCostLE + item.budgetBoostLE - usage.costLE,
+            budgetLeftLE: budget.maxCostLE + item.budgetBoostLE - usage.cost,
             planWritten: planWritten, reviewRejections: rejections.count, replanRequested: replan, p2OnlyFix: p2Only,
             claimedAt: claimedAt)
     }

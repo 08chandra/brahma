@@ -136,7 +136,7 @@ extension Store {
         let usage = try Store.itemUsage(db: db, itemId: item.id)
         let budget = TierBudget.of(item.tier)
         let costCap = budget.maxCostLE + item.budgetBoostLE
-        guard usage.turns > budget.maxTurns || usage.tokens > budget.maxTokens || usage.costLE > costCap else { return }
+        guard usage.turns > budget.maxTurns || usage.tokens > budget.maxTokens || usage.cost > costCap else { return }
         try blockOverBudget(db: db, item: &item, agent: agent, now: now)
     }
 

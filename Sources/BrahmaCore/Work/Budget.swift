@@ -27,15 +27,23 @@ public struct TierBudget: Equatable, Sendable {
     }
 }
 
-/// An item's spending so far: work turns that were not infrastructure failures or session resets.
+/// An item's spending so far: work turns that were not infrastructure failures or session resets, plus every dollar the
+/// model gateway charged for it (Plan X1 Task 9).
 public struct ItemUsage: Equatable, Sendable {
     public var turns = 0
     /// `TurnUsage.counted` summed over the turns.
     public var tokens = 0
+    /// The subscription turns' list-equivalent cost (`turn.costLE`; gateway turns leave it nil).
     public var costLE = 0.0
+    /// The gateway's charges for the item (`gatewayCharge`, every state: an open reservation counts at its estimate).
+    public var meteredUSD = 0.0
 
-    public init(turns: Int = 0, tokens: Int = 0, costLE: Double = 0) {
-        self.turns = turns; self.tokens = tokens; self.costLE = costLE
+    /// What the item's cost cap is held against: subscription $LE plus gateway dollars, so item budgets bound gateway spend
+    /// too (spec §8.2.3).
+    public var cost: Double { costLE + meteredUSD }
+
+    public init(turns: Int = 0, tokens: Int = 0, costLE: Double = 0, meteredUSD: Double = 0) {
+        self.turns = turns; self.tokens = tokens; self.costLE = costLE; self.meteredUSD = meteredUSD
     }
 }
 
@@ -47,7 +55,8 @@ public enum BudgetText {
     /// `16/15 turns, 1050k/1000k tokens, $11.20/$10.00`, plus `≈4% of week` once the weekly calibration exists.
     public static func parts(usage: ItemUsage, budget: TierBudget, costCapLE: Double, pctPerDollar: Double?) -> String {
         var text = "\(usage.turns)/\(budget.maxTurns) turns, \(usage.tokens / 1000)k/\(budget.maxTokens / 1000)k tokens, "
-            + "$\(money(usage.costLE))/$\(money(costCapLE))"
+            + "$\(money(usage.cost))/$\(money(costCapLE))"
+        // The week share calibrates subscription $LE; gateway dollars are not part of the weekly subscription window.
         if let pctPerDollar, pctPerDollar > 0 {
             text += ", ≈\(Int((usage.costLE * pctPerDollar * 100).rounded()))% of week"
         }
@@ -61,6 +70,7 @@ extension Store {
     /// Turns, counted tokens and cost recorded against the item. Review turns, infrastructure failures and session
     /// resets are not part of it; an interrupted or usage-limited turn adds its tokens and cost but is not a turn. An Ultra
     /// turn's tokens are left out of the tier token cap (its $LE cap governs it, Task 14u); it still counts as one turn.
+    /// `meteredUSD` is every gateway charge carrying the item, whatever turn made it: those dollars were spent (fail closed).
     public func itemUsage(itemId: String) throws -> ItemUsage {
         try writer.read { db in try Store.itemUsage(db: db, itemId: itemId) }
     }
@@ -74,6 +84,8 @@ extension Store {
             WHERE itemId = ? AND kind = 'work' AND infra = 0 AND sessionResetReason IS NULL
               AND (stopReason IS NULL OR stopReason <> 'sessionReset')
             """, arguments: [itemId])
-        return ItemUsage(turns: row?["turns"] ?? 0, tokens: row?["tokens"] ?? 0, costLE: row?["cost"] ?? 0)
+        let metered = try Double.fetchOne(db, sql: "SELECT COALESCE(SUM(usd), 0) FROM gatewayCharge WHERE itemId = ?",
+                                          arguments: [itemId]) ?? 0
+        return ItemUsage(turns: row?["turns"] ?? 0, tokens: row?["tokens"] ?? 0, costLE: row?["cost"] ?? 0, meteredUSD: metered)
     }
 }

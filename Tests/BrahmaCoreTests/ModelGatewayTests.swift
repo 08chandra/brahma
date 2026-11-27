@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import GRDB
 @testable import BrahmaCore
 
 /// Plan X1 Task 8: `ModelGateway` behind the real server — routing by the turn's grant, the policy refusals (Ruling 19's 400),
@@ -347,6 +348,123 @@ import Foundation
         #expect(session.connectionProxyDictionary?[kCFNetworkProxiesHTTPSPort as String] as? Int == Int(proxy.port))
         #expect(session.connectionProxyDictionary?[kCFNetworkProxiesHTTPSProxy as String] as? String == "127.0.0.1")
         #endif
+    }
+
+    // MARK: Task 9: metering through the gateway
+
+    /// The reservation is in the database before the request reaches the transport, and is settled with the usage after.
+    @Test func reservesBeforeSendingAndSettlesAfter() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let store = rig.store
+        let atSend = GatewayMeterTests.Locked<[String]>([])
+        rig.upstream.onSend { atSend.with { $0 = ((try? ModelGatewayRig.charges(store)) ?? []).map(\.state) } }
+        #expect(try await rig.exchange(Self.body("claude-opus-5-5"), token: rig.grant()).status == 200)
+        #expect(atSend.with { $0 } == ["reserved"])
+        let row = try #require(try rig.charges().first)
+        #expect(row.state == "settled" && !row.estimated && row.inputTokens == 1 && row.outputTokens == 2)
+        #expect(row.provider == "anthropic" && row.model == "claude-opus-5-5")
+        #expect(abs(row.usd - (1 * 4 + 2 * 20) / 1e6) < 1e-12)
+        // An alias is charged as its routed target.
+        #expect(try await rig.exchange(Self.body("brahma-standard"), token: rig.grant()).status == 200)
+        #expect(try rig.charges().last?.model == "claude-sonnet-5-5")
+    }
+
+    /// Ruling 23: a request refused before it leaves the gateway is never charged — by policy, routing, a missing
+    /// `max_tokens`, a missing key (after the reservation: released), or a transport that refused before sending.
+    @Test func refusedRequestsAreNeverCharged() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let token = rig.grant()
+        #expect(try await rig.exchange(Self.body("claude-fable-5-1"), token: token).status == 400)
+        #expect(try await rig.exchange(Self.body("claude-opus-5-5", extra: #","mcp_servers":[]"#), token: token).status == 403)
+        let noMax = try await rig.exchange(#"{"model":"claude-opus-5-5","messages":[]}"#, token: token)
+        #expect(noMax.status == 400 && noMax.text.contains("Brahma: max_tokens is required"), "\(noMax.text)")
+        #expect(try rig.charges().isEmpty)
+        let keyless = try ModelGatewayRig([Self.ok], storeKey: false)
+        #expect(try await keyless.exchange(Self.body("claude-opus-5-5"), token: keyless.grant()).status == 400)
+        #expect(try keyless.charges().isEmpty)
+        let refusing = try ModelGatewayRig([.fail(.unavailable("the request was cancelled"))])
+        #expect(try await refusing.exchange(Self.body("claude-opus-5-5"), token: refusing.grant()).status == 400)
+        let refusedCharges = try refusing.charges()
+        #expect(refusing.upstream.requests.count == 1 && refusedCharges.isEmpty)
+    }
+
+    /// Once the transport has the request: a failure that may have reached the provider is charged the estimate; an error
+    /// answer (which the provider does not bill) and `count_tokens` (free) are settled at zero.
+    @Test func sentRequestsAreSettled() async throws {
+        let body = Self.body("claude-opus-5-5")
+        let estimate = GatewayMeter.estimate(PriceBook.pinned["anthropic/claude-opus-5-5"]!, maxTokens: 16, inputBytes: body.utf8.count)
+        for (script, state, usd) in [(FakeUpstream.Reply.fail(.upstream(status: 502, message: "Brahma: the provider could not be reached")), "estimated", estimate),
+                                     (.respond(status: 302, headers: [:], chunks: [], hold: false), "estimated", estimate),
+                                     (FakeUpstream.json(529, #"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#), "settled", 0),
+                                     (FakeUpstream.json(400, #"{"type":"error","error":{"type":"invalid_request_error","message":"no"}}"#), "settled", 0)] {
+            let rig = try ModelGatewayRig([script])
+            #expect(try await rig.exchange(body, token: rig.grant()).status >= 400)
+            let row = try #require(try rig.charges().first, "\(script)")
+            #expect(row.state == state && abs(row.usd - usd) < 1e-12, "\(script): \(row)")
+        }
+        let count = try ModelGatewayRig([FakeUpstream.json(200, #"{"input_tokens":12}"#)])
+        let counted = try await count.exchange(#"{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}]}"#, token: count.grant(),
+                                               target: "/t/v1/messages/count_tokens?beta=true")
+        #expect(counted.status == 200)
+        let row = try #require(try count.charges().first)
+        #expect(row.state == "settled" && row.usd == 0)
+    }
+
+    /// Ruling 52(f): at most `GatewayLimits.maxUpstreamRequests` requests upstream at once; past it a 429 rate_limit_error
+    /// (transient: `claude` backs off and retries), never charged. A slot frees when its request ends.
+    @Test func gatewayBusyPastTheUpstreamLimit() async throws {
+        #expect(GatewayLimits.maxUpstreamRequests == 32)
+        let feeds = [UpstreamFeed(), UpstreamFeed()]
+        let rig = try ModelGatewayRig(feeds.map { .feed(status: 200, headers: ["content-type": "text/event-stream"], $0) } + [Self.ok], maxUpstream: 2)
+        let token = rig.grant()
+        let streamed = Self.body("claude-opus-5-5", extra: #","stream":true"#)
+        var open: [(TestPeer, Task<Void, Never>)] = []
+        for _ in feeds {
+            let (peer, served) = rig.connect()
+            await peer.write(rawRequest(token: token.value, body: streamed))
+            open.append((peer, served))
+        }
+        #expect(await eventually { rig.upstream.requests.count == 2 })
+        let busy = try await rig.exchange(Self.body("claude-opus-5-5"), token: token)
+        #expect(busy.status == 429 && busy.errorType == "rate_limit_error" && busy.text.contains("Brahma: gateway busy"), "\(busy.text)")
+        let held = try rig.charges()
+        #expect(rig.upstream.requests.count == 2 && held.count == 2)
+        // Which connection got which feed is a race: end both, then the slots are free again.
+        for feed in feeds {
+            feed.send("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")
+            feed.finish()
+        }
+        for (peer, served) in open {
+            #expect(try await peer.readHead().status == 200)
+            peer.close()
+            await served.value
+        }
+        #expect(try rig.charges().map(\.state) == ["settled", "settled"])
+        #expect(try await rig.exchange(Self.body("claude-opus-5-5"), token: token).status == 200)
+    }
+
+    /// Ruling 52(c): mid-conversation tool changes by reference and a tool search result's references pass the policy.
+    @Test func toolReferencesPass() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let body = #"{"model":"claude-opus-5-5","max_tokens":16,"tools":[{"name":"get_forecast","input_schema":{"type":"object"},"defer_loading":true}],"messages":[{"role":"user","content":"hi"},{"role":"system","content":[{"type":"tool_addition","tool":{"type":"tool_reference","name":"get_forecast"}},{"type":"tool_removal","tool":{"type":"tool_reference","name":"get_weather"}}]},{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Search","input":{"q":"weather"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"tool_reference","tool_name":"get_forecast"}]}]}]}"#
+        let r = try await rig.exchange(body, token: rig.grant(), extra: ["anthropic-beta: mid-conversation-tool-changes-2026-07-01"])
+        #expect(r.status == 200, "\(r.text)")
+    }
+
+    /// Ruling 52(d): a content `source` that is neither an object nor a string is refused with 403.
+    @Test func sourceOfAnotherShapeRefused() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let token = rig.grant()
+        for source in ["[]", "7", "true", "null", #"[{"type":"url","url":"https://x.example"}]"#] {
+            let body = #"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":[{"type":"image","source":\#(source)}]}]}"#
+            Self.expectForbidden(try await rig.exchange(body, token: token), "a content source must be an object")
+        }
+        #expect(rig.upstream.requests.isEmpty)
+    }
+
+    /// Ruling 52(b): the parse cap is 500 000 values and keys.
+    @Test func strictJSONStepCap() {
+        #expect(StrictJSON.maxSteps == 500_000)
     }
 
     @Test func startsAndStopsOnLoopback() throws {

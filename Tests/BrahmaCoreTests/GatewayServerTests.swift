@@ -620,7 +620,9 @@ func rawRequest(method: String = "POST", target: String = "/t/v1/messages?beta=t
     @Test func handlerWithoutAResponseIsAnError() async throws {
         let silent = GatewayHarness { _, _, _ in }
         let response = try await silent.exchange(rawRequest(token: silent.mint().value))
-        #expect(response.status == 500 && response.errorType == "api_error", "never an empty 200")
+        // Ruling 52(e): a 400 (`claude` ends the turn at once; it retries a 5xx for minutes).
+        #expect(response.status == 400 && response.errorType == "invalid_request_error", "never an empty 200")
+        #expect(response.text.contains("Brahma: no response"), "\(response.text)")
         // A stream the handler abandons is cut without its terminating chunk (the client sees a broken stream, not success).
         let abandoning = GatewayHarness { _, _, reply in
             await reply.startEvents()

@@ -120,10 +120,18 @@ public enum GatewayPolicy {
                 }
             }
             if value["input_schema"] != nil { throw forbidden("an inline tool definition is not allowed") }
-            if let source = value["source"], case .object = source {
-                guard let kind = source["type"]?.stringValue, contentSources.contains(kind) else {
-                    let shownKind = source["type"]?.stringValue.map(shown) ?? "(none)"
-                    throw forbidden("content source \(shownKind) is not allowed; send the content inline (base64 or text)")
+            if let source = value["source"] {
+                switch source {
+                case .object:
+                    guard let kind = source["type"]?.stringValue, contentSources.contains(kind) else {
+                        let shownKind = source["type"]?.stringValue.map(shown) ?? "(none)"
+                        throw forbidden("content source \(shownKind) is not allowed; send the content inline (base64 or text)")
+                    }
+                case .string:
+                    break
+                default:
+                    // Ruling 52(d): a source that is neither an object nor a string is no shape the policy can read.
+                    throw forbidden("a content source must be an object; send the content inline (base64 or text)")
                 }
             }
             for field in fields where !(type == "tool_use" && field.key == "input") {

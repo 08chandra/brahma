@@ -96,8 +96,10 @@ public struct AnthropicAdapter: ProviderAdapter {
             return try await relayEvents(body, into: reply, redact: redact)
         }
         let whole = try await Self.collect(body, limit: Self.maxResponseBytes)
-        // A cancelled task's stream ends early: what was collected may be cut short, so it is never relayed as a 200.
-        guard !Task.isCancelled, !reply.isCut else { return nil }
+        // A cancelled task's stream ends early: what was collected may be cut short, so it is never relayed as a 200. Its
+        // usage is still returned when the body is a whole message (Ruling 52(a)); a cut-short body parses to none, and the
+        // meter charges the estimate.
+        guard !Task.isCancelled, !reply.isCut else { return AnthropicUsageTap.usage(ofMessage: whole) }
         guard !whole.isEmpty else { throw .upstream(status: 502, message: "Brahma: the provider sent an empty response") }
         await reply.send(status: status, json: whole)
         return AnthropicUsageTap.usage(ofMessage: whole)

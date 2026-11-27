@@ -62,6 +62,9 @@ public enum GatewayLimits {
     public static let maxConnections = 64
     /// 503 refusals being sent at once (each takes a bounded write and drain); past it a connection is closed unanswered.
     public static let maxBusyRefusals = 16
+    /// Requests one engine's gateway has upstream at once (pinned, Ruling 52(f)); past it a request is answered 429
+    /// `rate_limit_error` "Brahma: gateway busy" (transient: `claude` backs off and retries).
+    public static let maxUpstreamRequests = 32
     /// A fresh connection whose first byte has not arrived after this long is closed (Ruling 42).
     public static let firstByteTimeout: Duration = .seconds(5)
     /// A keep-alive connection with no new request for this long is closed.
@@ -171,7 +174,9 @@ struct HTTPRefusal: Error, Equatable, Sendable {
     static let unauthorized = HTTPRefusal(status: 401, type: "authentication_error",
                                           message: "Brahma: a valid gateway token for a running turn is required")
     static let busy = HTTPRefusal(status: 503, type: "overloaded_error", message: "Brahma: the gateway is at its connection limit")
-    static let noResponse = HTTPRefusal(status: 500, type: "api_error", message: "Brahma: the gateway produced no response")
+    /// A handler that wrote nothing (Ruling 52(e)): a 400, like `GatewayError.unavailable` (Ruling 48) — `claude` retries any
+    /// other status for minutes, while a 400 ends the turn at once.
+    static let noResponse = HTTPRefusal(status: 400, type: "invalid_request_error", message: "Brahma: no response")
 }
 
 /// A parsed request head (request line + header fields), before routing.

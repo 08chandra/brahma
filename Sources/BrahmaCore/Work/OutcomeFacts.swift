@@ -33,6 +33,8 @@ public struct ItemFact: Codable, Equatable, Sendable, FetchableRecord, Persistab
     public var checkAuthorId: String?
     public var checkAuthorRole: String?
     public var mergeConflicts: Int
+    /// Subscription turns' list-equivalent cost only; the gateway's dollars are `meteredUSD` (spec §8.2.1: facts split cost
+    /// by mode).
     public var costLE: Double
     public var tierMaxCostLE: Double
     public var reviewCostLE: Double
@@ -44,6 +46,8 @@ public struct ItemFact: Codable, Equatable, Sendable, FetchableRecord, Persistab
     public var rungAtPass: Int?
     public var modesUsed: String?
     public var completedAt: Date
+    /// The dollars the model gateway charged for the item (Plan X1 Task 9; `ItemUsage.meteredUSD`).
+    public var meteredUSD: Double = 0
 }
 
 /// Writes the item's `ItemFact` inside the transaction that completes it. Always the store's first observer.
@@ -114,7 +118,7 @@ struct OutcomeFactsObserver: WorkItemObserver {
             mergeConflicts: events.filter { $0.kind == .mergeConflict }.count, costLE: usage.costLE,
             tierMaxCostLE: budget.maxCostLE + item.budgetBoostLE, reviewCostLE: reviewCost, autoMerged: item.autoApproved,
             audited: audit != nil, auditVerdict: audit?.verdict, rungAtPass: rung, modesUsed: modes.isEmpty ? nil : modes.joined(separator: ","),
-            completedAt: now)
+            completedAt: now, meteredUSD: usage.meteredUSD)
     }
 }
 

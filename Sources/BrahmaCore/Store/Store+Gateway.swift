@@ -171,7 +171,7 @@ extension Store {
     /// The company's spend with one provider in the owner's day or month holding `now` (the owner's time zone,
     /// `ownerTimeZone()`): every charge, reservations included.
     public func spend(companyId: String, provider: String, period: SpendPeriod, now: Date) throws -> Double {
-        let (start, end) = Self.spendWindow(period, now: now, zone: ownerTimeZone())
+        let (start, end) = try Self.spendWindow(period, now: now, zone: ownerTimeZone())
         return try writer.read { db in
             try Double.fetchOne(db, sql: """
                 SELECT COALESCE(SUM(usd), 0) FROM gatewayCharge WHERE companyId = ? AND provider = ? AND at >= ? AND at < ?
@@ -179,14 +179,111 @@ extension Store {
         }
     }
 
-    /// The owner-calendar day or month holding `now` in `zone`, as [start, end).
-    static func spendWindow(_ period: SpendPeriod, now: Date, zone: TimeZone) -> (Date, Date) {
+    /// The owner-calendar day or month holding `now` in `zone`, as [start, end). Throws when the calendar has none: a
+    /// guessed window could hold less than the month and let spend past a monthly cap (fail closed).
+    static func spendWindow(_ period: SpendPeriod, now: Date, zone: TimeZone) throws -> (Date, Date) {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = zone
         let unit: Calendar.Component = period == .day ? .day : .month
-        if let interval = calendar.dateInterval(of: unit, for: now) { return (interval.start, interval.end) }
-        let start = calendar.startOfDay(for: now)
-        return (start, start.addingTimeInterval(86_400))
+        guard let interval = calendar.dateInterval(of: unit, for: now) else {
+            throw WorkError.invalid("no \(period.rawValue) holds \(now) in \(zone.identifier)")
+        }
+        return (interval.start, interval.end)
+    }
+
+    // MARK: Meter (Task 9)
+
+    /// A provider's spend in one window, split by state: `committed` (settled and estimated charges) and `reserved` (open
+    /// reservations, each at its estimate).
+    struct SpendSplit: Equatable, Sendable {
+        var committed: Double
+        var reserved: Double
+    }
+
+    /// Records `c` as a reservation (`state = 'reserved'`) when `admit` lets it through, in one immediate transaction with the
+    /// spend `admit` decided on, so two concurrent reservations can never both pass on the same spend. `admit` gets the
+    /// company's caps for `c.provider` (nil when none are set) and the day's and month's spend (owner calendar in `zone`,
+    /// windows holding `c.at`); it throws to refuse, and nothing is written. Returns the new row's id.
+    func reserveCharge(_ c: GatewayCharge, zone: TimeZone,
+                       admit: (ProviderCaps?, _ day: SpendSplit, _ month: SpendSplit) throws -> Void) throws -> Int64 {
+        guard c.state == .reserved, c.usd.isFinite, c.usd >= 0 else { throw WorkError.invalid("a reservation is zero or more dollars") }
+        guard [c.inputTokens, c.outputTokens, c.cacheReadTokens, c.cacheWriteTokens].allSatisfy({ $0 >= 0 }) else {
+            throw WorkError.invalid("token counts are zero or more")
+        }
+        let day = try Self.spendWindow(.day, now: c.at, zone: zone)
+        let month = try Self.spendWindow(.month, now: c.at, zone: zone)
+        var id: Int64 = 0
+        try writer.writeWithoutTransaction { db in
+            try db.inTransaction(.immediate) {
+                try Self.requireCompany(db, c.companyId)
+                let caps = try Row.fetchOne(db, sql: "SELECT monthlyUSD, dailyUSD FROM providerCap WHERE companyId = ? AND provider = ?",
+                                            arguments: [c.companyId, c.provider])
+                    .map { ProviderCaps(monthlyUSD: $0["monthlyUSD"], dailyUSD: $0["dailyUSD"] as Double) }
+                try admit(caps, try Self.spendSplit(db, c, day), try Self.spendSplit(db, c, month))
+                try db.execute(sql: """
+                    INSERT INTO gatewayCharge (companyId, turnId, itemId, agentId, provider, model, inputTokens, outputTokens,
+                      cacheReadTokens, cacheWriteTokens, usd, estimated, state, at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, arguments: [c.companyId, c.turnId, c.itemId, c.agentId, c.provider, c.model, c.inputTokens, c.outputTokens,
+                                     c.cacheReadTokens, c.cacheWriteTokens, c.usd, c.estimated, c.state.rawValue, c.at])
+                id = db.lastInsertedRowID
+                return .commit
+            }
+        }
+        return id
+    }
+
+    private static func spendSplit(_ db: Database, _ c: GatewayCharge, _ window: (Date, Date)) throws -> SpendSplit {
+        let row = try Row.fetchOne(db, sql: """
+            SELECT COALESCE(SUM(CASE WHEN state = 'reserved' THEN 0 ELSE usd END), 0) AS committed,
+                   COALESCE(SUM(CASE WHEN state = 'reserved' THEN usd ELSE 0 END), 0) AS reserved
+            FROM gatewayCharge WHERE companyId = ? AND provider = ? AND at >= ? AND at < ?
+            """, arguments: [c.companyId, c.provider, window.0, window.1])
+        return SpendSplit(committed: row?["committed"] ?? 0, reserved: row?["reserved"] ?? 0)
+    }
+
+    /// Settles an open reservation with the provider's usage and its cost. Only a `reserved` row changes, so a second settle
+    /// (or one after `recoverReservations`) does nothing; returns whether the row changed.
+    @discardableResult
+    func settleCharge(id: Int64, usage: GatewayUsage, usd: Double) throws -> Bool {
+        guard usd.isFinite, usd >= 0 else { throw WorkError.invalid("a charge is zero or more dollars") }
+        return try writer.write { db in
+            try db.execute(sql: """
+                UPDATE gatewayCharge SET state = 'settled', estimated = 0, usd = ?, inputTokens = ?, outputTokens = ?,
+                  cacheReadTokens = ?, cacheWriteTokens = ?
+                WHERE id = ? AND state = 'reserved'
+                """, arguments: [usd, usage.inputTokens, usage.outputTokens, usage.cacheReadTokens, usage.cacheWriteTokens, id])
+            return db.changesCount > 0
+        }
+    }
+
+    /// Settles an open reservation at its reserved amount (`estimated`): the request went out and no usage came back.
+    @discardableResult
+    func estimateCharge(id: Int64) throws -> Bool {
+        try writer.write { db in
+            try db.execute(sql: "UPDATE gatewayCharge SET state = 'estimated', estimated = 1 WHERE id = ? AND state = 'reserved'",
+                           arguments: [id])
+            return db.changesCount > 0
+        }
+    }
+
+    /// Deletes an open reservation whose request never left the gateway (Ruling 23: a refused request is never charged).
+    @discardableResult
+    func releaseReservation(id: Int64) throws -> Bool {
+        try writer.write { db in
+            try db.execute(sql: "DELETE FROM gatewayCharge WHERE id = ? AND state = 'reserved'", arguments: [id])
+            return db.changesCount > 0
+        }
+    }
+
+    /// Every reservation still open (left by a gateway that stopped or died before settling) becomes `estimated` at its
+    /// reserved amount, so a `kill -9` never under-records spend. Returns how many changed.
+    @discardableResult
+    func recoverReservations() throws -> Int {
+        try writer.write { db in
+            try db.execute(sql: "UPDATE gatewayCharge SET state = 'estimated', estimated = 1 WHERE state = 'reserved'")
+            return db.changesCount
+        }
     }
 
     // MARK: Routes
