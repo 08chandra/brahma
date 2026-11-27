@@ -137,7 +137,7 @@ struct LiveShowBarTests {
         func running(_ body: () async throws -> String?) async throws {
             try await orchestrator.start()
             let engine = orchestrator
-            let loop = Task.detached { await engine.runForever(interval: .milliseconds(500)) }
+            let loop = Task.detached { await engine.runForever(interval: .milliseconds(500)) }  // scope-escape: the engine loop; makes no scratch dirs
             var failure: String?
             do { failure = try await body() } catch { failure = "\(error)" }
             if failure != nil { _ = try? store.emergencyStop(note: "LiveShowBarTests: \(failure!)", by: "owner", now: Store.now()) }
