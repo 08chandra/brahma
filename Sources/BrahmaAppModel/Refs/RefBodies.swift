@@ -58,6 +58,8 @@ public struct RefBody: Equatable, Sendable {
 /// copies, the agent handles and the clock.
 public struct RefRenderContext: Sendable {
     public var companyId: String
+    /// Ruling C6-2(b): the owner principal every owner-only Store call takes (only an owner surface has one).
+    public var owner: OwnerPrincipal
     public var knownValues: [(name: String, value: String)]
     public var paths: BrahmaPaths
     public var archives: any ArchiveReader
@@ -65,10 +67,13 @@ public struct RefRenderContext: Sendable {
     public var tempRoot: URL
     public var handles: [String: String]
     public var now: Date
+    /// The name prefix of this surface's copies under `tempRoot` (`open-tab`, `open-inspector`, `card`), so one surface's cleanup never
+    /// removes another's copy.
+    public var scratchPrefix: String
 
-    public init(companyId: String, knownValues: [(name: String, value: String)], paths: BrahmaPaths, archives: any ArchiveReader, timeZone: TimeZone,
-                tempRoot: URL, handles: [String: String], now: Date) {
-        self.companyId = companyId; self.knownValues = knownValues; self.paths = paths; self.archives = archives; self.timeZone = timeZone; self.tempRoot = tempRoot
+    public init(companyId: String, owner: OwnerPrincipal, knownValues: [(name: String, value: String)], paths: BrahmaPaths, archives: any ArchiveReader,
+                timeZone: TimeZone, tempRoot: URL, handles: [String: String], now: Date, scratchPrefix: String = "open-tab") {
+        self.companyId = companyId; self.owner = owner; self.scratchPrefix = scratchPrefix; self.knownValues = knownValues; self.paths = paths; self.archives = archives; self.timeZone = timeZone; self.tempRoot = tempRoot
         self.handles = handles; self.now = now
     }
 }
@@ -109,10 +114,11 @@ public enum RefBodies {
         }
         func unavailable(_ text: String = unavailableText) -> RefBody { RefBody(header: header(), content: .unavailable(text)) }
         func read() throws {
-            if let via { try store.recordOwnerRead(companyId: companyId, ref: ref, via: via, tainted: resolved.tainted, now: ctx.now) }
+            if let via { try store.recordOwnerRead(companyId: companyId, ref: ref, via: via, tainted: resolved.tainted, now: ctx.now, owner: ctx.owner) }
         }
         func render() throws -> RefRender {
-            try store.renderRef(companyId: companyId, ref: ref, knownValues: ctx.knownValues, paths: ctx.paths, archives: ctx.archives, via: via, now: ctx.now)
+            try store.renderRef(companyId: companyId, ref: ref, knownValues: ctx.knownValues, paths: ctx.paths, archives: ctx.archives, via: via, now: ctx.now,
+                                owner: ctx.owner)
         }
         do {
             switch ref.kind {
@@ -243,7 +249,7 @@ public enum RefBodies {
                            content: .code(lines: lines, firstLine: 1, highlight: resolved.ref.range, hasHidden: hidden))
         }
         // Anything else: a per-open confined copy for 4a's `FileBody` (agent and outside files open out of process: `effectiveMode`).
-        let dir = ctx.tempRoot.appending(path: "open-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let dir = ctx.tempRoot.appending(path: "\(ctx.scratchPrefix)-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let name = fileName(for: resolved.ref, ext: ext)
         let url = dir.appending(path: name)
@@ -350,7 +356,7 @@ public enum RefBodies {
         guard let agent = try store.agents(companyId: companyId).first(where: { $0.name == resolved.ref.id }) else {
             throw WorkError.notFound(Store.refUnavailable)
         }
-        let key = try store.leasedItemKey(companyId: companyId, agentId: agent.id)
+        let key = try store.leasedItemKey(companyId: companyId, agentId: agent.id, owner: ctx.owner)
         var liveDiff: DiffModel?
         if let key, let snapshot = try? store.changesSnapshot(companyId: companyId, key: key, compare: .main, reader: .owner,
                                                                knownValues: ctx.knownValues, now: ctx.now) {
@@ -367,9 +373,9 @@ public enum RefBodies {
                           return l
                       })
         }
-        let activity = try store.agentActivity(companyId: companyId, agentId: agent.id, limit: AgentNowModel.activityLines)
+        let activity = try store.agentActivity(companyId: companyId, agentId: agent.id, limit: AgentNowModel.activityLines, owner: ctx.owner)
             .map { gate.final(ActivityText.line($0, handles: ctx.handles), max: 400) ?? "(withheld)" }
-        let share = try store.agentUsageShareToday(agentId: agent.id, now: ctx.now)
+        let share = try store.agentUsageShareToday(agentId: agent.id, now: ctx.now, owner: ctx.owner)
         let requests = try store.showRequestsAwaitingTurn(agentId: agent.id).map { gate.final($0.query, max: ShowResolver.maxQuery) ?? "(withheld)" }
         let taint = turn.flatMap { $0.taintedAt != nil ? $0.taintSource : nil } ?? (agent.state == .running ? turn?.taintSource : nil)
         return AgentNowModel(handle: "@\(agent.name)", role: gate.final(agent.role, max: SafeTitle.max) ?? "", state: AgentBadge.label(agent),
@@ -399,7 +405,10 @@ public enum RefBodies {
     static func askTitle(for ref: WorkRef, store: Store, companyId: String, knownValues: [(name: String, value: String)]?) -> String? {
         guard ref.kind == .ask, let n = Int(ref.id),
               let ask = try? store.asks(companyId: companyId).first(where: { $0.number == n }) else { return nil }
-        return "\(ask.ref) " + Store.ownerShownTitle(ask, knownValues: knownValues)
+        let joined = "\(ask.ref) " + Store.ownerShownTitle(ask, knownValues: knownValues)
+        // Ruling 55: the joined string is what is shown, so it is what is gated.
+        guard let knownValues else { return joined }  // (the held-back text, an engine constant)
+        return GlobalSearch.TextGate(knownValues: knownValues).holdsSecret(joined) ? "\(ask.ref) \(FileRequestCard.withheld)" : joined
     }
 
     // MARK: Text

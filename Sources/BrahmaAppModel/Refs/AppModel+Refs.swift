@@ -14,20 +14,33 @@ extension AppModel {
     }
 
     /// What a render needs (`RefBodies`, `AttachmentCards`), with the values loaded now.
-    func renderContext(companyId: String) async throws -> RefRenderContext {
+    func renderContext(companyId: String, scratchPrefix: String = "open-tab") async throws -> RefRenderContext {
+        let owner = try store.requireOwner(self.owner)
         let store = self.store, paths = self.paths, vault = self.secretVault
         let known = try await Task.detached { try store.knownSecretValues(companyId: companyId, vault: vault) }.value
-        return RefRenderContext(companyId: companyId, knownValues: known, paths: paths, archives: refArchives(store, paths, companyId),
-                                timeZone: ownerTimeZone, tempRoot: try ensureRenderScratch(), handles: handles, now: clock())
+        return RefRenderContext(companyId: companyId, owner: owner, knownValues: known, paths: paths, archives: refArchives(store, paths, companyId),
+                                timeZone: ownerTimeZone, tempRoot: try ensureRenderScratch(), handles: handles, now: clock(), scratchPrefix: scratchPrefix)
+    }
+
+    /// Ruling C6-2(b): the owner principal, or the generic refusal in `errorMessage` and nil (no Store call is made).
+    func ownerOrRefuse() -> OwnerPrincipal? {
+        guard let owner else {
+            errorMessage = OwnerPrincipal.refusal
+            return nil
+        }
+        return owner
     }
 
     /// M4: where per-open and per-card copies of gated bytes live: `<data home>/tmp/preview`, 0700, never the shared TMPDIR. Opens
     /// (`open-*`) are removed when the slot changes or closes; everything is removed at launch.
     public var renderScratch: URL { paths.tmpDir.appending(path: "preview", directoryHint: .isDirectory) }
 
-    func ensureRenderScratch() throws -> URL {
+    func ensureRenderScratch() throws -> URL { try Self.ensureRenderScratch(paths: paths) }
+
+    /// `<data home>/tmp/preview`, made 0700 and re-asserted 0700 on every use (the cards path included).
+    nonisolated static func ensureRenderScratch(paths: BrahmaPaths) throws -> URL {
         _ = try paths.ensureTmpDir()
-        let dir = renderScratch
+        let dir = paths.tmpDir.appending(path: "preview", directoryHint: .isDirectory)
         if !FileManager.default.fileExists(atPath: dir.path) {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         }
@@ -35,11 +48,12 @@ extension AppModel {
         return dir
     }
 
-    /// Removes the copies of earlier opens (`open-*`), and with `all` the cards' too and anything else left there.
-    func cleanRenderScratch(all: Bool = false) {
+    /// Removes one surface's copies (`prefix`: `open-tab`, `open-inspector`, `card`), and with `all` everything left there. The
+    /// tab's and the inspector's copies are separate, so opening or closing a tab never removes what the inspector shows.
+    func cleanRenderScratch(prefix: String = "open-tab", all: Bool = false) {
         let dir = renderScratch
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
-        for name in names where all || name.hasPrefix("open-") {
+        for name in names where all || name.hasPrefix(prefix + "-") {
             try? FileManager.default.removeItem(at: dir.appending(path: name))
         }
     }
@@ -48,17 +62,16 @@ extension AppModel {
     /// kind chip alone). The stored values are loaded per call; a vault that can't be read shows no cards (fail closed).
     func makeCardMaker(companyId: String) -> @Sendable (Message) throws -> [AttachmentCard] {
         let store = self.store, paths = self.paths, vault = self.secretVault, archives: @Sendable (Store, BrahmaPaths, String) -> any ArchiveReader = refArchives, tz = ownerTimeZone, handles = self.handles
+        let owner = self.owner
         return { message in
+            // Ruling C6-2(b): no principal, no cards (and no Store read).
+            let owner = try store.requireOwner(owner)
             let rows = try store.messageRefs(companyId: companyId, messageId: message.id)
             guard !rows.isEmpty else { return [] }
             let known = try store.knownSecretValues(companyId: companyId, vault: vault)
-            _ = try paths.ensureTmpDir()
-            let tmp = paths.tmpDir.appending(path: "preview", directoryHint: .isDirectory)
-            if !FileManager.default.fileExists(atPath: tmp.path) {
-                try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-            }
-            let ctx = RefRenderContext(companyId: companyId, knownValues: known, paths: paths, archives: archives(store, paths, companyId), timeZone: tz,
-                                       tempRoot: tmp, handles: handles, now: Store.now())
+            let tmp = try Self.ensureRenderScratch(paths: paths)
+            let ctx = RefRenderContext(companyId: companyId, owner: owner, knownValues: known, paths: paths, archives: archives(store, paths, companyId),
+                                       timeZone: tz, tempRoot: tmp, handles: handles, now: Store.now(), scratchPrefix: "card")
             return try rows.compactMap(\.workRef).map { ref in
                 try AttachmentCards.make(try store.resolveRef(ref, for: .owner, companyId: companyId), store: store, context: ctx)
             }
@@ -70,7 +83,7 @@ extension AppModel {
     /// Opens `ref` in the OPENED slot (`origin`), selects the tab unless told otherwise, and loads its body (a `refRead(via: tab)`
     /// row). The title is the engine's, gated as a final string before it is kept.
     public func openRef(_ ref: WorkRef, origin: OpenOrigin, steps: [WorkRef]? = nil, stepIndex: Int? = nil, select: Bool = true) async {
-        guard let companyId = selectedCompanyId else { return }
+        guard let companyId = selectedCompanyId, ownerOrRefuse() != nil else { return }
         let store = self.store, vault = self.secretVault
         let known: [(name: String, value: String)]
         do {
@@ -122,7 +135,7 @@ extension AppModel {
     public func closeOpened() {
         previewNav.close()
         openedBody = nil
-        cleanRenderScratch()
+        cleanRenderScratch(prefix: "open-tab")
         if selectedPreviewTab == PreviewTabID.ref { selectPreviewTab(nil) }
         saveNav()
     }
@@ -184,7 +197,7 @@ extension AppModel {
         }
         openGeneration += 1
         let gen = openGeneration
-        cleanRenderScratch()
+        cleanRenderScratch(prefix: "open-tab")
         let body = await renderBody(for: opened, companyId: companyId, via: Store.tabReadVia)
         guard gen == openGeneration, previewNav.opened == opened, companyId == selectedCompanyId else { return }
         openedBody = body
@@ -196,23 +209,26 @@ extension AppModel {
     func renderBody(for opened: OpenedRef, companyId: String, via: String?) async -> RefBody {
         let store = self.store
         let ctx: RefRenderContext
-        do { ctx = try await renderContext(companyId: companyId) } catch {
+        do { ctx = try await renderContext(companyId: companyId, scratchPrefix: via == Store.inspectorReadVia ? "open-inspector" : "open-tab") } catch let e as WorkError {
+            return RefBody(header: RefHeader(title: opened.title, subtitle: "", chips: [], actions: []), content: .unavailable(e.message))
+        } catch {
             return RefBody(header: RefHeader(title: opened.title, subtitle: "", chips: [], actions: []),
                            content: .unavailable("REFUSED · the stored secrets can't be read"))
         }
+        let owner = ctx.owner
         let gate = GlobalSearch.TextGate(knownValues: ctx.knownValues)
         do {
             if case .showAnswer(let requestId, let by) = opened.origin {
                 let request = try? await Task.detached { try store.showRequest(companyId: companyId, id: requestId) }.value
                 let answer: Message? = try? await Task.detached { () -> Message? in
                     guard let id = request?.answerMessageId else { return nil }
-                    return try store.message(companyId: companyId, id: id)
+                    return try store.message(companyId: companyId, id: id, owner: owner)
                 }.value
                 if opened.ref.kind == .message, let answer, answer.id == opened.ref.id {
                     let refs = try await Task.detached { try store.messageRefs(companyId: companyId, messageId: answer.id).compactMap(\.workRef) }.value
                     let title = try? await Task.detached { try store.showAnswerTitle(companyId: companyId, messageId: answer.id, gate: gate) }.value
                     try? await Task.detached { try store.recordOwnerRead(companyId: companyId, ref: opened.ref, via: via ?? Store.tabReadVia,
-                                                                         tainted: answer.taintedOrigin || answer.fromTaintedSession) }.value
+                                                                         tainted: answer.taintedOrigin || answer.fromTaintedSession, owner: owner) }.value
                     return RefBodies.answerBody(message: answer, refs: refs, by: by, knownValues: ctx.knownValues, title: title ?? nil)
                 }
                 let resolved = try await Task.detached { try store.resolveRef(opened.ref, for: .owner, companyId: companyId) }.value
@@ -241,7 +257,7 @@ extension AppModel {
 
     /// Opens a card's ref in chat's right-side inspector split, without leaving the thread (a `refRead(via: inspector)` row).
     public func openInInspector(_ ref: WorkRef, messageId: String) async {
-        guard let companyId = selectedCompanyId else { return }
+        guard let companyId = selectedCompanyId, ownerOrRefuse() != nil else { return }
         let store = self.store, vault = self.secretVault
         guard let known = try? await Task.detached { try store.knownSecretValues(companyId: companyId, vault: vault) }.value else {
             errorMessage = "Couldn't open \(ref.kind.rawValue): the stored secrets can't be read, so nothing is shown."
@@ -251,6 +267,7 @@ extension AppModel {
         let opened = OpenedRef(ref: OpenedRef.stripped(ref), title: title, kindChip: OpenedRef.kindChip(for: ref), origin: .card(messageId: messageId))
         chatInspector = opened
         inspectorBody = nil
+        cleanRenderScratch(prefix: "open-inspector")
         let body = await renderBody(for: opened, companyId: companyId, via: Store.inspectorReadVia)
         guard chatInspector == opened else { return }
         inspectorBody = body
@@ -259,6 +276,7 @@ extension AppModel {
     public func closeInspector() {
         chatInspector = nil
         inspectorBody = nil
+        cleanRenderScratch(prefix: "open-inspector")
     }
 
     /// "Open in preview": the inspector's ref moves to the OPENED slot.
@@ -342,7 +360,7 @@ extension AppModel {
 
     /// Per tick: the waiting chips, the Budget line and the auto-opens (`ShowAnswerRouter`).
     public func refreshCollab() async {
-        guard let companyId = selectedCompanyId else { return }
+        guard let companyId = selectedCompanyId, let owner else { return }
         let store = self.store, vault = self.secretVault, now = clock(), tz = ownerTimeZone
         let usage = snapshot.usage, mode = selectedCompany?.company.usageMode ?? .balanced
         do {
@@ -350,7 +368,7 @@ extension AppModel {
                 let known = try store.knownSecretValues(companyId: companyId, vault: vault)
                 let gate = GlobalSearch.TextGate(knownValues: known)
                 var chips: [WaitingChip] = []
-                for r in try store.openShowRequests(companyId: companyId) {
+                for r in try store.openShowRequests(companyId: companyId, owner: owner) {
                     // I4: the assembled chip text is what is gated.
                     func chip(_ text: String) -> WaitingChip { WaitingChip(text: gate.final(text, max: 200) ?? "(withheld)", requestId: r.id) }
                     switch r.showTarget {
@@ -456,12 +474,12 @@ extension AppModel {
     /// The owner shares `refs` with `to` (`@handle`, `#channel`) with a note (`Store.ownerShare`).
     @discardableResult
     public func share(refs: [WorkRef], to: String, note: String?, replyTo: String? = nil) async -> Bool {
-        guard let companyId = selectedCompanyId else { return false }
+        guard let companyId = selectedCompanyId, let owner = ownerOrRefuse() else { return false }
         let paths = self.paths, vault = self.secretVault, archives: @Sendable (Store, BrahmaPaths, String) -> any ArchiveReader = refArchives, now = clock()
         return await ownerWrite("share") { store in
             let known = try store.knownSecretValues(companyId: companyId, vault: vault)
             _ = try store.ownerShare(companyId: companyId, refs: refs.map(\.canonical), to: to, note: note, replyTo: replyTo, knownValues: known,
-                                     paths: paths, now: now, archives: archives(store, paths, companyId))
+                                     paths: paths, now: now, archives: archives(store, paths, companyId), owner: owner)
             return true
         } ?? false
     }
@@ -475,10 +493,10 @@ extension AppModel {
     /// Replies in the thread of `rootId` as the owner. Returns the router's refusal when the reply carried `@here`/`@team`
     /// (a thread reply never broadcasts), for the composer to show.
     public func reply(inThread rootId: String, text: String) async -> String? {
-        guard let companyId = selectedCompanyId else { return nil }
+        guard let companyId = selectedCompanyId, let owner = ownerOrRefuse() else { return nil }
         let now = clock()
         let result: PostResult? = await ownerWrite("reply") { store in
-            do { return try store.ownerThreadReply(companyId: companyId, rootId: rootId, text: text, now: now) }
+            do { return try store.ownerThreadReply(companyId: companyId, rootId: rootId, text: text, now: now, owner: owner) }
             catch let e as ThreadError { throw WorkError.notFound(e.message) }
             catch let e as RouterError { throw WorkError.invalid("\(e)") }
         }
@@ -521,10 +539,11 @@ extension AppModel {
         case .item, .file, .diff:
             let key = ref.kind == .item ? ref.id : (ref.itemKey ?? "")
             guard !key.isEmpty else { errorMessage = "Nothing to vouch for: \(ref.canonical.prefix(80)) is not an item's work."; return }
+            guard let owner = ownerOrRefuse() else { return }
             let now = clock()
             await ownerWrite("vouch for \(key)") { store in
                 guard let item = try store.workItem(companyId: companyId, key: key) else { throw WorkError.notFound("no work item \(key)") }
-                try store.vouchItem(itemId: item.id, now: now)
+                try store.vouchItem(itemId: item.id, now: now, owner: owner)
             }
         default:
             errorMessage = "Nothing to vouch for: \(ref.kind.rawValue) refs carry no taint of their own."
@@ -538,7 +557,8 @@ extension AppModel {
         guard let companyId = selectedCompanyId else { return nil }
         // M6: the confirmation token comes only from the view's explicit owner confirmation (`confirmPurge`), never from here.
         if ref.kind == .resource {
-            _ = await purge(resource: "F-\(ref.id)")
+            // A refused purge (no confirmation) changes nothing, the tab included.
+            guard await purge(resource: "F-\(ref.id)") != nil else { return nil }
             if previewNav.opened?.ref == ref { closeOpened() }
             return nil
         }
@@ -547,10 +567,12 @@ extension AppModel {
             return nil
         }
         confirmPurge = nil
+        guard let owner = ownerOrRefuse() else { return nil }
         let paths = self.paths, vault = self.secretVault, now = clock()
         let report: RefPurgeReport? = await ownerWrite("purge \(ref.canonical.prefix(60))") { store in
             let known = try store.knownSecretValues(companyId: companyId, vault: vault)
-            return try store.purge(companyId: companyId, ref: ref, contentVault: ContentVault(paths: paths), paths: paths, knownValues: known, now: now)
+            return try store.purge(companyId: companyId, ref: ref, contentVault: ContentVault(paths: paths), paths: paths, knownValues: known, now: now,
+                                   owner: owner)
         }
         if previewNav.opened?.ref == ref { closeOpened() }
         return report
@@ -570,12 +592,12 @@ extension AppModel {
 
     /// View original (owner only): the bytes of `ref` as they are, through `gatedBytes` (a vouched PDF is its flattened copy).
     public func viewOriginal(_ ref: WorkRef) async -> Data? {
-        guard let companyId = selectedCompanyId else { return nil }
+        guard let companyId = selectedCompanyId, let owner = ownerOrRefuse() else { return nil }
         let paths = self.paths, vault = self.secretVault, archives: @Sendable (Store, BrahmaPaths, String) -> any ArchiveReader = refArchives, now = clock()
         return await ownerWrite("view the original of \(ref.canonical.prefix(60))") { store in
             let known = try store.knownSecretValues(companyId: companyId, vault: vault)
             return try store.viewOriginal(companyId: companyId, ref: ref, knownValues: known, paths: paths, now: now,
-                                          archives: archives(store, paths, companyId))
+                                          archives: archives(store, paths, companyId), owner: owner)
         }
     }
 

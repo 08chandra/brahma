@@ -44,6 +44,13 @@ struct MCP: ParsableCommand {
         }
         let packs = BrahmaPaths.fromEnvironment().packsDir
         let catalog = PackCatalog.loadOrBuiltin(directory: packs) { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
+        // Controller Ruling C6-3: this is an agent's process, before any Store opens: no owner principal can be minted in it, so no
+        // owner-only Store API is reachable from a tool, however one were wired. An unknown role here refuses (fail closed).
+        OwnerPrincipal.enterAgentProcess()
+        do { try OwnerPrincipal.requireAgentProcess() } catch {
+            FileHandle.standardError.write(Data("brahma mcp: \(error)\n".utf8))
+            throw ExitCode.failure
+        }
         let store = try Store(path: db, catalog: catalog)
         // Plan C Task C4c: the concierge's server. Its process runs as `BRAHMA_AGENT_ID=concierge` (so no owner command runs from
         // it), its token must name the live run of exactly this request in this company, and it serves only the concierge's

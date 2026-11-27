@@ -67,9 +67,14 @@ struct RefWorld {
         return model
     }
 
+    /// The owner principal of this (non-turn) test process.
+    func owner() throws -> OwnerPrincipal {
+        try OwnerPrincipal.mint()
+    }
+
     func renderContext() throws -> RefRenderContext {
-        try RefRenderContext(companyId: company.id, knownValues: [], paths: paths, archives: UnavailableArchiveReader(), timeZone: TimeZone(identifier: "UTC")!,
-                             tempRoot: tempDir(), handles: [cto.id: "cto", eng1.id: "eng-1", eng3.id: "eng-3"],
+        try RefRenderContext(companyId: company.id, owner: owner(), knownValues: [], paths: paths, archives: UnavailableArchiveReader(),
+                             timeZone: TimeZone(identifier: "UTC")!, tempRoot: tempDir(), handles: [cto.id: "cto", eng1.id: "eng-1", eng3.id: "eng-3"],
                          now: now)
     }
 

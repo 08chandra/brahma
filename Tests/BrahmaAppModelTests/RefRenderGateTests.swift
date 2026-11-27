@@ -53,7 +53,7 @@ import GRDB
         if case .code(let lines) = card.preview { #expect(!lines.flatMap { $0 }.map(\.text).joined().contains(s)) }
         // The render record says what the gate said.
         let render = try w.store.renderRef(companyId: w.company.id, ref: try w.ref("notes.md"), knownValues: [], paths: w.paths,
-                                           archives: UnavailableArchiveReader(), via: nil)
+                                           archives: UnavailableArchiveReader(), via: nil, owner: try w.owner())
         if case .pattern = render.verdict {} else { Issue.record("verdict \(render.verdict)") }
         #expect(!String(decoding: render.data, as: UTF8.self).contains(s))
     }
@@ -339,5 +339,72 @@ import GRDB
         await model.load()
         try await eventually { model.previewNav.opened?.title.contains("Checkout totals") == true }
         #expect(model.selectedPreviewTab == PreviewTabID.ref)
+    }
+
+    // MARK: Round 2 fold-ins
+
+    @Test func askTitleIsGatedAfterJoining() async throws {
+        let w = try RefWorld()
+        let (cId, eng1Id, now) = (w.company.id, w.eng1.id, w.now)
+        try w.write { db in
+            try Ask(id: "ask-9", companyId: cId, number: 9, kind: .info, risk: .low, requesterId: eng1Id, title: "Which API?", summary: "s",
+                    status: .pendingOwner, createdActive: 0, statusSinceActive: 0, createdAt: now, updatedAt: now).insert(db)
+        }
+        var ctx = try w.renderContext()
+        // A stored value that is exactly the joined title: the join is gated, so the title is withheld.
+        ctx.knownValues = [("JOINED", "A-9 Which API?")]
+        let body = try await RefBodies.body(for: try w.resolve("A-9"), store: w.store, companyId: w.company.id, context: ctx)
+        #expect(body.header.title == "A-9 " + FileRequestCard.withheld)
+        ctx.knownValues = []
+        let plain = try await RefBodies.body(for: try w.resolve("A-9"), store: w.store, companyId: w.company.id, context: ctx)
+        #expect(plain.header.title == "A-9 Which API?")
+    }
+
+    @Test func cardsScratchIsPrivate() async throws {
+        let w = try RefWorld()
+        let app = await w.app()
+        _ = try w.store.ownerShare(companyId: w.company.id, refs: ["src/a.ts"], to: "@eng-1", note: "see", replyTo: nil, knownValues: [], paths: w.paths,
+                                   owner: try w.owner())
+        let dm = try #require(try w.store.channel(companyId: w.company.id, name: "dm:eng-1:owner"))
+        let shared = try #require(try w.store.messages(channelId: dm.id, limit: 5).first)
+        try FileManager.default.createDirectory(at: app.renderScratch, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: app.renderScratch.path)
+        let cards = try app.makeCardMaker(companyId: w.company.id)(shared)
+        #expect(cards.count == 1 && cards[0].kindChip == "FILE")
+        let attrs = try FileManager.default.attributesOfItem(atPath: app.renderScratch.path)
+        #expect((attrs[FileAttributeKey.posixPermissions] as? Int) == 0o700)
+    }
+
+    @Test func refusedPurgeKeepsTheTab() async throws {
+        let w = try RefWorld()
+        try w.seedResource(number: 9, name: "x.md", bytes: Data("x\n".utf8), provenance: "owner")
+        let app = await w.app()
+        await app.openRef(try w.ref("F-9"), origin: .owner)
+        #expect(app.previewNav.opened?.ref.canonical == "F-9")
+        _ = await app.purge(try w.ref("F-9"))
+        #expect(app.errorMessage?.contains("Confirm") == true)
+        #expect(app.previewNav.opened?.ref.canonical == "F-9" && app.selectedPreviewTab == PreviewTabID.ref)
+    }
+
+    @Test func inspectorCopySurvivesTabChanges() async throws {
+        let w = try RefWorld()
+        _ = try Self.commit(w, [("img/a.png", TinyPNG.make()), ("img/b.png", TinyPNG.make())])
+        let app = await w.app()
+        await app.openRef(try w.ref("img/a.png"), origin: .owner)
+        try await eventually { app.openedBody != nil }
+        await app.openInInspector(try w.ref("img/b.png"), messageId: "m1")
+        try await eventually { app.inspectorBody != nil }
+        guard case .file(let inspected, _)? = app.inspectorBody?.content else {
+            Issue.record("inspector has no file body: \(String(describing: app.inspectorBody))")
+            return
+        }
+        #expect(FileManager.default.fileExists(atPath: inspected.url.path))
+        await app.openRef(try w.ref("img/b.png"), origin: .owner)
+        try await eventually { app.openedBody != nil }
+        #expect(FileManager.default.fileExists(atPath: inspected.url.path))
+        app.closeOpened()
+        #expect(FileManager.default.fileExists(atPath: inspected.url.path))
+        app.closeInspector()
+        #expect(!FileManager.default.fileExists(atPath: inspected.url.path))
     }
 }

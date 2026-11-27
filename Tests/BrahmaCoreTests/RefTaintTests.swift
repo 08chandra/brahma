@@ -315,7 +315,7 @@ import GRDB
         // Recording again is a no-op, never a second row.
         try cf.store.recordTaintedCommits(companyId: cf.c.id, itemId: cf.fx.item.id, agentId: cf.fx.eng3.id, turnId: nil,
                                           headBefore: base, headAfter: head, source: "docs.swift.org", git: git, now: cf.now)
-        try cf.store.vouchItem(itemId: cf.fx.item.id, now: cf.now)
+        try cf.store.vouchItem(itemId: cf.fx.item.id, now: cf.now, owner: try OwnerPrincipal.mint())
         let rows = try cf.store.writer.read { db in try TaintedCommit.fetchAll(db, sql: "SELECT * FROM taintedCommit ORDER BY companyId") }
         let mine = try #require(rows.first { $0.companyId == cf.c.id }), theirs = try #require(rows.first { $0.companyId == dId })
         #expect(rows.count == 2)
@@ -324,7 +324,7 @@ import GRDB
         #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:diff"), companyId: cf.c.id) == (false, nil))
         let activity = try cf.store.events(afterId: 0, companyId: cf.c.id)
         #expect(activity.contains { $0.kind == .access && $0.text == "Owner vouched for ENG-1's changes" })
-        #expect(throws: WorkError.self) { try cf.store.vouchItem(itemId: "nope", now: cf.now) }
+        #expect(throws: WorkError.self) { try cf.store.vouchItem(itemId: "nope", now: cf.now, owner: try OwnerPrincipal.mint()) }
     }
 
     // MARK: Fix round 1
@@ -398,7 +398,7 @@ import GRDB
         #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:src/c.ts"), companyId: cId) == (false, nil))
         #expect(try cf.store.refTaint(try cf.fx.ref("commit:\(replayed)"), companyId: cId).tainted)
         #expect(try cf.fx.resolve(.qa2, try cf.fx.ref("ENG-1:diff")).tainted)
-        try cf.store.vouchItem(itemId: itemId, now: cf.now)
+        try cf.store.vouchItem(itemId: itemId, now: cf.now, owner: try OwnerPrincipal.mint())
         #expect(try cf.store.refTaint(try cf.fx.ref("ENG-1:diff"), companyId: cId) == (false, nil))
     }
 
@@ -1304,7 +1304,7 @@ import GRDB
         #expect(try cf.store.refTaint(try cf.fx.ref(a.ref), companyId: cf.c.id) == (true, Store.sessionReason("docs.swift.org")))
         #expect(try cf.open(.qa2, a.ref).tainted)
         // The owner's vouch is a clearing too: still tainted.
-        try cf.store.vouchItem(itemId: item.id, now: cf.now.addingTimeInterval(120))
+        try cf.store.vouchItem(itemId: item.id, now: cf.now.addingTimeInterval(120), owner: try OwnerPrincipal.mint())
         try Self.expectArtifact(cf, a, tainted: true)
     }
 
@@ -1426,7 +1426,7 @@ import GRDB
         let cf2 = try CollabFixture()
         let x2 = try Self.taintItemCommit(cf2)
         let (_, a2) = try Self.neighbourArtifact(cf2, branchAt: x2)
-        try cf2.store.vouchItem(itemId: cf2.fx.item.id, now: cf2.now.addingTimeInterval(60))
+        try cf2.store.vouchItem(itemId: cf2.fx.item.id, now: cf2.now.addingTimeInterval(60), owner: try OwnerPrincipal.mint())
         try Self.expectArtifact(cf2, a2, tainted: true)
     }
 

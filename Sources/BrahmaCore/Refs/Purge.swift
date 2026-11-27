@@ -56,7 +56,7 @@ extension Store {
     /// ref's name appears in messages, alerts and notices only with the stored values (`knownValues`, and the engine's
     /// redactor) and the secret patterns redacted from it.
     public func purge(companyId: String, ref: WorkRef, contentVault: ContentVault, paths: BrahmaPaths,
-                      knownValues: [(name: String, value: String)] = [], now: Date = Store.now()) throws -> RefPurgeReport {
+                      knownValues: [(name: String, value: String)] = [], now: Date = Store.now(), owner: OwnerPrincipal) throws -> RefPurgeReport {
         guard contentVault.paths == paths else { throw WorkError.invalid("the vault belongs to another data home") }
         guard let company = try company(id: companyId) else { throw WorkError.notFound(Self.refUnavailable) }
         let workspace = URL(fileURLWithPath: company.workspacePath, isDirectory: true)

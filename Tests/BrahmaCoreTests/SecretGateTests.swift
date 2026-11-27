@@ -501,19 +501,19 @@ struct StubArchiveReader: ArchiveReader {
         let pinned = try cf.store.pinRef(try cf.fx.ref("ENG-1:src/conf.ts@worktree"), for: .agent(cf.fx.eng1.id), companyId: cf.c.id,
                                          messageRefId: "mr-v", knownValues: Self.known, paths: cf.paths)
         // The owner sees the original (for a worktree file, the worktree file itself), and the read is logged.
-        let bytes = try cf.store.viewOriginal(companyId: cf.c.id, ref: pinned, knownValues: Self.known, paths: cf.paths, now: cf.now)
+        let bytes = try cf.store.viewOriginal(companyId: cf.c.id, ref: pinned, knownValues: Self.known, paths: cf.paths, now: cf.now, owner: try OwnerPrincipal.mint())
         #expect(bytes == Data(original.utf8))
         let read = try #require(try cf.reads(pinned.canonical).first)
         #expect(read.via == "viewOriginal" && read.readerKind == "owner" && read.readerId == nil && read.bytes == original.utf8.count)
         // A committed file with a pattern: its unredacted bytes.
         try cf.commit(["src/aws.ts": Data("k = \(Self.aws)\n".utf8)])
-        #expect(try cf.store.viewOriginal(companyId: cf.c.id, ref: try cf.fx.ref("src/aws.ts"), knownValues: [], paths: cf.paths, now: cf.now)
+        #expect(try cf.store.viewOriginal(companyId: cf.c.id, ref: try cf.fx.ref("src/aws.ts"), knownValues: [], paths: cf.paths, now: cf.now, owner: try OwnerPrincipal.mint())
             == Data("k = \(Self.aws)\n".utf8))
         #expect(try cf.reads("src/aws.ts").first?.via == "viewOriginal")
         // A stored secret's value is never shown, not even to the owner.
         try cf.commit(["src/known.ts": Data("k = \(Self.value)\n".utf8)])
         #expect(throws: Self.refusal("src/known.ts", line: 1)) {
-            try cf.store.viewOriginal(companyId: cf.c.id, ref: try cf.fx.ref("src/known.ts"), knownValues: Self.known, paths: cf.paths, now: cf.now)
+            try cf.store.viewOriginal(companyId: cf.c.id, ref: try cf.fx.ref("src/known.ts"), knownValues: Self.known, paths: cf.paths, now: cf.now, owner: try OwnerPrincipal.mint())
         }
     }
 
@@ -578,7 +578,7 @@ struct StubArchiveReader: ArchiveReader {
         #expect(((try? FileManager.default.contentsOfDirectory(atPath: inbox)) ?? []).isEmpty)
         // The owner's view of the original refuses the value too.
         #expect(throws: Self.refusal(a.ref, line: 1)) {
-            try cf.store.viewOriginal(companyId: cf.c.id, ref: try cf.fx.ref(a.ref), knownValues: Self.known, paths: cf.paths, now: cf.now)
+            try cf.store.viewOriginal(companyId: cf.c.id, ref: try cf.fx.ref(a.ref), knownValues: Self.known, paths: cf.paths, now: cf.now, owner: try OwnerPrincipal.mint())
         }
     }
 

@@ -129,7 +129,8 @@ func ownerKeyStore(for paths: BrahmaPaths) throws -> any OwnerKeyStore {
 ///
 /// `quietly` (Plan 4b): the same checks, but a refusal throws without printing, for a command any caller may run that only
 /// shows owner-only detail to the owner (`brahma org vacancies` and its notes). Key-store warnings and errors still print.
-func requireOwnerShell(quietly: Bool = false) throws {
+@discardableResult
+func requireOwnerShell(quietly: Bool = false) throws -> OwnerPrincipal {
     func refuse(_ why: String) -> ExitCode { quietly ? ExitCode.failure : fail(why) }
     let paths = BrahmaPaths.fromEnvironment()
     let running = Store.recordedTurnLeaders(paths: paths)
@@ -144,4 +145,7 @@ func requireOwnerShell(quietly: Bool = false) throws {
     guard OwnerKey.databaseIsInsideHome(paths: paths) else {
         throw refuse("the database is a symlink or lies outside the data home; refusing owner command")
     }
+    // Controller Ruling C6-3: the owner principal the owner-only Store APIs take, minted only here and in the app.
+    OwnerPrincipal.enterOwnerProcess()
+    do { return try OwnerPrincipal.mint(runningTurnPids: running) } catch { throw refuse("\(error)") }
 }

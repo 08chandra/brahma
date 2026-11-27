@@ -64,7 +64,7 @@ extension Store {
 
     /// The owner vouches for an item's changes: its tainted commits are cleared (`clearedBy = "owner"`) and the activity log
     /// says so. Owner callers only (the app and the owner CLI).
-    public func vouchItem(itemId: String, now: Date) throws {
+    public func vouchItem(itemId: String, now: Date, owner: OwnerPrincipal) throws {
         try writer.write { db in
             guard let item = try WorkItem.fetchOne(db, key: itemId) else { throw WorkError.notFound("no such work item") }
             try Self.clearTaintedCommits(db: db, item: item, by: "owner", now: now)

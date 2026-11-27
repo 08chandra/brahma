@@ -47,7 +47,7 @@ import GRDB
     }
 
     func purge(_ cf: CollabFixture, _ ref: WorkRef, now: Date) throws -> RefPurgeReport {
-        try cf.store.purge(companyId: cf.c.id, ref: ref, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: now)
+        try cf.store.purge(companyId: cf.c.id, ref: ref, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: now, owner: try OwnerPrincipal.mint())
     }
 
     @Test func purgeRemovesObjectAndFlagsBackups() throws {
@@ -134,7 +134,7 @@ import GRDB
             #expect(r.visibility == .full && r.state == .purged && r.bytes == nil)
             #expect(try cf.open(.qa2, pinned: pinned).text == "that ref was purged by the owner")
             // Nothing is copied or shown to the owner either.
-            #expect(throws: WorkError.self) { try cf.store.viewOriginal(companyId: cId, ref: pinned, knownValues: [], paths: cf.paths, now: cf.now) }
+            #expect(throws: WorkError.self) { try cf.store.viewOriginal(companyId: cId, ref: pinned, knownValues: [], paths: cf.paths, now: cf.now, owner: try OwnerPrincipal.mint()) }
         }
         // Another company's reader still sees nothing at all.
         let outsider = try cf.store.hire(companyId: cf.fx.d.id, name: "d-eng", role: "engineer", model: "sonnet")
@@ -196,11 +196,11 @@ import GRDB
         #expect(try cf.fx.git.git(["rev-parse", "refs/brahma/shares/mr-o"]) == pinned.rev)
         // A ref of another company is not found, and the vault must be this data home's.
         #expect(throws: (any Error).self) {
-            try cf.store.purge(companyId: cf.fx.d.id, ref: pinned, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: cf.now)
+            try cf.store.purge(companyId: cf.fx.d.id, ref: pinned, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: cf.now, owner: try OwnerPrincipal.mint())
         }
         let elsewhere = BrahmaPaths(home: try tempDir(), workspaces: try tempDir())
         #expect(throws: (any Error).self) {
-            try cf.store.purge(companyId: cf.c.id, ref: pinned, contentVault: ContentVault(paths: elsewhere), paths: cf.paths, now: cf.now)
+            try cf.store.purge(companyId: cf.c.id, ref: pinned, contentVault: ContentVault(paths: elsewhere), paths: cf.paths, now: cf.now, owner: try OwnerPrincipal.mint())
         }
     }
 
@@ -345,7 +345,7 @@ import GRDB
                                          messageRefId: "mr-n", knownValues: [], paths: cf.paths)
         try Self.record(cf, pinned, id: "mr-n", at: cf.now)
         _ = try cf.store.purge(companyId: cId, ref: pinned, contentVault: ContentVault(paths: cf.paths), paths: cf.paths,
-                               knownValues: SecretGateTests.known, now: cf.now)
+                               knownValues: SecretGateTests.known, now: cf.now, owner: try OwnerPrincipal.mint())
         let log = try #require(try cf.store.writer.read { db in
             try PurgeLog.fetchOne(db, sql: "SELECT * FROM purgeLog WHERE companyId = ?", arguments: [cId])
         })

@@ -664,7 +664,7 @@ extension Store {
     /// (`sourceDetail`): for a worktree file the worktree file itself. A stored secret's value is still never shown (the
     /// gate refuses it), and a purged ref has no original. Owner only: nothing in `CompanyTools` reaches it.
     public func viewOriginal(companyId: String, ref: WorkRef, knownValues: [(name: String, value: String)], paths: BrahmaPaths,
-                             now: Date = Store.now(), archives: (any ArchiveReader)? = nil) throws -> Data {
+                             now: Date = Store.now(), archives: (any ArchiveReader)? = nil, owner: OwnerPrincipal) throws -> Data {
         guard let company = try company(id: companyId) else { throw WorkError.notFound(Self.refUnavailable) }
         var target = ref
         if ref.kind == .resource, let n = Int(ref.id), let row = try resource(companyId: companyId, number: n), row.purgedAt == nil,

@@ -60,7 +60,7 @@ public enum AttachmentCards {
             preview = (try? filePreview(r, store: store, ctx: ctx)) ?? .none
         case .diff, .commit:
             if let render = try? store.renderRef(companyId: ctx.companyId, ref: r.ref, knownValues: ctx.knownValues, paths: ctx.paths,
-                                                  archives: ctx.archives, via: nil, now: ctx.now), let text = render.text {
+                                                  archives: ctx.archives, via: nil, now: ctx.now, owner: ctx.owner), let text = render.text {
                 let m = DiffModel.parse(patch: RefBodies.redacted(text, knownValues: ctx.knownValues))
                 preview = .diffStat(added: m.added, removed: m.removed, files: m.files.count)
             }
@@ -85,7 +85,7 @@ public enum AttachmentCards {
     /// image; nothing for other binaries.
     static func filePreview(_ r: ResolvedRef, store: Store, ctx: RefRenderContext) throws -> CardPreview {
         let render = try store.renderRef(companyId: ctx.companyId, ref: r.ref, knownValues: ctx.knownValues, paths: ctx.paths,
-                                         archives: ctx.archives, via: nil, now: ctx.now)
+                                         archives: ctx.archives, via: nil, now: ctx.now, owner: ctx.owner)
         let ext = render.ext.lowercased()
         let kind = ArtifactKind.from(ext: ext)
         let binary = render.data.prefix(OpenRefLimits.binarySniffBytes).contains(0)

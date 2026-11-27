@@ -158,7 +158,7 @@ import Glibc
         let first = try export(cf, ref, to: try tempDir().appending(path: "notes.md"))
         let second = try export(cf, ref, to: try tempDir().appending(path: "copy.md"))
         #expect(try cf.reads("F-21").compactMap(\.exportPath).sorted() == [first.path, second.path].sorted())
-        let report = try cf.store.purge(companyId: cf.c.id, ref: ref, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: cf.now)
+        let report = try cf.store.purge(companyId: cf.c.id, ref: ref, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: cf.now, owner: try OwnerPrincipal.mint())
         #expect(report.exportedCopies.sorted() == [first.path, second.path].sorted())
         let notices = try cf.store.undeliveredNotices().filter { $0.title == Store.exportedCopiesTitle }
         #expect(notices.count == 2, "\(notices.map(\.body))")
@@ -295,7 +295,7 @@ import Glibc
         }
         for (pinned, url) in written {
             let report = try cf.store.purge(companyId: cf.c.id, ref: pinned, contentVault: ContentVault(paths: cf.paths), paths: cf.paths,
-                                            now: cf.now)
+                                            now: cf.now, owner: try OwnerPrincipal.mint())
             #expect(report.exportedCopies == [url.path], "\(pinned.canonical)")
         }
     }

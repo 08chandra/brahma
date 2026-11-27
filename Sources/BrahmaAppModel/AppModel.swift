@@ -132,6 +132,9 @@ public final class AppModel {
     @ObservationIgnored public var refArchives: @Sendable (Store, BrahmaPaths, String) -> any ArchiveReader = {
         Orchestrator.gateArchives(store: $0, paths: $1, companyId: $2)
     }
+    /// Ruling C6-2(b): the owner principal every owner-only Store call takes; established for this process at init (nil in a
+    /// turn's process: every owner action then refuses with the generic text).
+    @ObservationIgnored public var owner: OwnerPrincipal? = { OwnerPrincipal.enterOwnerProcess(); return try? OwnerPrincipal.mint() }()
     /// Where `PreviewNav` is kept (`.standard` in the app; tests give a suite of their own).
     @ObservationIgnored public var navDefaults: UserDefaults = .standard
 

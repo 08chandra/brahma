@@ -1,7 +1,10 @@
 import Foundation
 import GRDB
 
-/// Plan C Task C6: what the app renders for a ref the owner opened. `data` is THE bytes to draw (`Store.gatedBytes`: a PDF the
+/// Plan C Task C6: the owner's app paths into the Collab engine. Fix round 2 (Ruling C6-2(b)): every function here takes an
+/// `OwnerPrincipal`, which only an owner surface can establish; no `CompanyTools` or turn path reaches them.
+///
+/// What the app renders for a ref the owner opened. `data` is THE bytes to draw (`Store.gatedBytes`: a PDF the
 /// owner vouched for is its flattened copy); `text` is set when the engine composed the content as text (a patch, a page, a
 /// message, a run's log, a fact), already through the gate. `verdict` is the gate's: `.pattern` on text means the app
 /// redacts what it shows (`RedactedCopy.make`).
@@ -27,7 +30,7 @@ extension Store {
     /// value refuses, a flattened copy replaces a vouched PDF), and a `refRead(via:)` row when `via` is given (a card preview
     /// passes nil: it is not a read). Anything but `.full` is `Store.refUnavailable`; a purged ref `Store.purgedText`.
     public func renderRef(companyId: String, ref: WorkRef, knownValues: [(name: String, value: String)], paths: BrahmaPaths,
-                          archives: any ArchiveReader, via: String?, now: Date = Store.now()) throws -> RefRender {
+                          archives: any ArchiveReader, via: String?, now: Date = Store.now(), owner: OwnerPrincipal) throws -> RefRender {
         let r = try resolveDetailed(ref, reader: .owner, companyId: companyId, messageRefId: nil)
         guard r.resolved.visibility == .full, let subject = r.subject, let company = r.company else {
             throw WorkError.notFound(Self.refUnavailable)
@@ -78,7 +81,7 @@ extension Store {
     @discardableResult
     public func ownerShare(companyId: String, refs: [String], to: String, note: String?, replyTo: String?,
                            knownValues: [(name: String, value: String)], paths: BrahmaPaths, now: Date = Store.now(),
-                           archives: any ArchiveReader = UnavailableArchiveReader()) throws -> Message {
+                           archives: any ArchiveReader = UnavailableArchiveReader(), owner: OwnerPrincipal) throws -> Message {
         let note = note?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard (1...ShareLimits.maxRefs).contains(refs.count) else { throw WorkError.invalid("share takes 1 to \(ShareLimits.maxRefs) refs") }
         guard note.count <= ShareLimits.noteMax else { throw WorkError.invalid("the note is at most \(ShareLimits.noteMax) characters") }
@@ -211,7 +214,7 @@ extension Store {
     /// in a channel through `MessageRouter.postDetailed` (so an `@here`/`@team` the router refuses in a reply comes back as
     /// `broadcastRefusal`, for the owner to see), in the owner's DM with an agent through `sendDM`. A message of another
     /// company, or of a conversation the owner is not part of, is `ThreadError.unavailable`.
-    public func ownerThreadReply(companyId: String, rootId: String, text: String, now: Date = Store.now()) throws -> PostResult {
+    public func ownerThreadReply(companyId: String, rootId: String, text: String, now: Date = Store.now(), owner: OwnerPrincipal) throws -> PostResult {
         var id = rootId
         for prefix in ["msg:", "thread:"] where id.hasPrefix(prefix) { id = String(id.dropFirst(prefix.count)) }
         let (channel, root): (Channel, Message) = try writer.read { db in
@@ -237,7 +240,7 @@ extension Store {
     // MARK: Owner reads
 
     /// The company's open show requests, oldest first (the waiting chips).
-    public func openShowRequests(companyId: String) throws -> [ShowRequest] {
+    public func openShowRequests(companyId: String, owner: OwnerPrincipal) throws -> [ShowRequest] {
         try writer.read { db in
             try ShowRequest.fetchAll(db, sql: "SELECT * FROM showRequest WHERE companyId = ? AND status = 'open' ORDER BY createdAt, rowid",
                                      arguments: [companyId])
@@ -245,12 +248,12 @@ extension Store {
     }
 
     /// One message of this company, or nil.
-    public func message(companyId: String, id: String) throws -> Message? {
+    public func message(companyId: String, id: String, owner: OwnerPrincipal) throws -> Message? {
         try writer.read { db in try Message.fetchOne(db, sql: "SELECT * FROM message WHERE companyId = ? AND id = ?", arguments: [companyId, id]) }
     }
 
     /// The agent's spend today (owner time zone) as a share of the five-hour window, in percent (`ShowCost.share5h`).
-    public func agentUsageShareToday(agentId: String, now: Date) throws -> Double {
+    public func agentUsageShareToday(agentId: String, now: Date, owner: OwnerPrincipal) throws -> Double {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = ownerTimeZone()
         let start = cal.startOfDay(for: now)
@@ -263,7 +266,7 @@ extension Store {
 
     /// Records the owner's read of a ref the app rendered without bytes of its own (an item, an ask, a page, a thread, a fact):
     /// one `refRead` row with `via`.
-    public func recordOwnerRead(companyId: String, ref: WorkRef, via: String, tainted: Bool, now: Date = Store.now()) throws {
+    public func recordOwnerRead(companyId: String, ref: WorkRef, via: String, tainted: Bool, now: Date = Store.now(), owner: OwnerPrincipal) throws {
         try writer.write { db in
             try Self.recordRefRead(db: db, companyId: companyId, reader: .owner, canonical: ref.canonical, rev: ref.rev, bytes: nil, tainted: tainted,
                                    via: via, turnId: nil, now: now)
@@ -271,7 +274,7 @@ extension Store {
     }
 
     /// The key of the item `agentId` holds a lease on, or nil.
-    public func leasedItemKey(companyId: String, agentId: String) throws -> String? {
+    public func leasedItemKey(companyId: String, agentId: String, owner: OwnerPrincipal) throws -> String? {
         try writer.read { db in
             try String.fetchOne(db, sql: """
                 SELECT w.key FROM workLease l JOIN workItem w ON w.id = l.itemId WHERE l.companyId = ? AND l.agentId = ? ORDER BY l.acquiredAt DESC LIMIT 1
@@ -280,7 +283,7 @@ extension Store {
     }
 
     /// The newest `limit` activity lines of one agent in the company (its turns, tools, messages, errors), oldest first.
-    public func agentActivity(companyId: String, agentId: String, limit: Int) throws -> [ActivityEvent] {
+    public func agentActivity(companyId: String, agentId: String, limit: Int, owner: OwnerPrincipal) throws -> [ActivityEvent] {
         try writer.read { db in
             try ActivityEvent.fetchAll(db, sql: """
                 SELECT * FROM activityEvent WHERE companyId = ? AND agentId = ? ORDER BY id DESC LIMIT ?

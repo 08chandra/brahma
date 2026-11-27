@@ -208,7 +208,7 @@ import Foundation
         let file = cf.vault.root.appending(path: "flattened/\(row.id).pdf")
         #expect(FileManager.default.fileExists(atPath: file.path))
         try PurgeTests.record(cf, ref, id: "mr-spec", at: cf.now)
-        let report = try cf.store.purge(companyId: cf.c.id, ref: ref, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: cf.now)
+        let report = try cf.store.purge(companyId: cf.c.id, ref: ref, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: cf.now, owner: try OwnerPrincipal.mint())
         #expect(report.vaultPaths.contains("flattened/\(row.id).pdf"), "\(report.vaultPaths)")
         #expect(!FileManager.default.fileExists(atPath: file.path), "the flattened copy is still in the vault")
         #expect(try vaultHolds(cf, served.data) == false, "bytes of the copy remain in the vault")
@@ -217,7 +217,7 @@ import Foundation
         let again = outcome { try serve(cf, pdf, canonical: canonical, archives: reader).verdict }
         #expect(again.hasPrefix("this PDF's structure couldn't be verified"), "\(again)")
         // Purged again: nothing left, nothing thrown.
-        _ = try cf.store.purge(companyId: cf.c.id, ref: ref, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: cf.now)
+        _ = try cf.store.purge(companyId: cf.c.id, ref: ref, contentVault: ContentVault(paths: cf.paths), paths: cf.paths, now: cf.now, owner: try OwnerPrincipal.mint())
         // A later vouch makes a fresh copy.
         _ = try cf.store.vouchFile(companyId: cf.c.id, canonical: canonical, sha256: SHA256.hex(pdf), now: cf.now)
         #expect(try serve(cf, pdf, canonical: canonical, archives: reader).isFlattenedCopy)
