@@ -104,6 +104,11 @@ public actor PreviewRunner: EmergencyStopObserver {
 
     func failDemoRecords(with error: (any Error)?) { demoRecordFailure = error }
 
+    /// Tests only (S6-c1): runs just before a start resolves its surface's principals, after the surface was read for the start,
+    /// so a test can change the stored surface in between.
+    var beforeResolve: (@Sendable (PreviewSurface) -> Void)?
+    func setBeforeResolve(_ probe: (@Sendable (PreviewSurface) -> Void)?) { beforeResolve = probe }
+
     struct Run: Sendable {
         var company: Company
         var runId: String
@@ -426,9 +431,28 @@ public actor PreviewRunner: EmergencyStopObserver {
                 return
             }
         }
-        // The surface's subject principals, resolved once for this start (S6): its setter. Unsandboxed only when the setter and
-        // the company narrow to Full under the ceiling; in a Full company an unconfirmed setter runs sandboxed with the B1 line.
-        let principals = PrincipalResolver(store: engineStore, ceiling: ceiling).resolve(.preview(surfaceId: surface.id))
+        // The surface's subject principals, resolved once for this start (S6), from the surface record whose commands this
+        // start runs (S6-c1): its own setter, and only while the stored surface still has that setter and those commands.
+        // Unsandboxed only when the setter and the company narrow to Full under the ceiling; in a Full company an unconfirmed
+        // setter runs sandboxed with the B1 line. A surface changed or removed since it was read: nothing runs on the stale
+        // record; the start goes back to idle with a restart requested (no failure, no notice, no B1 line), and the next pass
+        // starts the current surface under its own setter.
+        beforeResolve?(surface)
+        let principals: PrincipalSet
+        switch PrincipalResolver(store: engineStore, ceiling: ceiling).resolve(holding: .preview(surface)) {
+        case .allow(let set, _) where set.companyId == company.id:
+            principals = set
+        case .allow, .deny:
+            await stopRun(id)
+            do {
+                _ = try store.updatePreviewState(surfaceId: id, now: clock()) {
+                    $0.status = .idle; $0.message = nil; $0.pid = nil; $0.resolvedURL = nil; $0.restartRequestedAt = now
+                }
+            } catch {
+                FileHandle.standardError.write(Data("brahma preview: could not request a restart of a changed surface (\(error))\n".utf8))
+            }
+            return
+        }
         PrincipalResolver.noteSandboxed(principals, store: engineStore, subject: "Preview \(surface.name)", kind: .preview, now: clock())
         let policies = PreviewPolicy.forKind(kind, layout: layout, run: run, company: company, sandbox: sandbox, port: port,
                                              surface: surface.name)

@@ -90,13 +90,15 @@ extension Orchestrator {
                             var recordedDirectory: String?
                             /// A merge queue run: its principals are resolved from the record (`.mergeRun`, never from a lease
                             /// alone) and an unknown one runs sandboxed.
-                            var isMergeRun = false }
+                            var isMergeRun = false
+                            /// The record itself: the route is decided from it (S6-c1), never from a later re-read.
+                            var held: PrincipalResolver.HeldRecord }
             let record: Record
             let place: (GitWorkspace) -> URL
             if let run = try? store.writer.read({ try VerificationRun.fetchOne($0, key: runId) }) {
                 guard run.status == .running else { return .refused("the check run \(runId) is not running (\(run.status.rawValue))") }
                 record = Record(id: run.id, companyId: run.companyId, itemId: run.itemId, requestedBy: run.requestedBy,
-                                purpose: run.purpose.rawValue, recordedDirectory: run.workingDirectory)
+                                purpose: run.purpose.rawValue, recordedDirectory: run.workingDirectory, held: .verificationRun(run))
                 // The exact place 3a's engine made for this run, by the run's recorded purpose (exhaustive; a new purpose must
                 // choose a place here rather than fall through to a checkout policy — B-M4).
                 switch run.purpose {
@@ -106,7 +108,7 @@ extension Orchestrator {
             } else if let run = try? store.writer.read({ try MergeRun.fetchOne($0, key: runId) }) {
                 guard run.status == .running else { return .refused("the merge run \(runId) is not running (\(run.status?.rawValue ?? "unknown"))") }
                 record = Record(id: run.id, companyId: run.companyId, itemId: run.itemId, requestedBy: nil, purpose: "merge", recordedDirectory: nil,
-                                isMergeRun: true)
+                                isMergeRun: true, held: .mergeRun(run))
                 place = { $0.exportPath(runId: run.id) }
             } else {
                 return .refused("no engine record of a check running in \(runId)")
@@ -129,8 +131,13 @@ extension Orchestrator {
             // company itself narrow to Full under the ceiling (`runsUnsandboxed`). In a Full company, an unconfirmed author of a
             // verification run (no holder, an unknown agent, a failed lookup) runs it sandboxed with the B1 activity line; a
             // merge run's unknown principals ran sandboxed before S6 too, and still do without a line (4a).
-            let principals = PrincipalResolver(store: store, ceiling: ceiling)
-                .resolve(record.isMergeRun ? .mergeRun(runId: record.id) : .verificationRun(runId: record.id))
+            // S6-c1: decided from the run record read above; a stored run that no longer matches it (another requester, item
+            // or command) is refused, so nothing runs on the stale record.
+            let principals: PrincipalSet
+            switch PrincipalResolver(store: store, ceiling: ceiling).resolve(holding: record.held) {
+            case .allow(let set, _): principals = set
+            case .deny(let why): return .refused(why)
+            }
             if principals.runsUnsandboxed { return .unsandboxed }
             if !record.isMergeRun, principals.unconfirmedInFullCompany != nil {
                 PrincipalResolver.noteSandboxed(principals, store: store, subject: itemSubject(store: store, companyId: record.companyId,

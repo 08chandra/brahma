@@ -159,6 +159,9 @@ extension Store {
         }
     }
 
+    /// S6-c1: the smoke check (or its setter) was re-set between the run's claim and its start.
+    static let smokeChangedWhileStarting = "the smoke check changed while it was starting"
+
     static func notMain(_ commit: String) -> String { "\(commit.prefix(7)) is not the engine-accepted main" }
     /// The engine-accepted main no longer descends from a release's commit (final-review I1's re-check inside the slot).
     static func noLongerOnMain(_ commit: String) -> String { "\(commit.prefix(7)) is no longer on the engine-accepted main" }
@@ -255,9 +258,18 @@ extension Store {
             // The engine's own failure, not main's: a merge run goes back to the queue (the tick backs off, fix I1).
             return try requeueOrError(run, tail: "could not export \(run.sha7)", now: clock())
         }
-        // The smoke's subject principals, resolved once for this run (S6): the smoke check's setter. Unsandboxed only when it and
-        // the company narrow to Full under the ceiling; in a Full company an unconfirmed setter runs sandboxed with the B1 line.
-        let principals = PrincipalResolver(store: self, ceiling: checks.ceiling).resolve(.mainSmoke(companyId: company.id))
+        // The smoke's subject principals, resolved once for this run (S6), from the company record whose smoke check this run
+        // runs (S6-c1): its recorded setter, and only while the stored check and setter are still those. Unsandboxed only when
+        // the setter and the company narrow to Full under the ceiling; in a Full company an unconfirmed setter runs sandboxed
+        // with the B1 line. A check re-set since the claim: nothing runs on the stale record (queued again, or an error).
+        let principals: PrincipalSet
+        switch PrincipalResolver(store: self, ceiling: checks.ceiling).resolve(holding: .mainSmoke(company)) {
+        case .allow(let set, _):
+            principals = set
+        case .deny:
+            await blocking.run { EngineExport.remove(store: store, company: company, runId: run.runId) }
+            return try requeueOrError(run, tail: Self.smokeChangedWhileStarting, now: clock())
+        }
         PrincipalResolver.noteSandboxed(principals, store: self, subject: "The main smoke check", kind: .release, now: clock())
         let unsandboxed = principals.runsUnsandboxed
         let runner = unsandboxed ? checks.unsandboxed : checks.sandbox

@@ -51,24 +51,115 @@ public struct PrincipalResolver: Sendable {
         }
     }
 
+    // MARK: Held records (controller ruling S6-c1)
+
+    /// A record the caller already holds and takes the action's command from (the check's run, the preview's surface, the
+    /// company's smoke check, the release's build). The decision must come from that same snapshot: a record re-read by id
+    /// could carry another setter than the command that runs (S6-c1, a TOCTOU to a sandbox bypass).
+    public enum HeldRecord: Sendable {
+        case verificationRun(VerificationRun)
+        case mergeRun(MergeRun)
+        case preview(PreviewSurface)
+        case mainSmoke(Company)
+        case release(Release)
+    }
+
+    /// Resolves the principals of `held` from the held record itself (its own setter, holder request or proposer), after
+    /// checking that the stored record still matches it: the same company, the same setter and the same command fields (the
+    /// command digest). A stored record that differs, is gone or cannot be read is `.deny(reason)`: the caller runs nothing on
+    /// this snapshot and tries again with a fresh one (fail closed). Counted as one resolution.
+    public func resolve(holding held: HeldRecord) -> Decision<PrincipalSet> {
+        Self.resolveCount?.add()
+        switch held {
+        case .verificationRun(let run):
+            let (id, cid) = (run.id, run.companyId)
+            return unchanged(run, "verification run \(id)", same: Self.sameCommand, stored: { db in
+                try VerificationRun.filter(Column("id") == id && Column("companyId") == cid).fetchOne(db)
+            }) { withCompany(cid) { verificationMembers(run, $0) } }
+        case .mergeRun(let run):
+            let (id, cid) = (run.id, run.companyId)
+            return unchanged(run, "merge run \(id)", same: Self.sameCommand, stored: { db in
+                try MergeRun.filter(Column("id") == id && Column("companyId") == cid).fetchOne(db)
+            }) { withCompany(cid) { mergeMembers(run, $0) } }
+        case .preview(let surface):
+            let (id, cid) = (surface.id, surface.companyId)
+            return unchanged(surface, "preview surface \(surface.name)", same: Self.sameCommand, stored: { db in
+                try PreviewSurface.filter(Column("id") == id && Column("companyId") == cid).fetchOne(db)
+            }) { withCompany(cid) { [$0.setter(surface.setById)] } }
+        case .mainSmoke(let company):
+            let cid = company.id
+            return unchanged(company, "the main smoke check", same: Self.sameSmokeCheck, stored: { db in
+                try Company.fetchOne(db, key: cid)
+            }) { withCompany(cid, held: company) { [$0.setter(company.smokeCheckSetById)] } }
+        case .release(let release):
+            let (id, cid) = (release.id, release.companyId)
+            return unchanged(release, release.ref, same: Self.sameCommand, stored: { db in
+                try Release.filter(Column("id") == id && Column("companyId") == cid).fetchOne(db)
+            }) { withCompany(cid) { [$0.setter(release.proposedById)] } }
+        }
+    }
+
+    /// `members` when the stored copy of `held` still matches it; `.deny` otherwise.
+    private func unchanged<Record>(_ held: Record, _ what: String, same: (Record, Record) -> Bool,
+                                   stored fetch: @escaping (Database) throws -> Record?,
+                                   _ members: () -> PrincipalSet) -> Decision<PrincipalSet> {
+        let stored: Record?
+        do { stored = try store.writer.read(fetch) } catch { return .deny("\(what) could not be read again (\(error))") }
+        guard let stored else { return .deny("\(what) is gone") }
+        guard same(held, stored) else { return .deny(Self.changedWhileStarting(what)) }
+        return .allow(members(), because: "\(what) is unchanged since it was read")
+    }
+
+    /// The text of a held record that no longer matches its stored copy.
+    static func changedWhileStarting(_ what: String) -> String { "\(what) changed while it was starting" }
+
+    /// The fields a check's route and command come from.
+    static func sameCommand(_ a: VerificationRun, _ b: VerificationRun) -> Bool {
+        a.companyId == b.companyId && a.itemId == b.itemId && a.requestedBy == b.requestedBy && a.command == b.command
+            && a.scriptHash == b.scriptHash && a.commit == b.commit && a.purpose == b.purpose
+    }
+
+    static func sameCommand(_ a: MergeRun, _ b: MergeRun) -> Bool {
+        a.companyId == b.companyId && a.kind == b.kind && a.itemId == b.itemId && a.batchId == b.batchId
+            && a.candidateCommit == b.candidateCommit && a.command == b.command && a.scriptHash == b.scriptHash
+    }
+
+    /// The setter and every field a preview's commands come from.
+    static func sameCommand(_ a: PreviewSurface, _ b: PreviewSurface) -> Bool {
+        a.companyId == b.companyId && a.setById == b.setById && a.kind == b.kind && a.build == b.build && a.run == b.run
+            && a.url == b.url && a.smoke == b.smoke && a.demo == b.demo && a.openapiPath == b.openapiPath && a.appPath == b.appPath
+            && a.bundleId == b.bundleId && a.device == b.device
+    }
+
+    static func sameSmokeCheck(_ a: Company, _ b: Company) -> Bool {
+        a.id == b.id && a.smokeCheck == b.smokeCheck && a.smokeCheckSetById == b.smokeCheckSetById
+    }
+
+    static func sameCommand(_ a: Release, _ b: Release) -> Bool {
+        a.companyId == b.companyId && a.proposedById == b.proposedById && a.build == b.build && a.commandsHash == b.commandsHash
+            && a.commit == b.commit && a.outputDir == b.outputDir
+    }
+
     // MARK: Rows of the resolution table
 
     /// The lease holder of the run's item, else who requested the run; neither, an unknown agent or a failed lookup:
     /// `.unknown` (the old `?? true` made it unsandboxed).
     private func verificationRun(_ runId: String) -> PrincipalSet {
-        root("verification run \(runId)", { try VerificationRun.fetchOne($0, key: runId) }, companyId: \.companyId) { run, scope in
-            let cid = scope.companyId
-            let holder: String?
-            do {
-                holder = try store.writer.read { db in
-                    try WorkLease.filter(Column("itemId") == run.itemId && Column("companyId") == cid).fetchOne(db)
-                }?.agentId ?? run.requestedBy
-            } catch {
-                return [.unknown(reason: Self.failed(error))]
-            }
-            guard let holder else { return [.unknown(reason: Self.nobodyHolds)] }
-            return [scope.agent(holder)]
+        root("verification run \(runId)", { try VerificationRun.fetchOne($0, key: runId) }, companyId: \.companyId, verificationMembers)
+    }
+
+    private func verificationMembers(_ run: VerificationRun, _ scope: Scope) -> [Principal] {
+        let cid = scope.companyId
+        let holder: String?
+        do {
+            holder = try store.writer.read { db in
+                try WorkLease.filter(Column("itemId") == run.itemId && Column("companyId") == cid).fetchOne(db)
+            }?.agentId ?? run.requestedBy
+        } catch {
+            return [.unknown(reason: Self.failed(error))]
         }
+        guard let holder else { return [.unknown(reason: Self.nobodyHolds)] }
+        return [scope.agent(holder)]
     }
 
     /// Exactly 4a's rule (`SandboxedCheckRunner.swift`, merge-run branch, before S6): the setter for `main`/`mainAtBase`; for
@@ -76,55 +167,63 @@ public struct PrincipalResolver: Sendable {
     /// or `done`); each item's holder and author. `mainAtBase` with a head the queue did not land, an unknown kind and any
     /// missing data: `.unknown`. Setters and authors are agents only (a `"owner"` id is not an agent: `.unknown`, as in 4a).
     private func mergeRun(_ runId: String) -> PrincipalSet {
-        root("merge run \(runId)", { try MergeRun.fetchOne($0, key: runId) }, companyId: \.companyId) { run, scope in
-            let cid = scope.companyId
-            var members: [Principal] = []
-            func missing(_ why: String) { members.append(.unknown(reason: why)) }
-            let usesItems = run.kind == .main || run.kind == .item
-            var itemIds = Set(usesItems ? run.itemId.map { [$0] } ?? [] : [])
-            if usesItems, let batchId = run.batchId {
-                do {
-                    itemIds.formUnion(try store.writer.read { db in
-                        try MergeRequest.filter(Column("batchId") == batchId && Column("companyId") == cid).fetchAll(db)
-                    }.map(\.itemId))
-                } catch { missing(Self.failed(error)) }
-            }
-            do { itemIds.formUnion(try store.landedItemIds(companyId: cid)) } catch { missing(Self.failed(error)) }
-            var ids: [String] = []
-            switch run.kind {
-            case .main:
-                if let setter = scope.company.mainCheckSetById { ids.append(setter) } else { missing(Self.noMainCheckSetter) }
-            case .item:
-                break
-            case .mainAtBase:
-                if let setter = scope.company.mainCheckSetById { ids.append(setter) } else { missing(Self.noMainCheckSetter) }
-                do {
-                    if try !store.isQueueLandedHead(companyId: cid, candidate: run.candidateCommit) { missing(Self.headNotLanded) }
-                } catch { missing(Self.failed(error)) }
-            case nil:
-                missing("merge run \(runId) has no kind")
-            }
-            if usesItems && run.itemId == nil && run.batchId == nil { missing("merge run \(runId) names no item") }
-            for id in itemIds.sorted() {
-                do {
-                    let holder = try store.writer.read { db in
-                        try WorkLease.filter(Column("itemId") == id && Column("companyId") == cid).fetchOne(db)
-                    }?.agentId
-                    let author = try store.writer.read { db in
-                        try WorkItem.filter(Column("id") == id && Column("companyId") == cid).fetchOne(db)
-                    }?.ownerId
-                    if holder == nil && author == nil { missing("no agent holds or wrote item \(id)") }
-                    ids.append(contentsOf: [holder, author].compactMap { $0 })
-                } catch { missing(Self.failed(error)) }
-            }
-            var seen = Set<String>()
-            for id in ids {
-                guard !seen.contains(id) else { continue }
-                seen.insert(id)
-                members.append(scope.agent(id))
-            }
-            return members
+        root("merge run \(runId)", { try MergeRun.fetchOne($0, key: runId) }, companyId: \.companyId, mergeMembers)
+    }
+
+    private func mergeMembers(_ run: MergeRun, _ scope: Scope) -> [Principal] {
+        let runId = run.id
+        let cid = scope.companyId
+        var members: [Principal] = []
+        func missing(_ why: String) { members.append(.unknown(reason: why)) }
+        let usesItems = run.kind == .main || run.kind == .item
+        var itemIds = Set(usesItems ? run.itemId.map { [$0] } ?? [] : [])
+        if usesItems, let batchId = run.batchId {
+            do {
+                itemIds.formUnion(try store.writer.read { db in
+                    try MergeRequest.filter(Column("batchId") == batchId && Column("companyId") == cid).fetchAll(db)
+                }.map(\.itemId))
+            } catch { missing(Self.failed(error)) }
         }
+        do { itemIds.formUnion(try store.landedItemIds(companyId: cid)) } catch { missing(Self.failed(error)) }
+        var ids: [String] = []
+        // S6-c1 (I2): the queue recorded the main check's command at batch time, the setter is read now. A command that is not
+        // the company's current main check was set by someone the engine can no longer name: unknown, so sandboxed.
+        if run.kind == .main || run.kind == .mainAtBase, scope.company.mainCheck?.command != run.command {
+            missing(Self.mainCheckChanged)
+        }
+        switch run.kind {
+        case .main:
+            if let setter = scope.company.mainCheckSetById { ids.append(setter) } else { missing(Self.noMainCheckSetter) }
+        case .item:
+            break
+        case .mainAtBase:
+            if let setter = scope.company.mainCheckSetById { ids.append(setter) } else { missing(Self.noMainCheckSetter) }
+            do {
+                if try !store.isQueueLandedHead(companyId: cid, candidate: run.candidateCommit) { missing(Self.headNotLanded) }
+            } catch { missing(Self.failed(error)) }
+        case nil:
+            missing("merge run \(runId) has no kind")
+        }
+        if usesItems && run.itemId == nil && run.batchId == nil { missing("merge run \(runId) names no item") }
+        for id in itemIds.sorted() {
+            do {
+                let holder = try store.writer.read { db in
+                    try WorkLease.filter(Column("itemId") == id && Column("companyId") == cid).fetchOne(db)
+                }?.agentId
+                let author = try store.writer.read { db in
+                    try WorkItem.filter(Column("id") == id && Column("companyId") == cid).fetchOne(db)
+                }?.ownerId
+                if holder == nil && author == nil { missing("no agent holds or wrote item \(id)") }
+                ids.append(contentsOf: [holder, author].compactMap { $0 })
+            } catch { missing(Self.failed(error)) }
+        }
+        var seen = Set<String>()
+        for id in ids {
+            guard !seen.contains(id) else { continue }
+            seen.insert(id)
+            members.append(scope.agent(id))
+        }
+        return members
     }
 
     /// The surface's setter; `"owner"` → `.owner`; none (an empty id) or a failed lookup → `.unknown` (it used to follow the
@@ -174,10 +273,13 @@ public struct PrincipalResolver: Sendable {
         return withCompany(record[keyPath: companyId]) { scope in members(record, scope) }
     }
 
-    /// Reads the company (`WHERE id = companyId`), then `members` with a scope on it.
-    private func withCompany(_ companyId: String, _ members: (Scope) -> [Principal]) -> PrincipalSet {
+    /// Reads the company (`WHERE id = companyId`), then `members` with a scope on it. `held`: the company snapshot the caller
+    /// takes the command from (a main smoke), used as it is (S6-c1).
+    private func withCompany(_ companyId: String, held: Company? = nil, _ members: (Scope) -> [Principal]) -> PrincipalSet {
         let company: Company?
-        do { company = try store.company(id: companyId) } catch { return Self.unresolved(companyId, Self.failed(error)) }
+        if let held { company = held } else {
+            do { company = try store.company(id: companyId) } catch { return Self.unresolved(companyId, Self.failed(error)) }
+        }
         guard let company else { return Self.unresolved(companyId, "no company \(companyId)") }
         let scope = Scope(store: store, company: company, ceiling: ceiling)
         return PrincipalSet(companyId: companyId, members: members(scope), ownerProfile: scope.narrowed(company.permissionProfile))
@@ -194,6 +296,7 @@ public struct PrincipalResolver: Sendable {
     static let noSetter = "no one is recorded as setting it"
     static let noMainCheckSetter = "no one is recorded as setting the main check"
     static let headNotLanded = "main's head was not landed by the queue"
+    static let mainCheckChanged = "the main check changed since this run started"
     static func noAgent(_ id: String) -> String { "no agent \(id) in the company's records" }
     static func failed(_ error: any Error) -> String { "the lookup failed: \(error)" }
 

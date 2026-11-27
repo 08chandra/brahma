@@ -355,10 +355,15 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         }
         let toolEnvironment = ChildEnvironment.make(base: environment, extra: ["BRAHMA_AGENT_ID": "release"], purpose: .check)
         if let build = r.build {
-            // The build's subject principals, resolved once for this build (S6): the release's proposer. Unsandboxed only when it
-            // and the company narrow to Full under the ceiling; in a Full company an unconfirmed proposer builds sandboxed with
-            // the B1 line.
-            let principals = PrincipalResolver(store: store, ceiling: ceiling).resolve(.release(releaseId: r.id))
+            // The build's subject principals, resolved once for this build (S6), from the release record whose build this runs
+            // (S6-c1): its proposer, and only while the stored release still has that proposer and those commands (else the
+            // integrity refusal, nothing built). Unsandboxed only when the proposer and the company narrow to Full under the
+            // ceiling; in a Full company an unconfirmed proposer builds sandboxed with the B1 line.
+            let principals: PrincipalSet
+            switch PrincipalResolver(store: store, ceiling: ceiling).resolve(holding: .release(r)) {
+            case .allow(let set, _): principals = set
+            case .deny: throw Self.mismatch
+            }
             PrincipalResolver.noteSandboxed(principals, store: store, subject: "\(r.ref) build", kind: .release, now: clock())
             let full = principals.runsUnsandboxed
             let log = releaseDir.appending(path: "build.log", directoryHint: .notDirectory)
