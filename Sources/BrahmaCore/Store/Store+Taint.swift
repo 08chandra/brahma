@@ -91,10 +91,14 @@ extension Store {
     /// turn-end taint record takes them: those it held as the turn started (`heldAtStart`) and every item in the turn's claim
     /// log (`turnId`), released since or not. Done items are left alone. `home`: where the hook flag file is read (the
     /// orchestrator's data home), else the store's.
-    public func markHeldItemsIfTainted(agentId: String, turnId: String? = nil, heldAtStart: [String] = [], home: URL? = nil) throws {
+    /// `force` (final wave B1, Ruling 23: the retry of a turn-end mark that failed): marks as if the session were tainted, since
+    /// whether it was can no longer be told (a fresh-session reset may have cleared it since).
+    public func markHeldItemsIfTainted(agentId: String, turnId: String? = nil, heldAtStart: [String] = [], home: URL? = nil,
+                                       force: Bool = false) throws {
+        if refHooks.failTaintRecords { throw WorkError.conflict("injected: the held items could not be marked") }
         try writer.write { db in
             guard let agent = try Agent.fetchOne(db, key: agentId) else { return }
-            var tainted = agent.sessionTainted
+            var tainted = agent.sessionTainted || force
             if !tainted, let home = home ?? dataHome, let flag = TaintFlag.url(home: home, agentId: agentId) { tainted = TaintFlag.exists(flag) }
             guard tainted else { return }
             try Store.markHeldItemsTainted(db: db, agentId: agentId)

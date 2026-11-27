@@ -265,6 +265,11 @@ final class RefHooks: @unchecked Sendable {
     /// C5 fix round 1, ruling (3): runs after an export opened its folder, before it writes there (a folder swapped meanwhile).
     var afterExportFolderOpened: (@Sendable () throws -> Void)? { lock.withLock { exportOpened } }
     func setAfterExportFolderOpened(_ body: (@Sendable () throws -> Void)?) { lock.withLock { exportOpened = body } }
+    private var taintRecordFails = false
+    /// Final wave B1 (Ruling 23): every turn-end taint write fails (`recordTaintedCommits`, the `unrecorded-…` marker and
+    /// `markHeldItemsIfTainted`), as a database that refuses writes would.
+    var failTaintRecords: Bool { lock.withLock { taintRecordFails } }
+    func setFailTaintRecords(_ fails: Bool) { lock.withLock { taintRecordFails = fails } }
     private var leaseFails: Set<String> = []
     /// C3b fix round 4 (N3-1): putting a share artifact of these lease kinds (`resource`, `snapshot`, `shareRef`) under a
     /// share's lease fails (a lease write that hits BUSY or a full disk).

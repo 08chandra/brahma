@@ -92,13 +92,27 @@ import GRDB
         let other = try #require(w.model.inboxRows.first { $0.kind == .engineAlert && $0.title.contains("something else") })
         #expect(alert.canVouchRestore, "the restore alert does not offer the vouch")
         #expect(!other.canVouchRestore)
+        #expect(alert.restoreEpochIds == ["epoch-app"])
+        // Ruling 28: an epoch that opens after the row was read is not the row's: the row's vouch leaves it open.
+        try await w.store.writer.write { db in
+            try RestoreEpoch(id: "epoch-later", companyId: company.id, mainCommit: nil, listed: false,
+                             source: RestoreCarry.unreadableCommitTaintSource, createdAt: Date(), clearedBy: nil, clearedAt: nil).insert(db)
+        }
         // Another ask: refused, nothing cleared.
-        await w.model.vouchRestoredCommits(askId: other.id)
+        await w.model.vouchRestoredCommits(askId: other.id, epochIds: alert.restoreEpochIds)
         #expect(w.model.errorMessage != nil)
         #expect(try w.store.refTaint(WorkRef(kind: .commit, id: sha), companyId: w.company.id).tainted)
         w.model.errorMessage = nil
-        await w.model.vouchRestoredCommits(askId: alert.id)
+        await w.model.vouchRestoredCommits(askId: alert.id, epochIds: alert.restoreEpochIds)
         #expect(w.model.errorMessage == nil, "\(w.model.errorMessage ?? "")")
+        #expect(try await w.store.writer.read { db in
+            try String.fetchOne(db, sql: "SELECT clearedBy FROM restoreEpoch WHERE id = 'epoch-later'")
+        } == nil, "the row's vouch cleared an epoch it never showed")
+        // The refreshed row shows the later epoch; its vouch clears that one.
+        await w.refresh()
+        let refreshed = try #require(w.model.inboxRows.first { $0.id == alert.id })
+        #expect(refreshed.restoreEpochIds == ["epoch-later"] && refreshed.canVouchRestore)
+        await w.model.vouchRestoredCommits(askId: alert.id, epochIds: refreshed.restoreEpochIds)
         let (epoch, commit) = try await w.store.writer.read { db in
             (try String.fetchOne(db, sql: "SELECT clearedBy FROM restoreEpoch WHERE id = 'epoch-app'"),
              try String.fetchOne(db, sql: "SELECT clearedBy FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [company.id, sha]))

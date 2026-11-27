@@ -47,6 +47,9 @@ public struct InboxRow: Equatable, Identifiable, Sendable {
     /// The restore alert of a company with a restore epoch the owner has not cleared (Plan C P2, Ruling 26): the owner can
     /// vouch for the commits the restore could not place (`AppModel.vouchRestoredCommits`).
     public var canVouchRestore: Bool = false
+    /// Final wave B1, Ruling 28: the restore epochs this row shows (engine ids), the only ones its vouch clears
+    /// (`AppModel.vouchRestoredCommits(askId:epochIds:)`); an epoch opened after the row was read stays open.
+    public var restoreEpochIds: [String] = []
     /// The alert about a file the secret gate refused for its structure (C2b fix round 5, Ruling 38): the owner can vouch
     /// for exactly those bytes (`AppModel.vouchFile`).
     public var canVouchFile: Bool = false
@@ -116,6 +119,7 @@ public enum InboxRows {
                 decidedLine: decided,
                 approveLabel: quarantine ? "Merge into main" : "Approve",
                 canVouchRestore: pending && a.kind == .engineAlert && a.subjectId == Store.restoreAlertSubject && work.restoreVouchOpen,
+                restoreEpochIds: pending && a.kind == .engineAlert && a.subjectId == Store.restoreAlertSubject ? work.restoreEpochIds : [],
                 canVouchFile: pending && Store.isFileVouchAlert(a),
                 fileVouchSides: pending ? (work.fileVouchChoices[a.id] ?? []).enumerated().map { k, f in
                     FileVouchSide(shown: f.shown, id: f.canonicalHash, sha256: f.sha256, refusedAt: f.refusedAt, vouched: f.vouchedAt != nil,

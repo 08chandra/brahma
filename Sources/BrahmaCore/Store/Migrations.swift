@@ -2027,6 +2027,19 @@ enum Migrations {
                 t.add(column: "messageId", .text)
             }
         }
+        m.registerMigration("vC-taint-hold") { db in
+            // Final wave B1, controller Ruling 23: a turn whose end could not record its taint holds its company (no turn, no
+            // dispatch, no merge) until the record is retried successfully or the owner clears the hold. The row carries what
+            // the retry needs.
+            try db.create(table: "taintHold") { t in
+                t.primaryKey("turnId", .text)
+                t.column("companyId", .text).notNull().references("company", onDelete: .cascade)
+                t.column("agentId", .text).notNull()
+                t.column("payload", .text).notNull()            // the TaintHold, JSON
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.create(index: "taintHold_company", on: "taintHold", columns: ["companyId"])
+        }
     }
 }
 

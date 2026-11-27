@@ -130,6 +130,12 @@ public actor Orchestrator {
     var gateTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
     /// When the tick last swept what failed shares left (`gateTick`).
     var lastShareSweep: Date?
+    /// Final wave B1, controller Ruling 23: turns whose end could not record their taint, by turn id (`TaintHold`), and whether
+    /// the hold's row is written. Their companies are held (no turn, dispatch or merge starts) until the retry succeeds or the
+    /// owner clears the hold; kept here too so a hold whose row could not be written still holds while the engine runs.
+    var taintHoldMemory: [String: (hold: TaintHold, persisted: Bool)] = [:]
+    /// The retry pass of the held turns' taint records (`taintHoldTick`), off the actor; never overlaps itself.
+    var taintRetryTask: Task<Void, Never>? { didSet { resumeIdleWaitersIfIdle() } }
     /// The companies whose system timers have been ensured; a change re-runs `SystemTimers.ensure`.
     var ensuredTimerCompanies: Set<String>?
     /// Phone alerts (Task 7b): one dispatcher for the engine's life, and its pass in flight (a pass never overlaps itself).
@@ -429,7 +435,7 @@ public actor Orchestrator {
     private var isIdle: Bool {
         tasks.isEmpty && healthTasks.isEmpty && gitTasks.isEmpty && checkTasks.isEmpty && mergeTasks.isEmpty && timerTasks.isEmpty
             && secretsTask == nil && pushTask == nil && stopObserverTask == nil && previewTask == nil && smokeTasks.isEmpty
-            && releaseTasks.isEmpty && gateTask == nil && conciergeTasks.isEmpty
+            && releaseTasks.isEmpty && gateTask == nil && conciergeTasks.isEmpty && taintRetryTask == nil
     }
 
     private func resumeIdleWaitersIfIdle() {
@@ -730,7 +736,9 @@ public actor Orchestrator {
         startChecks(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
         // 5a. The main guard (Plan 4a Task 3): for every company, `main` is where the queue left it, before the merge step.
         mainGuardTick(now: now, held: held, companies: companies)
-        startMerges(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
+        // Ruling 23: no merge of a company held for an unrecorded taint (its commits may read clean until the record is written).
+        startMerges(now: now, config: cfg, held: held, pressure: pressure,
+                    companies: companies.filter { c in !taintHoldMemory.values.contains { $0.hold.companyId == c.id } })
         // 5b. Previews (Plan L): one reconcile pass at a time, after the merge step.
         previewTick(held: held)
         // 5c. The smoke check on main (Plan L): queue a run for a new main, run queued ones one at a time per company.
@@ -739,6 +747,8 @@ public actor Orchestrator {
         releaseTick(now: now, config: cfg, held: held, pressure: pressure, companies: companies)
 
         infraCooldown = infraCooldown.filter { $0.value > now }
+        // Ruling 23: companies held because a turn's taint could not be recorded start no turn, dispatch or merge.
+        let taintHeld = taintHoldTick(now: now)
         let byId = Dictionary(uniqueKeysWithValues: companies.map { ($0.id, $0) })
         let ready = try store.agents(states: [.ready])
         // The holder of an item whose merge is running gets no work turn until the merge ends.
@@ -748,7 +758,7 @@ public actor Orchestrator {
         let canaryHeldIds = canaryTick(ready: ready, companies: byId)
         let candidates = ready.compactMap { a -> Candidate? in
             guard !a.paused, tasks[a.id] == nil, !dispatching.contains(a.id), infraCooldown[a.id] == nil, !mergingHolders.contains(a.id),
-                  !canaryHeldIds.contains(a.id), let c = byId[a.companyId] else { return nil }
+                  !canaryHeldIds.contains(a.id), !taintHeld.contains(a.companyId), let c = byId[a.companyId] else { return nil }
             return Candidate(agent: a, company: c, blockingCount: blocking[a.id] ?? 0)
         }
         let selected = Scheduler.select(candidates: candidates, runningByCompany: runningByCompany, config: cfg,
@@ -769,7 +779,8 @@ public actor Orchestrator {
                                            safetyOnly: previewChildren + conciergeTasks.count,
                                            pressure: pressure, held: held)
             var companyFree: [String: Int] = [:]
-            for c in companies where c.status == .running && (decisions[c.id] ?? .open) == .open && !paceClosed.contains(c.id) {
+            for c in companies where c.status == .running && (decisions[c.id] ?? .open) == .open && !paceClosed.contains(c.id)
+                && !taintHeld.contains(c.id) {
                 companyFree[c.id] = max(cfg.modeCap(c.usageMode) - (runningByCompany[c.id] ?? 0), 0)
             }
             dispatchTick(now: now, companies: companies, skipping: Set(reaped.map(\.itemId)), freeSlots: free, companyFree: companyFree)
@@ -1698,15 +1709,18 @@ public actor Orchestrator {
         // holds now; `recordTurnTaints`). The taint is the session's now (ML's `currentTaint`, so a resumed turn that read
         // nothing itself still counts; unreadable: tainted), read before any fresh-session reset below. Git, off the
         // cooperative pool.
+        // Ruling 23 (final wave B1): a record that could not be written holds the company (`holdForTaint`, below).
+        var taintSource: String?
+        var taintRecorded = true
         if launched {
             let (store, paths, turnId, started, leasedItem) = (self.store, self.paths, turn.id, heldAtStart, leaseHead?.item.id)
             let held = Array(heldItemsAtStart)
-            await blocking.run {
+            (taintSource, taintRecorded) = await blocking.run { () -> (String?, Bool) in
                 let source: String?
                 do { source = try store.currentTaint(agentId: agent.id, paths: paths) } catch { source = "session" }
-                guard let source else { return }
-                store.recordTurnTaints(companyId: agent.companyId, agentId: agent.id, turnId: turnId, heldAtStart: started,
-                                       heldItemsAtStart: held, leasedItemId: leasedItem, source: source, now: now)
+                guard let source else { return (nil, true) }
+                return (source, store.recordTurnTaints(companyId: agent.companyId, agentId: agent.id, turnId: turnId, heldAtStart: started,
+                                                       heldItemsAtStart: held, leasedItemId: leasedItem, source: source, now: now))
             }
         }
 
@@ -1764,10 +1778,20 @@ public actor Orchestrator {
         // A tainted session marks every item it holds at turn end, leases taken mid-turn included (S21), and (Plan C Ruling 20)
         // every item the turn touched and released: held as it started (R4-3: from its leases, whether or not git could read
         // the branch head then, and its own lease), or in its claim log. The hook flag is read under `paths`.
+        var itemsMarked = true
         if launched, !isReview {
-            attempt {
+            do {
                 try store.markHeldItemsIfTainted(agentId: agent.id, turnId: turn.id, heldAtStart: Array(heldItemsAtStart), home: paths.home)
+            } catch {
+                itemsMarked = false
+                log("@\(agent.name)'s held items could not be marked after its turn (\(error)); the company is held")
             }
+        }
+        if !taintRecorded || !itemsMarked {
+            await holdForTaint(TaintHold(turnId: turn.id, companyId: agent.companyId, agentId: agent.id, heldAtStart: heldAtStart,
+                                   heldItemsAtStart: Array(heldItemsAtStart), leasedItemId: leaseHead?.item.id,
+                                   source: taintRecorded ? nil : (taintSource ?? "session"), markItems: launched && !isReview,
+                                   createdAt: now), now: now)
         }
         if launched, let labWorkspace {
             let (store, handle, turnId, ended, start) = (self.store, agent.name, turn.id, now, labAtStart)
@@ -1921,6 +1945,46 @@ public actor Orchestrator {
     static func usageUntil(_ resetsAt: Date?, now: Date) -> Date {
         if let resetsAt, resetsAt > now { return resetsAt }
         return now.addingTimeInterval(usageRetry)
+    }
+
+    /// Ruling 23: holds the turn's company for an unrecorded taint: in memory at once, and its row and the company's alert
+    /// (de-duplicated) when the database takes them (else the next tick tries again).
+    func holdForTaint(_ hold: TaintHold, now: Date) {
+        log("the taint of turn \(hold.turnId) could not be recorded; company \(hold.companyId) is held until it is")
+        var persisted = false
+        do { try store.holdForTaint(hold, now: now); persisted = true } catch { log("the taint hold could not be written (\(error))") }
+        taintHoldMemory[hold.turnId] = (hold, persisted)
+    }
+
+    /// Ruling 23, every tick: reconciles the in-memory holds with the database (a row the owner cleared, or a retry deleted,
+    /// lifts its hold; a row this engine did not know, e.g. after a restart, holds), writes the rows not yet written, and starts
+    /// the retry pass when none runs. Returns the held companies.
+    func taintHoldTick(now: Date) -> Set<String> {
+        if let rows = try? store.taintHolds() {
+            let ids = Set(rows.map(\.turnId))
+            taintHoldMemory = taintHoldMemory.filter { !$0.value.persisted || ids.contains($0.key) }
+            for row in rows { taintHoldMemory[row.turnId] = (row, true) }
+        }
+        for (turnId, entry) in taintHoldMemory where !entry.persisted {
+            if (try? store.holdForTaint(entry.hold, now: now)) != nil { taintHoldMemory[turnId]?.persisted = true }
+        }
+        if taintRetryTask == nil, !taintHoldMemory.isEmpty {
+            let (store, home, blocking, holds) = (self.store, self.paths.home, self.blocking, taintHoldMemory.values.map(\.hold))
+            taintRetryTask = Task.detached { [self] in   // scope-escape: the engine's taint-record retry (git, off the actor)
+                let lifted: [String] = await blocking.run {
+                    holds.filter { store.retryTaintHold($0, home: home, now: Store.now()) }.map(\.turnId)
+                }
+                await taintRetryDone(lifted)
+            }
+        }
+        return Set(taintHoldMemory.values.map(\.hold.companyId))
+    }
+
+    private func taintRetryDone(_ lifted: [String]) {
+        for turnId in lifted {
+            if taintHoldMemory.removeValue(forKey: turnId) != nil { log("the taint of turn \(turnId) was recorded; its hold is lifted") }
+        }
+        taintRetryTask = nil
     }
 
     nonisolated func attempt(_ body: () throws -> Void) {

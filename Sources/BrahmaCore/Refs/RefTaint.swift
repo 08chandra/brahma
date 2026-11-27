@@ -32,6 +32,7 @@ extension Store {
     /// row is kept as it is). The caller has read the session's taint (`source`) before any fresh-session reset.
     public func recordTaintedCommits(companyId: String, itemId: String, agentId: String, turnId: String?, headBefore: String,
                                      headAfter: String, source: String, git: SafeGit, now: Date) throws {
+        if refHooks.failTaintRecords { throw WorkError.conflict("injected: the taint record could not be written") }
         guard headBefore != headAfter else { return }
         let shas = try git.revList(headBefore, headAfter)
         guard !shas.isEmpty else { return }
@@ -73,28 +74,48 @@ extension Store {
         }
     }
 
-    /// Ruling 22 (P2 R5-1): the owner vouches for what a restore over an unreadable database could not place in the company:
-    /// every uncleared restore epoch, and every uncleared tainted-commit row one recorded, is cleared (`clearedBy = "owner"`;
-    /// each clearing gets its `taintOrder` sequence from the triggers), and the activity log says so. An item's own rows
-    /// (a turn's, a marker) are not: those clear through the review gate or `vouchItem`. Owner callers only (the app and the
-    /// owner CLI: `brahma vouch restore <company>`, and the restore alert's Inbox action). No agent tool reaches it. Returns
-    /// how many commit rows and epochs it cleared (none: nothing was left, and nothing is logged).
+    /// Ruling 22 (P2 R5-1): the owner vouches for what a restore over an unreadable database could not place in the company.
+    /// Final wave B1, controller Ruling 28: the vouch binds to the exact epoch ids the owner was shown (the Inbox row's, or the
+    /// CLI's `--epoch <id>` / `--all` over the epochs it listed): only those epochs, and only those still open, are cleared, with
+    /// the tainted-commit rows each one recorded (`clearedBy = "owner"`; each clearing gets its `taintOrder` sequence from the
+    /// triggers); an epoch opened since (another restore) stays open, and so do its rows. An id that is not an open epoch of
+    /// this company clears nothing. An item's own rows (a turn's, a marker) are not cleared: those clear through the review
+    /// gate or `vouchItem`. Owner callers only (the owner principal; refused in an agent process). Returns how many commit rows
+    /// and epochs it cleared (none: nothing was left, and nothing is logged).
     @discardableResult
-    public func vouchRestoredCommits(companyId: String, now: Date) throws -> (commits: Int, epochs: Int) {
-        try writer.write { db in
+    public func vouchRestoredCommits(companyId: String, epochIds: [String], now: Date, owner: OwnerPrincipal) throws -> (commits: Int, epochs: Int) {
+        try ProcessRole.refuseInAgentProcess()
+        _ = try requireOwner(owner)
+        let ids = Array(Set(epochIds))
+        guard !ids.isEmpty else { return (0, 0) }
+        return try writer.write { db in
             guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
+            let marks = ids.map { _ in "?" }.joined(separator: ",")
+            let open = try String.fetchAll(db, sql: """
+                SELECT id FROM restoreEpoch WHERE companyId = ? AND clearedBy IS NULL AND id IN (\(marks))
+                """, arguments: StatementArguments([companyId] + ids))
+            guard !open.isEmpty else { return (0, 0) }
+            let openMarks = open.map { _ in "?" }.joined(separator: ",")
             try db.execute(sql: """
                 UPDATE taintedCommit SET clearedBy = 'owner', clearedAt = ?
-                WHERE companyId = ? AND restoreEpoch IS NOT NULL AND clearedBy IS NULL
-                """, arguments: [now, companyId])
+                WHERE companyId = ? AND restoreEpoch IN (\(openMarks)) AND clearedBy IS NULL
+                """, arguments: StatementArguments([now, companyId] as [any DatabaseValueConvertible] + open))
             let commits = db.changesCount
-            try db.execute(sql: "UPDATE restoreEpoch SET clearedBy = 'owner', clearedAt = ? WHERE companyId = ? AND clearedBy IS NULL",
-                           arguments: [now, companyId])
+            try db.execute(sql: "UPDATE restoreEpoch SET clearedBy = 'owner', clearedAt = ? WHERE companyId = ? AND id IN (\(openMarks)) AND clearedBy IS NULL",
+                           arguments: StatementArguments([now, companyId] as [any DatabaseValueConvertible] + open))
             let epochs = db.changesCount
-            guard commits + epochs > 0 else { return (0, 0) }
             try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .access,
                               text: "Owner vouched for the commits a restore could not place (\(commits))", createdAt: now).insert(db)
             return (commits, epochs)
+        }
+    }
+
+    /// The company's open restore epochs, oldest first: what the restore vouch lists and binds to (Ruling 28).
+    public func openRestoreEpochList(companyId: String) throws -> [RestoreEpoch] {
+        try writer.read { db in
+            guard try db.tableExists("restoreEpoch") else { return [] }
+            return try RestoreEpoch.fetchAll(db, sql: "SELECT * FROM restoreEpoch WHERE companyId = ? AND clearedBy IS NULL ORDER BY createdAt, rowid",
+                                             arguments: [companyId])
         }
     }
 
@@ -452,11 +473,13 @@ extension Store {
         // Fix round 2 (R1-2): both trees are displayed (context and `-` lines come from the base), so every commit either side
         // holds since its merge base with main counts, plus the pair's symmetric range. Fix round 3 (Ruling C5b-7): the commits
         // of every orphaned item (a taint record a rewrite left behind) count in that set too, and a lookup that fails is tainted.
-        let orphans: [(source: String, commits: Set<String>)]
+        let orphans: [OrphanedItem]
         do { orphans = Array(try orphanedItems(companyId: item.companyId, rows: rows).values) } catch {
             return rows.first { $0.itemId == item.id }?.source ?? rows.first?.source ?? Self.taintCheckFailedSource
         }
-        if let source = try Self.displayedRangeSource(git, bases.base, target, rows: rows, orphans: orphans) { return source }
+        let companyId = item.companyId
+        if let source = try Self.displayedRangeSource(git, bases.base, target, rows: rows, orphans: orphans,
+                                                      recorded: { try self.recordedCommitShas(companyId: companyId, shas: $0) }) { return source }
         // Never clean on a narrower check: `commitSource` (the item's own orphaned record, restore epochs, every orphaned
         // item's commits over the branch up to the target, fail-closed on any failure) has the last word.
         var committed = WorkRef(kind: .diff, id: item.key)
@@ -467,8 +490,12 @@ extension Store {
     /// R1-2: the source of the first uncleared tainted commit whose content a diff of `a` against `b` can display: the
     /// symmetric range `a...b`, and each side's own commits since its merge base with `main` (`merge-base(main, side)..side`).
     /// A side with no merge base with `main`, a pair with none, or a range that can't be listed reads as tainted (fail closed).
+    /// Final wave B1 item 13: `recorded` names which of a list of shas have a recorded author (`turnCommit`); while an orphaned
+    /// item's branch is gone, a displayed commit with none is tainted by it (`OrphanedItem.hit`). By default nothing is recorded
+    /// (fail closed).
     static func displayedRangeSource(_ git: SafeGit, _ a: String, _ b: String, rows: [TaintedCommit],
-                                     orphans: [(source: String, commits: Set<String>)] = []) throws -> String? {
+                                     orphans: [OrphanedItem] = [],
+                                     recorded: ([String]) throws -> Set<String> = { _ in [] }) throws -> String? {
         guard !rows.isEmpty else { return nil }
         do {
             var shas: [String] = []
@@ -481,8 +508,9 @@ extension Store {
                 if mainBase != side { shas += try git.revList(mainBase, side) }
             }
             if let hit = rows.first(where: { row in shas.contains { $0.hasPrefix(row.sha) } }) { return hit.source }
-            // Ruling C5b-7: a commit of an orphaned item's branch (its tainted record names shas a rewrite replaced).
-            return orphans.first { other in shas.contains { other.commits.contains($0) } }?.source
+            // Ruling C5b-7: a commit of an orphaned item's branch (its tainted record names shas a rewrite replaced); item 13:
+            // of a deleted one, a commit it recorded or one nobody recorded.
+            return try OrphanedItem.hit(orphans, in: shas, recorded: recorded)
         } catch {
             return "outside content"
         }
@@ -508,7 +536,10 @@ extension Store {
             let refs = try reachabilityRefs(companyId: companyId)
             let (a, b) = (try git.verifyRev(from, reachableFrom: refs), try git.verifyRev(to, reachableFrom: refs))
             let orphans = Array(try orphanedItems(companyId: companyId, rows: rows).values)
-            if let source = try Self.displayedRangeSource(git, a, b, rows: rows, orphans: orphans) { return source }
+            if let source = try Self.displayedRangeSource(git, a, b, rows: rows, orphans: orphans,
+                                                          recorded: { try self.recordedCommitShas(companyId: companyId, shas: $0) }) {
+                return source
+            }
             for side in Set([a, b]) {
                 if let source = restoreEpochSource(epochs, tip: side, path: nil, git: git) { return source }
             }
@@ -607,13 +638,15 @@ extension Store {
     /// Items with uncleared rows none of whose commits is provably clean any more: one of their rows (not carried by the
     /// engine's rebase) is not on the item's branch (a rewrite nothing carried the taint through, ruling 7), or is an
     /// `unrecorded-…` marker. Item id → (the newest row's source, every commit on its branch now). Throws when a branch can't
-    /// be listed (callers fail closed).
-    private func orphanedItems(companyId: String, rows: [TaintedCommit]) throws -> [String: (source: String, commits: Set<String>)] {
+    /// be listed (callers fail closed). Final wave B1 item 13: an item whose branch is gone (deleted) is orphaned with the
+    /// commits recorded for it instead (its taint rows and the engine's commit-author rows, `turnCommit`), and `gone`: a
+    /// commit nobody recorded, merged elsewhere, may be its rewritten work, so it reads tainted by it (`OrphanedItem.hit`).
+    private func orphanedItems(companyId: String, rows: [TaintedCommit]) throws -> [String: OrphanedItem] {
         let byItem = Dictionary(grouping: rows.filter { $0.itemId != nil && $0.carriedTo == nil }, by: { $0.itemId ?? "" })
         guard !byItem.isEmpty else { return [:] }
         guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
         let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
-        var out: [String: (source: String, commits: Set<String>)] = [:]
+        var out: [String: OrphanedItem] = [:]
         var failure: (any Error)?, readable: [WorkItem] = []
         for (itemId, itemRows) in byItem {
             guard let item = try workItem(id: itemId), item.companyId == companyId, let newest = itemRows.first else { continue }
@@ -623,7 +656,13 @@ extension Store {
                     let head = try git.head("item/\(item.key)")
                     branch = Set(try git.revList(try git.mergeBase("main", head), head))
                 } else {
-                    branch = []      // no branch (gone): nothing of it is on one. A git failure throws instead (fail closed).
+                    // No branch (gone): nothing of it is on one, so it is orphaned; its recorded commits stand in for its
+                    // branch. A git failure throws instead (fail closed).
+                    let recorded = try recordedItemShas(companyId: companyId, itemId: itemId)
+                        .union(itemRows.map(\.sha).filter { !$0.hasPrefix(TaintedCommit.unrecordedPrefix) })
+                    readable.append(item)
+                    out[itemId] = OrphanedItem(source: newest.source, commits: recorded, gone: true)
+                    continue
                 }
             } catch {
                 // Every other branch is still listed (each unreadable one gets its alert); the query then fails closed.
@@ -632,11 +671,32 @@ extension Store {
                 continue
             }
             readable.append(item)
-            if itemRows.contains(where: { !branch.contains($0.sha) }) { out[itemId] = (newest.source, branch) }
+            if itemRows.contains(where: { !branch.contains($0.sha) }) { out[itemId] = OrphanedItem(source: newest.source, commits: branch, gone: false) }
         }
         noteReadableBranches(companyId: companyId, items: readable)
         if let failure { throw failure }
         return out
+    }
+
+    /// The shas of `shas` the engine recorded an author for (`turnCommit`, this company).
+    func recordedCommitShas(companyId: String, shas: [String]) throws -> Set<String> {
+        guard !shas.isEmpty else { return [] }
+        return try writer.read { db in
+            var out: Set<String> = []
+            for chunk in stride(from: 0, to: shas.count, by: 500).map({ Array(shas[$0..<min($0 + 500, shas.count)]) }) {
+                let marks = chunk.map { _ in "?" }.joined(separator: ",")
+                out.formUnion(try String.fetchAll(db, sql: "SELECT sha FROM turnCommit WHERE companyId = ? AND sha IN (\(marks))",
+                                                  arguments: StatementArguments([companyId] + chunk)))
+            }
+            return out
+        }
+    }
+
+    /// Every sha the engine recorded as made on `itemId` (`turnCommit`, this company).
+    func recordedItemShas(companyId: String, itemId: String) throws -> Set<String> {
+        try writer.read { db in
+            Set(try String.fetchAll(db, sql: "SELECT sha FROM turnCommit WHERE companyId = ? AND itemId = ?", arguments: [companyId, itemId]))
+        }
     }
 
     /// The reason that keys the owner's alert about an item branch the taint check can't read (ruling 12).
@@ -727,7 +787,15 @@ extension Store {
         if let source = try restoreEpochSource(companyId: companyId, commit: sha) { return source }
         guard let newest = rows.first else { return nil }
         do {
-            return try orphanedItems(companyId: companyId, rows: rows).values.first(where: { $0.commits.contains { $0.hasPrefix(sha) } })?.source
+            let orphans = Array(try orphanedItems(companyId: companyId, rows: rows).values)
+            if let hit = orphans.first(where: { $0.commits.contains { $0.hasPrefix(sha) } }) { return hit.source }
+            // Item 13: while a deleted item's record is orphaned, a commit off `main` nobody recorded reads tainted by it.
+            guard let gone = orphans.first(where: \.gone) else { return nil }
+            guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
+            let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
+            let full = try git.verifyRev(sha, reachableFrom: try reachabilityRefs(companyId: companyId))
+            if try git.isAncestor(full, of: "main") { return nil }
+            return try recordedCommitShas(companyId: companyId, shas: [full]).contains(full) ? nil : gone.source
         } catch {
             return newest.source
         }
@@ -748,7 +816,8 @@ extension Store {
             if let hit = history.first(where: { bySha[$0] != nil }) { return bySha[hit] }
             if let source = restoreEpochSource(epochs, tip: rev, path: ref.id, git: git) { return source }
             let orphaned = try orphanedItems(companyId: companyId, rows: rows)
-            return orphaned.values.first(where: { item in history.contains { item.commits.contains($0) } })?.source
+            return try OrphanedItem.hit(Array(orphaned.values), in: history,
+                                        recorded: { try self.recordedCommitShas(companyId: companyId, shas: $0) })
         } catch {
             return newest      // the history can't be read: fail closed
         }
@@ -778,8 +847,11 @@ extension Store {
             let history = ref.kind == .diff ? try git.revList(base, head) : try git.logShas(range: "\(base)..\(head)", path: ref.id)
             if let hit = history.first(where: { bySha[$0] != nil }) { return bySha[hit] }
             if let source = restoreEpochSource(epochs, tip: head, path: ref.kind == .diff ? nil : ref.id, git: git) { return source }
-            // A commit of another orphaned item's branch on this one (a reset onto it, a cherry-pick that reused it).
-            return orphaned.values.first(where: { other in history.contains { other.commits.contains($0) } })?.source
+            // A commit of another orphaned item's branch on this one (a reset onto it, a cherry-pick that reused it); item 13:
+            // while a deleted item's record is orphaned, a commit it recorded, or one nobody recorded.
+            let companyId = item.companyId
+            return try OrphanedItem.hit(Array(orphaned.values), in: history,
+                                        recorded: { try self.recordedCommitShas(companyId: companyId, shas: $0) })
         } catch {
             // The history can't be read (this item's branch is gone, git failed on it or on any orphan candidate's branch, e.g.
             // one reset onto an unrelated root): fail closed for the whole query (ruling 11). The item's own newest source,
@@ -850,9 +922,13 @@ extension Store {
     /// claim log, even one released since), the leases it holds now and the turn's own leased item. Each starts at its head
     /// at turn start, else (held then, or the turn's own, with no head read) the merge base with `main`, else the trusted head
     /// of its first claim in the turn, else the lease's trusted claim head, else the merge base (never a head an agent could
-    /// have moved). A read that fails falls back to what is known and alerts the owner. Never throws.
+    /// have moved). A read that fails falls back to what is known and alerts the owner. Never throws. Returns whether the
+    /// record is complete (final wave B1, Ruling 23): false when the items the turn touched couldn't be read, or an item's
+    /// record could not be written even as its fail-closed marker; the engine then holds the company until a retry succeeds.
+    @discardableResult
     public func recordTurnTaints(companyId: String, agentId: String, turnId: String, heldAtStart: [String: String],
-                                 heldItemsAtStart: [String] = [], leasedItemId: String?, source: String, now: Date) {
+                                 heldItemsAtStart: [String] = [], leasedItemId: String?, source: String, now: Date) -> Bool {
+        var complete = true
         var targets: [String: String?] = heldAtStart.mapValues { Optional($0) }
         for itemId in heldItemsAtStart + [leasedItemId].compactMap({ $0 }) where targets[itemId] == nil { targets[itemId] = .some(nil) }
         do {
@@ -867,6 +943,7 @@ extension Store {
             }
             for lease in leases where targets[lease.itemId] == nil { targets[lease.itemId] = .some(lease.claimHead) }
         } catch {
+            complete = false
             alertTaintRecord(companyId: companyId, itemId: nil, what: "the items this turn touched could not be read (\(error))", now: now)
         }
         // Without the company (its workspace), nothing can be listed: every target still gets the fail-closed marker below.
@@ -877,39 +954,44 @@ extension Store {
             alertTaintRecord(companyId: companyId, itemId: nil, what: "the company could not be read", now: now)
         }
         for (itemId, start) in targets {
-            recordTurnTaint(companyId: companyId, itemId: itemId, agentId: agentId, turnId: turnId, start: start, source: source,
-                            workspace: workspace, now: now)
+            if !recordTurnTaint(companyId: companyId, itemId: itemId, agentId: agentId, turnId: turnId, start: start, source: source,
+                                workspace: workspace, now: now) { complete = false }
         }
+        return complete
     }
 
     /// Records `<start>..head(item/<KEY>)` of one item as tainted commits (`start` nil: the merge base with `main`; `workspace`
     /// nil: the company could not be read, so straight to the fail-closed marker). Fail
     /// closed: when that can't be done, every commit from the merge base is recorded instead; when not even that, an
     /// `unrecorded-…` marker makes all of the item's commits tainted (`orphanedItems`), the item is marked (5-lite's sticky
-    /// `taintedOrigin`, which taints its worktree) and the owner gets an engine alert. Never throws.
+    /// `taintedOrigin`, which taints its worktree) and the owner gets an engine alert. Never throws. Returns false only when
+    /// not even the marker could be written (Ruling 23: nothing recorded the taint).
+    @discardableResult
     public func recordTurnTaint(companyId: String, itemId: String, agentId: String, turnId: String?, start: String?,
-                                source: String, workspace: URL?, now: Date) {
+                                source: String, workspace: URL?, now: Date) -> Bool {
         var failure: (any Error)?
         do {
             guard let workspace else { throw WorkError.notFound("the company's workspace could not be read") }
-            guard let item = try workItem(id: itemId), item.companyId == companyId else { return }
+            guard let item = try workItem(id: itemId), item.companyId == companyId else { return true }
             let git = try refGit(workspace)
             let after = try git.head("item/\(item.key)")
             let base = try git.mergeBase("main", after)
             do {
                 try recordTaintedCommits(companyId: companyId, itemId: itemId, agentId: agentId, turnId: turnId, headBefore: start ?? base,
                                          headAfter: after, source: source, git: git, now: now)
-                return
+                return true
             } catch {
                 failure = error
                 try recordTaintedCommits(companyId: companyId, itemId: itemId, agentId: agentId, turnId: turnId, headBefore: base,
                                          headAfter: after, source: source, git: git, now: now)
-                return
+                return true
             }
         } catch {
             failure = failure ?? error
         }
+        var marked = true
         do {
+            if refHooks.failTaintRecords { throw WorkError.conflict("injected: the taint marker could not be written") }
             try writer.write { db in
                 try db.execute(sql: """
                     INSERT OR IGNORE INTO taintedCommit (companyId, sha, itemId, agentId, turnId, source, createdAt)
@@ -919,10 +1001,12 @@ extension Store {
                 try db.execute(sql: "UPDATE workItem SET taintedOrigin = 1 WHERE companyId = ? AND id = ?", arguments: [companyId, itemId])
             }
         } catch {
+            marked = false
             FileHandle.standardError.write(Data("brahma: could not mark item \(itemId) tainted: \(error)\n".utf8))
         }
         alertTaintRecord(companyId: companyId, itemId: itemId, what: "its commits could not be listed (\(failure.map { "\($0)" } ?? "unknown"))",
                          now: now)
+        return marked
     }
 
     /// The owner's engine alert for a taint record that could not be made as it should (stderr when even that fails).
@@ -1105,5 +1189,23 @@ enum ArtifactCopyListing {
                 throw VaultError.missing
             }
         }
+    }
+}
+
+/// An item whose taint record is orphaned (`Store.orphanedItems`): its newest uncleared row's source, the commits that stand
+/// for its work (on its branch now, or, its branch gone, the ones recorded for it), and whether its branch is gone.
+struct OrphanedItem: Sendable {
+    var source: String
+    var commits: Set<String>
+    var gone: Bool
+
+    /// The source of the first orphan any of `shas` belongs to; else (final wave B1 item 13) while an orphan's branch is gone,
+    /// its source when any of `shas` has no recorded author (`recorded` returns the shas that have one): unknown provenance next
+    /// to a deleted orphan reads tainted (fail closed). Nil when nothing matches.
+    static func hit(_ orphans: [OrphanedItem], in shas: [String], recorded: ([String]) throws -> Set<String>) throws -> String? {
+        if let hit = orphans.first(where: { o in shas.contains { o.commits.contains($0) } }) { return hit.source }
+        guard let gone = orphans.first(where: \.gone), !shas.isEmpty else { return nil }
+        let known = try recorded(shas)
+        return shas.contains { !known.contains($0) } ? gone.source : nil
     }
 }

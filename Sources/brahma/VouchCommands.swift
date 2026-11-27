@@ -8,29 +8,72 @@ struct VouchGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "vouch",
         abstract: "Vouch for what Brahma could not verify (owner only).",
-        subcommands: [VouchRestore.self, VouchFile.self])
+        subcommands: [VouchRestore.self, VouchFile.self, VouchTaintHold.self])
 
-    /// `brahma vouch restore <company>`: after a restore over a database that could not be read, every commit the restored
-    /// database can't place reads as outside content (a restore epoch). This clears the company's epochs and the commit rows
-    /// they recorded (`Store.vouchRestoredCommits`; each clearing sequenced, an owner activity line). A turn's own tainted
-    /// commits are not cleared here: they clear through review or the item's vouch.
+    /// `brahma vouch restore <company> [--epoch <id>]… [--all]`: after a restore over a database that could not be read, every
+    /// commit the restored database can't place reads as outside content (a restore epoch). This lists the company's open
+    /// epochs and clears the ones named, with the commit rows they recorded (`Store.vouchRestoredCommits`; each clearing
+    /// sequenced, an owner activity line). Final wave B1, Ruling 28: the vouch binds to the exact epochs listed: with one open
+    /// epoch it is that one; with more, `--epoch <id>` (repeatable) or `--all` (every epoch this command listed) is required,
+    /// and an epoch opened after the listing stays open. A turn's own tainted commits are not cleared here: they clear through
+    /// review or the item's vouch.
     struct VouchRestore: ParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "restore",
-            abstract: "Clear a restore's unplaced-commit taint in a company (owner only).")
+            abstract: "List and clear a restore's unplaced-commit taint in a company (owner only).")
         @Argument(help: "Company name or slug.") var company: String
+        @Option(name: .customLong("epoch"), help: "A restore epoch id, as listed (repeatable).") var epochs: [String] = []
+        @Flag(help: "Every open restore epoch listed.") var all = false
 
         func run() throws {
-            try requireOwnerShell()
+            let owner = try requireOwnerShell()
             let (store, _) = try openStore()
             let c = try resolveCompany(store, company)
-            let cleared = try store.vouchRestoredCommits(companyId: c.id, now: Date())
-            if cleared.epochs == 0 && cleared.commits == 0 {
+            let open = try store.openRestoreEpochList(companyId: c.id)
+            guard !open.isEmpty else {
                 print(safe("\(c.name): no restore left anything to vouch for."))
+                return
+            }
+            print(safe("\(c.name): open restore epochs:"))
+            for e in open { print(safe("  \(e.id)  restored \(e.createdAt.formatted(.iso8601))  \(e.source)")) }
+            let chosen: [String]
+            if all {
+                guard epochs.isEmpty else { throw fail("give --epoch <id> or --all, not both") }
+                chosen = open.map(\.id)
+            } else if !epochs.isEmpty {
+                let ids = Set(open.map(\.id))
+                for e in epochs where !ids.contains(e) { throw fail("\(e) is not an open restore epoch of \(c.name)") }
+                chosen = epochs
+            } else if open.count == 1 {
+                chosen = [open[0].id]
+            } else {
+                throw fail("\(c.name) has \(open.count) open restore epochs: name the ones to vouch for with --epoch <id>, or --all")
+            }
+            let cleared = try store.vouchRestoredCommits(companyId: c.id, epochIds: chosen, now: Date(), owner: owner)
+            if cleared.epochs == 0 && cleared.commits == 0 {
+                print(safe("\(c.name): nothing left to vouch for in the epochs named."))
             } else {
                 print(safe("\(c.name): vouched for the commits a restore could not place (\(cleared.epochs) restore(s), "
                            + "\(cleared.commits) commit(s)); they now read by the usual rules."))
             }
+        }
+    }
+
+    /// `brahma vouch taint-hold <company>` (final wave B1, Ruling 23): a turn's taint could not be recorded at its end, so the
+    /// company is held (no turn, dispatch or merge) while the engine retries the record. The owner clears the hold here,
+    /// accepting that what those turns' records lack stays unrecorded (`Store.clearTaintHolds`).
+    struct VouchTaintHold: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "taint-hold",
+            abstract: "Clear a company's hold for a taint record that could not be written (owner only).")
+        @Argument(help: "Company name or slug.") var company: String
+
+        func run() throws {
+            let owner = try requireOwnerShell()
+            let (store, _) = try openStore()
+            let c = try resolveCompany(store, company)
+            let cleared = try store.clearTaintHolds(companyId: c.id, now: Date(), owner: owner)
+            print(safe(cleared == 0 ? "\(c.name): no taint hold to clear." : "\(c.name): cleared the taint hold (\(cleared) turn(s)); turns may start again."))
         }
     }
 

@@ -455,6 +455,48 @@ final class PassthroughRecordingRunner: GitProcessRunning, @unchecked Sendable {
         #expect(try f.store.refTaint(try f.fx.ref("diff:\(f.r1)..\(f.r2)"), companyId: f.c.id).tainted)
     }
 
+    /// Final wave B1 item 13 (deleted-branch orphan): another item's tainted commit is rewritten, the rewrite lands on ENG-1,
+    /// then the other item's branch is deleted. With its branch gone the orphan's commits come from its records (the taint rows
+    /// and the engine's commit-author rows), and a commit on ENG-1 with no recorded provenance at all reads tainted (fail
+    /// closed): the rewritten work is never laundered by deleting its branch. Once the other item's record is cleared, ENG-1's
+    /// own recorded commits read clean again.
+    @Test(arguments: [false, true]) func deletedBranchOrphanStillTaints(_ recordedRewrite: Bool) throws {
+        let f = try ChangesFixture(edits: false)
+        let other = try f.store.createWorkItem(companyId: f.c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Other"))
+        let wt2 = try f.fx.git.ws.addWorktree(key: other.key)
+        try f.fx.git.write("other.txt", "from the other item\n", in: wt2)
+        try f.fx.git.git(["add", "-A"], in: wt2)
+        try f.fx.git.git(["commit", "-q", "-m", "other work"], in: wt2)
+        let x = try f.fx.git.git(["rev-parse", "HEAD"], in: wt2)
+        try f.store.recordTaintedCommits(companyId: f.c.id, itemId: other.id, agentId: f.fx.eng3.id, turnId: nil, headBefore: try f.fx.head("main"),
+                                         headAfter: x, source: "docs.swift.org", git: SafeGit(workspace: f.cf.workspace), now: f.cf.now)
+        try f.store.recordCommitAuthors(companyId: f.c.id, itemId: other.id, agentId: f.fx.eng3.id, turnId: "t-x", shas: [x], now: f.cf.now)
+        try f.fx.git.git(["commit", "-q", "--amend", "-m", "rewritten"], in: wt2)
+        let rewritten = try f.fx.git.git(["rev-parse", "HEAD"], in: wt2)
+        if recordedRewrite {
+            try f.store.recordCommitAuthors(companyId: f.c.id, itemId: other.id, agentId: f.fx.eng3.id, turnId: "t-y", shas: [rewritten], now: f.cf.now)
+        }
+        try f.fx.git.git(["merge", "-q", "--no-edit", rewritten], in: f.wt)
+        let merge = try f.fx.git.git(["rev-parse", "HEAD"], in: f.wt)
+        // ENG-1's own commits are recorded as its own.
+        try f.store.recordCommitAuthors(companyId: f.c.id, itemId: f.item.id, agentId: f.fx.eng1.id, turnId: "t-1", shas: [f.r2, merge], now: f.cf.now)
+        // The other item's branch is deleted.
+        try f.fx.git.git(["worktree", "remove", "--force", wt2.path])
+        try f.fx.git.git(["branch", "-D", "item/\(other.key)"])
+        for m in [CompareMode.main, .head] {
+            let s = try f.snapshot(m)
+            #expect(s.tainted && s.taintReason == Self.taintReason, "\(m), recorded \(recordedRewrite): \(String(describing: s.taintReason))")
+        }
+        #expect(try f.store.refTaint(try f.fx.ref("ENG-1:diff"), companyId: f.c.id).tainted, "recorded \(recordedRewrite)")
+        #expect(try f.store.refTaint(try f.fx.ref("ENG-1:other.txt"), companyId: f.c.id).tainted, "recorded \(recordedRewrite)")
+        #expect(try f.store.refTaint(try f.fx.ref("commit:\(rewritten)"), companyId: f.c.id).tainted, "recorded \(recordedRewrite)")
+        // Cleared by the owner's review of the other item: nothing orphaned remains, and ENG-1 reads clean.
+        try f.store.writer.write { db in
+            try db.execute(sql: "UPDATE taintedCommit SET clearedBy = 'owner', clearedAt = ? WHERE itemId = ?", arguments: [f.cf.now, other.id])
+        }
+        #expect(try !f.store.refTaint(try f.fx.ref("ENG-1:diff"), companyId: f.c.id).tainted)
+    }
+
     // MARK: Fix round 4
 
     /// Opens a restore epoch whose own `main` is `main` (the restored database can place nothing after it).

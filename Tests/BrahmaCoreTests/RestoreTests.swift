@@ -742,6 +742,74 @@ import GRDB
         #expect(try w.tainted(restored, "\(item.key):diff"))
     }
 
+    /// Final wave B1, controller Ruling 28: the restore vouch binds to the epochs the owner was shown. Epoch 1 is listed; then
+    /// epoch 2 opens; vouching for the listed epoch 1 clears it and its row only: epoch 2 and its row stay open and tainted. An
+    /// id that is no open epoch of the company clears nothing; the vouch needs the owner principal and refuses in agent mode.
+    @Test func restoreVouchBindsToTheEpochsShown() throws {
+        let w = try TaintWorld()
+        let s = w.env.store, cId = w.acme.id
+        let (a, b) = (String(repeating: "a1", count: 20), String(repeating: "b2", count: 20))
+        func open(_ id: String, _ sha: String) throws {
+            try s.writer.write { db in
+                try RestoreEpoch(id: id, companyId: cId, mainCommit: nil, listed: false, source: RestoreCarry.unreadableCommitTaintSource,
+                                 createdAt: Date(), clearedBy: nil, clearedAt: nil).insert(db)
+                try db.execute(sql: "INSERT INTO taintedCommit (companyId, sha, source, createdAt, restoreEpoch) VALUES (?, ?, ?, ?, ?)",
+                               arguments: [cId, sha, RestoreCarry.unreadableCommitTaintSource, Date(), id])
+            }
+        }
+        func cleared(_ epoch: String) throws -> String? {
+            try s.writer.read { db in try String.fetchOne(db, sql: "SELECT clearedBy FROM restoreEpoch WHERE id = ?", arguments: [epoch]) }
+        }
+        try open("epoch-1", a)
+        let shown = try s.openRestoreEpochList(companyId: cId).map(\.id)
+        #expect(shown == ["epoch-1"])
+        try open("epoch-2", b)
+        #if DEBUG
+        let owner = try OwnerPrincipal.test
+        OwnerPrincipal.simulatingAgentProcess {
+            #expect(throws: WorkError.self) { try s.vouchRestoredCommits(companyId: cId, epochIds: shown, now: Date(), owner: owner) }
+        }
+        #endif
+        #expect(try s.vouchRestoredCommits(companyId: cId, epochIds: ["epoch-9", "nope"], now: Date(), owner: .test) == (0, 0))
+        let done = try s.vouchRestoredCommits(companyId: cId, epochIds: shown, now: Date(), owner: .test)
+        #expect(done == (1, 1))
+        #expect(try cleared("epoch-1") == "owner" && cleared("epoch-2") == nil)
+        func rowCleared(_ sha: String) throws -> String? {
+            try s.writer.read { db in try String.fetchOne(db, sql: "SELECT clearedBy FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [cId, sha]) }
+        }
+        #expect(try rowCleared(a) == "owner" && rowCleared(b) == nil)
+        #expect(try w.tainted(s, "commit:\(b)"), "epoch 2 was cleared by a vouch for epoch 1")
+        // Vouching the cleared epoch again does nothing.
+        #expect(try s.vouchRestoredCommits(companyId: cId, epochIds: shown, now: Date(), owner: .test) == (0, 0))
+    }
+
+    /// Final wave B1 item 26 (final review m-1, Ruling 50 across a restore): the per-company ref counters only move forward. A
+    /// number handed out after the snapshot (an ask, an item key, a grant…) is never handed out again by the restored database:
+    /// each counter is the greater of the live and the restored value; a company only the live database has is not carried.
+    @Test func restoreNeverReissuesRefNumbers() throws {
+        let w = try TaintWorld()
+        let acme = w.acme.id
+        func next(_ store: Store, _ kind: RefCounterKind, count: Int = 1) throws -> Int {
+            try store.writer.write { db in try Store.nextRefNumber(db: db, companyId: acme, kind: kind, floor: 0, count: count) }
+        }
+        _ = try next(w.env.store, .sprint)
+        let snapshot = try w.service.snapshot(reason: .manual)
+        // After the snapshot: asks, items, grants and sprints numbered past the snapshot's counters (their rows are not needed:
+        // a number given out is cited in git, notes and transcripts whatever became of its row).
+        var issued: [RefCounterKind: Int] = [:]
+        for kind in [RefCounterKind.ask, .item, .grant, .sprint, .memory, .release] {
+            issued[kind] = try next(w.env.store, kind, count: 7) + 6
+        }
+        // The snapshot's counter ahead of the live one for one kind: the restored database keeps the snapshot's (higher) value.
+        try w.editSnapshot(snapshot, "INSERT INTO refCounter (companyId, kind, last) VALUES (?, 'mergeBatch', 500) "
+                           + "ON CONFLICT(companyId, kind) DO UPDATE SET last = 500", [acme])
+        let restored = try w.restore(snapshot)
+        for (kind, last) in issued {
+            #expect(try next(restored, kind) == last + 1, "\(kind): a number issued after the snapshot is issued again")
+        }
+        #expect(try next(restored, .mergeBatch) == 501)
+    }
+
     /// C4b fix round 1 (I-1): a restore never loses the engine's commit-author record (git is not rolled back): a commit whose
     /// turn was recorded after the snapshot keeps its author, so `by @agent` still finds it and no later turn can claim it; one
     /// recorded before the snapshot is unchanged.
@@ -829,7 +897,7 @@ import GRDB
         #expect(epochs.count == 1)
         #expect(epochs.first?["listed"] as Bool? == true)
         #expect(epochs.first?["mainCommit"] as String? == onMain)
-        try restored.vouchRestoredCommits(companyId: w.acme.id, now: Date())
+        try restored.vouchRestoredCommits(companyId: w.acme.id, epochIds: try restored.openRestoreEpochList(companyId: w.acme.id).map(\.id), now: Date(), owner: .test)
         #expect(try !w.tainted(restored, "commit:\(sha)"), "the owner's vouch did not clear it")
         #expect(try !w.tainted(restored, "src/late.ts@\(sha)"))
         let epochId = try #require(epochs.first?["id"] as String?)
@@ -864,7 +932,7 @@ import GRDB
             try Bool.fetchOne(db, sql: "SELECT listed FROM restoreEpoch WHERE companyId = ?", arguments: [w.acme.id])
         }
         #expect(listed == false)
-        try restored.vouchRestoredCommits(companyId: w.acme.id, now: Date())
+        try restored.vouchRestoredCommits(companyId: w.acme.id, epochIds: try restored.openRestoreEpochList(companyId: w.acme.id).map(\.id), now: Date(), owner: .test)
         #expect(try !w.tainted(restored, "commit:\(sha)"))
         #expect(try !w.tainted(restored, "src/late.ts@\(sha)"))
     }
@@ -977,7 +1045,7 @@ import GRDB
         }
         #expect(try !w.tainted(restored, "commit:\(onMain)"))
         #expect(try !w.tainted(restored, "README.md@\(onMain)"))
-        try restored.vouchRestoredCommits(companyId: w.acme.id, now: Date())
+        try restored.vouchRestoredCommits(companyId: w.acme.id, epochIds: try restored.openRestoreEpochList(companyId: w.acme.id).map(\.id), now: Date(), owner: .test)
         for ref in ["commit:\(sha)", "src/dangling.ts@\(sha)", "\(item.key):diff"] {
             #expect(try !w.tainted(restored, ref), "\(ref) after the owner's vouch")
         }
@@ -1025,7 +1093,7 @@ import GRDB
             }
             #expect(try !w.tainted(restored, "README.md"), "listed \(listed): a file X did not touch")
             #expect(try !w.tainted(restored, "README.md@\(x)"), "listed \(listed)")
-            try restored.vouchRestoredCommits(companyId: w.acme.id, now: Date())
+            try restored.vouchRestoredCommits(companyId: w.acme.id, epochIds: try restored.openRestoreEpochList(companyId: w.acme.id).map(\.id), now: Date(), owner: .test)
             for ref in refs {
                 #expect(try !w.tainted(restored, ref), "listed \(listed): \(ref) after the owner's vouch")
             }
@@ -1062,7 +1130,7 @@ import GRDB
         })
         #expect(row["restoreEpoch"] as String? == nil, "a turn's row took the epoch of the earlier restore's listing")
         #expect(row["source"] as String == "docs.swift.org")
-        try second.vouchRestoredCommits(companyId: w.acme.id, now: Date())
+        try second.vouchRestoredCommits(companyId: w.acme.id, epochIds: try second.openRestoreEpochList(companyId: w.acme.id).map(\.id), now: Date(), owner: .test)
         #expect(try second.writer.read { db in
             try String.fetchOne(db, sql: "SELECT clearedBy FROM taintedCommit WHERE companyId = ? AND sha = ?", arguments: [w.acme.id, x])
         } == nil, "the restore vouch cleared a turn's tainted commit")

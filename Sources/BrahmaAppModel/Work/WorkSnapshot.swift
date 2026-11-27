@@ -55,6 +55,9 @@ public struct WorkSnapshot: Equatable, Sendable {
     public var workspace: String = ""
     /// The company has a restore epoch the owner has not cleared (Plan C P2, Ruling 26): its restore alert offers the vouch.
     public var restoreVouchOpen = false
+    /// Final wave B1, Ruling 28: the open restore epochs as this snapshot read them (oldest first): the ones the Inbox shows,
+    /// and the only ones its vouch clears.
+    public var restoreEpochIds: [String] = []
     /// C2b-carry (b): for each pending alert about a file refused for its structure whose name collides with another refused
     /// file's, that file and every file it could be taken for (`Store.fileVouchChoice`), shown side by side in the Inbox.
     public var fileVouchChoices: [String: [FileVouch]] = [:]
@@ -94,7 +97,8 @@ public struct WorkSnapshot: Equatable, Sendable {
         w.reservedCategories = store.catalog.pack(company.packId)?.reservedCategories ?? []
         w.timeZone = store.ownerTimeZone()
         w.workspace = company.workspacePath
-        w.restoreVouchOpen = try store.hasOpenRestoreEpoch(companyId: companyId)
+        w.restoreEpochIds = try store.openRestoreEpochList(companyId: companyId).map(\.id)
+        w.restoreVouchOpen = !w.restoreEpochIds.isEmpty
         for ask in w.inbox where Store.isFileVouchAlert(ask) {
             if let choice = try store.fileVouchChoice(alertAskId: ask.id), !choice.colliding.isEmpty {
                 w.fileVouchChoices[ask.id] = [choice.file] + choice.colliding

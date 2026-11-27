@@ -91,6 +91,71 @@ import GRDB
         }
     }
 
+    /// Final wave B1, controller Ruling 23: a tainted holder turn whose end can't record its taint (every taint write fails:
+    /// the commits, the fail-closed marker and the held-item mark) holds its company: one owner alert, no new turn of the
+    /// company starts, and the record is retried every tick; once the writes work again the retry records the turn's commits,
+    /// the hold lifts, the alert resolves and turns run again. The owner can clear a hold too (the principal; refused in agent
+    /// mode).
+    @Test func unrecordedTurnTaintHoldsTheCompany() async throws {
+        let h = try Holder()
+        let (store, engId, wt) = (h.store, h.eng.id, h.worktree(h.item))
+        let shas = ShaBox()
+        store.refHooks.setFailTaintRecords(true)
+        defer { store.refHooks.setFailTaintRecords(false) }
+        try await h.turn {
+            try store.markTainted(agentId: engId, source: "docs.swift.org")
+            shas.append(try Holder.commit(wt, "src/a.ts", "a\n"))
+        }
+        let cId = h.company.id
+        #expect(try h.rows().isEmpty, "nothing could be recorded")
+        #expect(try store.taintHeldCompanies() == [cId])
+        func alerts() throws -> [Ask] {
+            try store.writer.read { db in
+                try Ask.fetchAll(db, sql: "SELECT * FROM ask WHERE companyId = ? AND kind = 'engineAlert' AND subjectId = ?",
+                                 arguments: [cId, Store.engineAlertKey("taint-hold:\(cId)")])
+            }
+        }
+        #expect(try alerts().count == 1 && alerts().first?.status == .pendingOwner)
+        #expect(try alerts().first?.summary.contains("couldn't record taint after a turn — company held") == true)
+        // Held: another message to the holder starts no turn, and the hold stays while the writes fail (one alert).
+        let before = try h.turns().count
+        try h.world.dm(h.company, h.eng)
+        for _ in 0..<3 {
+            await h.world.orchestrator.tick()
+            try await h.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        }
+        #expect(try h.turns().count == before, "a held company started a turn")
+        #expect(try store.taintHeldCompanies() == [cId])
+        #expect(try alerts().count == 1)
+        // The writes work again: the next tick's retry records the commit and lifts the hold; the alert resolves.
+        store.refHooks.setFailTaintRecords(false)
+        await h.world.orchestrator.tick()
+        try await h.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        #expect(Set(try h.rows().map(\.sha)).isSuperset(of: shas.all), "the retry recorded the turn's commits")
+        #expect(try store.workItem(id: h.item.id)?.taintedOrigin == true)
+        #expect(try store.taintHeldCompanies().isEmpty)
+        #expect(try alerts().first?.status == .answered)
+        // Turns run again.
+        await h.world.orchestrator.tick()
+        try await h.world.orchestrator.waitUntilIdle(timeout: .seconds(300))
+        #expect(try h.turns().count > before, "the hold did not lift")
+        // The owner's clear: needs the principal, refused in agent mode; lifts a recorded hold.
+        let hold = TaintHold(turnId: "t-held", companyId: cId, agentId: engId, heldAtStart: [:], heldItemsAtStart: [], leasedItemId: nil,
+                             source: "docs.swift.org", markItems: false, createdAt: h.world.clock.now)
+        try store.holdForTaint(hold, now: h.world.clock.now)
+        try store.holdForTaint(hold, now: h.world.clock.now)
+        #expect(try alerts().filter { $0.status == .pendingOwner }.count == 1, "one alert per company")
+        let owner = try OwnerPrincipal.mint()
+        #if DEBUG
+        OwnerPrincipal.simulatingAgentProcess {
+            #expect(throws: WorkError.self) { try store.clearTaintHolds(companyId: cId, now: h.world.clock.now, owner: owner) }
+        }
+        #endif
+        #expect(try store.taintHeldCompanies() == [cId])
+        #expect(try store.clearTaintHolds(companyId: cId, now: h.world.clock.now, owner: owner) == 1)
+        #expect(try store.taintHeldCompanies().isEmpty)
+    }
+
     @Test func taintedSnapshotTaintsReader() throws {
         let cf = try CollabFixture()
         try cf.store.markTainted(agentId: cf.fx.eng1.id, source: "docs.swift.org")

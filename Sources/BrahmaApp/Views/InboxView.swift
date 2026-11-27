@@ -290,7 +290,10 @@ private struct InboxCard: View {
                 }
                 if row.canVouchRestore {
                     // Plan C P2 (Ruling 26): the owner vouches for the commits the restore could not place.
-                    Button("Vouch for restored commits") { run { await model.vouchRestoredCommits(askId: row.id) } }
+                    // Ruling 28: the vouch binds to the epochs this row shows.
+                    Button("Vouch for restored commits (\(row.restoreEpochIds.count) restore(s))") {
+                        run { await model.vouchRestoredCommits(askId: row.id, epochIds: row.restoreEpochIds) }
+                    }
                         .buttonStyle(.brahma).disabled(busy)
                 }
                 if row.canVouchFile {

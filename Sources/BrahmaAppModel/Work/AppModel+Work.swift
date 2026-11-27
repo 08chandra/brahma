@@ -189,13 +189,15 @@ extension AppModel {
 
     /// The restore alert's action (Plan C P2, Ruling 26): the owner vouches for the commits a restore over an unreadable
     /// database could not place in the alert's company (`Store.vouchRestoredCommits`, the same path as
-    /// `brahma vouch restore`). Any other ask is refused.
-    public func vouchRestoredCommits(askId: String) async {
-        _ = await ownerWrite("vouch for the restored commits") { store in
-            guard let ask = try store.ask(id: askId), ask.kind == .engineAlert, ask.subjectId == Store.restoreAlertSubject else {
-                throw WorkError.invalid("only a restore alert can vouch for restored commits")
+    /// `brahma vouch restore`). Any other ask, or one no longer pending, is refused. Final wave B1, Ruling 28: only the epochs
+    /// the row showed (`InboxRow.restoreEpochIds`) are cleared, and only those still open.
+    public func vouchRestoredCommits(askId: String, epochIds: [String]) async {
+        _ = await ownerAct("vouch for the restored commits") { store, owner in
+            guard let ask = try store.ask(id: askId), ask.kind == .engineAlert, ask.subjectId == Store.restoreAlertSubject,
+                  ask.status == .pendingOwner else {
+                throw WorkError.invalid("only a pending restore alert can vouch for restored commits")
             }
-            try store.vouchRestoredCommits(companyId: ask.companyId, now: Date())
+            try store.vouchRestoredCommits(companyId: ask.companyId, epochIds: epochIds, now: Date(), owner: owner)
         }
     }
 
@@ -269,6 +271,14 @@ extension AppModel {
     }
 
     // MARK: Internals
+
+    /// `ownerWrite` for an owner-only Store call (controller Rulings C6-3/C6-4): the body gets this process's owner principal;
+    /// without one (a turn's process) it refuses with the generic text before any Store call.
+    @discardableResult
+    func ownerAct<T: Sendable>(_ what: String, _ body: @escaping @Sendable (Store, OwnerPrincipal) throws -> T) async -> T? {
+        let owner = self.owner
+        return await ownerWrite(what) { store in try body(store, try store.requireOwner(owner)) }
+    }
 
     /// Runs one owner write off the main actor, then refreshes. A refused write puts its reason in `errorMessage`.
     @discardableResult
