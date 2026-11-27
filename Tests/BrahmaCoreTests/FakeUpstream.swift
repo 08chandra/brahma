@@ -142,7 +142,8 @@ final class ModelGatewayRig: @unchecked Sendable {
             hook?()
             return byId[id]
         }, upstream: upstream, vault: vault, log: { line in recorder.lock.withLock { recorder.lines.append(line) } })
-        server = GatewayServer(registry: registry, handler: gateway, timing: .pinned, beforeDispatch: nil)
+        // Connection deadlines on a clock that stands still: no load can time a connection out (Ruling 44).
+        server = GatewayServer(registry: registry, handler: gateway, timing: .pinned, clock: ManualAwakeClock(), beforeDispatch: nil)
     }
 
     /// Runs on every provider lookup (the step before the key is read).
@@ -182,7 +183,7 @@ final class ModelGatewayRig: @unchecked Sendable {
 }
 
 /// Polls `condition` (awake time) until it holds or `seconds` pass.
-func eventually(within seconds: Int = 10, _ condition: () -> Bool) async -> Bool {
+func eventually(within seconds: Int = testPatience, _ condition: () -> Bool) async -> Bool {
     let deadline = AwakeTime.deadline(after: .seconds(seconds))
     while AwakeTime.now < deadline {
         if condition() { return true }

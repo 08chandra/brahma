@@ -13,6 +13,12 @@ public protocol GatewayHandler: Sendable {
 /// The model gateway's HTTP/1.1 front (Plan X1 Task 7): loopback only, keep-alive, the two Messages endpoints, a live turn token
 /// on every request, bounded heads and bodies, and responses as a JSON body or chunked SSE. Anything else is refused in the
 /// Anthropic error shape before a handler runs, and the connection is closed.
+///
+/// Liveness never depends on the Swift cooperative pool (Ruling 44): the accept loop and every connection run on their own
+/// threads, which do all socket reads, head and body parsing, refusals and the first-byte / idle / head / body / stall
+/// deadlines with blocking calls. Only the handler runs as a task; its connection thread waits for it. A saturated pool can
+/// delay a handler's answer, but it can never make the server drop or time out a live connection. Deadlines count on the
+/// injected awake clock (`clock`), so tests drive them exactly.
 public final class GatewayServer: @unchecked Sendable {
     private let registry: TurnTokenRegistry
     private let handler: any GatewayHandler
@@ -26,6 +32,8 @@ public final class GatewayServer: @unchecked Sendable {
     private var stopped = false
     private let acceptDone = DispatchSemaphore(value: 0)
     private let timing: GatewayTiming
+    /// What the connection deadlines count on (awake time; a manual clock in tests).
+    private let clock: any AwakeClock
     /// Test seam: runs after a request's body is read and before the pre-dispatch re-check.
     private let beforeDispatch: (@Sendable (TurnGrant) -> Void)?
 
@@ -33,9 +41,10 @@ public final class GatewayServer: @unchecked Sendable {
         self.init(registry: registry, handler: handler, timing: .pinned, beforeDispatch: nil)
     }
 
-    /// `timing` and `beforeDispatch` are for tests.
-    init(registry: TurnTokenRegistry, handler: any GatewayHandler, timing: GatewayTiming, beforeDispatch: (@Sendable (TurnGrant) -> Void)?) {
-        self.registry = registry; self.handler = handler; self.timing = timing; self.beforeDispatch = beforeDispatch
+    /// `timing`, `clock` and `beforeDispatch` are for tests.
+    init(registry: TurnTokenRegistry, handler: any GatewayHandler, timing: GatewayTiming, clock: any AwakeClock = SystemAwakeClock(),
+         beforeDispatch: (@Sendable (TurnGrant) -> Void)?) {
+        self.registry = registry; self.handler = handler; self.timing = timing; self.clock = clock; self.beforeDispatch = beforeDispatch
     }
 
     // MARK: Listening
@@ -115,9 +124,12 @@ public final class GatewayServer: @unchecked Sendable {
                 continue  // EAGAIN, an aborted handshake
             }
             failures = 0
+            // Each connection gets its own thread (never a task on the cooperative pool); one that cannot start is closed.
             switch register(client) {
-            case .admitted(let wire): Task { await self.run(wire) }
-            case .busy(let wire): Task { await self.refuseBusy(wire) }
+            case .admitted(let wire):
+                if !EgressProxy.startThread(name: "brahma-gateway-conn", { self.run(wire) }) { drop(wire) }
+            case .busy(let wire):
+                if !EgressProxy.startThread(name: "brahma-gateway-busy", { self.refuseBusy(wire) }) { endRefusal(wire) }
             case .overflow(let wire): wire.close()
             case .unusable: continue
             }
@@ -129,15 +141,33 @@ public final class GatewayServer: @unchecked Sendable {
 
     // MARK: Connections
 
-    /// Serves one HTTP/1.1 connection (keep-alive) until the client closes it, a refusal, an error or `stop`. Takes ownership of
-    /// `fd` and closes it before returning.
+    /// Serves one HTTP/1.1 connection (keep-alive) until the client closes it, a refusal, an error or `stop`, on a thread of
+    /// its own; returns when that thread is done. Takes ownership of `fd` and closes it before returning. Cancelling the
+    /// caller cuts the connection.
     public func serve(connection fd: Int32) async {
+        let wire: Wire, body: @Sendable () -> Void, unstarted: @Sendable () -> Void
         switch register(fd) {
-        case .admitted(let wire): await run(wire)
-        case .busy(let wire): await refuseBusy(wire)
-        case .overflow(let wire): wire.close()
+        case .admitted(let w): wire = w; body = { self.run(w) }; unstarted = { self.drop(w) }
+        case .busy(let w): wire = w; body = { self.refuseBusy(w) }; unstarted = { self.endRefusal(w) }
+        case .overflow(let w): w.close(); return
         case .unusable: return
         }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                if !EgressProxy.startThread(name: "brahma-gateway-conn", { body(); c.resume() }) {
+                    unstarted()
+                    c.resume()
+                }
+            }
+        } onCancel: {
+            wire.cut()
+        }
+    }
+
+    /// A registered connection whose thread could not start: forgotten and closed.
+    private func drop(_ wire: Wire) {
+        _ = lock.withLock { connections.removeValue(forKey: wire.id) }
+        wire.close()
     }
 
     private enum Admission { case admitted(Wire), busy(Wire), overflow(Wire), unusable }
@@ -146,7 +176,7 @@ public final class GatewayServer: @unchecked Sendable {
     /// already being sent, when it is closed unanswered (so a flood cannot hold unbounded refusals); a socket that cannot be
     /// made non-blocking and SIGPIPE-free is closed at once.
     private func register(_ fd: Int32) -> Admission {
-        guard let wire = Wire(fd: fd, ioStall: timing.ioStall) else { return .unusable }
+        guard let wire = Wire(fd: fd, ioStall: timing.ioStall, clock: clock) else { return .unusable }
         enum Slot { case connection, refusal, none }
         let slot: Slot = lock.withLock {
             if !stopped, connections.count < GatewayLimits.maxConnections {
@@ -167,8 +197,12 @@ public final class GatewayServer: @unchecked Sendable {
     }
 
     /// The 503 at the connection cap, sent like every refusal (write side shut, bounded drain), then closed.
-    private func refuseBusy(_ wire: Wire) async {
-        await HTTPConnection(wire: wire, timing: timing).refuse(.busy)
+    private func refuseBusy(_ wire: Wire) {
+        HTTPConnection(wire: wire, timing: timing).refuse(.busy)
+        endRefusal(wire)
+    }
+
+    private func endRefusal(_ wire: Wire) {
         wire.close()
         lock.withLock { busyRefusals -= 1 }
     }
@@ -176,37 +210,38 @@ public final class GatewayServer: @unchecked Sendable {
     /// 503 refusals being sent now (tests).
     var busyRefusalsInProgress: Int { lock.withLock { busyRefusals } }
 
-    private func run(_ wire: Wire) async {
+    /// The connection's thread: requests one after another until the connection ends.
+    private func run(_ wire: Wire) {
         defer {
             _ = lock.withLock { connections.removeValue(forKey: wire.id) }
             wire.close()
         }
         let connection = HTTPConnection(wire: wire, timing: timing)
         while true {
-            switch await connection.nextHead() {
+            switch connection.nextHead() {
             case .closed:
                 return
             case .refused(let refusal):
-                await connection.refuse(refusal)
+                connection.refuse(refusal)
                 return
             case .head(let head):
-                guard await exchange(head, on: connection) else { return }
+                guard exchange(head, on: connection) else { return }
             }
         }
     }
 
-    /// One request/response. Returns whether the connection may carry another request.
-    private func exchange(_ head: RequestHead, on connection: HTTPConnection) async -> Bool {
+    /// One request/response, on the connection's thread. Returns whether the connection may carry another request.
+    private func exchange(_ head: RequestHead, on connection: HTTPConnection) -> Bool {
         let framing: RequestFraming
         switch HTTPHead.frame(head) {
         case .failure(let refusal):
-            await connection.refuse(refusal)
+            connection.refuse(refusal)
             return false
         case .success(let f):
             framing = f
         }
         guard let credential = framing.credential, let lease = registry.open(credential) else {
-            await connection.refuse(.unauthorized)
+            connection.refuse(.unauthorized)
             return false
         }
         defer { lease.finish() }
@@ -214,12 +249,12 @@ public final class GatewayServer: @unchecked Sendable {
         // Armed before the body: a revocation, a stop or the end of the grace while the body is still arriving cuts the socket,
         // so the read ends and the request is never dispatched (X1-33).
         lease.arm { wire.cut() }
-        guard let body = await connection.readBody(framing.contentLength) else { return false }
+        guard let body = connection.readBody(framing.contentLength) else { return false }
         // Between the body and dispatch a cut only marks the lease, so the check below can still answer 401 on the open socket.
         lease.disarm()
         beforeDispatch?(lease.grant)
         guard lease.mayContinue() else {
-            await connection.refuse(.unauthorized)
+            connection.refuse(.unauthorized)
             return false
         }
         let request = GatewayRequest(endpoint: framing.endpoint, query: framing.query,
@@ -227,7 +262,9 @@ public final class GatewayServer: @unchecked Sendable {
                                      body: body)
         let reply = GatewayReply(wire: wire, lease: lease, close: framing.close)
         let handler = self.handler
+        let done = DispatchSemaphore(value: 0)
         let task = Task {
+            defer { done.signal() }
             // A cut that lands between the check above and the arming below cancels this task before the handler starts.
             guard !Task.isCancelled, lease.mayContinue() else { return }
             await handler.handle(request, grant: lease.grant, reply: reply)
@@ -235,12 +272,13 @@ public final class GatewayServer: @unchecked Sendable {
         // A cut — from the registry (revocation, stop, grace over) or from `stop()` — shuts the socket and cancels the handler.
         wire.whileServing { task.cancel() }
         lease.arm { wire.cut() }
-        await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        // The only wait on the cooperative pool: the handler itself. No connection deadline runs out while it works.
+        done.wait()
         wire.whileServing(nil)
         switch reply.finish() {
         case .unanswered:
             // Fail closed: never an empty 200.
-            await connection.refuse(.noResponse)
+            connection.refuse(.noResponse)
             return false
         case .incomplete:
             // A stream that was not ended is cut without its terminating chunk, so the client sees a broken stream.
@@ -258,7 +296,7 @@ public final class GatewayServer: @unchecked Sendable {
     }
 }
 
-/// The reading side of one connection: buffered bytes, the next head, a body.
+/// The reading side of one connection, on its thread: buffered bytes, the next head, a body. Blocking calls only.
 final class HTTPConnection {
     let wire: Wire
     private let timing: GatewayTiming
@@ -271,11 +309,11 @@ final class HTTPConnection {
 
     /// Waits for the next request head: a fresh connection's first byte within `firstByte`, a keep-alive connection's next
     /// request within `keepAliveIdle`; then the rest of the head within `headTimeout`.
-    func nextHead() async -> Next {
-        var deadline = AwakeTime.deadline(after: heads == 0 ? timing.firstByte : timing.keepAliveIdle)
+    func nextHead() -> Next {
+        var deadline = wire.deadline(after: heads == 0 ? timing.firstByte : timing.keepAliveIdle)
         heads += 1
         var started = !buffer.isEmpty
-        if started { deadline = AwakeTime.deadline(after: timing.headTimeout) }
+        if started { deadline = wire.deadline(after: timing.headTimeout) }
         while true {
             switch HTTPHead.scan(buffer) {
             case .refused(let refusal):
@@ -290,25 +328,25 @@ final class HTTPConnection {
             case .incomplete:
                 break
             }
-            guard case .data(let bytes) = await wire.read(max: 16 * 1024, deadline: deadline) else { return .closed }
+            guard case .data(let bytes) = wire.readBlocking(max: 16 * 1024, deadline: deadline) else { return .closed }
             buffer += bytes
             if !started {
                 started = true
-                deadline = AwakeTime.deadline(after: timing.headTimeout)
+                deadline = wire.deadline(after: timing.headTimeout)
             }
         }
     }
 
     /// Exactly `count` body bytes (what was buffered first); nil when the client stalls for `ioStall`, runs past the overall
     /// body allowance for `count` bytes, goes away, or the connection is cut.
-    func readBody(_ count: Int) async -> Data? {
-        let overall = AwakeTime.deadline(after: timing.bodyAllowance(count))
+    func readBody(_ count: Int) -> Data? {
+        let overall = wire.deadline(after: timing.bodyAllowance(count))
         var body = Data(buffer.prefix(count))
         buffer.removeFirst(min(count, buffer.count))
         while body.count < count {
             let want = min(256 * 1024, count - body.count)
-            let deadline = min(overall, AwakeTime.deadline(after: timing.ioStall))
-            guard case .data(let bytes) = await wire.read(max: want, deadline: deadline) else { return nil }
+            let deadline = min(overall, wire.deadline(after: timing.ioStall))
+            guard case .data(let bytes) = wire.readBlocking(max: want, deadline: deadline) else { return nil }
             body.append(contentsOf: bytes)
         }
         return body
@@ -316,9 +354,9 @@ final class HTTPConnection {
 
     /// Sends a refusal and ends the connection: the write side is shut, then a little of whatever the client is still sending
     /// is drained (bounded), so closing does not reset the connection before the client reads the refusal.
-    func refuse(_ refusal: HTTPRefusal) async {
-        _ = await wire.write(GatewayServer.refusalBytes(refusal))
-        await wire.lingerAndShut()
+    func refuse(_ refusal: HTTPRefusal) {
+        wire.writeBlocking(GatewayServer.refusalBytes(refusal), deadline: wire.deadline(after: timing.ioStall))
+        wire.lingerAndShut()
     }
 }
 
@@ -417,14 +455,16 @@ public final class GatewayReply: @unchecked Sendable {
     }
 }
 
-/// One client socket: non-blocking, no SIGPIPE, with blocking reads and writes run on its own serial queue (never on the
-/// cooperative pool) in awake-time poll slices. `cut` shuts the socket down from any thread, which wakes those waits at once.
+/// One client socket: non-blocking, no SIGPIPE, read and written with blocking calls in poll slices — by the connection's
+/// thread, or (a reply's writes) on the wire's own serial queue, never on the cooperative pool. Deadlines are on `clock`.
+/// `cut` shuts the socket down from any thread, which wakes those waits at once.
 ///
 /// Every `recv`, `send` and `shutdown` runs under the lock that `close` takes, after checking the socket is still open, so no
 /// call can ever reach a closed descriptor or one the process has since reused for another connection.
 final class Wire: @unchecked Sendable {
     let fd: Int32
     var id: UInt64 = 0
+    let clock: any AwakeClock
     private let ioStall: Duration
     private let queue: DispatchQueue
     private let lock = NSLock()
@@ -433,7 +473,7 @@ final class Wire: @unchecked Sendable {
     private var cutAction: (@Sendable () -> Void)?
 
     /// Takes ownership of `fd`. Nil (and `fd` closed) when it cannot be made close-on-exec, non-blocking and SIGPIPE-free.
-    init?(fd: Int32, ioStall: Duration) {
+    init?(fd: Int32, ioStall: Duration, clock: any AwakeClock = SystemAwakeClock()) {
         let flags = fcntl(fd, F_GETFL)
         var ok = fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 && flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0
         #if canImport(Darwin)
@@ -446,6 +486,7 @@ final class Wire: @unchecked Sendable {
         }
         self.fd = fd
         self.ioStall = ioStall
+        self.clock = clock
         queue = DispatchQueue(label: "brahma-gateway-conn")
     }
 
@@ -484,30 +525,27 @@ final class Wire: @unchecked Sendable {
         }
     }
 
-    func read(max: Int, deadline: SuspendingClock.Instant) async -> ReadResult {
-        await withCheckedContinuation { c in queue.async { c.resume(returning: self.readBlocking(max: max, deadline: deadline)) } }
-    }
+    /// `duration` from now on the wire's clock.
+    func deadline(after duration: Duration) -> Duration { clock.now + duration }
 
+    /// A reply's write, on the wire's serial queue (the handler awaits it; the bytes never wait on the cooperative pool).
     func write(_ bytes: [UInt8]) async -> Bool {
         await withCheckedContinuation { c in
-            queue.async { c.resume(returning: self.writeBlocking(bytes, deadline: AwakeTime.deadline(after: self.ioStall))) }
+            queue.async { c.resume(returning: self.writeBlocking(bytes, deadline: self.deadline(after: self.ioStall))) }
         }
     }
 
-    /// Shuts the write side, drains at most 64 KiB for at most 250 ms, then shuts the rest.
-    func lingerAndShut() async {
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            queue.async {
-                self.lock.withLock { if !self.closed && !self.isCut { _ = shutdown(self.fd, Int32(SHUT_WR)) } }
-                var drained = 0
-                let deadline = AwakeTime.deadline(after: .milliseconds(250))
-                while drained < 64 * 1024, case .data(let bytes) = self.readBlocking(max: 16 * 1024, deadline: deadline) {
-                    drained += bytes.count
-                }
-                self.cut()
-                c.resume()
-            }
+    /// Shuts the write side, drains at most 64 KiB for at most 250 ms of real awake time (a courtesy so the client can read
+    /// the refusal, not a policy deadline: it never waits on the injected clock), then shuts the rest.
+    func lingerAndShut() {
+        lock.withLock { if !closed && !isCut { _ = shutdown(fd, Int32(SHUT_WR)) } }
+        var drained = 0
+        let real = SystemAwakeClock()
+        let deadline = real.now + .milliseconds(250)
+        while drained < 64 * 1024, case .data(let bytes) = readBlocking(max: 16 * 1024, deadline: deadline, on: real) {
+            drained += bytes.count
         }
+        cut()
     }
 
     /// Runs one socket call under the lock, only while the socket is open and not cut; nil otherwise. Returns the call's
@@ -520,8 +558,10 @@ final class Wire: @unchecked Sendable {
         }
     }
 
-    /// Up to `max` bytes: waits (in poll slices) for the first, then takes whatever else is already there.
-    func readBlocking(max: Int, deadline: SuspendingClock.Instant) -> ReadResult {
+    /// Up to `max` bytes: waits (in poll slices) for the first, then takes whatever else is already there. `deadline` is on
+    /// `on` (the wire's clock unless given).
+    func readBlocking(max: Int, deadline: Duration, on deadlineClock: (any AwakeClock)? = nil) -> ReadResult {
+        let deadlineClock = deadlineClock ?? clock
         var chunk = [UInt8](repeating: 0, count: max)
         var got = 0
         while true {
@@ -536,14 +576,14 @@ final class Wire: @unchecked Sendable {
             if got > 0 { return .data(Array(chunk[0..<got])) }
             if n == 0 { return .eof }
             guard code == EAGAIN || code == EWOULDBLOCK || code == EINTR else { return .eof }
-            guard AwakeTime.now < deadline else { return .timeout }
+            guard deadlineClock.now < deadline else { return .timeout }
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             _ = poll(&pfd, 1, 250)
         }
     }
 
     @discardableResult
-    func writeBlocking(_ bytes: [UInt8], deadline: SuspendingClock.Instant) -> Bool {
+    func writeBlocking(_ bytes: [UInt8], deadline: Duration) -> Bool {
         var offset = 0
         while offset < bytes.count {
             guard let (n, code) = bytes[offset...].withUnsafeBytes({ buf in io { send(fd, buf.baseAddress, buf.count, Self.sendFlags) } }) else {
@@ -551,7 +591,7 @@ final class Wire: @unchecked Sendable {
             }
             if n > 0 { offset += n; continue }
             guard n < 0, code == EAGAIN || code == EWOULDBLOCK || code == EINTR else { return false }
-            guard AwakeTime.now < deadline else { return false }
+            guard clock.now < deadline else { return false }
             var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
             _ = poll(&pfd, 1, 250)
         }

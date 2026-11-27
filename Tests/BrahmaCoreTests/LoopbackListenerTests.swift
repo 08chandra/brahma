@@ -9,7 +9,7 @@ import Glibc
 
 /// Plan X1 Task 7: the gateway's listening socket is IPv4 loopback only, on an ephemeral port, close-on-exec, without
 /// SO_REUSEADDR, and `accept` refuses any peer that is not 127.0.0.1. Local sockets only (Ruling 40: no process tier here).
-@Suite(.scratch) struct LoopbackListenerTests {
+@Suite(.scratch, .serialized) struct LoopbackListenerTests {
     @Test func bindsLoopbackOnly() throws {
         let (fd, port) = try LoopbackListener.listen()
         defer { _ = Darwin_close(fd) }

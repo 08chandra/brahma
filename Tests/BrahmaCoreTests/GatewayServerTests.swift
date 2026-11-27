@@ -9,10 +9,18 @@ import Glibc
 
 // MARK: - Test plumbing shared by the gateway suites (socketpair peers, a recording handler, a manual awake clock)
 
-/// Runs blocking socket code on a GCD thread, never on the cooperative pool (where the server's tasks must keep running).
+/// Runs blocking socket code on a thread of its own: never on the cooperative pool, and not on the shared GCD pool either,
+/// which a loaded full suite can starve for minutes (Ruling 44).
 func offload<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
-    await withCheckedContinuation { c in DispatchQueue.global().async { c.resume(returning: body()) } }
+    await withCheckedContinuation { c in
+        Thread.detachNewThread { c.resume(returning: body()) }  // scope-escape: blocking client socket I/O, no scratch dirs
+    }
 }
+
+/// How long a test waits in real time for something the server will do. Generous (Ruling 44): a loaded full suite has been
+/// seen to stall test threads for minutes, and these bounds only end a test that would otherwise hang — they never decide a
+/// pass. Every server deadline itself runs on a manual clock the test advances.
+let testPatience = 300
 
 enum TestPeerError: Error, Equatable { case timeout, eof, malformed(String) }
 
@@ -64,7 +72,7 @@ final class TestPeer: @unchecked Sendable {
         let fd = self.fd
         return await offload {
             var offset = 0
-            let deadline = AwakeTime.deadline(after: .seconds(20))
+            let deadline = AwakeTime.deadline(after: .seconds(testPatience))
             while offset < bytes.count, AwakeTime.now < deadline {
                 let n = bytes[offset...].withUnsafeBytes { send(fd, $0.baseAddress, $0.count, peerSendFlags) }
                 if n > 0 { offset += n; continue }
@@ -136,11 +144,11 @@ final class TestPeer: @unchecked Sendable {
         return data
     }
 
-    func readHead(within seconds: Int = 20) async throws -> TestHead {
+    func readHead(within seconds: Int = testPatience) async throws -> TestHead {
         try await run { [self] () throws(TestPeerError) in try headSync(within: seconds) }
     }
 
-    func readBytes(_ count: Int, within seconds: Int = 20) async throws -> [UInt8] {
+    func readBytes(_ count: Int, within seconds: Int = testPatience) async throws -> [UInt8] {
         try await run { [self] () throws(TestPeerError) in
             _ = try fill(within: seconds) { $0.count >= count ? true : nil }
             return take(count)
@@ -148,12 +156,12 @@ final class TestPeer: @unchecked Sendable {
     }
 
     /// One chunk of a chunked body (empty for the terminating chunk, whose trailer is consumed too).
-    func readChunk(within seconds: Int = 20) async throws -> [UInt8] {
+    func readChunk(within seconds: Int = testPatience) async throws -> [UInt8] {
         try await run { [self] () throws(TestPeerError) in try chunkSync(within: seconds) }
     }
 
     /// A whole response: Content-Length bodies are read in full; chunked bodies are read to the terminator and joined.
-    func readResponse(within seconds: Int = 20) async throws -> TestResponse {
+    func readResponse(within seconds: Int = testPatience) async throws -> TestResponse {
         let head = try await readHead(within: seconds)
         if head.headers["transfer-encoding"] == "chunked" {
             var body: [UInt8] = []
@@ -169,7 +177,7 @@ final class TestPeer: @unchecked Sendable {
     }
 
     /// Whether the server closed its end (EOF) within `seconds`, discarding any bytes before it.
-    func seesEOF(within seconds: Int = 20) async -> Bool {
+    func seesEOF(within seconds: Int = testPatience) async -> Bool {
         await offload { [self] in
             let r = Result { () throws(TestPeerError) in try fill(within: seconds) { _ -> Bool? in nil } }
             if case .failure(.eof) = r { return true }
@@ -276,7 +284,11 @@ struct GatewayHarness {
         }
     }
 
+    /// The registry's clock (turn grace).
     let clock: ManualAwakeClock
+    /// The server's clock (first byte, idle, head, body and stall deadlines): it stands still unless a test advances it, so
+    /// no load can make a connection time out (Ruling 44).
+    let serverClock = ManualAwakeClock()
     let registry: TurnTokenRegistry
     let handler: RecordingHandler
     let server: GatewayServer
@@ -287,7 +299,18 @@ struct GatewayHarness {
         registry = TurnTokenRegistry(clock: clock)
         if let behaviour { handler = RecordingHandler(behaviour) } else { handler = RecordingHandler() }
         let hook = beforeDispatch
-        server = GatewayServer(registry: registry, handler: handler, timing: timing, beforeDispatch: { hook.action?($0) })
+        server = GatewayServer(registry: registry, handler: handler, timing: timing, clock: serverClock,
+                               beforeDispatch: { hook.action?($0) })
+    }
+
+    /// Advances the server clock by `step` until `done` (at most `steps` times): the server computes a deadline when its
+    /// connection thread reaches that point, which the test cannot observe, so it steps until the effect shows.
+    func advanceServerClock(by step: Duration, steps: Int = 60, until done: () async -> Bool) async -> Bool {
+        for _ in 0..<steps {
+            serverClock.advance(by: step)
+            if await done() { return true }
+        }
+        return false
     }
 
     static func grant(_ turn: String = "turn-1") -> TurnGrant {
@@ -338,7 +361,7 @@ func rawRequest(method: String = "POST", target: String = "/t/v1/messages?beta=t
 // MARK: - The suite
 
 /// Plan X1 Task 7: HTTP/1.1 framing, the endpoint allowlist, turn-token auth, size caps, keep-alive and chunked SSE.
-@Suite(.scratch) struct GatewayServerTests {
+@Suite(.scratch, .serialized) struct GatewayServerTests {
     @Test func classifyServesOnlyTheTwoEndpointsWithTheRecordedQueries() {
         #expect(GatewayRoutes.prefix == "/t/")
         #expect(GatewayRoutes.allowedQueries == ["", "beta=true"])
@@ -633,24 +656,19 @@ func rawRequest(method: String = "POST", target: String = "/t/v1/messages?beta=t
         #expect(GatewayTiming.pinned.bodyAllowance(0) == .seconds(10))
         #expect(GatewayTiming.pinned.bodyAllowance(GatewayLimits.maxBodyBytes) == .seconds(42))
         #expect(GatewayTiming.pinned.bodyAllowance(Int(Int32.max)) == .seconds(60))
-        var timing = GatewayTiming.pinned
-        timing.bodyBase = .milliseconds(300)
-        timing.bodyMax = .seconds(1)
-        let h = GatewayHarness(timing: timing)
+        // Pinned timing on the server clock: 1000 bytes may take 10 s in all; any one read may wait 30 s.
+        let h = GatewayHarness()
         let token = h.mint().value
         let (peer, served) = h.connect()
-        let started = AwakeTime.now
         await peer.write(rawRequest(token: token, body: "", extra: ["Content-Length: 1000"], contentLength: false))
-        // One byte every 50 ms: never stalls a single read for long, but would need 50 s for the whole body.
-        let drip = Task.detached {
-            for _ in 0..<1000 {
-                if await peer.write([0x61]) == 0 { return }
-                try? await Task.sleep(for: .milliseconds(50))
-            }
+        // One byte per 4 s of server time: no read ever waits near the 30 s stall bound, but the whole body would need 4000 s.
+        var cut = false
+        for _ in 0..<100 where !cut {
+            _ = await peer.write([0x61])
+            h.serverClock.advance(by: .seconds(4))
+            cut = await peer.seesEOF(within: 1)
         }
-        #expect(await peer.seesEOF(within: 20))
-        #expect(started.duration(to: AwakeTime.now) < .seconds(10), "cut near the 300 ms allowance, not at the 30 s stall bound")
-        drip.cancel()
+        #expect(cut, "cut at the overall body deadline")
         await served.value
         #expect(h.handler.callCount == 0)
     }
@@ -659,25 +677,26 @@ func rawRequest(method: String = "POST", target: String = "/t/v1/messages?beta=t
     /// longer idle bound applies.
     @Test func freshConnectionMustSpeakFirst() async throws {
         #expect(GatewayLimits.firstByteTimeout == .seconds(5) && GatewayLimits.keepAliveIdle == .seconds(60))
-        var timing = GatewayTiming.pinned
-        timing.firstByte = .seconds(1)
-        let h = GatewayHarness(timing: timing)
+        let h = GatewayHarness()
         let token = h.mint().value
         do {
             let (peer, served) = h.connect()
-            let started = AwakeTime.now
-            #expect(await peer.seesEOF(within: 20))
-            #expect(started.duration(to: AwakeTime.now) < .seconds(5))
+            // While the server clock stands still nothing times out, however long a loaded machine takes...
+            #expect(await peer.staysQuiet(milliseconds: 300))
+            // ...and once 5 s have passed on it with no byte, the connection is closed.
+            #expect(await h.advanceServerClock(by: .seconds(6)) { await peer.seesEOF(within: 1) })
             await served.value
         }
         do {
             let (peer, served) = h.connect()
             await peer.write(rawRequest(token: token))
             #expect(try await peer.readResponse().status == 200)
-            #expect(await peer.staysQuiet(milliseconds: 1500), "an idle keep-alive connection outlives the first-byte bound")
+            // Between keep-alive requests the first-byte bound no longer applies: 6 s idle is fine...
+            h.serverClock.advance(by: .seconds(6))
             await peer.write(rawRequest(token: token))
             #expect(try await peer.readResponse().status == 200)
-            peer.close()
+            // ...and past the 60 s idle bound the connection is closed.
+            #expect(await h.advanceServerClock(by: .seconds(61)) { await peer.seesEOF(within: 1) })
             await served.value
         }
     }
@@ -745,10 +764,10 @@ func rawRequest(method: String = "POST", target: String = "/t/v1/messages?beta=t
         #expect(socketpair(AF_UNIX, type, 0, &fds) == 0)
         let peer = TestPeer(fd: fds[1])
         let wire = try #require(Wire(fd: fds[0], ioStall: .seconds(1)))
-        #expect(wire.writeBlocking(Array("ok".utf8), deadline: AwakeTime.deadline(after: .seconds(1))))
+        #expect(wire.writeBlocking(Array("ok".utf8), deadline: wire.deadline(after: .seconds(1))))
         wire.close()
-        #expect(wire.writeBlocking(Array("late".utf8), deadline: AwakeTime.deadline(after: .seconds(1))) == false)
-        if case .eof = wire.readBlocking(max: 16, deadline: AwakeTime.deadline(after: .milliseconds(100))) {} else {
+        #expect(wire.writeBlocking(Array("late".utf8), deadline: wire.deadline(after: .seconds(1))) == false)
+        if case .eof = wire.readBlocking(max: 16, deadline: wire.deadline(after: .milliseconds(100))) {} else {
             Issue.record("a closed wire must not read")
         }
         peer.close()
@@ -759,13 +778,11 @@ func rawRequest(method: String = "POST", target: String = "/t/v1/messages?beta=t
     /// Ruling 42 (m7): past the connection cap a connection gets the 503 refusal (shut and drained like every refusal), and the
     /// served ones are untouched.
     @Test func connectionCapAnswers503() async throws {
-        var timing = GatewayTiming.pinned
-        timing.firstByte = .seconds(120)  // the idle connections that fill the cap must outlive a loaded test run
-        let h = GatewayHarness(timing: timing)
+        let h = GatewayHarness()  // the server clock stands still: the idle connections that fill the cap never time out
         let token = h.mint().value
         var open: [(TestPeer, Task<Void, Never>)] = []
         for _ in 0..<GatewayLimits.maxConnections { open.append(h.connect()) }
-        let deadline = AwakeTime.deadline(after: .seconds(20))
+        let deadline = AwakeTime.deadline(after: .seconds(testPatience))
         while h.server.activeConnections < GatewayLimits.maxConnections, AwakeTime.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -797,7 +814,7 @@ func rawRequest(method: String = "POST", target: String = "/t/v1/messages?beta=t
         h.server.stop()
         #expect(!h.server.isAccepting)
         #expect(await peer.seesEOF())
-        let deadline = AwakeTime.deadline(after: .seconds(20))
+        let deadline = AwakeTime.deadline(after: .seconds(testPatience))
         while h.server.activeConnections > 0, AwakeTime.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
         #expect(h.server.activeConnections == 0)
         #expect(connectLoopback(port: port) == nil, "nothing listens after stop")

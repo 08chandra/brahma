@@ -4,7 +4,7 @@ import Foundation
 
 /// Plan X1 Task 7: per-turn gateway tokens — minting, admission, the end-of-turn grace for in-flight streams, revocation and
 /// the emergency stop. Grace is counted on an injected awake clock (`ManualAwakeClock`), so no test waits 30 s.
-@Suite(.scratch) struct TurnTokenRegistryTests {
+@Suite(.scratch, .serialized) struct TurnTokenRegistryTests {
     /// A handler that starts a stream, sends one event, then parks until `release` opens and sends the rest; it records whether
     /// each later write went through and whether it saw the cut.
     final class ParkedStream: @unchecked Sendable {
@@ -44,7 +44,7 @@ import Foundation
             await reply.startEvents()
             await reply.event(Data("event: message_start\ndata: {}\n\n".utf8))
             parked.open()
-            let deadline = AwakeTime.deadline(after: .seconds(60))
+            let deadline = AwakeTime.deadline(after: .seconds(testPatience))
             while !Task.isCancelled, !reply.isCut, AwakeTime.now < deadline { try? await Task.sleep(for: .milliseconds(5)) }
             lock.withLock { cancelled = Task.isCancelled }
             done.open()
@@ -123,7 +123,7 @@ import Foundation
         await served.value
         // The finished stream's grace timer is gone: moving past the grace cuts nothing and leaves no sleeper.
         #expect(h.registry.inFlightRequests == 0)
-        let deadline = AwakeTime.deadline(after: .seconds(20))
+        let deadline = AwakeTime.deadline(after: .seconds(testPatience))
         while h.clock.sleeperCount > 0, AwakeTime.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
         #expect(h.clock.sleeperCount == 0)
     }
@@ -174,7 +174,7 @@ import Foundation
         let (peer, served) = h.connect()
         await peer.write(rawRequest(token: token.value, body: String(repeating: "a", count: 500), extra: ["Content-Length: 1000"],
                                     contentLength: false))
-        let deadline = AwakeTime.deadline(after: .seconds(20))
+        let deadline = AwakeTime.deadline(after: .seconds(testPatience))
         while h.registry.inFlightRequests == 0, AwakeTime.now < deadline { try await Task.sleep(for: .milliseconds(2)) }
         #expect(h.registry.inFlightRequests == 1, "the request was admitted and is reading its body")
         return (peer, served)
@@ -191,7 +191,7 @@ import Foundation
             let token = h.mint()
             let (peer, served) = try await halfSentBody(h, token)
             await revoke(h, token)
-            #expect(await peer.seesEOF(within: 10), "\(name): cut mid-body")
+            #expect(await peer.seesEOF(), "\(name): cut mid-body")
             // The rest of the body arriving now changes nothing.
             await peer.write(String(repeating: "b", count: 500))
             await served.value
@@ -206,7 +206,7 @@ import Foundation
         h.clock.advance(by: .seconds(29))
         #expect(await peer.staysQuiet(milliseconds: 100), "not cut inside the grace")
         h.clock.advance(by: .seconds(1))
-        #expect(await peer.seesEOF(within: 10))
+        #expect(await peer.seesEOF())
         await served.value
         #expect(h.handler.callCount == 0)
     }
@@ -266,7 +266,7 @@ import Foundation
         let observer: any EmergencyStopObserver = h.registry
         await observer.stopAll(reason: "everything stopped by the owner")
         for (i, (peer, served)) in peers.enumerated() {
-            #expect(await peer.seesEOF(within: 10), "stream \(i) cut at once")
+            #expect(await peer.seesEOF(), "stream \(i) cut at once")
             await streams[i].done.wait()
             await served.value
         }

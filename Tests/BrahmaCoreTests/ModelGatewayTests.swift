@@ -4,7 +4,7 @@ import Foundation
 
 /// Plan X1 Task 8: `ModelGateway` behind the real server — routing by the turn's grant, the policy refusals (Ruling 19's 400),
 /// the key read from the vault per request, cancellation, and an upstream that fails is always an error, never an empty 200.
-@Suite(.scratch) struct ModelGatewayTests {
+@Suite(.scratch, .serialized) struct ModelGatewayTests {
     static let ok = FakeUpstream.json(200, #"{"type":"message","usage":{"input_tokens":1,"output_tokens":2}}"#)
 
     static func body(_ model: String, tools: Bool = false, extra: String = "") -> String {
@@ -239,7 +239,7 @@ import Foundation
         rig.onProviderLookup { registry.revokeAll(reason: "test stop") }
         let (peer, served) = rig.connect()
         await peer.write(rawRequest(token: rig.grant().value, body: Self.body("claude-opus-5-5")))
-        #expect(await peer.seesEOF(within: 10))
+        #expect(await peer.seesEOF())
         await served.value
         #expect(rig.providerLookups == 1)
         #expect(rig.upstream.requests.isEmpty)
@@ -255,7 +255,7 @@ import Foundation
         #expect(head.status == 200)
         #expect(try await peer.readChunk() == Array(firstEvent))
         rig.registry.revokeAll(reason: "owner stop")
-        #expect(await peer.seesEOF(within: 10))
+        #expect(await peer.seesEOF())
         await served.value
         #expect(await eventually { rig.upstream.cancelledStreams == 1 })
     }

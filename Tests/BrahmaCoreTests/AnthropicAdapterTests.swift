@@ -4,7 +4,7 @@ import Foundation
 
 /// Plan X1 Task 8: the canonical request and the `anthropic` adapter — the key swap, the body pass-through (only `model` for an
 /// alias and `metadata.user_id` ever change), the upstream header allowlist (Ruling 43), the usage tap and redacted errors.
-@Suite(.scratch) struct AnthropicAdapterTests {
+@Suite(.scratch, .serialized) struct AnthropicAdapterTests {
     static let provider = AnthropicFixture.provider()
 
     static func upstream(_ body: String, model: String? = nil, endpoint: GatewayEndpoint = .messages,
