@@ -51,6 +51,9 @@ public enum DemoRunner {
     public static let failedName = "failed"
     /// The sha when the company has no `main` yet (only artifacts to show).
     static let noMain = "none"
+    /// A surface's demo line when its stored record no longer matches its run's, or its live company cannot be read (C7,
+    /// S6-c2): the demo is skipped, nothing runs on the stale record.
+    static let previewChanged = "the preview changed"
 
     /// Sprints in `review` with no demo rows yet, of running companies (a paused company's surfaces are stopped; fix round 1,
     /// M7), oldest first across companies: what the "demos" tick works through.
@@ -164,9 +167,14 @@ extension PreviewRunner {
             guard !halted() else { return nil }
             let state = states[surface.id] ?? PreviewState(surfaceId: surface.id, companyId: company.id, updatedAt: clock())
             let capture: DemoCapture
-            if let kind = surface.previewKind, let run = runs[surface.id], var context = run.context, let adapter = adapters[kind] {
-                context.demoSprint = sprint.number
-                capture = await adapter.demo(context, state: state)
+            if let kind = surface.previewKind, let run = runs[surface.id], let started = run.context, let adapter = adapters[kind] {
+                // C7 (S6-c2): decided again against the live records, never the start's decision; skipped when it changed.
+                if var context = redecided(started, kind: kind) {
+                    context.demoSprint = sprint.number
+                    capture = await adapter.demo(context, state: state)
+                } else {
+                    capture = DemoCapture(ok: false, line: "\(surface.name): \(DemoRunner.previewChanged)")
+                }
             } else {
                 capture = DemoCapture(ok: false, line: "\(surface.name): not running")
             }

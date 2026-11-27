@@ -358,17 +358,20 @@ public actor ReleaseExecutor: EmergencyStopObserver {
             // The build's subject principals, resolved once for this build (S6), from the release record whose build this runs
             // (S6-c1): its proposer, and only while the stored release still has that proposer and those commands (else the
             // integrity refusal, nothing built). Unsandboxed only when the proposer and the company narrow to Full under the
-            // ceiling; in a Full company an unconfirmed proposer builds sandboxed with the B1 line.
+            // ceiling; in a Full company an unconfirmed proposer builds sandboxed with the B1 line. S6-c2: the release supplies
+            // only the build and its proposer; the profiles and the policy's domains are the live company's (`live`), read at
+            // the resolution, never the company read when the release started (minutes ago, before its smoke).
             let principals: PrincipalSet
+            let live: Company
             switch PrincipalResolver(store: store, ceiling: ceiling).resolve(holding: .release(r)) {
-            case .allow(let set, _): principals = set
+            case .allow(let resolved, _): (principals, live) = (resolved.principals, resolved.company)
             case .deny: throw Self.mismatch
             }
             PrincipalResolver.noteSandboxed(principals, store: store, subject: "\(r.ref) build", kind: .release, now: clock())
             let full = principals.runsUnsandboxed
             let log = releaseDir.appending(path: "build.log", directoryHint: .notDirectory)
             let outcome = await runStep(r, runner: full ? unsandboxed : sandbox, command: build, cwd: export, environment: toolEnvironment,
-                                        policy: Store.smokePolicy(company: company, export: export), timeout: ReleasePolicy.buildTimeout,
+                                        policy: Store.smokePolicy(company: live, export: export), timeout: ReleasePolicy.buildTimeout,
                                         log: log)
             let tail = await logs.publish(raw: [log], as: "build.log", header: nil).tail
             switch outcome {

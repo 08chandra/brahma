@@ -262,10 +262,14 @@ extension Store {
         // runs (S6-c1): its recorded setter, and only while the stored check and setter are still those. Unsandboxed only when
         // the setter and the company narrow to Full under the ceiling; in a Full company an unconfirmed setter runs sandboxed
         // with the B1 line. A check re-set since the claim: nothing runs on the stale record (queued again, or an error).
+        // S6-c2: the claimed company supplies only the check and its setter; the profiles (the company's, the setter's role)
+        // and the policy's domains are the live company's (`live`), read at the resolution. A live company that cannot be
+        // read is a denial too.
         let principals: PrincipalSet
+        let live: Company
         switch PrincipalResolver(store: self, ceiling: checks.ceiling).resolve(holding: .mainSmoke(company)) {
-        case .allow(let set, _):
-            principals = set
+        case .allow(let resolved, _):
+            (principals, live) = (resolved.principals, resolved.company)
         case .deny:
             await blocking.run { EngineExport.remove(store: store, company: company, runId: run.runId) }
             return try requeueOrError(run, tail: Self.smokeChangedWhileStarting, now: clock())
@@ -273,7 +277,7 @@ extension Store {
         PrincipalResolver.noteSandboxed(principals, store: self, subject: "The main smoke check", kind: .release, now: clock())
         let unsandboxed = principals.runsUnsandboxed
         let runner = unsandboxed ? checks.unsandboxed : checks.sandbox
-        let policy = Self.smokePolicy(company: company, export: export)
+        let policy = Self.smokePolicy(company: live, export: export)
         let environment = ChildEnvironment.make(base: checks.environment,
                                                 extra: company.smokeCheckSetById.map { ["BRAHMA_AGENT_ID": $0] } ?? [:],
                                                 purpose: .check)

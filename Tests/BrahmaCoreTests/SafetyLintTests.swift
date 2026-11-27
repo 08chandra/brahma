@@ -10,7 +10,7 @@ import Foundation
 /// happens. Same scan style as `EngineGitGuardTests` (comments blanked with its `code`).
 enum SafetyLint {
     enum Rule: String, CaseIterable {
-        case spawn, sandboxPolicy, descriptor, fileAPI, dirWalk, loopbackHTTP, failOpen, alertScope, turnScope, publicBool
+        case spawn, sandboxPolicy, descriptor, fileAPI, dirWalk, loopbackHTTP, failOpen, alertScope, turnScope, publicBool, idSubject
 
         /// The code-only pattern (spec §6.8.2). `alertScope` is matched by `alertScopeHits` instead, which reads the argument
         /// list up to the matching `)`. `failOpen` also holds spec §6.7's two other bans (S4): a `catch` with an empty body
@@ -18,7 +18,11 @@ enum SafetyLint {
         /// `return true` (also `return (true);`, after nested blocks); the part before a `catch`'s `{` may span lines, and
         /// `?? (true)` counts as `?? true` (a tuple default such as `?? (false, nil)` does not). `publicBool` is spec §6.7's
         /// ban on new `public func … -> Bool` in the policy and principal code (Ruling S4-B), a decision there being a
-        /// `Decision`.
+        /// `Decision`. `idSubject` (S6 fix round 2, M-e) bans a new id-based resolution of an action whose caller holds the
+        /// record its command comes from (`resolve(.preview(surfaceId:` / `.mainSmoke(companyId:` / `.release(releaseId:` /
+        /// `.verificationRun(` / `.mergeRun(`): those callers use `resolve(holding:)` (S6-c1, S6-c2). Zero in every scanned
+        /// root, the resolver's own file included: it switches over those rows (`case .preview(let surfaceId)`) but never
+        /// calls `resolve(` on one, so it needs no exemption.
         var pattern: String {
             switch self {
             case .spawn: return #"\bProcess\(\)|\bposix_spawn\(|"/usr/bin/env"|\[\s*"git""#
@@ -34,6 +38,8 @@ enum SafetyLint {
             case .turnScope: return #"\bSandboxScope\.forTurn\("#
             case .publicBool:
                 return #"\bpublic\s+(?:(?:static|class|final|nonisolated|override|mutating|@\w+)\s+)*func\b[^{]*?->\s*Bool\b"#
+            case .idSubject:
+                return #"\bresolve\(\s*\.(?:preview\(\s*surfaceId\s*:|mainSmoke\(\s*companyId\s*:|release\(\s*releaseId\s*:|verificationRun\(|mergeRun\()"#
             }
         }
 
@@ -42,7 +48,7 @@ enum SafetyLint {
         var only: [String]? {
             switch self {
             case .publicBool: return Self.policyAndPrincipal
-            case .spawn, .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope:
+            case .spawn, .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope, .idSubject:
                 return nil
             }
         }
@@ -61,7 +67,7 @@ enum SafetyLint {
             switch self {
             case .spawn: return ["Sources/BrahmaCore/", "Sources/brahma/"]
             case .failOpen: return ["Sources/BrahmaSafety/", "Sources/BrahmaCore/Principal/"]
-            case .alertScope: return SafetyLint.scanned.map { $0 + "/" }
+            case .alertScope, .idSubject: return SafetyLint.scanned.map { $0 + "/" }
             case .publicBool: return Self.policyAndPrincipal
             case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .turnScope:
                 return []
@@ -75,7 +81,7 @@ enum SafetyLint {
             case .spawn:
                 return ["Sources/BrahmaCore/Sandbox/ClaudeSettings.swift":
                             "script text, not a spawn: `ShellPrefix.tools` names the absolute tools (`/usr/bin/env -i`) the agent's shell prefix script runs; the engine spawns nothing here"]
-            case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope, .publicBool:
+            case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope, .publicBool, .idSubject:
                 return [:]
             }
         }
@@ -424,6 +430,15 @@ enum SafetyLint {
         #expect(publicBool("func internalCheck() -> Bool { true }") == 0)
         #expect(publicBool("public func decide() -> Decision<Int> { .deny(\"no\") }\nfunc other() -> Bool { true }") == 0)
         #expect(publicBool("public var isOK: Bool { true }") == 0)
+
+        // `idSubject` (S6 fix round 2, M-e): an id-based resolution of a held-record action; never `resolve(holding:)` nor
+        // the rows that have no held form.
+        func idSubject(_ code: String) -> Int { SafetyLint.regexHits(in: code, pattern: SafetyLint.Rule.idSubject.pattern).count }
+        #expect(idSubject("let set = resolver.resolve(.preview(surfaceId: surface.id))") == 1)
+        #expect(idSubject("r.resolve( .mainSmoke(companyId: cid)); r.resolve(.release(releaseId: id))") == 2)
+        #expect(idSubject("resolve(.verificationRun(runId: id))\nresolve(.mergeRun(runId: id))") == 2)
+        #expect(idSubject("resolver.resolve(holding: .preview(surface))") == 0)
+        #expect(idSubject("resolver.resolve(.worktree(companyId: c, key: k)); resolver.resolve(.engine)") == 0)
 
         // The matcher: no `scope:` → a hit; `scope:` anywhere in the argument list, across lines and nested calls → none;
         // parentheses in string literals and interpolations do not end the list early.

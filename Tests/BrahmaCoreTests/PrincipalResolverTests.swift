@@ -515,8 +515,8 @@ import GRDB
         let item = try s.submitted()
         let run = try s.latest(item)
         let resolver = PrincipalResolver(store: s.store, ceiling: nil)
-        func allowed(_ d: Decision<PrincipalSet>) -> PrincipalSet? { if case .allow(let set, _) = d { return set }; return nil }
-        func denied(_ d: Decision<PrincipalSet>) -> String? { if case .deny(let why) = d { return why }; return nil }
+        func allowed(_ d: Decision<PrincipalResolver.Resolved>) -> PrincipalSet? { if case .allow(let r, _) = d { return r.principals }; return nil }
+        func denied(_ d: Decision<PrincipalResolver.Resolved>) -> String? { if case .deny(let why) = d { return why }; return nil }
         // Checks (verification run).
         #expect(allowed(resolver.resolve(holding: .verificationRun(run))) == resolver.resolve(.verificationRun(runId: run.id)))
         try Self.exec(s.store, "UPDATE verificationRun SET requestedBy = ? WHERE id = ?", [s.eng2.id, run.id])
@@ -562,7 +562,8 @@ import GRDB
         try fx.preinstallTools()
         let approved = try fx.proposeAndApprove()
         let resolver = PrincipalResolver(store: fx.store, ceiling: nil)
-        guard case .allow(let set, _) = resolver.resolve(holding: .release(approved)) else { Issue.record("denied"); return }
+        guard case .allow(let resolved, _) = resolver.resolve(holding: .release(approved)) else { Issue.record("denied"); return }
+        let set = resolved.principals
         #expect(Self.agentIds(set) == [fx.devops.id])
         #expect(set == resolver.resolve(.release(releaseId: approved.id)), "the held path and the id path agree when nothing changed")
         // M4: the ceiling narrows a release's principals too.
@@ -681,31 +682,270 @@ import GRDB
         #expect(!Self.unknownReasons(item).contains("the main check changed since this run started"), "an item run has its own check")
     }
 
+    // MARK: S6-c2: the held record supplies only the command and its setter; every sandbox input is the live record's
+
+    /// The set of an allowed held resolution; nil when it was denied.
+    static func allowedSet(_ d: Decision<PrincipalResolver.Resolved>) -> PrincipalSet? {
+        if case .allow(let r, _) = d { return r.principals }
+        return nil
+    }
+
+    /// The live company an allowed held resolution decided from; nil when it was denied.
+    static func allowedCompany(_ d: Decision<PrincipalResolver.Resolved>) -> Company? {
+        if case .allow(let r, _) = d { return r.company }
+        return nil
+    }
+
+    static func isDenied(_ d: Decision<PrincipalResolver.Resolved>) -> Bool {
+        if case .deny = d { return true }
+        return false
+    }
+
+    /// The domains a policy's network allows.
+    static func domains(_ network: SandboxNetwork) -> [String] {
+        switch network {
+        case .none: return []
+        case .outbound(let allow): return allow
+        case .loopbackListen(let allow, _): return allow
+        }
+    }
+
+    /// A held check (verification run, merge run), surface and smoke check of a Full company whose Full agents set them, read
+    /// before the owner tightens anything.
+    private static func heldRecords(_ s: S) async throws -> [(String, PrincipalResolver.HeldRecord)] {
+        let item = try s.submitted()
+        let run = try s.latest(item)
+        let merge = MergeRun(companyId: s.company.id, kind: .item, itemId: item.id, status: .running)
+        try await s.store.writer.write { try merge.insert($0) }
+        let surface = try s.store.upsertPreviewSurface(companyId: s.company.id, by: .agent(s.eng.id),
+                                                       PreviewDraft(name: "web", run: "sleep 1", url: "http://127.0.0.1:{port}/"))
+        let (cid, engId) = (s.company.id, s.eng.id)
+        try await s.store.writer.write { db in
+            var c = try #require(try Company.fetchOne(db, key: cid))
+            c.smokeCheck = CheckSpec(command: "true"); c.smokeCheckSetById = engId
+            try c.update(db)
+        }
+        let company = try #require(try s.store.company(id: cid))
+        return [("verification run", .verificationRun(run)), ("merge run", .mergeRun(merge)), ("preview", .preview(surface)),
+                ("main smoke", .mainSmoke(company))]
+    }
+
+    /// S6-c2: the owner tightens the company Full → Sandboxed after the record was read and before it is resolved. The command
+    /// and its setter are unchanged, so the action may run, but only under the live profile: sandboxed, never unsandboxed.
+    @Test func s6c2ProfileTightenedAfterTheRecordWasRead() async throws {
+        let s = try S(profile: .full)
+        let held = try await Self.heldRecords(s)
+        let resolver = PrincipalResolver(store: s.store, ceiling: nil)
+        for (what, record) in held where what != "merge run" {
+            #expect(Self.allowedSet(resolver.resolve(holding: record))?.runsUnsandboxed == true, "\(what): control, Full before the change")
+        }
+        try s.store.updateSandbox(companyId: s.company.id, SandboxPatch(profile: .sandboxed), userHome: try tempDir())
+        for (what, record) in held {
+            let set = try #require(Self.allowedSet(resolver.resolve(holding: record)), "\(what): the command is unchanged, so it runs")
+            #expect(!set.runsUnsandboxed && set.ownerProfile == .sandboxed, "\(what): the live profile decides")
+            #expect(Self.allowedCompany(resolver.resolve(holding: record))?.permissionProfile == .sandboxed,
+                    "\(what): the policy is built from the live company")
+        }
+        // Release builds: the same.
+        let fx = try ReleaseExecutorTests.Fx(profile: .full)
+        try fx.preinstallTools()
+        let approved = try fx.proposeAndApprove()
+        let releases = PrincipalResolver(store: fx.store, ceiling: nil)
+        #expect(Self.allowedSet(releases.resolve(holding: .release(approved)))?.runsUnsandboxed == true, "release: control")
+        try fx.store.updateSandbox(companyId: fx.company.id, SandboxPatch(profile: .sandboxed), userHome: try tempDir())
+        let set = try #require(Self.allowedSet(releases.resolve(holding: .release(approved))), "release: unchanged, so it builds")
+        #expect(!set.runsUnsandboxed && set.ownerProfile == .sandboxed, "release: the live profile decides")
+    }
+
+    /// S6-c2: a role-profile narrowing after the record was read: the setter's live role profile decides (smoke, preview).
+    @Test func s6c2RoleProfileNarrowedAfterTheRecordWasRead() async throws {
+        let s = try S(profile: .full)
+        let held = try await Self.heldRecords(s).filter { $0.0 == "preview" || $0.0 == "main smoke" }
+        let resolver = PrincipalResolver(store: s.store, ceiling: nil)
+        for (what, record) in held {
+            #expect(Self.allowedSet(resolver.resolve(holding: record))?.runsUnsandboxed == true, "\(what): control")
+        }
+        try s.store.updateSandbox(companyId: s.company.id, SandboxPatch(roleProfiles: [s.eng.role: .workspace]), userHome: try tempDir())
+        for (what, record) in held {
+            let set = try #require(Self.allowedSet(resolver.resolve(holding: record)), "\(what): unchanged, so it runs")
+            #expect(!set.runsUnsandboxed && Self.profiles(set) == [.workspace], "\(what): the setter's live role profile decides")
+        }
+    }
+
+    /// S6-c2 (A2): the live company cannot be read at resolve time: denied at every held site, never a decision from the held
+    /// copy and never an allowed unresolved set.
+    @Test func s6c2LiveCompanyUnreadableDenies() async throws {
+        let s = try S(profile: .full)
+        let held = try await Self.heldRecords(s)
+        let resolver = PrincipalResolver(store: s.store, ceiling: nil)
+        try Self.exec(s.store, "ALTER TABLE company RENAME TO company_unreachable")
+        for (what, record) in held {
+            #expect(Self.isDenied(resolver.resolve(holding: record)), "\(what): an unreadable company is a denial")
+        }
+        let fx = try ReleaseExecutorTests.Fx(profile: .full)
+        try fx.preinstallTools()
+        let approved = try fx.proposeAndApprove()
+        try Self.exec(fx.store, "ALTER TABLE company RENAME TO company_unreachable")
+        #expect(Self.isDenied(PrincipalResolver(store: fx.store, ceiling: nil).resolve(holding: .release(approved))), "release")
+    }
+
+    /// S6-c2 (B3, preview): the owner tightens the profile and drops a domain between the start's read and its resolution: the
+    /// preview runs sandboxed, under a policy built from the live company (the dropped domain is not in it).
+    @Test func s6c2PreviewTightenedBetweenFetchAndResolve() async throws {
+        let x = try PreviewRunnerTests.Fx(profile: .full)
+        let home = try tempDir()
+        try x.store.updateSandbox(companyId: x.company.id, SandboxPatch(allowedDomains: ["example.org"]), userHome: home)
+        let (store, cid) = (x.store, x.company.id)
+        await x.runner.setBeforeResolve { _ in
+            do { try store.updateSandbox(companyId: cid, SandboxPatch(profile: .sandboxed, allowedDomains: []), userHome: home) } catch {
+                Issue.record("could not tighten: \(error)")
+            }
+        }
+        await x.pass()
+        #expect(x.unsandboxed.calls.isEmpty, "never under the start's Full decision")
+        let spawn = try #require(x.spawns.first, "it ran in the sandbox")
+        #expect(!Self.domains(spawn.policy.network).contains("example.org"), "the policy is the live company's: \(spawn.policy.network)")
+        await x.stop()
+    }
+
+    /// S6-c2 (A1, B4, main smoke): the owner tightens the profile and drops a domain after the run was claimed: the smoke runs
+    /// sandboxed under the live company's policy, never under the claimed company's Full decision.
+    @Test func s6c2MainSmokeTightenedAfterTheClaim() async throws {
+        let fx = try MainSmokeTests.Fx(profile: .full)
+        let home = try tempDir()
+        try fx.store.updateSandbox(companyId: fx.company.id, SandboxPatch(allowedDomains: ["example.org"]), userHome: home)
+        try fx.setSmoke("test -f a.txt")
+        let head = try fx.merge(["a.txt": "x"])
+        let (store, cid) = (fx.store, fx.company.id)
+        var checks = SmokeChecks(sandbox: fx.sandbox, unsandboxed: fx.unsandboxed, paths: fx.w.paths)
+        checks.afterClaim = { _ in
+            do { try store.updateSandbox(companyId: cid, SandboxPatch(profile: .sandboxed, allowedDomains: []), userHome: home) } catch {
+                Issue.record("could not tighten: \(error)")
+            }
+        }
+        let run = try await fx.store.runSmoke(companyId: cid, commit: head, reason: .manual, releaseId: nil, checks: checks,
+                                              blocking: Blocking(), clock: { Date() })
+        #expect(fx.unsandboxed.calls.isEmpty, "never under the claimed company's Full decision")
+        let call = try #require(fx.sandbox.calls.first, "it ran in the sandbox")
+        #expect(!Self.domains(call.policy.network).contains("example.org"), "the policy is the live company's")
+        #expect(run.status == .passed, "\(run)")
+    }
+
+    /// S6-c2 (B5, release build): the owner tightens the profile and drops a domain while the release's smoke runs: the build
+    /// runs sandboxed under the live company's policy (the company the executor read at the start is minutes old).
+    @Test func s6c2ReleaseTightenedBeforeTheBuild() async throws {
+        let fx = try ReleaseExecutorTests.Fx(smoke: "sleep 2", profile: .full)
+        let home = try tempDir()
+        try fx.store.updateSandbox(companyId: fx.company.id, SandboxPatch(allowedDomains: ["example.org"]), userHome: home)
+        try fx.preinstallTools()
+        let approved = try fx.proposeAndApprove()
+        // The smoke's setter unconfirmed, so the smoke itself runs in the observable sandbox; the build's proposer stays a
+        // Full agent, so only the live company can sandbox the build.
+        try Self.exec(fx.store, "UPDATE company SET smokeCheckSetById = 'ghost-agent' WHERE id = ?", [fx.company.id])
+        async let advanced: Void = fx.advance()
+        await fx.smokeSandbox.waitForRun { $0.command == "sleep 2" }
+        try fx.store.updateSandbox(companyId: fx.company.id, SandboxPatch(profile: .sandboxed, allowedDomains: []), userHome: home)
+        await advanced
+        let r = try fx.reload(approved)
+        #expect(fx.calls(in: fx.export(r), of: fx.unsandboxed).isEmpty, "never under the start's Full decision")
+        let build = try #require(fx.calls(in: fx.export(r), of: fx.sandbox).first, "the build ran in the sandbox: \(r)")
+        #expect(!Self.domains(build.policy.network).contains("example.org"), "the policy is the live company's")
+    }
+
+    /// S6-c2 (C7): a sprint demo re-decides against the live records. After the owner tightens the company, a demo of a
+    /// preview started Full runs sandboxed; a surface whose stored record no longer matches its run's is skipped.
+    @Test func s6c2DemoAfterTighteningIsNotUnsandboxed() async throws {
+        let x = try PreviewRunnerTests.Fx(profile: .full)
+        try x.store.upsertPreviewSurface(companyId: x.company.id, by: .agent(x.devops.id),
+                                         PreviewDraft(name: "web", kind: "cli", run: nil, url: nil, demo: "echo s6c2"), now: x.now)
+        x.w.clock.advance(1)
+        await x.pass()
+        func demos(_ runner: FakeSandbox, _ text: String) -> Int { runner.calls.filter { $0.command.contains(text) }.count }
+        #expect(try x.state().status == .ran && demos(x.unsandboxed, "echo s6c2") == 1, "control: the start ran Full")
+        try x.store.updateSandbox(companyId: x.company.id, SandboxPatch(profile: .sandboxed), userHome: try tempDir())
+        func sprint(_ n: Int) async throws -> Sprint {
+            let sprint = Sprint(id: UUID().uuidString, companyId: x.company.id, number: n, team: nil, goal: "g", cadence: .sprint,
+                                status: .review, createdAt: x.now)
+            try await x.store.writer.write { try sprint.insert($0) }
+            return sprint
+        }
+        let first = try #require(await x.runner.demo(sprint: try await sprint(1)))
+        #expect(demos(x.unsandboxed, "echo s6c2") == 1, "the demo never ran under the start's Full decision")
+        #expect(demos(x.sandbox, "echo s6c2") == 1, "it ran in the sandbox")
+        #expect(first.rows.map(\.ok) == [true], "\(first.rows)")
+        // The stored surface changed under the run (no restart flagged): the demo is skipped, nothing runs on the stale record.
+        try Self.exec(x.store, "UPDATE previewSurface SET demo = 'echo s6c2-changed' WHERE companyId = ?", [x.company.id])
+        let second = try #require(await x.runner.demo(sprint: try await sprint(2)))
+        #expect(second.rows.map(\.line) == ["web: the preview changed"], "\(second.rows)")
+        #expect(demos(x.unsandboxed, "echo s6c2") == 1 && demos(x.sandbox, "echo s6c2") == 1, "nothing ran")
+        await x.stop()
+    }
+
+    /// S6-c2 addendum (Ruling S6-R1): a narrowed sandbox restarts running previews (profile, role profiles, domains, local
+    /// binding, read paths); a widening never does, and a surface with nothing running is not flagged.
+    @Test func s6c2NarrowedSandboxRestartsRunningPreviews() async throws {
+        let x = try PreviewRunnerTests.Fx(profile: .full)
+        let home = try tempDir()
+        try x.store.updateSandbox(companyId: x.company.id, SandboxPatch(allowedDomains: ["example.org"], webDomains: ["docs.example.org"],
+                                                                        allowLocalBinding: true), userHome: home)
+        await x.pass()
+        #expect(try x.state().status == .running && x.unsandboxed.calls.count == 1, "control: running Full")
+        func flagged(_ patch: SandboxPatch) throws -> Bool {
+            try x.store.updateSandbox(companyId: x.company.id, patch, userHome: home)
+            let flagged = try x.state().restartRequestedAt != nil
+            try Self.exec(x.store, "UPDATE previewState SET restartRequestedAt = NULL WHERE companyId = ?", [x.company.id])
+            return flagged
+        }
+        #expect(try !flagged(SandboxPatch(allowedDomains: ["example.org", "example.net"])), "a domain added")
+        #expect(try !flagged(SandboxPatch(allowedDomains: ["example.org", "example.net"])), "nothing changed")
+        #expect(try !flagged(SandboxPatch(webDomains: ["docs.example.org", "docs.example.net"])), "a web domain added")
+        #expect(try flagged(SandboxPatch(allowedDomains: ["example.net"])), "a domain removed")
+        #expect(try flagged(SandboxPatch(webDomains: ["docs.example.net"])), "a web domain removed")
+        #expect(try flagged(SandboxPatch(roleProfiles: [x.devops.role: .workspace])), "the setter's role narrowed")
+        #expect(try !flagged(SandboxPatch(roleProfiles: [:])), "the role widened back")
+        #expect(try flagged(SandboxPatch(allowLocalBinding: false)), "local binding withdrawn")
+        #expect(try !flagged(SandboxPatch(allowLocalBinding: true)), "local binding given")
+        // The profile: the running Full preview restarts, in the sandbox.
+        try x.store.updateSandbox(companyId: x.company.id, SandboxPatch(profile: .sandboxed), userHome: home)
+        #expect(try x.state().restartRequestedAt != nil, "a narrowed profile flags the running preview")
+        await x.pass()
+        #expect(x.unsandboxed.calls.count == 1 && !x.spawns.isEmpty, "restarted in the sandbox")
+        #expect(try x.state().status == .running)
+        #expect(try !flagged(SandboxPatch(profile: .full)), "a widened profile restarts nothing")
+        // Nothing running: not flagged (its next start decides from the live records anyway).
+        await x.stop()
+        #expect(try !flagged(SandboxPatch(profile: .sandboxed)), "a stopped preview is not flagged")
+    }
+
     // MARK: B1 negatives (M2)
 
     /// No B1 line when the company is not Full, when the ceiling narrows it below Full, or when the setter is a known non-Full
     /// agent (the ordinary sandboxed route): previews.
     @Test func b1NoLineForPreviewsUnlessAnUnconfirmedFullDecision() async throws {
-        func lines(_ x: PreviewRunnerTests.Fx, runner: PreviewRunner? = nil) async throws -> [String] {
+        /// The B1 lines of one pass; the preview must have run (sandboxed: spawned by the sandbox, recorded running), so a
+        /// refusal can never pass for "no line" (M-a).
+        func lines(_ x: PreviewRunnerTests.Fx, runner: PreviewRunner? = nil, _ what: String) async throws -> [String] {
             let r = runner ?? x.runner
             await r.reconcile(now: x.now)
             await r.waitForStarts()
+            #expect(!x.spawns.isEmpty && x.unsandboxed.calls.isEmpty, "\(what): it ran, sandboxed")
+            #expect(try x.state().status == .running, "\(what): it is running")
             await r.stopAll()
             return try x.activity().filter { $0.contains("ran sandboxed") }
         }
         let notFull = try PreviewRunnerTests.Fx(profile: .workspace)
         try Self.exec(notFull.store, "UPDATE previewSurface SET setById = 'ghost-agent' WHERE companyId = ?", [notFull.company.id])
-        #expect(try await lines(notFull).isEmpty, "a Workspace company")
+        #expect(try await lines(notFull, "a Workspace company").isEmpty, "a Workspace company")
         let ceiled = try PreviewRunnerTests.Fx(profile: .full)
         try Self.exec(ceiled.store, "UPDATE previewSurface SET setById = 'ghost-agent' WHERE companyId = ?", [ceiled.company.id])
         let paths = ceiled.w.paths
         let narrowed = PreviewRunner(store: ceiled.store, paths: paths, deps: ceiled.deps,
                                      sandboxLayout: { SandboxLayout(paths: paths, company: $0, agentHandle: "preview") },
                                      timeouts: PreviewRunnerTests.Fx.fast, memory: { false }, clock: ceiled.w.clock.function, ceiling: .workspace)
-        #expect(try await lines(ceiled, runner: narrowed).isEmpty, "a Full company under a Workspace ceiling")
+        #expect(try await lines(ceiled, runner: narrowed, "a Workspace ceiling").isEmpty, "a Full company under a Workspace ceiling")
         let known = try PreviewRunnerTests.Fx(profile: .full)
         try known.store.updateSandbox(companyId: known.company.id, SandboxPatch(roleProfiles: [known.devops.role: .workspace]), userHome: try tempDir())
-        #expect(try await lines(known).isEmpty, "a known Workspace-role setter")
+        #expect(try await lines(known, "a known Workspace-role setter").isEmpty, "a known Workspace-role setter")
         #expect(!known.spawns.isEmpty && known.unsandboxed.calls.isEmpty, "it ran sandboxed, silently")
     }
 
@@ -742,8 +982,9 @@ import GRDB
             let approved = try fx.proposeAndApprove()
             if ghost { try Self.exec(fx.store, "UPDATE release SET proposedById = 'ghost-agent' WHERE id = ?", [approved.id]) }
             if profile == .full {
-                guard case .allow(let ceiled, _) = PrincipalResolver(store: fx.store, ceiling: .workspace).resolve(holding: .release(try fx.reload(approved)))
+                guard case .allow(let resolved, _) = PrincipalResolver(store: fx.store, ceiling: .workspace).resolve(holding: .release(try fx.reload(approved)))
                 else { Issue.record("denied"); continue }
+                let ceiled = resolved.principals
                 #expect(ceiled.unconfirmedInFullCompany == nil && !ceiled.runsUnsandboxed, "a Workspace ceiling")
             }
             await fx.advance()

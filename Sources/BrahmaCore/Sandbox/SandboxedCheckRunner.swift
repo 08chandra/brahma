@@ -132,12 +132,16 @@ extension Orchestrator {
             // verification run (no holder, an unknown agent, a failed lookup) runs it sandboxed with the B1 activity line; a
             // merge run's unknown principals ran sandboxed before S6 too, and still do without a line (4a).
             // S6-c1: decided from the run record read above; a stored run that no longer matches it (another requester, item
-            // or command) is refused, so nothing runs on the stale record.
+            // or command) is refused, so nothing runs on the stale record. S6-c2: the run supplies only the command and who
+            // asked for it; the profiles and the policy's domains come from the live company the resolver read (`live`), and
+            // a live company that cannot be read, or whose workspace is not the one checked above, is refused.
             let principals: PrincipalSet
+            let live: Company
             switch PrincipalResolver(store: store, ceiling: ceiling).resolve(holding: record.held) {
-            case .allow(let set, _): principals = set
+            case .allow(let resolved, _): (principals, live) = (resolved.principals, resolved.company)
             case .deny(let why): return .refused(why)
             }
+            guard live.workspacePath == company.workspacePath else { return .refused("the company of run \(runId) changed while it was starting") }
             if principals.runsUnsandboxed { return .unsandboxed }
             if !record.isMergeRun, principals.unconfirmedInFullCompany != nil {
                 PrincipalResolver.noteSandboxed(principals, store: store, subject: itemSubject(store: store, companyId: record.companyId,
@@ -152,7 +156,7 @@ extension Orchestrator {
             let checkout = URL(fileURLWithPath: SandboxPath.resolve(placeURL.path), isDirectory: false)
             guard SandboxPath.kind(checkout.path) == .directory else { return .refused("the \(record.purpose) place of \(runId) is missing") }
 
-            let network = CompanyNetwork.scope(company: company, grantDomains: [], grantWebDomains: []).allowedDomains
+            let network = CompanyNetwork.scope(company: live, grantDomains: [], grantWebDomains: []).allowedDomains
             // A check writes only its own checkout/export — no writable shared cache at all (A re-review ruling). Every
             // toolchain cache is per-run under TMPDIR (SeatbeltRunner), so nothing a check plants can run in a later check
             // or a merge check, and there is no shared `npm` a check could break for its company's later runs.

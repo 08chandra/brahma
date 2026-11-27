@@ -10,8 +10,10 @@ import Glibc
 /// company's engine-accepted `main` (`company.mainCommit`, PR-22) under the data home, keyed by surface, commit and start
 /// (`EngineLayout.previewRunId`, PR-16), never shared and deleted when the run stops; its build and server run through
 /// 5-lite's `SandboxedRunner` with `PreviewPolicy.server` (writes only its run, listens only on its own loopback port), except
-/// that a Full company's preview runs unsandboxed exactly when its checks would (PR-5: its setter, resolved with
-/// `PrincipalResolver.resolve(.preview(surfaceId:))`, and the company narrow to Full under the ceiling; S6).
+/// that a Full company's preview runs unsandboxed exactly when its checks would (PR-5: its setter, resolved from the surface
+/// record the start runs with `PrincipalResolver.resolve(holding: .preview(surface))`, and the live company narrow to Full
+/// under the ceiling; S6, S6-c1, S6-c2). The start's policies are built from the live company that resolution read, and a
+/// sprint demo resolves the run's surface again before it runs (`redecided`).
 ///
 /// `reconcile` is one pass over every company (the orchestrator's "preview" tick step runs it as a tracked task, PR-6):
 /// - a paused company's surfaces are stopped (`stopped`);
@@ -104,10 +106,12 @@ public actor PreviewRunner: EmergencyStopObserver {
 
     func failDemoRecords(with error: (any Error)?) { demoRecordFailure = error }
 
+    #if DEBUG
     /// Tests only (S6-c1): runs just before a start resolves its surface's principals, after the surface was read for the start,
-    /// so a test can change the stored surface in between.
+    /// so a test can change the stored surface in between. Not in a release build (M-b).
     var beforeResolve: (@Sendable (PreviewSurface) -> Void)?
     func setBeforeResolve(_ probe: (@Sendable (PreviewSurface) -> Void)?) { beforeResolve = probe }
+    #endif
 
     struct Run: Sendable {
         var company: Company
@@ -437,11 +441,18 @@ public actor PreviewRunner: EmergencyStopObserver {
         // setter runs sandboxed with the B1 line. A surface changed or removed since it was read: nothing runs on the stale
         // record; the start goes back to idle with a restart requested (no failure, no notice, no B1 line), and the next pass
         // starts the current surface under its own setter.
+        // S6-c2: the surface supplies only the commands and who set them. The profiles (the company's, the setter's role) and
+        // every policy input (domains, local binding, read paths) are the live company's, read at the resolution (`live`);
+        // a live company that cannot be read, or whose sandbox layout (workspace, slug) is not the one this start exported
+        // into, takes the same abort.
+        #if DEBUG
         beforeResolve?(surface)
+        #endif
         let principals: PrincipalSet
+        let live: Company
         switch PrincipalResolver(store: engineStore, ceiling: ceiling).resolve(holding: .preview(surface)) {
-        case .allow(let set, _) where set.companyId == company.id:
-            principals = set
+        case .allow(let resolved, _) where resolved.company.id == company.id && sandboxLayout(resolved.company) == sandbox:
+            (principals, live) = (resolved.principals, resolved.company)
         case .allow, .deny:
             await stopRun(id)
             do {
@@ -454,11 +465,11 @@ public actor PreviewRunner: EmergencyStopObserver {
             return
         }
         PrincipalResolver.noteSandboxed(principals, store: engineStore, subject: "Preview \(surface.name)", kind: .preview, now: clock())
-        let policies = PreviewPolicy.forKind(kind, layout: layout, run: run, company: company, sandbox: sandbox, port: port,
+        let policies = PreviewPolicy.forKind(kind, layout: layout, run: run, company: live, sandbox: sandbox, port: port,
                                              surface: surface.name)
         var environment = PreviewContext.environment(base: baseEnvironment, port: port)
         if kind == .ios || kind == .macos { environment["BRAHMA_DERIVED_DATA"] = PreviewPolicy.derivedData(run: run).path }
-        let context = PreviewContext(surface: surface, company: company, layout: layout, run: run, commit: commit, port: port,
+        let context = PreviewContext(surface: surface, company: live, layout: layout, run: run, commit: commit, port: port,
                                      policy: policies.policy, environment: environment, logURL: logURL, timeouts: timeouts,
                                      outputURL: layout.previewOutput(name: surface.name), appPolicy: policies.appPolicy,
                                      unsandboxed: principals.runsUnsandboxed,
@@ -503,6 +514,29 @@ public actor PreviewRunner: EmergencyStopObserver {
     }
 
     struct ExportFailure: Error, Sendable { var message: String }
+
+    /// C7 (S6-c2): a sprint demo runs a new command in a run started earlier, so it never reuses the start's decision. The
+    /// run's surface is resolved again (`resolve(holding:)`, against the live records), and the demo's context takes the
+    /// Full route, the policies and the company from that resolution. Nil (the demo is skipped) when the stored surface no
+    /// longer matches the run's, the live company cannot be read, or its sandbox layout is not the run's. No B1 line: the
+    /// start wrote the surface's.
+    func redecided(_ context: PreviewContext, kind: PreviewKind) -> PreviewContext? {
+        let resolved: PrincipalResolver.Resolved
+        switch PrincipalResolver(store: store, ceiling: ceiling).resolve(holding: .preview(context.surface)) {
+        case .allow(let r, _) where r.company.id == context.company.id: resolved = r
+        case .allow, .deny: return nil
+        }
+        let sandbox = sandboxLayout(resolved.company)
+        guard sandbox == sandboxLayout(context.company) else { return nil }
+        let policies = PreviewPolicy.forKind(kind, layout: context.layout, run: context.run, company: resolved.company, sandbox: sandbox,
+                                             port: context.port, surface: context.surface.name)
+        var c = context
+        c.company = resolved.company
+        c.policy = policies.policy
+        c.appPolicy = policies.appPolicy
+        c.unsandboxed = resolved.principals.runsUnsandboxed
+        return c
+    }
 
     /// The adapter spawned the server (or app): its pid and its exact start time, read while it was unreaped (final review I2).
     private func spawned(_ id: String, pid: Int32, start: Double) {

@@ -23,6 +23,11 @@ public struct PrincipalResolver: Sendable {
     }
 
     /// Total: never throws, never returns an empty set (see the type's notes).
+    ///
+    /// The id-based rows `.verificationRun(runId:)`, `.mergeRun(runId:)`, `.preview(surfaceId:)`, `.mainSmoke(companyId:)` and
+    /// `.release(releaseId:)` are for tests and diagnostics only: every production caller of those actions holds the record
+    /// its command comes from and resolves it with `resolve(holding:)` (S6-c1, S6-c2). `SafetyLint`'s `idSubject` zero rule
+    /// bans a `resolve(` of those rows anywhere in the scanned sources (this file included).
     public func resolve(_ subject: ActionSubject) -> PrincipalSet {
         Self.resolveCount?.add()
         switch subject {
@@ -51,7 +56,7 @@ public struct PrincipalResolver: Sendable {
         }
     }
 
-    // MARK: Held records (controller ruling S6-c1)
+    // MARK: Held records (controller rulings S6-c1, S6-c2)
 
     /// A record the caller already holds and takes the action's command from (the check's run, the preview's surface, the
     /// company's smoke check, the release's build). The decision must come from that same snapshot: a record re-read by id
@@ -64,50 +69,72 @@ public struct PrincipalResolver: Sendable {
         case release(Release)
     }
 
-    /// Resolves the principals of `held` from the held record itself (its own setter, holder request or proposer), after
-    /// checking that the stored record still matches it: the same company, the same setter and the same command fields (the
-    /// command digest). A stored record that differs, is gone or cannot be read is `.deny(reason)`: the caller runs nothing on
-    /// this snapshot and tries again with a fresh one (fail closed). Counted as one resolution.
-    public func resolve(holding held: HeldRecord) -> Decision<PrincipalSet> {
+    /// What a held resolution decided from: the principals, and the live company row they were resolved against. The caller
+    /// builds every policy of the action from `company` (its profile, role profiles, domains, local binding and read paths),
+    /// never from a company it read earlier (S6-c2).
+    public struct Resolved: Sendable {
+        public let principals: PrincipalSet
+        public let company: Company
+    }
+
+    /// Resolves the principals of `held`. The held record supplies only the command and who set it (its setter, holder or
+    /// requester, or proposer); every sandbox and grant input (the company's profile and role profiles, the setter's role and
+    /// profile, the pack's role covers, the grants) comes from the live records, read at this call (S6-c2).
+    /// - In one read: the stored copy of `held` (`WHERE id = ? AND companyId = ?`; the company by its key) and the live company.
+    /// - The stored copy must still match the held one: the same company, the same setter and the same command fields (the
+    ///   command digest). A stored copy that differs or is gone is `.deny(reason)`: the caller runs nothing on this snapshot
+    ///   and tries again with a fresh one (fail closed).
+    /// - A read that fails, or a live company that is gone, is `.deny` too: never a decision from the held copy.
+    /// Counted as one resolution.
+    public func resolve(holding held: HeldRecord) -> Decision<Resolved> {
         Self.resolveCount?.add()
         switch held {
         case .verificationRun(let run):
             let (id, cid) = (run.id, run.companyId)
-            return unchanged(run, "verification run \(id)", same: Self.sameCommand, stored: { db in
+            return live(run, "verification run \(id)", companyId: cid, same: Self.sameCommand, stored: { db in
                 try VerificationRun.filter(Column("id") == id && Column("companyId") == cid).fetchOne(db)
-            }) { withCompany(cid) { verificationMembers(run, $0) } }
+            }) { verificationMembers(run, $0) }
         case .mergeRun(let run):
             let (id, cid) = (run.id, run.companyId)
-            return unchanged(run, "merge run \(id)", same: Self.sameCommand, stored: { db in
+            return live(run, "merge run \(id)", companyId: cid, same: Self.sameCommand, stored: { db in
                 try MergeRun.filter(Column("id") == id && Column("companyId") == cid).fetchOne(db)
-            }) { withCompany(cid) { mergeMembers(run, $0) } }
+            }) { mergeMembers(run, $0) }
         case .preview(let surface):
             let (id, cid) = (surface.id, surface.companyId)
-            return unchanged(surface, "preview surface \(surface.name)", same: Self.sameCommand, stored: { db in
+            return live(surface, "preview surface \(surface.name)", companyId: cid, same: Self.sameCommand, stored: { db in
                 try PreviewSurface.filter(Column("id") == id && Column("companyId") == cid).fetchOne(db)
-            }) { withCompany(cid) { [$0.setter(surface.setById)] } }
+            }) { [$0.setter(surface.setById)] }
         case .mainSmoke(let company):
+            // The held company supplies the smoke check and its setter only; the scope is the live row (A1).
             let cid = company.id
-            return unchanged(company, "the main smoke check", same: Self.sameSmokeCheck, stored: { db in
+            return live(company, "the main smoke check", companyId: cid, same: Self.sameSmokeCheck, stored: { db in
                 try Company.fetchOne(db, key: cid)
-            }) { withCompany(cid, held: company) { [$0.setter(company.smokeCheckSetById)] } }
+            }) { [$0.setter(company.smokeCheckSetById)] }
         case .release(let release):
             let (id, cid) = (release.id, release.companyId)
-            return unchanged(release, release.ref, same: Self.sameCommand, stored: { db in
+            return live(release, release.ref, companyId: cid, same: Self.sameCommand, stored: { db in
                 try Release.filter(Column("id") == id && Column("companyId") == cid).fetchOne(db)
-            }) { withCompany(cid) { [$0.setter(release.proposedById)] } }
+            }) { [$0.setter(release.proposedById)] }
         }
     }
 
-    /// `members` when the stored copy of `held` still matches it; `.deny` otherwise.
-    private func unchanged<Record>(_ held: Record, _ what: String, same: (Record, Record) -> Bool,
-                                   stored fetch: @escaping (Database) throws -> Record?,
-                                   _ members: () -> PrincipalSet) -> Decision<PrincipalSet> {
-        let stored: Record?
-        do { stored = try store.writer.read(fetch) } catch { return .deny("\(what) could not be read again (\(error))") }
-        guard let stored else { return .deny("\(what) is gone") }
+    /// `members` on a scope over the live company, when the stored copy of `held` still matches it; `.deny` otherwise, and
+    /// when the stored copy or the live company cannot be read or is gone.
+    private func live<Record>(_ held: Record, _ what: String, companyId cid: String, same: (Record, Record) -> Bool,
+                              stored fetch: @escaping (Database) throws -> Record?,
+                              _ members: (Scope) -> [Principal]) -> Decision<Resolved> {
+        let read: (stored: Record?, company: Company?)
+        do {
+            read = try store.writer.read { db in (try fetch(db), try Company.fetchOne(db, key: cid)) }
+        } catch {
+            return .deny("\(what) could not be read again (\(error))")
+        }
+        guard let stored = read.stored else { return .deny("\(what) is gone") }
         guard same(held, stored) else { return .deny(Self.changedWhileStarting(what)) }
-        return .allow(members(), because: "\(what) is unchanged since it was read")
+        guard let company = read.company else { return .deny("the company of \(what) is gone") }
+        let scope = Scope(store: store, company: company, ceiling: ceiling)
+        let set = PrincipalSet(companyId: cid, members: members(scope), ownerProfile: scope.narrowed(company.permissionProfile))
+        return .allow(Resolved(principals: set, company: company), because: "\(what) is unchanged since it was read")
     }
 
     /// The text of a held record that no longer matches its stored copy.
@@ -273,13 +300,10 @@ public struct PrincipalResolver: Sendable {
         return withCompany(record[keyPath: companyId]) { scope in members(record, scope) }
     }
 
-    /// Reads the company (`WHERE id = companyId`), then `members` with a scope on it. `held`: the company snapshot the caller
-    /// takes the command from (a main smoke), used as it is (S6-c1).
-    private func withCompany(_ companyId: String, held: Company? = nil, _ members: (Scope) -> [Principal]) -> PrincipalSet {
+    /// Reads the company (`WHERE id = companyId`), then `members` with a scope on it.
+    private func withCompany(_ companyId: String, _ members: (Scope) -> [Principal]) -> PrincipalSet {
         let company: Company?
-        if let held { company = held } else {
-            do { company = try store.company(id: companyId) } catch { return Self.unresolved(companyId, Self.failed(error)) }
-        }
+        do { company = try store.company(id: companyId) } catch { return Self.unresolved(companyId, Self.failed(error)) }
         guard let company else { return Self.unresolved(companyId, "no company \(companyId)") }
         let scope = Scope(store: store, company: company, ceiling: ceiling)
         return PrincipalSet(companyId: companyId, members: members(scope), ownerProfile: scope.narrowed(company.permissionProfile))

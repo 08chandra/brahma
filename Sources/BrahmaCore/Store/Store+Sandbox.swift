@@ -62,9 +62,36 @@ extension Store {
         try writer.write { db in
             guard var company = try Company.fetchOne(db, key: companyId) else { throw StoreError.notFound }
             if unless(company) { return }
+            let before = company
             apply(&company)
             try company.update(db)
+            // S6-c2 addendum (Ruling S6-R1): a narrowed sandbox restarts running previews. A preview server or app keeps the
+            // route and policy of its start, so every surface of the company with something in flight or running is flagged
+            // in this same write; its restart decides from the live records. A widening restarts nothing.
+            if Self.sandboxNarrowed(from: before, to: company) {
+                let now = Store.now()
+                for var state in try PreviewState.filter(Column("companyId") == companyId).fetchAll(db)
+                where [.building, .starting, .running].contains(state.status) {
+                    state.restartRequestedAt = now; state.updatedAt = now
+                    try state.update(db)
+                }
+            }
         }
+    }
+
+    /// Whether `new` narrows anything of `old`'s sandbox: the company's profile, the effective profile of any role (the company's
+    /// narrowed by the role's), an allowed or web domain removed, local binding withdrawn, a toolchain read path removed. A
+    /// change that only widens (or changes nothing) is not a narrowing.
+    static func sandboxNarrowed(from old: Company, to new: Company) -> Bool {
+        func narrower(_ a: PermissionProfile, than b: PermissionProfile) -> Bool { a != b && PermissionProfile.narrower(a, b) == a }
+        func effective(_ c: Company, _ role: String) -> PermissionProfile { PermissionProfile.narrower(c.permissionProfile, c.profile(forRole: role)) }
+        if narrower(new.permissionProfile, than: old.permissionProfile) { return true }
+        for role in Set(old.roleProfiles.keys).union(new.roleProfiles.keys) where narrower(effective(new, role), than: effective(old, role)) {
+            return true
+        }
+        if !Set(old.allowedDomains).isSubset(of: new.allowedDomains) || !Set(old.webDomains).isSubset(of: new.webDomains) { return true }
+        if old.allowLocalBinding && !new.allowLocalBinding { return true }
+        return !Set(old.toolchainReadPaths).isSubset(of: new.toolchainReadPaths)
     }
 
     /// An owner edit computed from the STORED company (M8): `edit` gets the current row, its patch is validated as

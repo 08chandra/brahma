@@ -84,7 +84,7 @@ import GRDB
             try db.execute(sql: "UPDATE company SET smokeCheckSetById = ? WHERE id = ?", arguments: [setById, s.company.id])
         }
         let company = try #require(try s.store.company(id: s.company.id))
-        return Self.full(PrincipalResolver(store: s.store, ceiling: ceiling).resolve(holding: .mainSmoke(company)))
+        return try Self.full(PrincipalResolver(store: s.store, ceiling: ceiling).resolve(holding: .mainSmoke(company)))
     }
 
     private func surfaceRunsUnsandboxed(_ s: S, setById: String?, ceiling: PermissionProfile?) throws -> Bool {
@@ -95,15 +95,21 @@ import GRDB
             try db.execute(sql: "UPDATE previewSurface SET setById = ? WHERE id = ?", arguments: [setById ?? "", surface.id])
         }
         let held = try #require(try s.store.previewSurface(companyId: s.company.id, id: surface.id))
-        return Self.full(PrincipalResolver(store: s.store, ceiling: ceiling).resolve(holding: .preview(held)))
+        return try Self.full(PrincipalResolver(store: s.store, ceiling: ceiling).resolve(holding: .preview(held)))
     }
 
-    /// The Full route of an allowed resolution; a denial never runs Full.
-    private static func full(_ d: Decision<PrincipalSet>) -> Bool {
+    /// The Full route of a resolution that must be allowed: every caller here expects the action to run (its record is
+    /// unchanged), so a denial fails the test instead of passing for "sandboxed" (M-c). A `false` is an allowed, sandboxed run.
+    private static func full(_ d: Decision<PrincipalResolver.Resolved>) throws -> Bool {
         switch d {
-        case .allow(let set, _): return set.runsUnsandboxed
-        case .deny: return false
+        case .allow(let resolved, _): return resolved.principals.runsUnsandboxed
+        case .deny(let why): throw Denied(why: why)
         }
+    }
+
+    struct Denied: Error, CustomStringConvertible {
+        let why: String
+        var description: String { "expected the unchanged record to be allowed, but it was denied: \(why)" }
     }
 
     /// A smoke with no setter: the engine cannot confirm who wrote its command, so it runs sandboxed even in a Full company.
