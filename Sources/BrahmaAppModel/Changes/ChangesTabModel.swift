@@ -22,7 +22,7 @@ import BrahmaCore
     /// `"The stored secrets can't be read, so no changes are shown."`
     public static let refusedText = "The stored secrets can't be read, so no changes are shown."
     /// Ruling C6b-2: the parse disagreed with the engine's sections; nothing of the diff is drawn.
-    public static let unverifiedText = "diff couldn't be verified"
+    public nonisolated static let unverifiedText = "diff couldn't be verified"
     /// Stream ends in a row (no yield between them) before the model gives up with the generic refusal (with `backoff`, about 15 s
     /// of patience: a git call that timed out or was starved under load recovers; a refusal costs no git work per attempt).
     public static let maxRetries = 5
@@ -340,13 +340,18 @@ import BrahmaCore
     /// Ruling C6b-2: nil when `diff`'s sections are the engine's (`sectionPaths`: the same count, the same path at every index) and
     /// (R2-1) every hunk of every section has the engine's line counts and (N3-1) start lines (`sectionHunks`), else
     /// `unverifiedText`: a parse that reads any line or hunk header differently from the engine never has its markers or numbers drawn.
-    public static func verify(_ diff: DiffModel, against snapshot: ChangesSnapshot) -> String? {
-        guard diff.files.map(\.path) == snapshot.sectionPaths, spans(diff) == snapshot.sectionHunks else { return unverifiedText }
+    public nonisolated static func verify(_ diff: DiffModel, against snapshot: ChangesSnapshot) -> String? {
+        verify(diff, paths: snapshot.sectionPaths, hunks: snapshot.sectionHunks)
+    }
+
+    /// C7a fix round 1 (I-1): the same check against any engine identity (`ChangesPatch.identity` of a static diff or commit).
+    public nonisolated static func verify(_ diff: DiffModel, paths: [String], hunks: [[HunkSpan]]) -> String? {
+        guard diff.files.map(\.path) == paths, spans(diff) == hunks else { return unverifiedText }
         return nil
     }
 
     /// R2-1: the app parse's start lines (N3-1) and line counts per file and hunk, in the engine's `HunkSpan` terms.
-    public static func spans(_ diff: DiffModel) -> [[HunkSpan]] {
+    public nonisolated static func spans(_ diff: DiffModel) -> [[HunkSpan]] {
         diff.files.map { file in
             file.hunks.map { h in
                 HunkSpan(oldStart: h.oldStart, newStart: h.newStart, old: h.lines.filter { $0.oldNo != nil }.count, new: h.lines.filter { $0.newNo != nil }.count,
@@ -364,7 +369,7 @@ import BrahmaCore
 
     /// The header chips of a shown diff (color tokens: UNCOMMITTED, TAINTED, TRUNCATED and HIDDEN CHARACTERS `warning`; LIVE
     /// `running`; STALE `text2`). The taint reason is gated as a final string (nil → the bare chip).
-    public static func chips(for snapshot: ChangesSnapshot, diff: DiffModel?, live: Bool, gate: GlobalSearch.TextGate) -> [RefChip] {
+    public nonisolated static func chips(for snapshot: ChangesSnapshot, diff: DiffModel?, live: Bool, gate: GlobalSearch.TextGate) -> [RefChip] {
         var out: [RefChip] = []
         if snapshot.target == "worktree" { out.append(RefChip(text: "UNCOMMITTED", tone: .warn)) }
         out.append(live ? RefChip(text: "LIVE", tone: .busy) : RefChip(text: "STALE", tone: .idle))

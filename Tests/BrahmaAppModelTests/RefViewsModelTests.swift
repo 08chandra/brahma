@@ -128,4 +128,93 @@ import Foundation
         #expect(RefBodies.authorLabel(by: by, concierge: concierge) == "Concierge")
         #expect(OpenOrigin.showAnswer(requestId: "r", by: "Brahma", concierge: true).answeredBy == "Concierge")
     }
+
+    // MARK: Fix round 1
+
+    /// I-2a: a ranged ref always renders as code with its range (an `.html` file included), never as the page.
+    @Test func rangedHtmlRefRendersAsCode() throws {
+        var files = RefWorld.defaultFiles
+        files["web/index.html"] = "<h1>Habit tracker</h1>\n<p>Daily streaks</p>\n<p>Reminders</p>\n"
+        let w = try RefWorld(files: files)
+        let body = try RefBodies.bodyNow(for: try w.resolve("web/index.html:1-2"), store: w.store, companyId: w.company.id,
+                                         context: try w.renderContext(), via: nil)
+        guard case .code(let lines, _, let highlight, _) = body.content else {
+            Issue.record("expected code, got \(body.content)")
+            return
+        }
+        #expect(highlight == LineRange(start: 1, end: 2))
+        #expect(lines.first.map { $0.map(\.text).joined() } == "<h1>Habit tracker</h1>")
+    }
+
+    /// I-1: a static diff is drawn only when the engine's reading of the same patch agrees (sections, paths, hunk starts and
+    /// counts); otherwise nothing of it is drawn.
+    @Test func staticDiffIsVerifiedAgainstTheEnginesReading() {
+        let gate = GlobalSearch.TextGate(knownValues: [])
+        let good = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n"
+        #expect(RefBodies.verifiedDiff(patch: good, gate: gate)?.files.map(\.displayPath) == ["src/a.ts"])
+        // The engine reads this deleted file's path from `--- a/`; the parse doesn't agree: refused.
+        let hostile = "diff --git a/x b/y.txt b/x b/y.txt\ndeleted file mode 100644\n--- a/x b/y.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n"
+        let engine = ChangesPatch.identity(hostile)
+        if DiffModel.parse(patch: hostile, gate: gate).files.map(\.path) != engine.paths {
+            #expect(RefBodies.verifiedDiff(patch: hostile, gate: gate) == nil)
+        }
+        // A parse that disagrees with the engine's identity is refused whatever the cause.
+        let parsed = DiffModel.parse(patch: good, gate: gate)
+        #expect(ChangesTabModel.verify(parsed, paths: ["src/b.ts"], hunks: ChangesPatch.identity(good).hunks) == ChangesTabModel.unverifiedText)
+        #expect(ChangesTabModel.verify(parsed, paths: ["src/a.ts"], hunks: ChangesPatch.identity(good).hunks) == nil)
+    }
+
+    /// I-1: the agent "now" live diff is the verified one, with the model's chips (UNCOMMITTED, LIVE, TAINTED…), never LIVE
+    /// when refused.
+    @Test func agentNowLiveDiffIsVerifiedWithTheModelsChips() throws {
+        let c = try ChangesWorld()
+        let body = try RefBodies.bodyNow(for: try c.w.resolve("@eng-1"), store: c.w.store, companyId: c.w.company.id,
+                                         context: try c.w.renderContext(), via: nil)
+        guard case .agentNow(let now) = body.content else {
+            Issue.record("expected the agent now view, got \(body.content)")
+            return
+        }
+        #expect(now.liveDiff != nil && now.liveRefusal == nil)
+        #expect(now.liveChips.contains(RefChip(text: "UNCOMMITTED", tone: .warn)))
+        #expect(now.liveChips.contains(RefChip(text: "LIVE", tone: .busy)))
+        // The header carries no LIVE of its own: only the verified section does.
+        #expect(!body.header.chips.contains { $0.text == "LIVE" })
+        // Refused: no diff, the refusal, and never LIVE.
+        let refused = AgentNowModel.verifiedLiveDiff(DiffModel.parse(patch: "diff --git a/src/a.ts b/src/a.ts\n", gate: GlobalSearch.TextGate(knownValues: [])),
+                                                    paths: ["other"], hunks: [[]], chips: now.liveChips)
+        #expect(refused.diff == nil && refused.refusal == ChangesTabModel.unverifiedText)
+        #expect(!refused.chips.contains { $0.text == "LIVE" })
+    }
+
+    /// M-3: Save As… suggests the gated display name, sanitized: its last component, no separators, no control or bidi.
+    @Test func saveNameIsTheGatedDisplayName() {
+        #expect(RefBodies.saveName(title: "src/ev\u{202E}il/a b.ts", kind: .file) == "a b.ts")
+        #expect(RefBodies.saveName(title: "../../.ssh/id\u{0007}", kind: .file) == "id")
+        #expect(RefBodies.saveName(title: "INITE-3 Reminder fires twice", kind: .item) == "INITE-3 Reminder fires twice")
+        #expect(RefBodies.saveName(title: "/", kind: .diff) == "diff")
+        #expect(RefBodies.saveName(title: ".hidden", kind: .file) == "file.hidden")
+    }
+
+    /// M-6: READS lists the company's recorded reads from the engine's rows, never parsed back out of display text.
+    @Test func readsComeFromStructuredRows() async throws {
+        let w = try RefWorld()
+        let app = await w.app()
+        // Opened, never shared: no share event names it, yet its read is listed.
+        await app.openRef(try w.ref("src/a.ts"), origin: .owner)
+        let rows = try await app.sharingRows(reads: true)
+        #expect(rows.contains { $0.result.hasPrefix("read") && $0.ref.contains("src/a.ts") })
+        #expect(try w.store.recentRefReads(companyId: "other-company", limit: 50, owner: try w.owner()).isEmpty)
+    }
+
+    /// M-9: "Can't provide → reply" is the engine's decline (recorded as declined), owner only.
+    @Test func cantProvideDeclinesTheFileRequest() async throws {
+        let w = try RefWorld()
+        let ask = try w.store.requestFileFromOwner(companyId: w.company.id, by: w.eng1.id, title: "Logo", question: "Can you send it?",
+                                                   details: nil, knownValues: [], now: w.now)
+        let app = await w.app()
+        #expect(await app.declineFileRequest(askId: ask.id, note: "no logo yet"))
+        let after = try #require(try w.store.ask(id: ask.id))
+        #expect(after.status != .pendingOwner && after.ownerAnswer == "declined: no logo yet")
+    }
 }
+

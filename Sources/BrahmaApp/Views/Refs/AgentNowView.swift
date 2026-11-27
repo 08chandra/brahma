@@ -24,8 +24,12 @@ struct AgentNowView: View {
                 }
                 actions
                 section("Live diff") {
-                    if let diff = now.liveDiff {
-                        DiffView(diff: diff, live: true, uncommitted: true, updatedText: "updated just now")
+                    // Fix round 1 (I-1): the model's verified diff with the model's chips; a refused diff shows the refusal.
+                    if !now.liveChips.isEmpty { RefChipRow(chips: now.liveChips) }
+                    if let refusal = now.liveRefusal {
+                        RefUnavailableView(caption: "NOT SHOWN", text: refusal).frame(height: 80)
+                    } else if let diff = now.liveDiff {
+                        DiffView(diff: diff, updatedText: "updated just now")
                             .frame(height: 260)
                             .overlay(Rectangle().strokeBorder(BrahmaTheme.line, lineWidth: 1))
                     } else {

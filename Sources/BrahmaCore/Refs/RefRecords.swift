@@ -200,6 +200,17 @@ extension Store {
         }
     }
 
+    /// C7a fix round 1 (M-6): the company's newest recorded reads, owner only (the SHARING filter's READS toggle reads these
+    /// rows as they are, never a canonical parsed back out of display text).
+    public func recentRefReads(companyId: String, limit: Int, owner: OwnerPrincipal) throws -> [RefRead] {
+        _ = owner
+        return try writer.read { db in
+            try RefRead.fetchAll(db, sql: """
+                SELECT * FROM refRead WHERE companyId = ? ORDER BY createdAt DESC, rowid DESC LIMIT ?
+                """, arguments: [companyId, max(0, limit)])
+        }
+    }
+
     /// Writes one read.
     static func recordRefRead(db: Database, companyId: String, reader: Reader, canonical: String, rev: String?, bytes: Int?,
                            tainted: Bool, via: String, turnId: String?, now: Date, exportPath: String? = nil) throws {

@@ -6,7 +6,7 @@ import BrahmaAppModel
 /// An agent's file request in the Inbox (collab design §3.4): the engine's gated card (`AppModel.fileRequestCard`: every
 /// agent-written field its final display string, `[withheld: …]` when it held a value, impersonation flagged), a drop zone that
 /// answers it through ML's pipeline (`DropContext.inbox(askId:)`: scope chooser, trust chip, secret sheet), and "Can't provide →
-/// reply" (`AppModel.answer`). Without the stored values nothing the agent wrote is shown.
+/// reply" (`AppModel.declineFileRequest`: the engine records the decline, fix round 1 M-9). Without the stored values nothing the agent wrote is shown.
 struct FileRequestCardView: View {
     let model: AppModel
     let row: InboxRow
@@ -104,7 +104,7 @@ struct FileRequestCardView: View {
                     guard !text.isEmpty else { return }
                     busy = true
                     Task {
-                        _ = await model.answer(askId: row.id, text: text)
+                        _ = await model.declineFileRequest(askId: row.id, note: text)
                         busy = false
                         showReply = false
                     }

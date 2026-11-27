@@ -150,13 +150,19 @@ public enum RefBodies {
                 }
                 let r = try render()
                 let live = ref.isWorktree && ref.params["snapshot"] == nil
-                let model = DiffModel.parse(patch: redacted(r.text ?? "", knownValues: ctx.knownValues), gate: gate)
+                // Fix round 1 (I-1): drawn only when the engine's reading of the same patch agrees; never LIVE when refused.
+                guard let model = verifiedDiff(patch: redacted(r.text ?? "", knownValues: ctx.knownValues), gate: gate) else {
+                    return RefBody(header: header(), content: .unavailable(ChangesTabModel.unverifiedText))
+                }
                 return RefBody(header: header(hasHidden: model.hasHidden, live: live),
                                content: .diff(model, live: live, updated: live ? "updated just now" : nil))
             case .commit:
                 let r = try render()
                 let text = redacted(r.text ?? "", knownValues: ctx.knownValues)
-                let model = DiffModel.parse(patch: text, gate: gate)
+                // Fix round 1 (I-1): verified against the engine's reading of the same text, else nothing of it is drawn.
+                guard let model = verifiedDiff(patch: text, gate: gate) else {
+                    return RefBody(header: header(), content: .unavailable(ChangesTabModel.unverifiedText))
+                }
                 var h = header(hasHidden: model.hasHidden)
                 if let subject = text.split(separator: "\n", maxSplits: 1).first {
                     // The assembled string is what is gated (Ruling 55), never its parts.
@@ -223,8 +229,8 @@ public enum RefBodies {
                 try read()
                 var chips: [RefChip] = []
                 if let tainted = model.taintedBy, let shown = gate.final(tainted.uppercased(), max: SafeTitle.max) { chips.append(RefChip(text: shown, tone: .warn)) }
-                return RefBody(header: header(chips: chips, hasHidden: model.liveDiff?.hasHidden ?? false, live: model.liveDiff != nil),
-                               content: .agentNow(model))
+                // Fix round 1 (I-1): the live diff's chips (LIVE among them) are the CHANGES model's, on the diff itself.
+                return RefBody(header: header(chips: chips), content: .agentNow(model))
             case .sprint, .fact:
                 guard let answer = try FactsResolver(store: store).answer(for: ref, companyId: companyId, reader: .owner, now: ctx.now, gate: gate) else {
                     return unavailable()
@@ -245,7 +251,8 @@ public enum RefBodies {
         let ext = r.ext.lowercased()
         let kind = ArtifactKind.from(ext: ext)
         let binary = r.data.prefix(OpenRefLimits.binarySniffBytes).contains(0)
-        let isCode = !binary && (kind == nil || kind == .code || kind == .text)
+        // Fix round 1 (I-2a): a ref with a line range is always code with its range (an `.html` file's lines too), never the page.
+        let isCode = !binary && (kind == nil || kind == .code || kind == .text || resolved.ref.range != nil)
         if isCode {
             // The bytes are the gate's (a pattern already redacted by `renderRef`).
             let text = String(decoding: r.data.prefix(maxTextBytes), as: UTF8.self)
@@ -379,9 +386,16 @@ public enum RefBodies {
         }
         let key = try store.leasedItemKey(companyId: companyId, agentId: agent.id, owner: ctx.owner)
         var liveDiff: DiffModel?
+        var liveChips: [RefChip] = []
+        var liveRefusal: String?
         if let key, let snapshot = try? store.changesSnapshot(companyId: companyId, key: key, compare: .main, reader: .owner,
                                                                knownValues: ctx.knownValues, now: ctx.now) {
-            liveDiff = DiffModel.parse(patch: redacted(snapshot.patch, knownValues: ctx.knownValues), gate: GlobalSearch.TextGate(knownValues: ctx.knownValues))
+            // Fix round 1 (I-1): the snapshot's own patch (gated by the engine), verified against its sections exactly as the
+            // CHANGES tab does, with that model's chips.
+            let parsed = DiffModel.parse(patch: snapshot.patch, gate: gate)
+            let verified = AgentNowModel.verifiedLiveDiff(parsed, paths: snapshot.sectionPaths, hunks: snapshot.sectionHunks,
+                                                          chips: ChangesTabModel.chips(for: snapshot, diff: parsed, live: true, gate: gate))
+            (liveDiff, liveRefusal, liveChips) = (verified.diff, verified.refusal, verified.chips)
         }
         let turn = try store.lastTurn(agentId: agent.id)
         var stream: (turnId: String?, running: Bool, lines: [TurnStreamLine]) = (nil, false, [])
@@ -402,7 +416,38 @@ public enum RefBodies {
         return AgentNowModel(handle: "@\(agent.name)", role: gate.final(agent.role, max: SafeTitle.max) ?? "", state: AgentBadge.label(agent),
                              item: key, liveDiff: liveDiff, stream: stream, activity: activity,
                              usageShare: AgentNowModel.usageText(share: share), openRequests: requests,
-                             taintedBy: AgentNowModel.taintText(source: taint).flatMap { gate.final($0, max: SafeTitle.max) })
+                             taintedBy: AgentNowModel.taintText(source: taint).flatMap { gate.final($0, max: SafeTitle.max) },
+                             liveChips: liveChips, liveRefusal: liveRefusal)
+    }
+
+    /// Fix round 1 (I-1): a static diff or commit parsed for drawing only when the engine's identity of the same text
+    /// (`ChangesPatch.identity`: section paths, hunk starts and counts) agrees with the parse; nil (refused) otherwise.
+    public static func verifiedDiff(patch: String, gate: GlobalSearch.TextGate) -> DiffModel? {
+        let model = DiffModel.parse(patch: patch, gate: gate)
+        let engine = ChangesPatch.identity(patch)
+        if model.truncated {
+            // A parse cut at its line cap covers a prefix of the sections: those must still be the engine's.
+            let n = model.files.count
+            let paths = Array(engine.paths.prefix(n)), hunks = Array(engine.hunks.prefix(n))
+            guard model.files.map(\.path) == paths else { return nil }
+            // The last (cut) section's hunks can't match in full; the earlier ones must.
+            guard n == 0 || ChangesTabModel.spans(model).dropLast() == hunks.dropLast() else { return nil }
+            return model
+        }
+        return ChangesTabModel.verify(model, paths: engine.paths, hunks: engine.hunks) == nil ? model : nil
+    }
+
+    /// Fix round 1 (M-3): the name Save As… suggests: the gated display title's last component, with every separator, control,
+    /// bidi and format character removed (never the agent's raw path); the kind when nothing is left; a leading dot kept off.
+    public static func saveName(title: String, kind: WorkRefKind) -> String {
+        let last = title.split(separator: "/").last.map(String.init) ?? ""
+        var out = String(String.UnicodeScalarView(last.unicodeScalars.filter { s in
+            !(s.properties.generalCategory == .control || s.properties.generalCategory == .format || InvisibleMarkers.isHidden(s)
+              || s == "/" || s == "\\" || s == ":")
+        })).trimmingCharacters(in: .whitespaces)
+        if out.isEmpty || out == "." || out == ".." { out = kind.rawValue }
+        if out.hasPrefix(".") { out = (kind == .file ? "file" : kind.rawValue) + out }
+        return String(out.prefix(120))
     }
 
     // MARK: Trust and titles

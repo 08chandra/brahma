@@ -389,24 +389,33 @@ public final class Store: Sendable {
     public static let reservedSpeakerHandles: Set<String> = ["concierge", "brahma", "owner"]
 
     /// Whether `name` reads as a reserved speaker handle in any spelling: NFKC with case, width and accents folded, Cyrillic and
-    /// Greek lookalikes as Latin (`OwnerImpersonation.confusables`), digits for letters (`0`→o, `1`→l, `3`→e, `4`→a, `5`→s, `7`→t), `rn`→m,
-    /// `vv`→w, and `-`, `_`, `.` and spaces dropped. `concierge-helper` is not reserved; `сoncierge` (Cyrillic с) is.
+    /// Greek lookalikes as Latin (`OwnerImpersonation.confusables`), `-`, `_`, `.`, spaces and format characters dropped, then
+    /// both it and the reserved handles reduced to one confusables skeleton (fix round 1, M-5): `1`, `l`, `|`, `!` and `i` are
+    /// one letter; so are `0`/`o`, `3`/`e`, `4`/`@`/`a`, `5`/`$`/`s`, `7`/`t`, `6`/`8`/`b`, `9`/`g`, `rn`/`m` and `vv`/`w`.
+    /// `concierge-helper` is not reserved; `сoncierge` (Cyrillic с) and `conc1erge` are.
     public static func isReservedHandle(_ name: String) -> Bool {
         let folded = name.precomposedStringWithCompatibilityMapping
             .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
-        let digits: [Character: Character] = ["0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "7": "t"]
-        var out = ""
+        var latin = ""
         for scalar in folded.unicodeScalars {
-            let latin = OwnerImpersonation.confusables[scalar] ?? scalar
-            for ch in String(latin).lowercased() {
+            let mapped = OwnerImpersonation.confusables[scalar] ?? scalar
+            for ch in String(mapped).lowercased() {
                 if ch == "-" || ch == "_" || ch == "." || ch.isWhitespace || ch.unicodeScalars.allSatisfy({ $0.properties.generalCategory == .format }) {
                     continue
                 }
-                out.append(digits[ch] ?? ch)
+                latin.append(ch)
             }
         }
-        out = out.replacingOccurrences(of: "rn", with: "m").replacingOccurrences(of: "vv", with: "w")
-        return reservedSpeakerHandles.contains(out)
+        let shape = handleSkeleton(latin)
+        return reservedSpeakerHandles.contains { handleSkeleton($0) == shape }
+    }
+
+    /// One shape per group of characters that read alike in a handle (see `isReservedHandle`).
+    static func handleSkeleton(_ s: String) -> String {
+        let one: [Character: Character] = ["1": "i", "l": "i", "|": "i", "!": "i", "0": "o", "3": "e", "4": "a", "@": "a", "5": "s", "$": "s",
+                                           "7": "t", "6": "b", "8": "b", "9": "g"]
+        let mapped = String(s.map { one[$0] ?? $0 })
+        return mapped.replacingOccurrences(of: "rn", with: "m").replacingOccurrences(of: "vv", with: "w")
     }
 
     /// `reserved` lets `applyOrg` and `fillVacancy` hire into a handle an open vacancy holds; everyone else is refused.

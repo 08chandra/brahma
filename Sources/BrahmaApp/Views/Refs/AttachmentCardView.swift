@@ -25,7 +25,7 @@ struct AttachmentCardView: View {
         } else {
             Button(action: open) { content }
                 .buttonStyle(.plain)
-                .refContextMenu(model: model, ref: card.ref, messageId: messageId)
+                .refContextMenu(model: model, ref: card.ref, title: card.title, messageId: messageId)
                 .help("Open beside the conversation")
         }
     }

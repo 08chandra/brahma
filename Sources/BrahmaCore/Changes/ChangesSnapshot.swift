@@ -394,6 +394,14 @@ extension Store {
 /// Plain parsing of a unified patch into per-file sections (no regex over agent text). The path helpers are public so the app's
 /// `DiffModel` reads paths exactly as the engine does (C6b I-1).
 public enum ChangesPatch {
+    /// C7a fix round 1 (I-1): the engine's identity of any patch — each section's path and the start lines and counts of its
+    /// hunks, read exactly as `ChangesSnapshot.sectionPaths`/`sectionHunks` are — so a static diff or a commit can be verified
+    /// against it (`ChangesTabModel.verify`) before anything of the app's parse is drawn.
+    public static func identity(_ patch: String) -> (paths: [String], hunks: [[HunkSpan]]) {
+        let sections = parse(patch)
+        return (sections.map(\.path), sections.map(DiffAnchoring.spans(of:)))
+    }
+
     /// C6b R2-1: what a patch line is to a hunk reader.
     public enum LineMarker: Equatable, Sendable {
         /// `@@ … @@`.

@@ -24,7 +24,7 @@ enum RefActions {
         Task { await model.showBar.update(query: "Explain this") }
     }
 
-    /// Save As…: the owner's save panel, then `AppModel.export` (gated, quarantined, recorded).
+    /// Save As…: the owner's save panel (suggesting `suggestedName`), then `AppModel.export` (gated, quarantined, recorded).
     static func saveAs(model: AppModel, ref: WorkRef, suggested: String) {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = suggested
@@ -44,18 +44,11 @@ enum RefActions {
         Task { await model.openInInspector(WorkRef(kind: .thread, id: messageId), messageId: messageId) }
     }
 
-    /// The file name Save As… suggests: an engine-made name (`F-3`, `ENG-1-diff`), never the agent's path text.
-    static func suggestedName(_ ref: WorkRef) -> String {
-        let base = OpenedRef.kindChip(for: ref).lowercased()
-        let id = ref.id.filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
-        switch ref.kind {
-        case .resource: return "F-\(id)"
-        case .file:
-            let last = ref.id.split(separator: "/").last.map(String.init) ?? "file"
-            let safe = last.filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_") }
-            return safe.isEmpty || safe.hasPrefix(".") ? "file" + safe : safe
-        default: return id.isEmpty ? base : "\(id)-\(base)"
-        }
+    /// The file name Save As… suggests (fix round 1, M-3): the model's gated display title, sanitized by the model
+    /// (`RefBodies.saveName`: last component, no separators, control, bidi or format characters), never the agent's raw path;
+    /// the ref's kind when no title is known.
+    static func suggestedName(_ ref: WorkRef, title: String?) -> String {
+        RefBodies.saveName(title: title ?? "", kind: ref.kind)
     }
 }
 
@@ -136,7 +129,7 @@ extension View {
     /// The ref context menu (collab design §3.6): Ask to explain, Copy ref, Share to…, Quote and Reply in thread (for a
     /// message: `messageId` is quoted, `threadRoot` — the message itself unless it is a reply — is the thread replied in),
     /// Save As…, Open in preview. Nothing for a nil ref (a locked card opens nothing).
-    func refContextMenu(model: AppModel, ref: WorkRef?, messageId: String? = nil, threadRoot: String? = nil) -> some View {
+    func refContextMenu(model: AppModel, ref: WorkRef?, title: String? = nil, messageId: String? = nil, threadRoot: String? = nil) -> some View {
         let root = threadRoot ?? messageId
         return contextMenu {
             if let ref {
@@ -148,7 +141,7 @@ extension View {
                     Button("Reply in thread") { RefActions.replyInThread(model: model, messageId: root ?? messageId) }
                 }
                 Divider()
-                Button("Save As…") { RefActions.saveAs(model: model, ref: ref, suggested: RefActions.suggestedName(ref)) }
+                Button("Save As…") { RefActions.saveAs(model: model, ref: ref, suggested: RefActions.suggestedName(ref, title: title)) }
                 Button("Open in preview") { RefActions.openInPreview(model: model, ref: ref) }
             } else if let messageId {
                 Button("Quote") { RefSheets.shared.share = RefSheets.Share(refs: [], quoteMessageId: messageId) }

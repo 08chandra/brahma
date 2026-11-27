@@ -11,7 +11,9 @@ import Foundation
     }
 
     @Test(arguments: ["Concierge", "concierge", "CONCIERGE", "\u{0441}oncierge", "c0ncierge", "con-cierge", "brahma", "Brahma", "brahrna",
-                      "br4hma", "owner", "0wner", "\u{043E}wner"])
+                      "br4hma", "owner", "0wner", "\u{043E}wner",
+                      // Fix round 1 (M-5): digit and letter confusables.
+                      "conc1erge", "concierg3", "c0nc1erge", "conc|erge", "concIerge", "concier9e", "bra hma", "6rahma", "own3r", "0vvner"])
     func reservedHandlesAreRefused(_ name: String) throws {
         let (store, c) = try company()
         #expect(Store.isReservedHandle(name))

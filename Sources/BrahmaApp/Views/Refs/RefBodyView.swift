@@ -37,9 +37,10 @@ struct RefBodyView: View {
         switch refBody.content {
         case .code(let lines, let firstLine, let highlight, let hasHidden):
             CodeView(lines: lines, firstLine: firstLine, highlight: highlight, hasHidden: hasHidden)
-                .refContextMenu(model: model, ref: opened?.ref)
+                .refContextMenu(model: model, ref: opened?.ref, title: refBody.header.title)
         case .diff(let diff, let live, let updated):
-            DiffView(diff: diff, live: live, uncommitted: opened?.ref.isWorktree ?? false, updatedText: updated)
+            // The header carries the model's chips (UNCOMMITTED, LIVE, TAINTED…); the diff draws none of its own.
+            DiffView(diff: diff, updatedText: live ? updated : nil)
         case .changes(let key, let compare):
             LiveDiffBody(model: model, key: key, compare: compare)
         case .file(let file, let provenance):
@@ -127,7 +128,7 @@ struct RefHeaderView: View {
         .padding(.vertical, BrahmaTheme.spaceXS + 2)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(BrahmaTheme.bg2)
-        .refContextMenu(model: model, ref: opened?.ref, messageId: Self.messageId(opened))
+        .refContextMenu(model: model, ref: opened?.ref, title: header.title, messageId: Self.messageId(opened))
         .sheet(item: $original) { o in OriginalSheet(original: o) }
     }
 
@@ -159,7 +160,9 @@ struct RefHeaderView: View {
         case .askToExplain:
             iconButton("questionmark.bubble", "Ask to explain") { RefActions.askToExplain(model: model, ref: ref) }
         case .saveAs:
-            iconButton("arrow.down.doc", "Save As…") { RefActions.saveAs(model: model, ref: ref, suggested: RefActions.suggestedName(ref)) }
+            iconButton("arrow.down.doc", "Save As…") {
+                RefActions.saveAs(model: model, ref: ref, suggested: RefActions.suggestedName(ref, title: header.title))
+            }
         case .openInChat:
             iconButton("bubble.left.and.bubble.right", "Open in chat") { Task { await model.openInChat(messageId: ref.id) } }
         case .viewOriginal:
@@ -244,10 +247,12 @@ private struct LiveDiffBody: View {
 
     var body: some View {
         if let changes = model.changes, changes.selectedKey == key, changes.compare == compare {
-            if let diff = changes.diff, let snapshot = changes.snapshot {
-                DiffView(diff: diff, live: changes.isLive, uncommitted: snapshot.target == "worktree", updatedAt: snapshot.computedAt)
-            } else if let error = changes.error {
+            // Fix round 1 (M-4): a refusal first — a refused or failed generation never draws the previous diff.
+            if let error = changes.error {
                 RefUnavailableView(text: error)
+            } else if let diff = changes.diff, let snapshot = changes.snapshot {
+                // The model's chips are the header's (`liveOpenedBody`); the diff draws none of its own.
+                DiffView(diff: diff, updatedAt: snapshot.computedAt)
             } else {
                 ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
