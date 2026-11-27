@@ -1,0 +1,29 @@
+---
+title: CSandboxCheck
+description: "Three C functions over sandbox_check: is a process sandboxed, may it write a path, may it look up a Mach name. The engine's way to recognise a turn's processes by their sandbox alone."
+---
+
+import ModuleFacts from '../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../components/SourceLink.astro';
+
+## Purpose
+
+Three C functions over `sandbox_check`, the one place the package calls it: the function is variadic, which Swift cannot call. They ask the kernel what another process's sandbox allows, without that process's cooperation: whether `pid` runs under a sandbox profile, whether its sandbox denies writing a path, and whether it allows a Mach lookup of a global name. A process cannot drop the sandbox it was started in, so the engine uses the Mach-name answer, with a per-run unique name no real service answers, to recognise what is left of an agent's earlier turn. Off macOS every call returns `-1`.
+
+## Key types
+
+The target has no types. Its public API is three functions, listed in the [API reference](/api/csandboxcheck/documentation/csandboxcheck/):
+
+- `brahma_sandbox_is_sandboxed(pid)` — `1` sandboxed, `0` not, `-1` cannot be told.
+- `brahma_sandbox_write_denied(pid, path)` — `0` allowed, `1` denied, `-1` cannot be told; the path must exist, and an unsandboxed process is allowed everything.
+- `brahma_sandbox_mach_allowed(pid, name)` — `1` allowed, `0` denied, `-1` cannot be told; nothing is logged.
+
+## How it connects
+
+- **Called by BrahmaCore's Turns area.** `TurnProcess.swift` is the only file in the package that imports it; its `SandboxCheck` enum wraps the three functions and turns `-1` into `nil`, for the sweep that classifies a turn's surviving processes.
+- **Linked by BrahmaCore only.** `Package.swift` makes `CSandboxCheck` a dependency of `BrahmaCore` and of nothing else.
+- **Calls the kernel.** `sandbox_check` is declared `extern`; the write check uses the `file-write-data` operation and the Mach check `mach-lookup`, both with the no-report flag so a denial is never logged.
+
+<ModuleFacts module="CSandboxCheck" />
+
+<SourceLink path="Sources/CSandboxCheck" />

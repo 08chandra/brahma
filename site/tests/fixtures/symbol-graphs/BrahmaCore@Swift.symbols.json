@@ -1,0 +1,22 @@
+{
+  "metadata": { "formatVersion": { "major": 0, "minor": 6, "patch": 0 }, "generator": "fixture: extension graph (BrahmaCore extends Swift)" },
+  "module": { "name": "BrahmaCore", "platform": {} },
+  "symbols": [
+    {
+      "kind": { "identifier": "swift.property", "displayName": "Instance Property" },
+      "identifier": { "precise": "s:SS10BrahmaCoreE11shellQuotedSSvp", "interfaceLanguage": "swift" },
+      "pathComponents": ["String", "shellQuoted"],
+      "names": { "title": "shellQuoted" },
+      "accessLevel": "public",
+      "location": { "uri": "file:///Users/example/repo/Sources/BrahmaCore/Util/String+Shell.swift", "position": { "line": 2, "character": 15 } }
+    },
+    {
+      "kind": { "identifier": "swift.func.op", "displayName": "Operator" },
+      "identifier": { "precise": "s:SQsE2neoiySbx_xtFZ::SYNTHESIZED::s:10BrahmaCore3FooV", "interfaceLanguage": "swift" },
+      "pathComponents": ["Foo", "!=(_:_:)"],
+      "names": { "title": "!=(_:_:)" },
+      "accessLevel": "public"
+    }
+  ],
+  "relationships": []
+}

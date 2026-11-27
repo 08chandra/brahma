@@ -1,0 +1,80 @@
+---
+title: brahma (CLI)
+description: "The command-line executable over the same library: the root command, what every command shares, the engine and MCP server entry points, and one source file per command group."
+---
+
+import SourceLink from '../../../../components/SourceLink.astro';
+
+## Purpose
+
+The command-line executable over the same library. `Brahma` in `Brahma.swift` is the root `AsyncParsableCommand`; its `subcommands` list names every command group, one Swift file each. Owner commands open the store, do their work and exit. `brahma run` builds an `Orchestrator` and runs it in the terminal under the lock the app uses; `brahma mcp` runs the company MCP server for one agent over stdio; `brahma hook` is the tool hooks the `claude` process runs inside agent turns. `CLISupport.swift` holds what every command shares: `openStore()`, the secret vault, `safe()` and `fail()`. The [CLI reference](/docs/cli/) is generated from `brahma --help`.
+
+## Key types
+
+This target has no public symbols, so there is no API reference for it. The types and functions below are internal.
+
+- `Brahma` — the root command; its `subcommands` array is the list of command groups.
+- `openStore()` — resolves the data home, refuses a bad secret-store choice, opens the `Store`, validates and locks down the data home, and arms the lazy secrets loader.
+- `cliSecretVault(interactive:)` — the process's vault; interactive only for explicit owner actions.
+- `safe()` and `fail()` — agent-controlled text never reaches the terminal raw; errors go to stderr as `brahma: <message>` with exit code `1`.
+- `Run` — `brahma run`: the orchestrator in the foreground until Ctrl-C.
+- `MCP` — `brahma mcp`: the company tools server over stdio.
+
+## How it connects
+
+- **Calls BrahmaCore.** `42` of the `43` files import it; `Brahma.swift` is the one that does not. `openStore()` builds the `Store` with `PackCatalog.loadOrBuiltin` and runs `DataHomeGuard`; `Run` builds an `Orchestrator`; `MCP` builds an `MCPServer` over `CompanyTools`; `Doctor` runs `Doctor.run`; `hook pre-tool` and `hook post-tool` call `PreToolHook.run` and `PostToolHook.handle`.
+- **Calls BrahmaKeychain.** `6` files import it. `openStore()` refuses a bad store choice first; `cliSecretVault` and `ownerKeyStore(for:)` resolve the vault and the owner-key store; `brahma mcp` resolves its vault non-interactively.
+- **Started by the engine.** `brahma run` passes its own executable as the MCP executable for each turn's `brahma mcp`; the app looks for the same binary at `Contents/Helpers/brahma` inside its bundle. `brahma hook` is run by the `claude` process, from the `hooks` entries in the settings file the engine compiles for each turn.
+- **Called by nothing in the package.** It is an executable target; `Package.swift` lists its dependencies as `BrahmaCore`, `BrahmaKeychain` and `ArgumentParser`.
+
+## Files and command groups
+
+`Sources/brahma/`, `43` files. Each command group links to its page in the generated reference. `dev` and `hook` are hidden from `--help` (`shouldDisplay: false`) and have no page; `help` is ArgumentParser's built-in.
+
+| Source file | Commands |
+| --- | --- |
+| `Brahma.swift` | the root command: [`brahma`](/docs/cli/) |
+| `CLISupport.swift` | shared helpers, no command |
+| `AccessCommands.swift` | [`access`](/docs/cli/access/), [`grants`](/docs/cli/grants/), [`presets`](/docs/cli/presets/) |
+| `AgentCommands.swift` | [`hire`](/docs/cli/hire/), [`kill`](/docs/cli/kill/), [`pause`](/docs/cli/pause/), [`wake`](/docs/cli/wake/) |
+| `BackupCommands.swift` | [`backup`](/docs/cli/backup/), [`restore`](/docs/cli/restore/), [`export`](/docs/cli/export/) |
+| `CanaryCommands.swift` | [`canary`](/docs/cli/canary/) |
+| `CompanyCommands.swift` | [`company`](/docs/cli/company/) |
+| `DevCommands.swift` | `dev` (hidden; `BRAHMA_DEV=1`) |
+| `DigestCommand.swift` | [`digest`](/docs/cli/digest/) |
+| `DoctorCommand.swift` | [`doctor`](/docs/cli/doctor/) |
+| `ExtCommands.swift` | [`ext`](/docs/cli/ext/) |
+| `HookCommand.swift` | `hook` (hidden) |
+| `HostingCommands.swift` | [`hosting`](/docs/cli/hosting/) |
+| `InboxCommands.swift` | [`inbox`](/docs/cli/inbox/), [`approve`](/docs/cli/approve/), [`answer`](/docs/cli/answer/), [`rescind`](/docs/cli/rescind/) |
+| `ItemCommands.swift` | [`items`](/docs/cli/items/) |
+| `KBCommands.swift` | [`kb`](/docs/cli/kb/) |
+| `LabCommands.swift` | [`lab`](/docs/cli/lab/) |
+| `MainCommand.swift` | [`main`](/docs/cli/main/) |
+| `MCPCommand.swift` | [`mcp`](/docs/cli/mcp/) |
+| `MemoryCommands.swift` | [`memory`](/docs/cli/memory/) |
+| `MessageCommands.swift` | [`say`](/docs/cli/say/), [`log`](/docs/cli/log/), [`search`](/docs/cli/search/) |
+| `ModeCommands.swift` | [`mode`](/docs/cli/mode/) |
+| `NoticesCommand.swift` | [`notices`](/docs/cli/notices/) |
+| `OrgCommands.swift` | [`org`](/docs/cli/org/) |
+| `OwnerCommand.swift` | [`owner`](/docs/cli/owner/) |
+| `PerfCommands.swift` | [`perf`](/docs/cli/perf/) |
+| `PrefsCommand.swift` | [`prefs`](/docs/cli/prefs/) |
+| `PreviewCommands.swift` | [`preview`](/docs/cli/preview/) |
+| `PushCommand.swift` | [`push`](/docs/cli/push/) |
+| `ReleaseCommands.swift` | [`release`](/docs/cli/release/), [`milestones`](/docs/cli/milestones/) |
+| `ReplayCommand.swift` | [`replay`](/docs/cli/replay/) |
+| `ResourceCommands.swift` | [`resource`](/docs/cli/resource/) |
+| `RunCommand.swift` | [`run`](/docs/cli/run/) |
+| `SandboxCommands.swift` | [`company profile`](/docs/cli/company/profile/), [`network`](/docs/cli/network/) |
+| `SecretCommands.swift` | [`secret`](/docs/cli/secret/) |
+| `SettingsCommands.swift` | [`settings`](/docs/cli/settings/) |
+| `SprintCommands.swift` | [`sprint`](/docs/cli/sprint/) |
+| `StatusCommand.swift` | [`status`](/docs/cli/status/) |
+| `StopCommand.swift` | [`stop`](/docs/cli/stop/), [`resume`](/docs/cli/resume/) |
+| `TaskCommands.swift` | [`task`](/docs/cli/task/) |
+| `TimersCommand.swift` | [`timers`](/docs/cli/timers/) |
+| `TranscriptCommand.swift` | [`transcript`](/docs/cli/transcript/) |
+| `WhyCommand.swift` | [`why`](/docs/cli/why/) |
+
+<SourceLink path="Sources/brahma" />

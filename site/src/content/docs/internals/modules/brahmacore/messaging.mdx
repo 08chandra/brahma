@@ -1,0 +1,30 @@
+---
+title: Messaging
+description: "Posting a message to a channel or DM, and the wake policy that decides which agents a message wakes."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+`MessageRouter` is the one way a message enters the store: it writes the row, fans out inbox items to the recipients, and marks which of them wake. `WakePolicy` is the rule: channel membership is not attention. Only a direct address (a DM or an `@mention`), a reply to someone the agent waits on, or a permitted `@here` or `@team` broadcast wakes an agent; broadcasts are limited to managers and executives, `2` per hour. System messages in channels never wake anybody; a system DM does. A message whose text impersonates the owner is flagged on the way in.
+
+## Key types
+
+- [`MessageRouter`](/api/brahmacore/documentation/brahmacore/messagerouter/) — `post` and `sendDM`.
+- [`WakePolicy`](/api/brahmacore/documentation/brahmacore/wakepolicy/) — who a message wakes, and the broadcast limits.
+- [`PostResult`](/api/brahmacore/documentation/brahmacore/postresult/) — what a post did, including any refusal text.
+- [`NoticeRecipientRole`](/api/brahmacore/documentation/brahmacore/noticerecipientrole/) — how a recipient relates to the item an event is about.
+- [`RouterError`](/api/brahmacore/documentation/brahmacore/routererror/) — a refused post.
+
+## How it connects
+
+- **Called by Store.** The ask lifecycle, asks and the budget step send their system DMs through `MessageRouter(store:)`.
+- **Called by MCP.** `CompanyTools` posts agents' messages through the router.
+- **Called by Orchestrator, Engine and Work.** Timer-fired turns, engine alerts and the watchdog's DMs all use it.
+- **Calls Safety.** `OwnerImpersonation.flags` marks text that pretends to be the owner.
+
+<ModuleFacts module="BrahmaCore" area="Messaging" />
+
+<SourceLink path="Sources/BrahmaCore/Messaging" />

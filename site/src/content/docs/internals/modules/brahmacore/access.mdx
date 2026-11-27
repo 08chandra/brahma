@@ -1,0 +1,30 @@
+---
+title: Access
+description: "Grants that widen one turn's sandbox: an egress domain, a fetch domain or a read-only path, asked for by an agent and approved only by the owner."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+A grant widens the sandbox of one agent, a role, an item or the whole company by one thing: a Bash egress domain, a WebFetch domain, or a read-only path. An agent asks for one with the `request_access` tool, which files a `grant` ask. Only the owner approves it, directly or through an access preset the owner turned on. At every turn start the active grants are resolved into the inputs the sandbox scope is built from, and a ledger counts each use. This area holds the grant model, its validation rules, the presets and the refusal texts.
+
+## Key types
+
+- [`Grant`](/api/brahmacore/documentation/brahmacore/grant/) — one approved widening: kind, scope, value, duration and revocation.
+- [`GrantKind`](/api/brahmacore/documentation/brahmacore/grantkind/) and [`GrantScope`](/api/brahmacore/documentation/brahmacore/grantscope/) — what a grant opens, and for whom.
+- [`GrantResolver`](/api/brahmacore/documentation/brahmacore/grantresolver/) — turns the active grants into the sandbox scope's `GrantInputs`.
+- [`AccessPreset`](/api/brahmacore/documentation/brahmacore/accesspreset/) — an owner-chosen preset that approves a class of grant automatically.
+- [`Grants`](/api/brahmacore/documentation/brahmacore/grants/) — validation of a requested value against the company and the forbidden domains.
+
+## How it connects
+
+- **Called by MCP.** The `request_access` tool in the safety tool group calls the store's `requestAccess`, which files the ask.
+- **Called by Store.** `Store+Grants` validates a request through `Grants.validate` and keeps the grant rows and the ledger.
+- **Called by Orchestrator.** Before a turn's sandbox scope is built, the orchestrator resolves the agent's active grants with `GrantResolver.inputs`; a grant that changes mid-turn rebuilds the scope the same way.
+- **Calls Sandbox.** Host patterns are checked with the sandbox's `DomainMatcher` and its forbidden-domain list, so a grant can never name a host the sandbox refuses outright.
+
+<ModuleFacts module="BrahmaCore" area="Access" />
+
+<SourceLink path="Sources/BrahmaCore/Access" />

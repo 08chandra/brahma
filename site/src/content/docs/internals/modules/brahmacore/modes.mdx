@@ -1,0 +1,30 @@
+---
+title: Modes
+description: "Ultra admission and reservations, the zero-inference control probe, and the probe gates each settings shape must pass."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+Ultra is the `claude` CLI's Workflow runner under Brahma's caps: one approved run of an inline Workflow script on the sandboxed profile, admitted only when every hard gate holds, with its cap reserved up front and charged in full if it is killed. `UltraGate` is the pure admission rule; `UltraReservation` is the admitted run's reservation row, counted against the company's allowance and every other turn's five-hour check until released. `ControlProbe` reads the CLI's usage with no model call. `ProbeGates` names the settings shapes a gate is recorded for; `LiveProbeGates` runs the automated gates as live turns when the owner asks.
+
+## Key types
+
+- [`UltraGate`](/api/brahmacore/documentation/brahmacore/ultragate/) and [`UltraAdmission`](/api/brahmacore/documentation/brahmacore/ultraadmission/) — the hard gates and an admitted run.
+- [`UltraReservation`](/api/brahmacore/documentation/brahmacore/ultrareservation/) — the reserved cap.
+- [`UltraVariant`](/api/brahmacore/documentation/brahmacore/ultravariant/) and [`UltraCaps`](/api/brahmacore/documentation/brahmacore/ultracaps/) — the two variants and their caps.
+- [`ControlProbe`](/api/brahmacore/documentation/brahmacore/controlprobe/) and [`UsageReading`](/api/brahmacore/documentation/brahmacore/usagereading/) — the fresh usage reading.
+- [`ProbeGates`](/api/brahmacore/documentation/brahmacore/probegates/) and [`LiveProbeGates`](/api/brahmacore/documentation/brahmacore/liveprobegates/) — the shapes and the live runner.
+
+## How it connects
+
+- **Called by Orchestrator.** Before a leaseholder's work turn, `Orchestrator+Ultra` runs `UltraGate.failures` and `UltraGate.admit` and carries the `UltraAdmission` into the mode inputs.
+- **Called by Work and Store.** `ModePolicy`'s inputs include the admission; `Store+ModeRequests` validates requested modes against `UltraVariant`.
+- **Calls Turns and Engine.** The control probe runs through `TurnRunning` and reuses `ModeCanary`'s control messages.
+- **Calls Safety.** Live probe gates build on `SandboxCanary.prepare`'s throwaway company.
+
+<ModuleFacts module="BrahmaCore" area="Modes" />
+
+<SourceLink path="Sources/BrahmaCore/Modes" />

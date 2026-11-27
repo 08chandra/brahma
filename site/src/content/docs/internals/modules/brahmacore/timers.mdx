@@ -1,0 +1,30 @@
+---
+title: Timers
+description: "Calendar-facing engine timers in the owner's time zone, the registry of jobs they fire, and the system timers every engine keeps."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+An `EngineTimer` is a row with a `TimerSchedule` (`daily` and `weekly` are wall-clock times in the owner's time zone) and a `TimerAction`: run a named engine job, or start a turn for an agent with a prompt. `TimerJobRegistry` maps job names to code; `SystemTimers` is the set every engine makes sure exists, with the backup jobs bound to it. A job runs off the orchestrator actor with a `TimerContext` that gives it the store, the paths and the engine's blocking runner.
+
+## Key types
+
+- [`EngineTimer`](/api/brahmacore/documentation/brahmacore/enginetimer/) — one timer row.
+- [`TimerSchedule`](/api/brahmacore/documentation/brahmacore/timerschedule/) — when it fires.
+- [`TimerAction`](/api/brahmacore/documentation/brahmacore/timeraction/) — a job or a turn.
+- [`TimerJobRegistry`](/api/brahmacore/documentation/brahmacore/timerjobregistry/) and [`TimerContext`](/api/brahmacore/documentation/brahmacore/timercontext/) — the jobs and what they get.
+- [`SystemTimers`](/api/brahmacore/documentation/brahmacore/systemtimers/) — the timers every engine ensures.
+
+## How it connects
+
+- **Called by Orchestrator.** The timers step calls `SystemTimers.ensure`, reads `store.dueTimers`, looks each job up in the registry, and then ticks the push dispatcher.
+- **Called by Store.** `Store+Timers` creates `EngineTimer` rows; `Store+Notices` schedules the digest with `TimerSchedule.daily`.
+- **Called by Owner.** Quiet-hours arithmetic uses `TimerSchedule.daily(...).next(after:)`.
+- **Calls Backup.** The system registry binds `backup.hourly`, `backup.repos`, `backup.home` and `backup.targets` to `BackupJobs`.
+
+<ModuleFacts module="BrahmaCore" area="Timers" />
+
+<SourceLink path="Sources/BrahmaCore/Timers" />

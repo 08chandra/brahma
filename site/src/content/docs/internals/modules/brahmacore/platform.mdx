@@ -1,0 +1,23 @@
+---
+title: Platform
+description: "The macOS quarantine attribute check: whether a dropped file came from outside, failing closed when the attribute cannot be read."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+One file. `Quarantine` reads macOS's download mark, the `com.apple.quarantine` extended attribute, on a path or an open descriptor, without following links. A file that carries it came from outside the machine, which `DropTrust` uses to give it the untrusted default. The check fails closed: only "no such attribute" and "attributes not supported here" mean not quarantined; any other error counts as quarantined. Off Darwin nothing is ever quarantined.
+
+## Key types
+
+- [`Quarantine`](/api/brahmacore/documentation/brahmacore/quarantine/) — `isQuarantined(_:)` for a URL and `isQuarantined(fd:)` for a descriptor.
+
+## How it connects
+
+- **Called by Resources.** `ResourceIntake.inspect` asks `Quarantine.isQuarantined(fd:)` on the descriptor it already holds for each dropped file, so the trust decision and the secret scan read the same file.
+
+<ModuleFacts module="BrahmaCore" area="Platform" />
+
+<SourceLink path="Sources/BrahmaCore/Platform" />

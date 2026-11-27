@@ -1,0 +1,49 @@
+/* Motion tokens and the one orchestrated reveal. Only opacity and transform ever animate. */
+:root {
+  --dur-fast: 120ms; /* hover, focus colour */
+  --dur: 200ms; /* state changes */
+  --dur-slow: 600ms; /* the console's new-line flash (visual spec: 600 ms) */
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+/* Page-load reveal: 200 ms fade + 6 px rise, staggered 60 ms by --i (set inline: style="--i: 2"). */
+.reveal {
+  animation: reveal var(--dur) var(--ease) both;
+  animation-delay: calc(var(--i, 0) * 60ms);
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Running-status pulse (Chip). */
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal {
+    animation: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

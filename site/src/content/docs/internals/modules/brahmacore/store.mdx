@@ -1,0 +1,31 @@
+---
+title: Store
+description: "The one SQLite database, brahma.sqlite, opened through GRDB in WAL mode, and every durable operation on it: companies, agents, work, asks, leases, turns, secrets' names, memory, handbook, releases."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+`Store` is the database. `Store.swift` opens it, migrates it and owns the writer; the 47 `Store+<topic>.swift` files are the operations, one topic each: work items and leases, asks, messaging, sprints, grants, secrets (names and flags; values stay in the vault), memory, handbook, hosting and releases, previews, timers, notices and digests, taint, verification, the main guard, and the engine's holds and credentials. Every process (app, CLI, engine, each turn's MCP server) opens the same file, so the store is also the message bus. Every company-scoped query is bound to one `companyId`: another company's row answers like a missing one.
+
+## Key types
+
+- [`Store`](/api/brahmacore/documentation/brahmacore/store/) — the database and its writer.
+- [`StoreError`](/api/brahmacore/documentation/brahmacore/storeerror/) — a refused or failed operation.
+- [`WorkLease`](/api/brahmacore/documentation/brahmacore/worklease/) — the single-writer lease on an item.
+- [`VerificationRun`](/api/brahmacore/documentation/brahmacore/verificationrun/) — one run of an item's check.
+- [`TurnCredentialContext`](/api/brahmacore/documentation/brahmacore/turncredentialcontext/) — what a live turn credential was issued for.
+- [`SessionPolicy`](/api/brahmacore/documentation/brahmacore/sessionpolicy/) — which session a turn belongs to.
+
+## How it connects
+
+- **Opened by the CLI, the app and the engine.** `openStore()` in the CLI, `reopenStore()` in the app model and `Orchestrator(store:)` in both hosts share one `Store`.
+- **Called by MCP.** `CompanyTools` writes straight to the store after checking `turnCredentialIsLive`.
+- **Calls Model.** Every operation fetches and persists the model records.
+- **Calls the other areas.** The store's topic files call out rather than in: `MessageRouter` for DMs, `KBAccess` for handbook reads, `Grants.validate` for grants, `WorkPolicy` for who may change an item, `SandboxedCheckRunner` for the smoke check, `GitWorkspace` for the installed git, and `MemoryIngestDoc` for indexing.
+
+<ModuleFacts module="BrahmaCore" area="Store" />
+
+<SourceLink path="Sources/BrahmaCore/Store" />

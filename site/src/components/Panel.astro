@@ -1,0 +1,77 @@
+---
+/**
+ * Instrument panel: bg2 body, 28 px bg3 header strip with an uppercase title and an
+ * optional right-aligned `actions` slot, 1 px hairline, 2 px radius, no shadow.
+ * `dense` tightens the body padding to 8 px (tables, key–value grids).
+ */
+import Label from './Label.astro';
+
+interface Props {
+  title?: string;
+  titleAs?: 'h2' | 'h3' | 'p'; // heading level of the title; `p` when the panel is a widget, not a section
+  dense?: boolean;
+  flush?: boolean; // body has no padding (for tables that run edge to edge)
+  class?: string;
+  id?: string;
+}
+const { title, titleAs = 'h3', dense = false, flush = false, class: className, id } = Astro.props;
+const hasActions = Astro.slots.has('actions');
+---
+
+<section class:list={['panel', { 'panel--dense': dense, 'panel--flush': flush }, className]} id={id}>
+  {
+    (title || hasActions) && (
+      <header class="panel__head">
+        {title && <Label as={titleAs}>{title}</Label>}
+        {hasActions && (
+          <div class="panel__actions">
+            <slot name="actions" />
+          </div>
+        )}
+      </header>
+    )
+  }
+  <div class="panel__body"><slot /></div>
+</section>
+
+<style>
+  .panel {
+    background: var(--bg2);
+    border: var(--hairline);
+    border-radius: var(--radius);
+    min-width: 0;
+  }
+  .panel__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s-3);
+    height: 1.75rem; /* 28 px */
+    padding: 0 var(--s-3);
+    background: var(--bg3);
+    border-bottom: var(--hairline);
+    border-radius: var(--radius) var(--radius) 0 0;
+  }
+  .panel__head :global(.label) {
+    margin: 0;
+    font-size: var(--text-label);
+  }
+  .panel__actions {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--text1);
+  }
+  .panel__body {
+    padding: var(--s-4);
+  }
+  .panel--dense .panel__body {
+    padding: var(--s-2);
+  }
+  .panel--flush .panel__body {
+    padding: 0;
+    overflow-x: auto;
+  }
+</style>

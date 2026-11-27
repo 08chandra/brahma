@@ -1,0 +1,32 @@
+---
+title: Orchestrator
+description: "The one engine per machine: an actor whose tick recovers, reaps, gates and starts turns across every company, the per-launch sandbox gate, and the lock that keeps two engines off one data home."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+`Orchestrator` is a Swift actor, one per machine. At start it recovers turns left running. Each tick it checks the stop and holds, reaps leases, sweeps reviews, asks and timers, runs memory ingest and the handbook refresh, applies the usage gate and the turn budget, then starts turns for the agents the scheduler picks; each turn is a child task that builds the sandbox, compiles the profile, runs the `claude` process and ends the turn in one store transaction. `OrchestratorLock` is the `flock` that keeps a second engine off the data home; `BrahmaPaths` names every place under it.
+
+## Key types
+
+- [`Orchestrator`](/api/brahmacore/documentation/brahmacore/orchestrator/) — the engine actor.
+- [`OrchestratorLock`](/api/brahmacore/documentation/brahmacore/orchestratorlock/) and [`OrchestratorLockError`](/api/brahmacore/documentation/brahmacore/orchestratorlockerror/) — one engine per data home.
+- [`BrahmaPaths`](/api/brahmacore/documentation/brahmacore/brahmapaths/) — the data home's layout.
+- [`SandboxEnvironment`](/api/brahmacore/documentation/brahmacore/sandboxenvironment/) and [`SandboxCanaryGate`](/api/brahmacore/documentation/brahmacore/sandboxcanarygate/) — the per-launch sandbox gate.
+- [`OrchestratorError`](/api/brahmacore/documentation/brahmacore/orchestratorerror/) — why the engine refused to start.
+
+## How it connects
+
+- **Constructed by the CLI and the app.** `brahma run` and the app's `EngineHost` each take the `OrchestratorLock` and build an `Orchestrator(store:...)`.
+- **Calls Scheduler and Work.** Per tick: `UsageGate.evaluateParts`, `Scheduler.select`, `ModePolicy.select`.
+- **Calls Sandbox and Turns.** Per turn: `SandboxScope.forTurn`, then `runner.run(request)` on a `TurnRequest`.
+- **Calls Engine, Memory, Handbook and Timers.** `Doctor.run` in the health step, `MemoryIngest.run` and `HandbookRefresh.run` per company, and `store.dueTimers` in the timers step.
+- **Owns the long-lived services.** It constructs the `ReleaseExecutor`, `PreviewRunner`, `PushDispatcher`, `WALShipper`, the `Blocking` pool and the default `CheckRunning`.
+- **Calls Lifecycle.** Agents move between states through `store.transition`.
+
+<ModuleFacts module="BrahmaCore" area="Orchestrator" />
+
+<SourceLink path="Sources/BrahmaCore" />

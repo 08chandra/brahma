@@ -1,0 +1,44 @@
+---
+title: BrahmaApp
+description: "The SwiftUI views and the menu bar extra: the executable the owner runs. Boot, windows, theme, the harness, and the file list. No public API."
+---
+
+import SourceLink from '../../../../components/SourceLink.astro';
+
+## Purpose
+
+The SwiftUI views and the menu bar extra: the executable the owner runs. `BrahmaApp` declares the main window, the pop-out Agent Map window and the `MenuBarExtra`. `AppDelegate` boots: it picks the owner-key store and the secrets vault, opens the database the way the CLI's `openStore()` does, builds the `AppModel` and the `EngineHost`, and posts Inbox banners through `UNNotificationPoster`. `MainWindow` draws the top bar, company rail, sidebar and detail pane; the views under `Views/` each render one part of the snapshot. `BrahmaTheme` turns `ThemeHex` into SwiftUI colours and fonts. `Harness` runs the smoke, snapshot and map-bench launch modes.
+
+## Key types
+
+This target has no public symbols, so there is no API reference for it. The types below are internal.
+
+- `BrahmaApp` — the `App`: the `main` window, the `map` window and the menu bar extra.
+- `AppDelegate` — boot, the signal handlers, the quit path and the notification poster.
+- `MainWindow` — the shell: top bar over rail, sidebar and detail, plus the sheets.
+- `MenuBarContent` — a native menu: the emergency stop, totals, per-company toggles, open and quit.
+- `AgentMapPanel` — the org-chart panel and its header, inline or in the pop-out window.
+- `BrahmaTheme` — the design tokens every view uses instead of ad-hoc colours and fonts.
+
+## How it connects
+
+- **Calls BrahmaAppModel.** `61` of the `65` files import it. `AppDelegate` builds the `AppModel` and the `EngineHost`; `MenuBarContent` renders `model.menuBar`; `UNNotificationPoster` implements `NotificationPosting`; every colour in `BrahmaTheme` reads `ThemeHex`.
+- **Calls BrahmaKeychain.** Only `AppDelegate` imports it: `PlatformOwnerKeyStore.resolve` for the owner key, and `PlatformSecretVault.resolve` twice, non-interactive for the engine and interactive for the owner's "Load secrets".
+- **Calls BrahmaMapKit.** `AgentMapPanel` mounts an `OrgView`; `Harness` finds the `MapSKView` for `--map-bench`.
+- **Calls BrahmaCore directly** for the model types the views show, for example `EmergencyStop.buttonTitle` in the menu and `BrahmaPaths.fromEnvironment()` at boot.
+- **Called by nothing.** It is an executable target; `Package.swift` lists its dependencies as `BrahmaAppModel`, `BrahmaKeychain` and `BrahmaMapKit`.
+
+## Files
+
+`Sources/BrahmaApp/`, `65` files:
+
+- Top level: `AppDelegate.swift`, `BrahmaApp.swift`, `Harness.swift`.
+- `Owner/`: `UNNotificationPoster.swift`.
+- `Theme/`: `BrahmaTheme.swift`, `Components.swift`, `Controls.swift`, `Instruments.swift`.
+- `Views/`: `AccessCardView.swift`, `ActivityFeedView.swift`, `AgentsView.swift`, `BacklogView.swift`, `BackupsView.swift`, `BoardView.swift`, `BudgetView.swift`, `ChatView.swift`, `CompanyRail.swift`, `CompanySettingsView.swift`, `Composer.swift`, `DeployCardView.swift`, `DetailView.swift`, `DigestView.swift`, `EngineBanner.swift`, `GrantsView.swift`, `HireSheet.swift`, `HostingPanel.swift`, `HumanTaskCardView.swift`, `InboxView.swift`, `ItemEditorSheet.swift`, `LiveCardFallbackView.swift`, `MainWindow.swift`, `MenuBarContent.swift`, `MissionControlView.swift`, `NewCompanySheet.swift`, `NewDMPicker.swift`, `OrgPreview.swift`, `ReleasesView.swift`, `ReplayView.swift`, `SearchResultsView.swift`, `SecretSheet.swift`, `Sidebar.swift`, `StartupErrorView.swift`, `StoragePanel.swift`, `TopBar.swift`, `WorkComponents.swift`.
+- `Views/Handbook/`: `HandbookView.swift`, `KBEditSheet.swift`, `KBPageView.swift`, `MemoryBrowserView.swift`.
+- `Views/Map/`: `AgentMapPanel.swift`, `FillVacancySheet.swift`, `MapHeader.swift`, `MapHoverCardView.swift`, `MapScrubber.swift`, `MapTeamCardView.swift`, `MapWindow.swift`, `VacancySheet.swift`.
+- `Views/Preview/`: `AgentBuiltFrame.swift`, `PreviewPane.swift`, `TurnStreamView.swift`, `WebPreviewView.swift`.
+- `Views/Resources/`: `DropZone.swift`, `PendingDropChips.swift`, `ResourceSecretSheet.swift`, `ResourcesView.swift`.
+
+<SourceLink path="Sources/BrahmaApp" />

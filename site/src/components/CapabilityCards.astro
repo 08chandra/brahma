@@ -1,0 +1,146 @@
+---
+/**
+ * Capability matrix on Home: four whole-cell links into the docs, laid out as one hairline
+ * panel split 2 × 2 (1 px dividers from a 1 px gap over --line), not four floating cards.
+ * Each cell: uppercase label, sans title, one sentence, and its destination path in mono.
+ * Hover (and press) lifts the cell to bg3, where the link blue still passes AA (4.54:1);
+ * focus-visible draws the 2 px accent ring inside the cell.
+ */
+interface Props {
+  headingId: string;
+}
+const { headingId } = Astro.props;
+
+const cards = [
+  {
+    label: 'Work system',
+    title: 'The engine is the referee.',
+    body: 'Agents claim items from a backlog and work in their own git worktrees. The engine runs each check and merges into main; on the default Sandboxed profile, no agent can mark its own work done.',
+    href: '/docs/concepts/work-items/',
+  },
+  {
+    label: 'Safety',
+    title: 'Every turn runs under a profile.',
+    body: 'Sandboxed, the default, confines a turn with macOS Seatbelt to its own places in the workspace. Workspace and Full give that up, and the docs say exactly how.',
+    href: '/docs/safety/profiles/',
+  },
+  {
+    label: 'Live previews',
+    title: 'A preview from every merge.',
+    body: 'The engine serves a web preview from main on a loopback port and restarts it when main moves. A deploy happens only after you approve it.',
+    href: '/docs/concepts/previews-and-hosting/',
+  },
+  {
+    label: 'Inside Brahma',
+    title: 'Read how it is built.',
+    body: 'The orchestrator, the turn sandbox, the store and the Mac app, module by module, down to the Swift API reference.',
+    href: '/internals/architecture/',
+  },
+];
+---
+
+<ul class="caps" aria-labelledby={headingId}>
+  {
+    cards.map((card) => (
+      <li class="cap">
+        <a class="cap__link" href={card.href}>
+          <span class="cap__label label">{card.label}</span>
+          <h3 class="cap__title">{card.title}</h3>
+          <p class="cap__body">{card.body}</p>
+          <span class="cap__path">
+            <span>{card.href}</span>
+            <span class="cap__arrow" aria-hidden="true">
+              →
+            </span>
+          </span>
+        </a>
+      </li>
+    ))
+  }
+</ul>
+
+<style>
+  .caps {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1px;
+    background: var(--line);
+    border: var(--hairline);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  @media (min-width: 40em) {
+    .caps {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+  .cap {
+    margin: 0;
+    min-width: 0;
+    display: flex;
+  }
+  .cap__link {
+    flex: 1;
+    display: grid;
+    grid-template-rows: auto auto 1fr auto;
+    gap: var(--s-2);
+    padding: var(--s-5);
+    background: var(--bg2);
+    color: inherit;
+    text-decoration: none;
+    transition: background-color var(--dur-fast) var(--ease);
+  }
+  .cap__link:hover {
+    background: var(--bg3);
+  }
+  .cap__link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    border-radius: 0;
+  }
+  .cap__title {
+    margin: var(--s-1) 0 0;
+    font-family: var(--font-sans);
+    font-size: var(--step-2);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.2;
+    color: var(--text0);
+  }
+  .cap__body {
+    margin: 0;
+    font-size: var(--text-ui);
+    line-height: 1.55;
+    color: var(--text1);
+    max-width: 52ch;
+  }
+  .cap__path {
+    display: inline-flex;
+    gap: var(--s-2);
+    align-items: baseline;
+    margin-top: var(--s-3);
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--text-link);
+    overflow-wrap: anywhere;
+  }
+  .cap__path > span:first-child {
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+    text-decoration-color: color-mix(in srgb, var(--text-link) 45%, transparent);
+    transition: text-decoration-color var(--dur-fast) var(--ease);
+  }
+  .cap__link:hover .cap__path > span:first-child {
+    text-decoration-color: var(--text-link);
+  }
+  .cap__arrow {
+    transition: transform var(--dur-fast) var(--ease);
+  }
+  .cap__link:hover .cap__arrow {
+    transform: translateX(3px);
+  }
+</style>

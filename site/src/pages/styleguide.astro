@@ -1,0 +1,610 @@
+---
+/**
+ * /styleguide — the design system rendered: every token with its hex, the type scale, the
+ * spacing scale, every component in every state, a code block, a zebra table, a chip row.
+ * Not indexed (robots noindex, pagefind off); it is a reference for reviewers and later
+ * tasks, not a public page.
+ */
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import { Code } from '@astrojs/starlight/components';
+import Label from '../components/Label.astro';
+import Panel from '../components/Panel.astro';
+import Chip from '../components/Chip.astro';
+import Button from '../components/Button.astro';
+
+const surfaces = [
+  ['bg0', '#0E1217', 'page'],
+  ['bg1', '#141A21', 'header, sidebar, code'],
+  ['bg2', '#1A2129', 'panels'],
+  ['bg3', '#212A33', 'panel headers, hover'],
+  ['bg4', '#2A3540', 'selected'],
+  ['zebra', '#1D252E', 'alternate rows'],
+];
+const lines = [
+  ['line', '#2F3A45', 'hairline'],
+  ['line-strong', '#3D4A57', 'emphasised hairline'],
+];
+const texts = [
+  ['text0', '#E6EBF0', 'primary · 15.7:1 on bg0'],
+  ['text1', '#A7B3BF', 'secondary · 8.8:1'],
+  ['text2', '#6E7C89', 'non-text marks only · 4.4:1'],
+  ['text-link', '#4C90F0', 'links · 5.9:1'],
+];
+const accents = [
+  ['accent', '#2D72D2', 'selection, focus, primary button'],
+  ['accent-dim', '#1F4F91', 'pressed, ::selection'],
+];
+const statuses = [
+  ['ok', '#32A467', 'running, success'],
+  ['ready', '#4C90F0', 'ready'],
+  ['danger', '#E76A6E', 'blocked, danger'],
+  ['warn', '#EC9A3C', 'warning'],
+  ['sleep', '#6E7C89', 'sleeping'],
+  ['killed', '#404854', 'killed'],
+];
+const steps = [
+  ['--step-5', '44 → 80 px', 'display'],
+  ['--step-4', '32 → 48 px', 'h1'],
+  ['--step-3', '24 → 32 px', 'h2'],
+  ['--step-2', '20 → 24 px', 'h3'],
+  ['--step-1', '1.2 × base', 'lede, h4'],
+  ['--step-0', '14 / 16 px', 'body'],
+  ['--step--1', '12 px', 'meta, captions'],
+  ['--text-label', '11 px', 'labels'],
+  ['--text-chip', '10 px', 'chips'],
+];
+const spaces = [4, 8, 12, 16, 24, 32, 48, 64, 96];
+const chips = ['running', 'ready', 'blocked', 'sleeping', 'killed', 'warning'] as const;
+const sample = `brahma company create acme --template startup
+brahma run --company acme --budget 5h
+brahma status            # roster, usage, approvals`;
+---
+
+<StarlightPage
+  frontmatter={{
+    title: 'Styleguide',
+    description: 'Brahma site design system: tokens, type, spacing, components.',
+    template: 'splash',
+    pagefind: false,
+    head: [{ tag: 'meta', attrs: { name: 'robots', content: 'noindex' } }],
+  }}
+>
+  <div class="sg not-content">
+    <header class="sg__intro">
+      <Label as="p">Design system · v1</Label>
+      <h1 class="display-xl">An instrument panel, typeset.</h1>
+      <p class="lede">
+        Dark only. Hairline panels, mono numbers, colour only where it carries meaning. One roman
+        serif for titles, one UI sans, one engineering mono, a 4 px rhythm.
+      </p>
+    </header>
+
+    <!-- Tokens -->
+    <section class="sg__section" id="colour">
+      <div class="sg__head">
+        <Label as="h2" id="colour-label">Colour</Label>
+        <p class="sg__note">Every value verbatim from the visual-design spec. Hex is shown in mono.</p>
+      </div>
+      <div class="sg__swatch-groups">
+        {
+          [
+            ['Surfaces', surfaces],
+            ['Hairlines', lines],
+            ['Text', texts],
+            ['Accent', accents],
+            ['Status', statuses],
+          ].map(([group, list]) => (
+            <div class="sg__swatch-group">
+              <Label as="h3">{group}</Label>
+              <ul class="sg__swatches">
+                {(list as string[][]).map(([name, hex, use]) => (
+                  <li class="sg__swatch">
+                    <span class="sg__swatch-chip" style={`background: var(--${name})`} aria-hidden="true" />
+                    <span class="sg__swatch-name">--{name}</span>
+                    <span class="sg__swatch-hex num">{hex}</span>
+                    <span class="sg__swatch-use">{use}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))
+        }
+      </div>
+    </section>
+
+    <!-- Type -->
+    <section class="sg__section" id="type">
+      <div class="sg__head">
+        <Label as="h2">Type</Label>
+        <p class="sg__note">
+          Instrument Serif 400 · Inter Variable 400–600 · JetBrains Mono Variable 400–500. Ratio ≈ 1.25,
+          fluid above <span class="mono">--step-1</span>.
+        </p>
+      </div>
+      <ol class="sg__type">
+        <li class="sg__type-row">
+          <span class="sg__type-meta num">--step-5 · display</span>
+          <span class="display display-xl">Run a company of agents.</span>
+        </li>
+        <li class="sg__type-row">
+          <span class="sg__type-meta num">--step-4 · h1</span>
+          <span class="display" style="font-size: var(--step-4); line-height: 1.04">Sandboxed turns, one engine.</span>
+        </li>
+        <li class="sg__type-row">
+          <span class="sg__type-meta num">--step-3 · h2</span>
+          <span class="display" style="font-size: var(--step-3)">Approvals, budgets, cadence.</span>
+        </li>
+        <li class="sg__type-row">
+          <span class="sg__type-meta num">--step-2 · h3</span>
+          <span style="font-size: var(--step-2); font-weight: 600; letter-spacing: -0.01em; line-height: 1.25"
+            >The roster is a table, not a dashboard.</span
+          >
+        </li>
+        <li class="sg__type-row">
+          <span class="sg__type-meta num">--step-1 · lede</span>
+          <span class="lede">Every agent runs as a sandboxed process with a budget, a mailbox and a seat on the org chart.</span>
+        </li>
+        <li class="sg__type-row">
+          <span class="sg__type-meta num">--step-0 · body</span>
+          <span class="sg__body"
+            >Body copy is Inter at 14 px on docs and 16 px on Home, line height 1.6. Emphasis is <strong>weight</strong>, never
+            colour; inline commands such as <code>brahma status</code> are mono on <span class="mono">bg3</span>.</span
+          >
+        </li>
+        <li class="sg__type-row">
+          <span class="sg__type-meta num">--step--1 · meta</span>
+          <span class="num" style="font-size: var(--step--1); color: var(--text1)">14:02:17 · ENG-142 · 5H 52% ▮▮▮▯▯ · RESETS 20:00</span>
+        </li>
+        <li class="sg__type-row">
+          <span class="sg__type-meta num">--text-label</span>
+          <Label>Mission control · 12 running</Label>
+        </li>
+      </ol>
+      <div class="sg__scroll">
+      <table class="sg__table">
+        <thead><tr><th>Token</th><th>Size</th><th>Role</th></tr></thead>
+        <tbody>
+          {steps.map(([t, s, r]) => (<tr><td class="num">{t}</td><td class="num">{s}</td><td>{r}</td></tr>))}
+        </tbody>
+      </table>
+      </div>
+    </section>
+
+    <!-- Spacing -->
+    <section class="sg__section" id="spacing">
+      <div class="sg__head">
+        <Label as="h2">Spacing</Label>
+        <p class="sg__note">4 px base, nine steps. Use <span class="mono">gap</span> between siblings; margins only to break the flow.</p>
+      </div>
+      <ol class="sg__spaces">
+        {spaces.map((px, i) => (
+          <li class="sg__space">
+            <span class="sg__space-bar" style={`width: ${px}px`} aria-hidden="true" />
+            <span class="num sg__space-name">--s-{i + 1}</span>
+            <span class="num sg__space-px">{px} px</span>
+          </li>
+        ))}
+      </ol>
+    </section>
+
+    <!-- Components -->
+    <section class="sg__section" id="components">
+      <div class="sg__head">
+        <Label as="h2">Components</Label>
+        <p class="sg__note">Every state. Hover, focus and active are simulated with <span class="mono">.is-*</span> classes.</p>
+      </div>
+
+      <div class="sg__grid">
+        <Panel title="Button · primary">
+          <div class="sg__states">
+            {['default', 'hover', 'focus', 'active', 'disabled'].map((s) => (
+              <div class="sg__state">
+                <span class="sg__state-name num">{s}</span>
+                <Button variant="primary" trailing="→" class={s === 'default' ? '' : `is-${s}`} disabled={s === 'disabled'}>
+                  Install Brahma
+                </Button>
+              </div>
+            ))}
+          </div>
+        </Panel>
+
+        <Panel title="Button · ghost">
+          <div class="sg__states">
+            {['default', 'hover', 'focus', 'active', 'disabled'].map((s) => (
+              <div class="sg__state">
+                <span class="sg__state-name num">{s}</span>
+                <Button variant="ghost" trailing="⌘K" class={s === 'default' ? '' : `is-${s}`} disabled={s === 'disabled'}>
+                  Search docs
+                </Button>
+              </div>
+            ))}
+            <div class="sg__state">
+              <span class="sg__state-name num">sm · link</span>
+              <Button variant="ghost" size="sm" href="/docs/">Read the docs</Button>
+            </div>
+          </div>
+        </Panel>
+
+        <Panel title="Chip · status">
+          <div class="sg__chips">
+            {chips.map((s) => <Chip status={s} />)}
+          </div>
+          <p class="sg__note" style="margin-top: var(--s-3)">
+            18 px, 1 px status border, 15 % fill, 6 px dot. <span class="mono">running</span> pulses;{' '}
+            <span class="mono">killed</span> is struck through. Label is always <span class="mono">text0</span>.
+          </p>
+        </Panel>
+
+        <Panel title="Label">
+          <div class="sg__labels">
+            <Label>default · text1</Label>
+            <Label tone="accent">accent · text-link</Label>
+          </div>
+        </Panel>
+
+        <Panel title="Panel · with actions" class="sg__span2">
+          <Fragment slot="actions">
+            <span>12 rows</span>
+            <Button size="sm">Filter</Button>
+          </Fragment>
+          <p class="sg__body">
+            bg2 body, 28 px bg3 header strip, 1 px line, radius 2, no shadow. The header holds an uppercase title and
+            right-aligned mono actions.
+          </p>
+        </Panel>
+
+        <Panel title="Panel · dense" dense>
+          <dl class="sg__kv">
+            <dt><Label as="span">Company</Label></dt><dd>acme</dd>
+            <dt><Label as="span">Agents</Label></dt><dd class="num">12 running · 30 ready</dd>
+            <dt><Label as="span">Budget</Label></dt><dd class="num">5H 52% ▮▮▮▯▯</dd>
+            <dt><Label as="span">Resets</Label></dt><dd class="num">20:00</dd>
+          </dl>
+        </Panel>
+      </div>
+    </section>
+
+    <!-- Table -->
+    <section class="sg__section" id="table">
+      <div class="sg__head">
+        <Label as="h2">Table</Label>
+        <p class="sg__note">Dense rows, uppercase headers on bg3, zebra <span class="mono">#1D252E</span>, mono for keys and numbers.</p>
+      </div>
+      <Panel title="Roster" flush>
+        <Fragment slot="actions"><span>4 of 42</span></Fragment>
+        <div class="sg__scroll">
+        <table class="sg__table sg__table--flush">
+          <thead>
+            <tr><th>Handle</th><th>Role</th><th>Status</th><th class="sg__right">Turns</th><th class="sg__right">Usage</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="num">@priya</td><td>Engineering lead</td><td><Chip status="running" /></td><td class="num sg__right">142</td><td class="num sg__right">38%</td></tr>
+            <tr><td class="num">@marco</td><td>Backend</td><td><Chip status="ready" /></td><td class="num sg__right">97</td><td class="num sg__right">22%</td></tr>
+            <tr><td class="num">@lena</td><td>Design</td><td><Chip status="blocked" /></td><td class="num sg__right">61</td><td class="num sg__right">14%</td></tr>
+            <tr><td class="num">@omar</td><td>QA</td><td><Chip status="sleeping" /></td><td class="num sg__right">30</td><td class="num sg__right">6%</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </Panel>
+    </section>
+
+    <!-- Code -->
+    <section class="sg__section" id="code">
+      <div class="sg__head">
+        <Label as="h2">Code</Label>
+        <p class="sg__note">Expressive Code frame on bg1 with a hairline; the copy button appears on hover and keyboard focus.</p>
+      </div>
+      <Code code={sample} lang="sh" title="Terminal" />
+    </section>
+
+    <!-- Motion -->
+    <section class="sg__section" id="motion">
+      <div class="sg__head">
+        <Label as="h2">Motion</Label>
+        <p class="sg__note">
+          120 / 200 ms, one easing (600 ms only for the console's line flash). <span class="mono">.reveal</span> fades and rises 6 px in 200 ms, staggered by
+          <span class="mono">--i</span>. Nothing moves under <span class="mono">prefers-reduced-motion</span>.
+        </p>
+      </div>
+      <div class="sg__reveal">
+        {[0, 1, 2, 3].map((i) => (
+          <div class="sg__reveal-item reveal" style={`--i: ${i}`}>
+            <span class="num">--i: {i}</span>
+            <span class="num" style="color: var(--text1)">{i * 60} ms</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  </div>
+</StarlightPage>
+
+<style>
+  .sg {
+    max-width: var(--grid-max);
+    margin-inline: auto;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr); /* code blocks must not widen the track */
+    gap: var(--s-8);
+    padding-block: var(--s-6) var(--s-8);
+  }
+  .sg__intro {
+    display: grid;
+    gap: var(--s-4);
+    max-width: 44rem;
+  }
+  .sg__intro h1 {
+    margin-top: var(--s-2);
+  }
+  .sg__section {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    min-width: 0;
+    gap: var(--s-5);
+    padding-top: var(--s-5);
+    border-top: var(--hairline);
+  }
+  .sg__head {
+    display: grid;
+    gap: var(--s-2);
+  }
+  .sg__note {
+    font-size: var(--step--1);
+    color: var(--text1);
+    max-width: 64ch;
+    margin: 0;
+  }
+  .sg__body {
+    font-size: var(--step-0);
+    line-height: 1.6;
+    max-width: 64ch;
+  }
+
+  /* swatches */
+  .sg__swatch-groups {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+    gap: var(--s-5);
+  }
+  @media (min-width: 60em) {
+    .sg__swatch-groups {
+      grid-template-columns: 1.3fr 1fr 1.2fr 1fr 1.2fr;
+    }
+  }
+  .sg__swatch-group {
+    display: grid;
+    gap: var(--s-3);
+    align-content: start;
+  }
+  .sg__swatches {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: var(--s-2);
+  }
+  .sg__swatch {
+    display: grid;
+    grid-template-columns: 2rem 1fr;
+    grid-template-areas:
+      'chip name'
+      'chip hex'
+      'chip use';
+    column-gap: var(--s-3);
+    align-items: start;
+    font-size: var(--step--1);
+    line-height: 1.35;
+  }
+  .sg__swatch-chip {
+    grid-area: chip;
+    width: 2rem;
+    height: 3rem;
+    border: var(--hairline);
+    border-radius: var(--radius);
+  }
+  .sg__swatch-name {
+    grid-area: name;
+    font-family: var(--font-mono);
+    color: var(--text0);
+  }
+  .sg__swatch-hex {
+    grid-area: hex;
+    color: var(--text1);
+  }
+  .sg__swatch-use {
+    grid-area: use;
+    color: var(--text1);
+  }
+
+  /* type */
+  .sg__type {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+  }
+  .sg__type-row {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--s-2);
+    padding-block: var(--s-4);
+    border-bottom: var(--hairline);
+    align-items: baseline;
+  }
+  @media (min-width: 48em) {
+    .sg__type-row {
+      grid-template-columns: 11rem minmax(0, 1fr);
+      gap: var(--s-5);
+    }
+  }
+  .sg__type-meta {
+    font-size: var(--step--1);
+    color: var(--text1);
+  }
+
+  /* spacing */
+  .sg__spaces {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: var(--s-2);
+  }
+  .sg__space {
+    display: grid;
+    grid-template-columns: 6.5rem 4rem 1fr;
+    align-items: center;
+    gap: var(--s-3);
+    font-size: var(--step--1);
+  }
+  .sg__space-bar {
+    grid-column: 3;
+    height: 0.75rem;
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+  }
+  .sg__space-name {
+    grid-column: 1;
+    grid-row: 1;
+    color: var(--text0);
+  }
+  .sg__space-px {
+    grid-column: 2;
+    grid-row: 1;
+    color: var(--text1);
+  }
+
+  /* components */
+  .sg__grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--s-5);
+    align-items: start;
+  }
+  @media (min-width: 48em) {
+    .sg__grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+  @media (min-width: 72em) {
+    .sg__grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .sg__span2 {
+      grid-column: span 2;
+    }
+  }
+  .sg__states {
+    display: grid;
+    gap: var(--s-3);
+  }
+  .sg__state {
+    display: grid;
+    grid-template-columns: 5rem auto;
+    align-items: center;
+    gap: var(--s-3);
+  }
+  .sg__state-name {
+    font-size: var(--step--1);
+    color: var(--text1);
+  }
+  .sg__chips,
+  .sg__labels {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s-2) var(--s-3);
+  }
+  .sg__labels {
+    flex-direction: column;
+  }
+  .sg__kv {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: var(--s-2) var(--s-4);
+    margin: 0;
+    font-size: var(--step--1);
+  }
+  .sg__kv dt,
+  .sg__kv dd {
+    margin: 0;
+    padding-block: var(--s-1);
+    border-bottom: var(--hairline);
+  }
+  .sg__kv dt:nth-last-of-type(1),
+  .sg__kv dd:last-of-type {
+    border-bottom: 0;
+  }
+
+  /* table */
+  .sg__table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: var(--step--1);
+    text-align: left;
+  }
+  .sg__table:not(.sg__table--flush) {
+    border: var(--hairline);
+    border-radius: var(--radius);
+    max-width: 36rem;
+  }
+  .sg__table thead {
+    background: var(--bg3);
+  }
+  .sg__table th {
+    font-size: var(--text-label);
+    font-weight: 600;
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+    color: var(--text1);
+    white-space: nowrap;
+  }
+  .sg__table th,
+  .sg__table td {
+    padding: 0.375rem var(--s-3);
+    border-bottom: var(--hairline);
+    vertical-align: middle;
+    height: 1.75rem;
+  }
+  .sg__table tbody tr:nth-child(even) {
+    background: var(--zebra);
+  }
+  .sg__table tbody tr:hover {
+    background: var(--bg3);
+  }
+  .sg__table tbody tr:last-child td {
+    border-bottom: 0;
+  }
+  .sg__right {
+    text-align: right;
+  }
+
+  /* motion */
+  .sg__reveal {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--s-3);
+  }
+  @media (min-width: 48em) {
+    .sg__reveal {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+  }
+  /* Tables never widen the page: scroll inside their frame on narrow viewports. */
+  .sg__scroll {
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  /* The splash template renders its own title panel; this page sets its own h1. */
+  :global(main .content-panel:has(> .sl-container > h1#_top)) {
+    display: none;
+  }
+  .sg__reveal-item {
+    display: grid;
+    gap: var(--s-1);
+    padding: var(--s-3);
+    background: var(--bg2);
+    border: var(--hairline);
+    border-radius: var(--radius);
+    font-size: var(--step--1);
+  }
+</style>

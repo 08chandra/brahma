@@ -1,0 +1,41 @@
+---
+/**
+ * "View source" link for one path of the repository, gated on `site.repoURL`:
+ *
+ *   <SourceLink path="Sources/BrahmaCore/Work" />
+ *
+ * Renders nothing while `site.repoURL` is '' (the repository is not public yet); otherwise one
+ * line linking to `<repoURL>/tree/main/<path>`. Existing tokens and link colour only.
+ */
+import { site } from '../../site.config';
+
+interface Props {
+  path: string;
+}
+const { path } = Astro.props;
+const repo = site.repoURL.replace(/\/$/, '');
+const clean = path.replace(/^\/+|\/+$/g, '');
+const href = repo ? `${repo}/tree/main/${clean}` : '';
+---
+
+{
+  href && (
+    <p class="source-link">
+      <a href={href}>
+        View source
+      </a>{' '}
+      <code>{clean}</code>
+    </p>
+  )
+}
+
+<style>
+  .source-link {
+    margin: var(--s-4) 0 0;
+    font-size: var(--step--1);
+    color: var(--text1);
+  }
+  .source-link a {
+    color: var(--text-link);
+  }
+</style>
