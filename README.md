@@ -268,9 +268,13 @@ message, add or fill a vacancy, hire) bring the main window to the front, where 
 ```
 scripts/map-demo.sh [agents] [--flag=value ...]  # read-only synthetic company, no write actions, temp home
 scripts/map-snapshots.sh                          # offscreen PNGs of the scenes into .superpowers/maps
-Brahma --map-demo --map-demo-agents=300           # the same demo, straight from the app binary
-Brahma --map-bench=20                             # implies --map-demo: prints one MAP BENCH line and exits
 ```
+
+The harness flags (`--map-demo`, `--map-bench=<s>` (implies `--map-demo`), `--smoke-test`, `--ui-snapshot <path>`) never run
+under the owner's app: they would write its `dev.brahma.app` defaults (window frames, preview navigation, the CHANGES
+layout). The app refuses them unless its bundle identifier is a harness copy's (`dev.brahma.harness.<id>`), and
+`scripts/map-demo.sh`, `scripts/smoke-app.sh` and `scripts/ui-snapshot.sh` launch such a copy (`scripts/harness-app.sh`)
+and remove its defaults domain when they end.
 
 `--map-bench=<s>` measures the on-screen frame rate for `<s>` seconds and prints
 `MAP BENCH mode=org agents=<n> fps=… p95=…ms max=…ms dropped=… aggregate=…s`. The display must be awake. AppKit

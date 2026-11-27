@@ -59,6 +59,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     override init() {
         options = LaunchOptions.parse(CommandLine.arguments)
+        // Item 20 (FW-B2): a smoke, snapshot or map-demo run never writes the owner's `dev.brahma.app` defaults. It runs only
+        // as a harness copy (its own throwaway defaults domain); refused here, before any window, store or engine exists.
+        if case .refuse(let why) = AppDefaults.decide(options: options, bundleIdentifier: Bundle.main.bundleIdentifier) {
+            print("HARNESS REFUSED \(why)")
+            fflush(stdout)
+            FileHandle.standardError.write(Data("brahma: \(why)\n".utf8))
+            exit(2)
+        }
         boot = AppDelegate.makeBoot()
         super.init()
         AppDelegate.current = self

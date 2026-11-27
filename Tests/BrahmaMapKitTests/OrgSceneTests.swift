@@ -59,7 +59,7 @@ import AppKit
     }
 
     static func controller(_ agents: Int, seed: UInt64 = 7) -> MapController {
-        MapController(source: .synthetic(agents: agents, rate: 0, seed: seed), defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        MapController(source: .synthetic(agents: agents, rate: 0, seed: seed), defaults: TestDefaults.make("orgscene"))
     }
 
     static func scene(_ model: MapModel, collapsed: Set<String> = []) -> OrgScene {
@@ -566,7 +566,7 @@ import AppKit
             Vacancy(id: "x-1", role: "designer", roleTitle: "Designer", managerId: cto.id, team: nil, note: "", source: .org),
         ]))
         let live = MapController(source: .live(store: store, companyId: company.id), people: provider,
-                                 defaults: UserDefaults(suiteName: UUID().uuidString)!)
+                                 defaults: TestDefaults.make("orgscene"))
         live.sync(snapshot: try Snapshot.load(store: store, selectedCompanyId: company.id))
         await live.poll()
         #expect(live.model.vacancies.contains { $0.id == "x-1" && $0.source == .provider })
@@ -866,7 +866,7 @@ import AppKit
             func advance(_ s: TimeInterval) { lock.lock(); t = t.addingTimeInterval(s); lock.unlock() }
         }
         let clock = Clock()
-        let c = MapController(source: .synthetic(agents: 40, rate: 0, seed: 7), defaults: UserDefaults(suiteName: UUID().uuidString)!,
+        let c = MapController(source: .synthetic(agents: 40, rate: 0, seed: 7), defaults: TestDefaults.make("orgscene"),
                               clock: { clock.now })
         _ = c.frame(now: 100)
         clock.advance(30)

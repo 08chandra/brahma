@@ -47,8 +47,11 @@ public enum MapBench {
                            expandAll: Bool = false) -> MapBenchResult {
         // An epoch multiple of 10 s, so a (10, n) burst lands 10 s into the run.
         let clock = VirtualClock(Date(timeIntervalSince1970: 1_800_000_000))
+        // A throwaway suite, removed when the run ends (item 20 / C6 M13: no bench leaves a defaults domain behind).
+        let suite = "brahma.mapbench.\(UUID().uuidString)"
+        defer { UserDefaults().removePersistentDomain(forName: suite) }
         let controller = MapController(source: .synthetic(agents: agents, rate: rate, seed: 42),
-                                       defaults: UserDefaults(suiteName: "brahma.mapbench.\(UUID().uuidString)")!,
+                                       defaults: UserDefaults(suiteName: suite)!,
                                        clock: { clock.now })
         controller.syntheticBurst = burst.map { (every: $0.0, size: $0.1) }
         let scene = OrgScene(size: size)

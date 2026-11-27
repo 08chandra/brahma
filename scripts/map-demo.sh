@@ -11,7 +11,10 @@ shift || true
 scripts/make-app.sh debug >/dev/null
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Item 20: the app runs as a throwaway harness copy, so nothing here writes the owner's dev.brahma.app defaults.
+. scripts/harness-app.sh
+trap 'harness_app_cleanup; rm -rf "$TMP"' EXIT
+harness_app_prepare "$TMP"
 export BRAHMA_OWNER_KEY_STORE=file
 export BRAHMA_SECRET_STORE=file
 export BRAHMA_HOME="$TMP/home"
@@ -20,4 +23,4 @@ export BRAHMA_CLAUDE="$PWD/scripts/fake-claude.sh"
 mkdir -p "$BRAHMA_HOME" "$BRAHMA_WORKSPACES"
 
 # Order matters: AppKit mis-parses a bare "--flag=value" before a "--flag value" pair as a file to open.
-.build/Brahma.app/Contents/MacOS/Brahma --map-demo --map-demo-agents="$AGENTS" "$@"
+"$HARNESS_APP" --map-demo --map-demo-agents="$AGENTS" "$@"

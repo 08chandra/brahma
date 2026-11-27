@@ -46,7 +46,7 @@ struct ChangesWorld {
     func model(interval: Duration = .milliseconds(100), defaults: UserDefaults? = nil, known: [(name: String, value: String)] = [],
                noOwner: Bool = false) throws -> (ChangesTabModel, LiveChanges) {
         let live = LiveChanges(store: w.store, interval: interval, idle: interval)
-        let suite = defaults ?? UserDefaults(suiteName: "brahma.tests.changes.\(UUID().uuidString)")!
+        let suite = defaults ?? TestDefaults.make("changes")
         let now = w.now
         let principal: OwnerPrincipal? = noOwner ? nil : try w.owner()
         let m = ChangesTabModel(store: w.store, live: live, companyId: w.company.id, owner: principal, knownValues: { known }, defaults: suite, clock: { now })
@@ -157,7 +157,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
 
     @Test func selectingRowOpensLiveDiff() async throws {
         let cw = try ChangesWorld()
-        let suite = UserDefaults(suiteName: "brahma.tests.changes.\(UUID().uuidString)")!
+        let suite = TestDefaults.make("changes")
         let (m, live) = try cw.model(defaults: suite)
         #expect(m.selectedKey == nil && m.snapshot == nil && m.diff == nil && m.compare == .main && m.mode == .unified)
         m.start()
@@ -284,7 +284,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         // A stored value that can't be read refuses the stream (fail closed): nothing is shown.
         let (refused, refusedLive) = try cw.model()
         let blind = ChangesTabModel(store: cw.w.store, live: refusedLive, companyId: cw.w.company.id, owner: try cw.w.owner(),
-                                    knownValues: { throw WorkError.invalid("vault locked") }, defaults: UserDefaults(suiteName: "brahma.tests.changes.x")!,
+                                    knownValues: { throw WorkError.invalid("vault locked") }, defaults: TestDefaults.make("changes"),
                                     clock: { cw.w.now })
         _ = refused
         blind.start()

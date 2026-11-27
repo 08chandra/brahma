@@ -7,9 +7,12 @@ scripts/make-app.sh debug
 TMP="$(mktemp -d)"
 CLI_PID=""
 APP_PID=""
+# Item 20: the app runs as a throwaway harness copy, so nothing here writes the owner's dev.brahma.app defaults.
+. scripts/harness-app.sh
 cleanup() {
   [ -n "$CLI_PID" ] && kill -INT "$CLI_PID" 2>/dev/null || true
   [ -n "$APP_PID" ] && kill -KILL "$APP_PID" 2>/dev/null || true
+  harness_app_cleanup
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -24,7 +27,8 @@ export BRAHMA_CLAUDE="$PWD/scripts/fake-claude.sh"
 mkdir -p "$BRAHMA_HOME" "$BRAHMA_WORKSPACES"
 scripts/seed-demo.sh >/dev/null
 
-APP=.build/Brahma.app/Contents/MacOS/Brahma
+harness_app_prepare "$TMP"
+APP="$HARNESS_APP"
 CLI=.build/Brahma.app/Contents/Helpers/brahma
 # The lifecycle cases need @ceo's fake turn to run. A Sandboxed turn starts only after the sandbox canary passed for the claude
 # that runs it (its fingerprint is in the canary key), and the canary's turn layer needs a real model to run the owner's

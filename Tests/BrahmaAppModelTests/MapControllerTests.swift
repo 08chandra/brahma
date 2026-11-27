@@ -42,7 +42,7 @@ final class MapTestClock: @unchecked Sendable {
 }
 
 @MainActor @Suite(.scratch) struct MapControllerTests {
-    private func defaults() -> UserDefaults { UserDefaults(suiteName: UUID().uuidString)! }
+    private func defaults() -> UserDefaults { TestDefaults.make("map") }
 
     private func live(_ store: Store, _ companyId: String, people: (any MapPeopleProviding)? = nil,
                       vault: (any SecretVault)? = nil) -> MapController {

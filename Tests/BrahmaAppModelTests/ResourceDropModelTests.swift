@@ -6,10 +6,9 @@ import BrahmaCore
 /// Plan ML Task 7: drops on the owner's composers (DM, channel, Inbox question, library), their scope and trust chips, the
 /// secret sheet and the advisory alert. Every vault is a `MemoryVault` (the test `AppModel`); the defaults are a fresh suite.
 @MainActor @Suite(.scratch) struct ResourceDropModelTests {
-    /// Acme (Workspace profile): ceo, cto, eng (blocked on the owner); Globex empty. A fresh defaults suite, removed at the end.
+    /// Acme (Workspace profile): ceo, cto, eng (blocked on the owner); Globex empty. A fresh defaults suite (`TestDefaults`).
     final class W {
         let app: AppModel, store: Store, paths: BrahmaPaths, company: Company, eng: Agent, cto: Agent
-        let suite = "brahma-test-drops-\(UUID().uuidString)"
         let defaults: UserDefaults
         let drops: URL
 
@@ -18,14 +17,12 @@ import BrahmaCore
             let (acme, _, cto, eng) = try seedAcme(store, paths)
             self.store = store; self.paths = paths; company = acme; self.eng = eng; self.cto = cto
             app = AppModel(store: store, paths: paths)
-            defaults = try #require(UserDefaults(suiteName: suite))
+            defaults = TestDefaults.make("drops")
             app.dropDefaults = defaults
             drops = try tempDir().appending(path: "Drops", directoryHint: .isDirectory)
             try FileManager.default.createDirectory(at: drops, withIntermediateDirectories: true)
             await app.load()
         }
-
-        deinit { UserDefaults().removePersistentDomain(forName: suite) }
 
         func file(_ name: String, _ text: String) throws -> URL {
             let url = drops.appending(path: name)

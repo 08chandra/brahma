@@ -35,7 +35,7 @@ import BrahmaCore
     }
 
     @Test func historyIsPerCompany() {
-        let defaults = UserDefaults(suiteName: "brahma.tests.previewNav.\(UUID().uuidString)")!
+        let defaults = TestDefaults.make("previewNav")
         var c = PreviewNav()
         c.open(Self.opened("ENG-1"), select: true)
         var d = PreviewNav()

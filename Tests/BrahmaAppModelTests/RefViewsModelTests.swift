@@ -10,7 +10,7 @@ import Foundation
     func app(_ w: RefWorld, vault: any SecretVault) async -> AppModel {
         let model = AppModel(store: w.store, paths: w.paths, secretVault: vault, clock: { Date() })
         model.refArchives = { _, _, _ in UnavailableArchiveReader() }
-        model.navDefaults = UserDefaults(suiteName: "brahma.tests.refviews.\(UUID().uuidString)") ?? .standard
+        model.navDefaults = TestDefaults.make("refviews")
         await model.load()
         await model.selectCompany(w.company.id)
         return model

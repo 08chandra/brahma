@@ -13,7 +13,10 @@ OUT=".superpowers/ui/$NAME.png"
 rm -f "$OUT"
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Item 20: the app runs as a throwaway harness copy, so nothing here writes the owner's dev.brahma.app defaults.
+. scripts/harness-app.sh
+trap 'harness_app_cleanup; rm -rf "$TMP"' EXIT
+harness_app_prepare "$TMP"
 DEFAULT_HOME="$HOME/Library/Application Support/Brahma"
 if [ "${BRAHMA_SNAPSHOT_REUSE_HOME:-}" = "1" ] && [ -n "${BRAHMA_HOME:-}" ]; then
   RESOLVED="$BRAHMA_HOME"
@@ -46,7 +49,7 @@ COMPANY="${BRAHMA_SNAPSHOT_COMPANY:-}"
 case "$SELECT" in backlog|board|inbox|grants|digest|settings|resources|handbook|memory|budget|merge|merge-settings|item:*|kb:*|search:*|replay:*|preview:*|artifact:*) [ -n "$COMPANY" ] || COMPANY=Initech ;; esac
 if [ -n "$COMPANY" ]; then ARGS+=(--company "$COMPANY"); fi
 # Order matters: AppKit mis-parses a bare "--flag=value" before a "--flag value" pair as a file to open.
-.build/Brahma.app/Contents/MacOS/Brahma "${ARGS[@]}" --smoke-hold=4
+"$HARNESS_APP" "${ARGS[@]}" --smoke-hold=4
 if [ ! -s "$OUT" ]; then
   echo "snapshot missing or empty: $OUT" >&2
   exit 1

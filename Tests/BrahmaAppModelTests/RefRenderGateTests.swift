@@ -330,7 +330,7 @@ import GRDB
         #expect(back.opened?.origin == .showAnswer(requestId: "r", by: "@eng-1"))
         // On restore the app re-resolves and re-gates the title.
         let w = try RefWorld()
-        let defaults = UserDefaults(suiteName: "brahma.tests.nav.\(UUID().uuidString)")!
+        let defaults = TestDefaults.make("nav")
         var saved = PreviewNav()
         saved.open(OpenedRef(ref: try w.ref("ENG-1"), title: "stale", kindChip: "ITEM", origin: .owner), select: true)
         PreviewNavStore.save(saved, companyId: w.company.id, defaults: defaults)
