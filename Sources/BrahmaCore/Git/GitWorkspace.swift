@@ -924,7 +924,7 @@ public struct GitWorkspace: Sendable {
         switch st.st_mode & S_IFMT {
         case S_IFLNK: return "\(ref) is a symbolic ref (a link)"
         case S_IFREG:
-            guard let text = Self.regularText(url), text.hasPrefix("ref:") else { return nil }
+            guard let text = Self.regularText(ref, under: gitDir), text.hasPrefix("ref:") else { return nil }
             let target = String(text.dropFirst(4).trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
             return "\(ref) is a symbolic ref to \(Self.shown(target))"
         default: return "\(ref) is not a ref file"
@@ -941,22 +941,23 @@ public struct GitWorkspace: Sendable {
         return out
     }
 
-    private static func regularText(_ url: URL) -> String? {
-        var st = stat()
-        guard lstat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG else { return nil }
-        return try? String(contentsOf: url, encoding: .utf8)
+    /// The text of the pointer file `name` under `dir` (an admin directory, a worktree, the repository's `.git`), read without
+    /// following a link and bounded (`SafeRead.smallText`, 4 KiB: S2, spec §7.1). Nil when it is a link, not a plain regular
+    /// file of this user's, oversized or unreadable: every caller treats nil as "changed" (fail closed).
+    private static func regularText(_ name: String, under dir: URL) -> String? {
+        do { return try SafeRead.smallText(name, under: dir) } catch { return nil }
     }
 
     /// What differs from the engine's record of one item worktree; empty when it is as the engine created it.
     private func linkProblems(key: String) -> [String] {
         let admin = adminDir(key: key), tree = worktreePath(key: key)
         var problems: [String] = []
-        if Self.regularText(admin.appending(path: "HEAD")) != "ref: \(branchRef(key: key))\n" { problems.append("HEAD is not \(branchRef(key: key))") }
-        let commondir = Self.regularText(admin.appending(path: "commondir"))?.trimmingCharacters(in: .newlines)
+        if Self.regularText("HEAD", under: admin) != "ref: \(branchRef(key: key))\n" { problems.append("HEAD is not \(branchRef(key: key))") }
+        let commondir = Self.regularText("commondir", under: admin)?.trimmingCharacters(in: .newlines)
         if commondir != "../.." { problems.append("commondir was changed") }
-        let gitdir = Self.regularText(admin.appending(path: "gitdir"))?.trimmingCharacters(in: .newlines)
+        let gitdir = Self.regularText("gitdir", under: admin)?.trimmingCharacters(in: .newlines)
         if gitdir.map({ !Self.forms(tree).map { "\($0)/.git" }.contains($0) }) ?? true { problems.append("gitdir was changed") }
-        let link = Self.regularText(tree.appending(path: ".git"))?.trimmingCharacters(in: .newlines)
+        let link = Self.regularText(".git", under: tree)?.trimmingCharacters(in: .newlines)
         if link.map({ !Self.forms(admin).map { "gitdir: \($0)" }.contains($0) }) ?? true { problems.append(".git was changed") }
         if let symbolic = symbolicItemRef(key: key) { problems.append(symbolic) }
         return problems
@@ -967,16 +968,17 @@ public struct GitWorkspace: Sendable {
     /// a commit move a branch in another repository.
     private func heal(key: String) {
         let admin = adminDir(key: key)
-        func ensure(_ url: URL, _ text: String) {
-            guard Self.regularText(url) != text else { return }
+        func ensure(_ name: String, under dir: URL, _ text: String) {
+            guard Self.regularText(name, under: dir) != text else { return }
+            let url = dir.appending(path: name)
             var st = stat()
             if lstat(url.path, &st) == 0, st.st_mode & S_IFMT != S_IFREG { _ = try? EngineFiles.removeNoFollow(url, under: root) }
             try? text.write(to: url, atomically: true, encoding: .utf8)
         }
-        ensure(admin.appending(path: "HEAD"), "ref: \(branchRef(key: key))\n")
-        ensure(admin.appending(path: "commondir"), "../..\n")
-        ensure(admin.appending(path: "gitdir"), "\(worktreePath(key: key).path)/.git\n")
-        ensure(worktreePath(key: key).appending(path: ".git"), "gitdir: \(admin.path)\n")
+        ensure("HEAD", under: admin, "ref: \(branchRef(key: key))\n")
+        ensure("commondir", under: admin, "../..\n")
+        ensure("gitdir", under: admin, "\(worktreePath(key: key).path)/.git\n")
+        ensure(".git", under: worktreePath(key: key), "gitdir: \(admin.path)\n")
     }
 
     // MARK: Repository

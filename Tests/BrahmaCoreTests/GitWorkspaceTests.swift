@@ -936,6 +936,35 @@ import Foundation
         #expect(log.all.count == 3)
     }
 
+    /// Plan S S2 (spec §7.1): the worktree's `.git` pointer is read without following a link and bounded (4 KiB). A `.git`
+    /// swapped for a link to a valid-looking pointer, and one padded past the bound (whose trimmed text would still match),
+    /// both read as nil: reported as ".git was changed", refused and healed.
+    @Test func linkedDotGitIsReportedChanged() throws {
+        let f = try GitFixture(files: ["a.txt": "one"])
+        let (ws, log) = watched(f)
+        let wt = try ws.addWorktree(key: "K-1")
+        let admin = f.root.appending(path: ".git/worktrees/K-1")
+        let pointer = wt.appending(path: ".git")
+        let valid = try String(contentsOf: pointer, encoding: .utf8)
+        #expect(valid.hasPrefix("gitdir: "))
+        // A link to a regular file holding exactly the valid pointer text.
+        let elsewhere = try tempDir().appending(path: "pointer")
+        try valid.write(to: elsewhere, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: pointer)
+        try FileManager.default.createSymbolicLink(atPath: pointer.path, withDestinationPath: elsewhere.path)
+        #expect(throws: GitError.self) { try ws.isDirty(in: wt) }
+        #expect(log.all.count == 1 && log.all[0].contains(".git was changed"), "\(log.all)")
+        var st = stat()
+        #expect(lstat(pointer.path, &st) == 0 && st.st_mode & S_IFMT == S_IFREG, "healed back to a regular file")
+        #expect(try String(contentsOf: pointer, encoding: .utf8) == "gitdir: \(admin.path)\n")
+        #expect(try ws.isDirty(in: wt) == false)
+        // The valid text followed by 5000 newlines: trimmed it would match, but it is past the bound, so it is refused.
+        try (valid + String(repeating: "\n", count: 5000)).write(to: pointer, atomically: true, encoding: .utf8)
+        #expect(throws: GitError.self) { try ws.isDirty(in: wt) }
+        #expect(log.all.count == 2 && log.all[1].contains(".git was changed"), "\(log.all)")
+        #expect(try ws.isDirty(in: wt) == false)
+    }
+
     // MARK: Engine commits never go through HEAD
 
     @Test func commitLandsOnTheItemBranchEvenIfHeadIsFlippedMidOperation() throws {

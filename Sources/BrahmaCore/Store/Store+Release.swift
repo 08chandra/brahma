@@ -255,7 +255,7 @@ extension Store {
             // The engine's own failure, not main's: a merge run goes back to the queue (the tick backs off, fix I1).
             return try requeueOrError(run, tail: "could not export \(run.sha7)", now: clock())
         }
-        let unsandboxed = PreviewRunner.unsandboxed(store: self, company: company, setById: company.smokeCheckSetById)
+        let unsandboxed = PreviewRunner.unsandboxed(store: self, company: company, setById: company.smokeCheckSetById, ceiling: checks.ceiling)
         let runner = unsandboxed ? checks.unsandboxed : checks.sandbox
         let policy = Self.smokePolicy(company: company, export: export)
         let environment = ChildEnvironment.make(base: checks.environment,

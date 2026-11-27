@@ -410,16 +410,16 @@ import Glibc
         var byOwner = byAgent; byOwner.setById = "owner"
         var c = x.company
         c.permissionProfile = .workspace
-        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent))
-        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner))
+        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent, ceiling: nil))
+        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner, ceiling: nil))
         c.permissionProfile = .sandboxed
-        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent))
+        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent, ceiling: nil))
         c.permissionProfile = .full
-        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent), "Full company, Full role")
-        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner), "an owner-set surface follows the company")
+        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent, ceiling: nil), "Full company, Full role")
+        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner, ceiling: nil), "an owner-set surface follows the company")
         c.roleProfiles = [x.devops.role: .workspace]
-        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent), "Full company, non-Full setter role")
-        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner))
+        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent, ceiling: nil), "Full company, non-Full setter role")
+        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner, ceiling: nil))
     }
 
     @Test func fullCompanyPreviewRunsUnsandboxed() async throws {

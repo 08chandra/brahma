@@ -1,0 +1,121 @@
+import Testing
+import Foundation
+import GRDB
+@testable import BrahmaCore
+
+/// Plan S Task S2 (spec §7.1, B1/B2): the engine's routing of checks and previews fails closed. A check or preview whose
+/// author the engine cannot confirm (no holder, an unknown agent, a lookup that throws) runs sandboxed in a Full company,
+/// with an activity line that says so; the engine's ceiling narrows previews as it narrows checks; the known-author routes
+/// are unchanged. The fixture is `SandboxedCheckTests.S` (a Full company with a real git workspace and engine-run checks).
+@Suite(.scratch, .serialized) struct FailOpenFixTests {
+    typealias S = SandboxedCheckTests.S
+
+    /// A submitted item's check run, recorded `running` in its engine-made checkout (what `checkRoute` needs to route it).
+    private func runningCheck(_ s: S, of item: WorkItem) async throws -> (run: VerificationRun, checkout: URL) {
+        let run = try s.latest(item)
+        let checkout = s.git.checkoutPath(runId: run.id)
+        try FileManager.default.createDirectory(at: checkout, withIntermediateDirectories: true)
+        try await s.store.writer.write { db in
+            try db.execute(sql: "UPDATE verificationRun SET status = 'running', workingDirectory = ? WHERE id = ?",
+                           arguments: [checkout.path, run.id])
+        }
+        return (run, checkout)
+    }
+
+    private func activity(_ s: S) async throws -> [String] {
+        try await s.store.writer.read { try ActivityEvent.filter(Column("companyId") == s.company.id).fetchAll($0) }.map(\.text)
+    }
+
+    // MARK: Checks (B1)
+
+    /// No lease and a `requestedBy` the company has no agent for: the engine cannot confirm who wrote the check, so a Full
+    /// company's check runs sandboxed, and one activity line on the company says so.
+    @Test func verificationRunWithUnknownHolderRunsSandboxed() async throws {
+        let s = try S(profile: .full)
+        let item = try s.submitted()
+        let (run, checkout) = try await runningCheck(s, of: item)
+        try await s.store.writer.write { db in
+            try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [item.id])
+            try db.execute(sql: "UPDATE verificationRun SET requestedBy = ? WHERE id = ?", arguments: ["ghost-agent", run.id])
+        }
+        guard case .sandboxed = Orchestrator.checkRoute(store: s.store)(checkout.path) else {
+            Issue.record("a check with an unknown holder ran unsandboxed in a Full company"); return
+        }
+        let lines = try await activity(s).filter { $0.contains("ran sandboxed: the engine could not confirm who wrote it") }
+        #expect(lines.count == 1, "\(lines)")
+        #expect(lines.first?.hasPrefix(item.key) == true, "the subject is the item key: \(lines)")
+    }
+
+    /// The agent lookup throws (the `agent` table is renamed out from under the store, so every other lookup still works):
+    /// sandboxed, never unsandboxed by default.
+    @Test func verificationRunWithLookupErrorRunsSandboxed() async throws {
+        let s = try S(profile: .full)
+        let item = try s.submitted()
+        let (_, checkout) = try await runningCheck(s, of: item)
+        try await s.store.writer.write { db in try db.execute(sql: "ALTER TABLE agent RENAME TO agent_unreachable") }
+        #expect(throws: (any Error).self) { try s.store.agent(id: s.eng.id) }
+        guard case .sandboxed = Orchestrator.checkRoute(store: s.store)(checkout.path) else {
+            Issue.record("a check whose holder lookup failed ran unsandboxed in a Full company"); return
+        }
+        let lines = try await activity(s).filter { $0.contains("ran sandboxed: the engine could not confirm who wrote it") }
+        #expect(lines.count == 1, "\(lines)")
+    }
+
+    /// Unchanged: a Full company's check held by a known agent whose role runs Full is unconfined, with no note.
+    @Test func knownFullHolderStillUnsandboxed() async throws {
+        let s = try S(profile: .full)
+        let item = try s.submitted()
+        let (_, checkout) = try await runningCheck(s, of: item)
+        guard case .unsandboxed = Orchestrator.checkRoute(store: s.store)(checkout.path) else {
+            Issue.record("a Full company's check with a known Full holder was sandboxed"); return
+        }
+        #expect(try await activity(s).allSatisfy { !$0.contains("ran sandboxed") })
+    }
+
+    // MARK: Previews (B1, B2)
+
+    /// A surface or smoke with no setter: the engine cannot confirm who wrote its command, so it runs sandboxed even in a
+    /// Full company.
+    @Test func previewWithNilSetterInFullCompanyIsSandboxed() throws {
+        let s = try S(profile: .full)
+        #expect(s.company.permissionProfile == .full)
+        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: nil, ceiling: nil) == false)
+    }
+
+    /// The engine's ceiling (`brahma run --profile`) narrows previews as it narrows checks: a Full company and a Full setter
+    /// role under a Sandboxed ceiling run sandboxed; the Full ceiling (or none) leaves them unconfined.
+    @Test func previewHonoursCeiling() throws {
+        let s = try S(profile: .full)
+        #expect(s.company.profile(forRole: s.eng.role) == .full)
+        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: .sandboxed) == false)
+        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: .workspace) == false)
+        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: .full) == true)
+        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: nil) == true)
+        // The owner's command is narrowed by the ceiling too.
+        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: "owner", ceiling: .sandboxed) == false)
+    }
+
+    /// Unchanged: an owner-set command follows its Full company.
+    @Test func ownerSetterStillFollowsCompany() throws {
+        let s = try S(profile: .full)
+        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: "owner", ceiling: nil) == true)
+        var sandboxed = s.company
+        sandboxed.permissionProfile = .sandboxed
+        #expect(PreviewRunner.unsandboxed(store: s.store, company: sandboxed, setById: "owner", ceiling: nil) == false)
+    }
+
+    /// An agent id the company has no record of, or a lookup that throws, runs sandboxed.
+    @Test func previewWithUnknownOrUnreadableSetterIsSandboxed() async throws {
+        let s = try S(profile: .full)
+        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: "ghost-agent", ceiling: nil) == false)
+        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: nil) == true)
+        try await s.store.writer.write { db in try db.execute(sql: "ALTER TABLE agent RENAME TO agent_unreachable") }
+        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: nil) == false)
+    }
+
+    /// The B1 text, exactly.
+    @Test func sandboxedNoteText() {
+        #expect(SafeRead.sandboxedNote(subject: "K-7", reason: "no agent holds or requested it")
+                == "K-7 ran sandboxed: the engine could not confirm who wrote it (no agent holds or requested it)")
+    }
+}

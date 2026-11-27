@@ -198,7 +198,10 @@ public actor Orchestrator {
         self.smokeSlots = slots
         // Releases (Plan L): the executor runs its release smoke through the same entry as `runSmoke` (this engine's slot,
         // Blocking and clock), its steps through the platform sandbox by default (`defaultReleaseDependencies`).
-        let smokes = smokeChecks ?? Orchestrator.defaultSmokeChecks(store: store, paths: paths, environment: checkBaseEnvironment)
+        // The engine's ceiling (`profile`) reaches every main smoke, release build and preview as it reaches checks (B2),
+        // whichever runners the host injected.
+        var smokes = smokeChecks ?? Orchestrator.defaultSmokeChecks(store: store, paths: paths, environment: checkBaseEnvironment)
+        smokes.ceiling = profile
         self.smokeChecks = smokes
         let releaseDeps = releaseDeps ?? Orchestrator.defaultReleaseDependencies(store: store, paths: paths)
         let executor = ReleaseExecutor(
@@ -206,14 +209,14 @@ public actor Orchestrator {
             smoke: Orchestrator.smokeEntry(store: store, checks: smokes, slots: slots, blocking: engineBlocking, clock: clock,
                                            engineId: engineId),
             adapters: releaseDeps.adapters, sleep: releaseDeps.sleep, clock: clock, blocking: engineBlocking,
-            environment: releaseDeps.environment ?? checkBaseEnvironment)
+            environment: releaseDeps.environment ?? checkBaseEnvironment, ceiling: profile)
         self.releaseExecutor = executor
         // Previews (Plan L): the platform sandbox with the checks' baseline by default (`defaultPreviewDependencies`).
         let previewDeps = previewDeps ?? Orchestrator.defaultPreviewDependencies(store: store, paths: paths)
         let previews = PreviewRunner(store: store, paths: paths, deps: previewDeps,
                                      sandboxLayout: { SandboxLayout(paths: paths, company: $0, agentHandle: "preview") },
                                      timeouts: PreviewTimeouts(), memory: { memory.current != .normal }, clock: clock,
-                                     blocking: engineBlocking, environment: checkBaseEnvironment, adapters: previewDeps.adapters)
+                                     blocking: engineBlocking, environment: checkBaseEnvironment, ceiling: profile, adapters: previewDeps.adapters)
         self.previewRunner = previews
         // Checks run sandboxed by default (`SandboxedCheckRunner`; Seatbelt on macOS, fail closed elsewhere).
         let checkRunner = checkRunner ?? Orchestrator.defaultCheckRunner(store: store, paths: paths, ceiling: profile)

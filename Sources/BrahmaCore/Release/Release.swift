@@ -223,12 +223,15 @@ public struct SmokeChecks: Sendable {
     public var unsandboxed: any SandboxedRunner
     public var paths: BrahmaPaths
     public var environment: [String: String]
+    /// The engine's ceiling on every profile (`brahma run --profile`, `Orchestrator.profileCeiling`, set by the orchestrator
+    /// on the checks it runs smokes through): narrows the Full-mode route of a main smoke (B2); nil is no ceiling.
+    public var ceiling: PermissionProfile?
     /// Test seam: called by `Store.runSmoke` right after its insert-and-claim write, before the export (nil in production).
     var afterClaim: (@Sendable (MainSmokeRun) -> Void)? = nil
 
     public init(sandbox: any SandboxedRunner, unsandboxed: any SandboxedRunner = UnsandboxedPreviewRunner(), paths: BrahmaPaths,
-                environment: [String: String] = ProcessInfo.processInfo.environment) {
-        self.sandbox = sandbox; self.unsandboxed = unsandboxed; self.paths = paths; self.environment = environment
+                environment: [String: String] = ProcessInfo.processInfo.environment, ceiling: PermissionProfile? = nil) {
+        self.sandbox = sandbox; self.unsandboxed = unsandboxed; self.paths = paths; self.environment = environment; self.ceiling = ceiling
     }
 
     /// The smoke run's log: `<home>/companies/<companyId>/smoke-output/<id>.log` (the data home, like check output).

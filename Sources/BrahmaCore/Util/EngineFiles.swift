@@ -418,7 +418,7 @@ public enum EngineFiles {
         /// The path as the caller names it.
         let shown: URL
 
-        fileprivate init(fd: Int32, real: String, shown: URL) { self.fd = fd; self.real = real; self.shown = shown }
+        init(fd: Int32, real: String, shown: URL) { self.fd = fd; self.real = real; self.shown = shown }
         deinit { close(fd) }
 
         /// True while the directory is still at the path it was opened at (no part of the way to it was moved or swapped):

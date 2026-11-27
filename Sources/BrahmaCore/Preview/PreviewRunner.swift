@@ -67,6 +67,9 @@ public actor PreviewRunner: EmergencyStopObserver {
     let clock: @Sendable () -> Date
     let blocking: Blocking
     let baseEnvironment: [String: String]
+    /// The engine's ceiling on every profile (`brahma run --profile`, `Orchestrator.profileCeiling`): narrows the Full-mode
+    /// route of every preview (B2); nil is no ceiling.
+    let ceiling: PermissionProfile?
     /// The adapter of each kind (Plan 4a fix 5: injected).
     nonisolated let adapters: [PreviewKind: any PreviewAdapter]
     /// Each kind's `availability()`, asked once per runner.
@@ -110,19 +113,19 @@ public actor PreviewRunner: EmergencyStopObserver {
         var simulatorId: String? = nil
     }
 
-    /// `adapters` nil: `PreviewAdapters.defaults(deps)`.
+    /// `adapters` nil: `PreviewAdapters.defaults(deps)`. `ceiling` nil: no engine ceiling (a host without `brahma run --profile`).
     public init(store: Store, paths: BrahmaPaths, deps: PreviewDependencies, sandboxLayout: @escaping @Sendable (Company) -> SandboxLayout,
                 timeouts: PreviewTimeouts = .init(), memory: @escaping @Sendable () -> Bool, clock: @escaping @Sendable () -> Date = Store.now,
-                adapters: [PreviewKind: any PreviewAdapter]? = nil) {
+                adapters: [PreviewKind: any PreviewAdapter]? = nil, ceiling: PermissionProfile? = nil) {
         self.init(store: store, paths: paths, deps: deps, sandboxLayout: sandboxLayout, timeouts: timeouts, memory: memory, clock: clock,
-                  blocking: Blocking(), environment: ProcessInfo.processInfo.environment, adapters: adapters)
+                  blocking: Blocking(), environment: ProcessInfo.processInfo.environment, ceiling: ceiling, adapters: adapters)
     }
 
     init(store: Store, paths: BrahmaPaths, deps: PreviewDependencies, sandboxLayout: @escaping @Sendable (Company) -> SandboxLayout,
          timeouts: PreviewTimeouts, memory: @escaping @Sendable () -> Bool, clock: @escaping @Sendable () -> Date, blocking: Blocking,
-         environment: [String: String], adapters: [PreviewKind: any PreviewAdapter]? = nil) {
+         environment: [String: String], ceiling: PermissionProfile?, adapters: [PreviewKind: any PreviewAdapter]? = nil) {
         self.store = store; self.paths = paths; self.deps = deps; self.sandboxLayout = sandboxLayout; self.timeouts = timeouts
-        self.memory = memory; self.clock = clock; self.blocking = blocking; self.baseEnvironment = environment
+        self.memory = memory; self.clock = clock; self.blocking = blocking; self.baseEnvironment = environment; self.ceiling = ceiling
         self.adapters = adapters ?? PreviewAdapters.defaults(deps)
     }
 
@@ -429,7 +432,7 @@ public actor PreviewRunner: EmergencyStopObserver {
         let context = PreviewContext(surface: surface, company: company, layout: layout, run: run, commit: commit, port: port,
                                      policy: policies.policy, environment: environment, logURL: logURL, timeouts: timeouts,
                                      outputURL: layout.previewOutput(name: surface.name), appPolicy: policies.appPolicy,
-                                     unsandboxed: Self.unsandboxed(store: engineStore, company: company, surface: surface),
+                                     unsandboxed: Self.unsandboxed(store: engineStore, company: company, surface: surface, ceiling: ceiling),
                                      onSpawn: { pid, start in await self.spawned(id, pid: pid, start: start) }, redactor: engineStore.redactor)
         runs[id]?.context = context
         let update = await adapter.start(context)
@@ -625,17 +628,27 @@ public actor PreviewRunner: EmergencyStopObserver {
     // MARK: Routing (PR-5)
 
     /// A Full company's preview runs unsandboxed exactly when its checks would (`Orchestrator.checkRoute`): the company runs
-    /// Full and so does the role of the agent who set the surface (an owner-set surface follows the company).
-    static func unsandboxed(store: Store, company: Company, surface: PreviewSurface) -> Bool {
-        unsandboxed(store: store, company: company, setById: surface.setById)
+    /// Full and so does the role of the agent who set the surface (an owner-set surface follows the company), both narrowed
+    /// by the engine's `ceiling`.
+    static func unsandboxed(store: Store, company: Company, surface: PreviewSurface, ceiling: PermissionProfile?) -> Bool {
+        unsandboxed(store: store, company: company, setById: surface.setById, ceiling: ceiling)
     }
 
-    /// The shared rule (previews, main smokes): the company runs Full and so does the role of `setById` (the owner, or nil,
-    /// follows the company). One copy for every agent-written command the engine runs outside a check (PR-5).
-    static func unsandboxed(store: Store, company: Company, setById: String?) -> Bool {
-        guard company.permissionProfile == .full else { return false }
-        let role = setById.flatMap { $0 == "owner" ? nil : (try? store.agent(id: $0))?.role }
-        return role.map { company.profile(forRole: $0) == .full } ?? true
+    /// The shared rule (previews, main smokes, release builds): the company runs Full and so does the role of `setById`, a
+    /// known agent (the owner follows the company), each narrowed by the engine's `ceiling` (`brahma run --profile`, B2),
+    /// which never widens. No setter, an agent the company has no record of, or a lookup that fails: sandboxed (B1). One
+    /// copy for every agent-written command the engine runs outside a check (PR-5).
+    static func unsandboxed(store: Store, company: Company, setById: String?, ceiling: PermissionProfile?) -> Bool {
+        func narrowed(_ p: PermissionProfile) -> PermissionProfile { ceiling.map { PermissionProfile.narrower(p, $0) } ?? p }
+        guard narrowed(company.permissionProfile) == .full else { return false }
+        guard let setById else { return false }
+        if setById == "owner" { return true }
+        do {
+            guard let role = try store.agent(id: setById)?.role else { return false }
+            return narrowed(company.profile(forRole: role)) == .full
+        } catch {
+            return false
+        }
     }
 }
 

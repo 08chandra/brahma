@@ -76,6 +76,9 @@ public actor ReleaseExecutor: EmergencyStopObserver {
     let clock: @Sendable () -> Date
     let blocking: Blocking
     let environment: [String: String]
+    /// The engine's ceiling on every profile (`brahma run --profile`, `Orchestrator.profileCeiling`): narrows the Full-mode
+    /// route of a release's build (B2); nil is no ceiling.
+    let ceiling: PermissionProfile?
     /// How often a running step's exit, timeout and stop are looked at.
     let stepPoll: Duration
     /// Every step process running now, by pid (the L process registry, PR-4).
@@ -103,18 +106,18 @@ public actor ReleaseExecutor: EmergencyStopObserver {
                 adapters: @escaping HostingAdapters.Lookup = HostingAdapters.adapter,
                 sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
                 clock: @escaping @Sendable () -> Date = Store.now,
-                environment: [String: String] = ProcessInfo.processInfo.environment) {
+                environment: [String: String] = ProcessInfo.processInfo.environment, ceiling: PermissionProfile? = nil) {
         self.init(store: store, paths: paths, sandbox: sandbox, unsandboxed: unsandboxed, vault: vault, http: http, smoke: smoke,
-                  adapters: adapters, sleep: sleep, clock: clock, blocking: Blocking(), environment: environment)
+                  adapters: adapters, sleep: sleep, clock: clock, blocking: Blocking(), environment: environment, ceiling: ceiling)
     }
 
     init(store: Store, paths: BrahmaPaths, sandbox: any SandboxedRunner, unsandboxed: any SandboxedRunner, vault: any SecretVault,
          http: any HTTPProbing, smoke: @escaping Smoke, adapters: @escaping HostingAdapters.Lookup,
          sleep: @escaping @Sendable (Duration) async -> Void, clock: @escaping @Sendable () -> Date, blocking: Blocking,
-         environment: [String: String], stepPoll: Duration = .milliseconds(200)) {
+         environment: [String: String], ceiling: PermissionProfile?, stepPoll: Duration = .milliseconds(200)) {
         self.store = store; self.paths = paths; self.sandbox = sandbox; self.unsandboxed = unsandboxed
         self.vault = vault.nonInteractive(); self.http = http; self.smoke = smoke; self.adapters = adapters; self.sleep = sleep
-        self.clock = clock; self.blocking = blocking; self.environment = environment; self.stepPoll = stepPoll
+        self.clock = clock; self.blocking = blocking; self.environment = environment; self.ceiling = ceiling; self.stepPoll = stepPoll
     }
 
     /// The export run id of a release's build: `rel-<release id>` (a valid 3a run id, unique across companies).
@@ -352,7 +355,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         }
         let toolEnvironment = ChildEnvironment.make(base: environment, extra: ["BRAHMA_AGENT_ID": "release"], purpose: .check)
         if let build = r.build {
-            let full = PreviewRunner.unsandboxed(store: store, company: company, setById: r.proposedById)
+            let full = PreviewRunner.unsandboxed(store: store, company: company, setById: r.proposedById, ceiling: ceiling)
             let log = releaseDir.appending(path: "build.log", directoryHint: .notDirectory)
             let outcome = await runStep(r, runner: full ? unsandboxed : sandbox, command: build, cwd: export, environment: toolEnvironment,
                                         policy: Store.smokePolicy(company: company, export: export), timeout: ReleasePolicy.buildTimeout,

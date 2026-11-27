@@ -68,8 +68,9 @@ extension Orchestrator {
     /// - the working directory must be exactly the place 3a's engine made for that run: `<home>/run/checkouts/<runId>` for
     ///   a submission's check, `<home>/run/exports/<runId>` for a merge check (`GitWorkspace.checkoutPath`/`exportPath`, by
     ///   the run's purpose), the run must be `running`, and its recorded directory must be that place; otherwise `.refused`;
-    /// - the run's company runs Full (its own profile, and its item holder's role profile too when there is a holder):
-    ///   `.unsandboxed`;
+    /// - the run's company runs Full, and so does the role of its confirmed holder (the lease's agent, else who requested the
+    ///   run; a known agent): `.unsandboxed`. An unconfirmed author (no holder, an unknown agent, a lookup that fails) runs
+    ///   sandboxed with an activity line (B1);
     /// - otherwise `.sandboxed`: writable = exactly that checkout (or export) and the company's shared check cache
     ///   (`SandboxLayout.sharedCache`, created without following a link); readable = the company workspace; network =
     ///   `.outbound(allow: CompanyNetwork.scope(...).allowedDomains)`; toolchain on. A merge check writes only its export
@@ -167,9 +168,30 @@ extension Orchestrator {
                     }
                     if allFull { return .unsandboxed }
                 } else {
-                    let holder = record.itemId.flatMap { try? store.lease(itemId: $0) }?.agentId ?? record.requestedBy
-                    let role = holder.flatMap { try? store.agent(id: $0) }?.role
-                    if role.map({ narrowed(company.profile(forRole: $0)) == .full }) ?? true { return .unsandboxed }
+                    // B1 (spec §7.1): the check runs unsandboxed only when its author is confirmed: the holder (the lease's
+                    // agent, else who requested the run) is a known agent whose role narrows to Full. No holder, an unknown
+                    // agent or a lookup that fails runs it sandboxed and says so on the company's activity; a known holder
+                    // whose role is not Full is the ordinary sandboxed route (no note).
+                    let unconfirmed: String?
+                    do {
+                        let holder = try record.itemId.flatMap { try store.lease(itemId: $0) }?.agentId ?? record.requestedBy
+                        if let holder {
+                            if let role = try store.agent(id: holder)?.role {
+                                if narrowed(company.profile(forRole: role)) == .full { return .unsandboxed }
+                                unconfirmed = nil
+                            } else {
+                                unconfirmed = "no agent \(holder) in the company's records"
+                            }
+                        } else {
+                            unconfirmed = "no agent holds or requested it"
+                        }
+                    } catch {
+                        unconfirmed = "the lookup failed: \(error)"
+                    }
+                    if let unconfirmed {
+                        noteSandboxed(store: store, companyId: record.companyId, itemId: record.itemId, requestedBy: record.requestedBy,
+                                      runId: runId, reason: unconfirmed)
+                    }
                 }
             }
 
@@ -186,6 +208,21 @@ extension Orchestrator {
             // or a merge check, and there is no shared `npm` a check could break for its company's later runs.
             return .sandboxed(SandboxPolicy(writable: [checkout], readable: [wsReal], network: .outbound(allow: network),
                                             toolchain: true))
+        }
+    }
+
+    /// B1: the activity line on the run's company for a check that ran sandboxed because the engine could not confirm its
+    /// author (`SafeRead.sandboxedNote`; the subject is the item's key, else the run). A line that cannot be recorded is
+    /// logged; the route stands.
+    private static func noteSandboxed(store: Store, companyId: String, itemId: String?, requestedBy: String?, runId: String, reason: String) {
+        let subject: String
+        do { subject = try itemId.flatMap { try store.workItem(id: $0) }?.key ?? "run \(runId)" } catch { subject = "run \(runId)" }
+        let text = SafeRead.sandboxedNote(subject: subject, reason: reason)
+        do {
+            try store.appendEvent(ActivityEvent(companyId: companyId, agentId: requestedBy, turnId: nil, kind: .work, text: text,
+                                                createdAt: Store.now()))
+        } catch {
+            FileHandle.standardError.write(Data("brahma orchestrator: could not record \"\(text)\" (\(error))\n".utf8))
         }
     }
 
