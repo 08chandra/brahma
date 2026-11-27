@@ -2032,7 +2032,7 @@ enum Migrations {
     }
 
     /// Plan X1 migrations: registered after every Plan ML/C migration (the last is `vC-changes-quote`), never inside an earlier
-    /// plan's function, in landing order vX1-gateway. Never edit an earlier one.
+    /// plan's function, in landing order vX1-gateway, vX1-gateway-2. Never edit an earlier one.
     static func registerPlanX1(_ m: inout DatabaseMigrator) {
         m.registerMigration("vX1-gateway") { db in
             // Plan X1 Task 5: the provider gateway's tables. Every company-owned row has `companyId` (cascading with the company);
@@ -2149,6 +2149,10 @@ enum Migrations {
                     INSERT INTO provider (id, adapter, baseURL, host, keySecret, lan, builtin, createdAt) VALUES (?, ?, ?, ?, ?, 0, 1, ?)
                     """, arguments: [id, adapter, baseURL, host, key, now])
             }
+        }
+        m.registerMigration("vX1-gateway-2") { db in
+            // Plan X1 Task 9 (Ruling 56 m4): an item's gateway dollars are read on every budget step (`Store.itemUsage`).
+            try db.create(index: "gatewayCharge_company_item", on: "gatewayCharge", columns: ["companyId", "itemId"])
         }
     }
 }

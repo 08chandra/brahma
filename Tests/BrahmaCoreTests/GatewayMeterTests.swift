@@ -64,6 +64,9 @@ import GRDB
     /// Opus, 1000 output tokens, 3000 body bytes: 1000 input tokens at the cache-write rate ($8) + 1000 at $20 = $0.028.
     static let small = (maxTokens: 1000, bytes: 3000, usd: 0.028)
 
+    /// An ASCII body of `n` bytes (estimated at ceil(n / 3) input tokens).
+    static func ascii(_ n: Int) -> Data { Data(repeating: UInt8(ascii: "a"), count: max(n, 0)) }
+
     static func expectRefusal(_ body: () throws(GatewayError) -> Void, status: Int = GatewayRefusal.status, type: String,
                               _ message: String, sourceLocation: SourceLocation = #_sourceLocation) {
         do {
@@ -77,15 +80,21 @@ import GRDB
     // MARK: Estimate and caps
 
     @Test func estimateIsThePinnedFormula() {
-        #expect(abs(GatewayMeter.estimate(Self.opus, maxTokens: Self.small.maxTokens, inputBytes: Self.small.bytes) - Self.small.usd) < 1e-12)
-        // ceil(bytes / 3): 3001 bytes are 1001 tokens; the higher of the input and cache-write rates.
-        #expect(abs(GatewayMeter.estimate(Self.opus, maxTokens: 0, inputBytes: 3001) - 1001 * 8 / 1e6) < 1e-12)
+        #expect(abs(GatewayMeter.estimate(Self.opus, maxTokens: Self.small.maxTokens, body: Self.ascii(Self.small.bytes)) - Self.small.usd) < 1e-12)
+        // ASCII: ceil(bytes / 3) — 3001 bytes are 1001 tokens — at the higher of the input and cache-write rates.
+        #expect(GatewayMeter.estimatedInputTokens(Self.ascii(3001)) == 1001)
+        #expect(abs(GatewayMeter.estimate(Self.opus, maxTokens: 0, body: Self.ascii(3001)) - 1001 * 8 / 1e6) < 1e-12)
         let cheapCache = Price(inPerMTok: 3, outPerMTok: 15, cacheReadPerMTok: 0.3, cacheWritePerMTok: 1)
-        #expect(abs(GatewayMeter.estimate(cheapCache, maxTokens: 0, inputBytes: 3) - 3 / 1e6) < 1e-12)
+        #expect(abs(GatewayMeter.estimate(cheapCache, maxTokens: 0, body: Self.ascii(3)) - 3 / 1e6) < 1e-12)
+        // Ruling 54: two tokens per scalar at or above U+0080, whatever its UTF-8 length; ASCII beside it at bytes / 3.
+        #expect(GatewayMeter.estimatedInputTokens(Data("é中😀".utf8)) == 6)
+        #expect(GatewayMeter.estimatedInputTokens(Data("abc中".utf8)) == 3)
+        #expect(GatewayMeter.estimatedInputTokens(Data([0x61, 0xFF, 0xFE])) == 5, "bytes that are not UTF-8 count as U+FFFD")
+        #expect(GatewayMeter.estimatedInputTokens(Data()) == 0)
         // Never negative; output bounded by the most any usage is metered for.
-        #expect(GatewayMeter.estimate(Self.opus, maxTokens: -5, inputBytes: -7) == 0)
-        #expect(GatewayMeter.estimate(Self.opus, maxTokens: .max, inputBytes: 0) == Double(GatewayUsage.maxTokens) * 20 / 1e6)
-        #expect(GatewayMeter.estimate(Self.opus, maxTokens: .max, inputBytes: .max).isFinite)
+        #expect(GatewayMeter.estimate(Self.opus, maxTokens: -5, inputTokens: -7) == 0)
+        #expect(GatewayMeter.estimate(Self.opus, maxTokens: .max, body: Data()) == Double(GatewayUsage.maxTokens) * 20 / 1e6)
+        #expect(GatewayMeter.estimate(Self.opus, maxTokens: .max, inputTokens: .max).isFinite)
     }
 
     /// Admitted while the day's spend plus open reservations is below the cap; the refusal names the provider, the period, the
@@ -93,35 +102,35 @@ import GRDB
     @Test func refusesAtCap() throws {
         let rig = try Rig(caps: ProviderCaps(monthlyUSD: 10, dailyUSD: 0.05))
         let g = rig.grant()
-        let first = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, inputBytes: Self.small.bytes)
+        let first = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, body: Self.ascii(Self.small.bytes))
         #expect(abs(first.estimateUSD - Self.small.usd) < 1e-12)
-        _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, inputBytes: Self.small.bytes)  // 0.028 < 0.05
+        _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, body: Self.ascii(Self.small.bytes))  // 0.028 < 0.05
         let daily = "Brahma: anthropic daily cap of $0.05 reached for \(rig.companyId)"
         Self.expectRefusal({ () throws(GatewayError) in
-            _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: 1, inputBytes: 1)   // 0.056 ≥ 0.05
-        }, type: "rate_limit_error", daily)
+            _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: 1, body: Self.ascii(1))   // 0.056 ≥ 0.05
+        }, type: GatewayRefusal.type, daily)
         #expect(try rig.charges().map(\.state) == ["reserved", "reserved"])
         // An alias routed to the same provider shares the cap.
         Self.expectRefusal({ () throws(GatewayError) in
-            _ = try rig.meter.reserve(g, model: "brahma-standard", maxTokens: 1, inputBytes: 1)
-        }, type: "rate_limit_error", daily)
+            _ = try rig.meter.reserve(g, model: "brahma-standard", maxTokens: 1, body: Self.ascii(1))
+        }, type: GatewayRefusal.type, daily)
 
         // The first settles far below its estimate: 0.028 + 0.001 < 0.05 admits again.
         rig.meter.settle(first, usage: GatewayUsage(inputTokens: 0, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0))
-        _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: 1, inputBytes: 1)
+        _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: 1, body: Self.ascii(1))
 
         // The monthly cap is named when it is the one reached.
         let monthly = try Rig(caps: ProviderCaps(monthlyUSD: 0.02, dailyUSD: 5))
-        _ = try monthly.meter.reserve(monthly.grant(), model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, inputBytes: Self.small.bytes)
+        _ = try monthly.meter.reserve(monthly.grant(), model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, body: Self.ascii(Self.small.bytes))
         Self.expectRefusal({ () throws(GatewayError) in
-            _ = try monthly.meter.reserve(monthly.grant(), model: "claude-opus-5-5", maxTokens: 1, inputBytes: 1)
-        }, type: "rate_limit_error", "Brahma: anthropic monthly cap of $0.02 reached for \(monthly.companyId)")
+            _ = try monthly.meter.reserve(monthly.grant(), model: "claude-opus-5-5", maxTokens: 1, body: Self.ascii(1))
+        }, type: GatewayRefusal.type, "Brahma: anthropic monthly cap of $0.02 reached for \(monthly.companyId)")
 
         // A zero cap admits nothing.
         let zero = try Rig(caps: ProviderCaps(monthlyUSD: 0))
         Self.expectRefusal({ () throws(GatewayError) in
-            _ = try zero.meter.reserve(zero.grant(), model: "claude-opus-5-5", maxTokens: 1, inputBytes: 1)
-        }, type: "rate_limit_error", "Brahma: anthropic monthly cap of $0.00 reached for \(zero.companyId)")
+            _ = try zero.meter.reserve(zero.grant(), model: "claude-opus-5-5", maxTokens: 1, body: Self.ascii(1))
+        }, type: GatewayRefusal.type, "Brahma: anthropic monthly cap of $0.00 reached for \(zero.companyId)")
         #expect(try zero.charges().isEmpty)
     }
 
@@ -132,7 +141,7 @@ import GRDB
         try rig.store.setProviderCaps(ProviderCaps(monthlyUSD: 100), companyId: rig.companyId, provider: "groq")
         let message = "Brahma: no cap set for anthropic; run brahma billing \(rig.companyId) caps anthropic --monthly-cap <usd>"
         Self.expectRefusal({ () throws(GatewayError) in
-            _ = try rig.meter.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: 1, inputBytes: 1)
+            _ = try rig.meter.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: 1, body: Self.ascii(1))
         }, type: GatewayRefusal.type, message)
         #expect(try rig.charges().isEmpty)
 
@@ -152,17 +161,17 @@ import GRDB
         let g = rig.grant(aliases: ["brahma-deep": target])
         let message = "Brahma: no price for anthropic/claude-opus-9-9; run brahma settings model-price anthropic/claude-opus-9-9 <in> <out>"
         Self.expectRefusal({ () throws(GatewayError) in
-            _ = try rig.meter.reserve(g, model: "brahma-deep", maxTokens: 1, inputBytes: 1)
+            _ = try rig.meter.reserve(g, model: "brahma-deep", maxTokens: 1, body: Self.ascii(1))
         }, type: GatewayRefusal.type, message)
         #expect(try rig.charges().isEmpty)
         // A refused (zero) owner row leaves it unpriced; a valid one prices it.
         let zeroRow = PriceRow(provider: "anthropic", model: "claude-opus-9-9", inPerMTok: 0, outPerMTok: 0, setBy: "owner")
         Self.expectRefusal({ () throws(GatewayError) in
-            _ = try Rig.meter(rig.store, clock: rig.clock, prices: [zeroRow]).reserve(g, model: "brahma-deep", maxTokens: 1, inputBytes: 1)
+            _ = try Rig.meter(rig.store, clock: rig.clock, prices: [zeroRow]).reserve(g, model: "brahma-deep", maxTokens: 1, body: Self.ascii(1))
         }, type: GatewayRefusal.type, message)
         var priced = zeroRow
         priced.inPerMTok = 1; priced.outPerMTok = 2
-        let r = try Rig.meter(rig.store, clock: rig.clock, prices: [priced]).reserve(g, model: "brahma-deep", maxTokens: 1000, inputBytes: 3)
+        let r = try Rig.meter(rig.store, clock: rig.clock, prices: [priced]).reserve(g, model: "brahma-deep", maxTokens: 1000, body: Self.ascii(3))
         #expect(r.provider == "anthropic" && r.model == "claude-opus-9-9" && abs(r.estimateUSD - (1 * 1 + 1000 * 2) / 1e6) < 1e-12)
 
         let gateway = try ModelGatewayRig([ModelGatewayTests.ok])
@@ -204,7 +213,7 @@ import GRDB
             let opus = rng.below(2) == 0
             let maxTokens = 100 + rng.below(3900)
             let bytes = 300 + rng.below(29_700)
-            let estIn = GatewayMeter.estimatedInputTokens(bytes)
+            let estIn = (bytes + 2) / 3
             var usage: GatewayUsage?
             if rng.below(6) != 0 {
                 usage = overshoot
@@ -261,7 +270,7 @@ import GRDB
                 DispatchQueue.concurrentPerform(iterations: round.requests.count) { n in
                     let request = round.requests[n]
                     do {
-                        let r = try rig.meter.reserve(g, model: request.model, maxTokens: request.maxTokens, inputBytes: request.inputBytes)
+                        let r = try rig.meter.reserve(g, model: request.model, maxTokens: request.maxTokens, body: Self.ascii(request.inputBytes))
                         estimates.with { $0[r.id] = r.estimateUSD }
                         counts.with { $0.admitted += 1 }
                         if request.deferred {
@@ -295,7 +304,11 @@ import GRDB
                     let state: String = row["state"]
                     if state == "reserved" { run.violations.append("case \(index) \(name): charge \(id) left reserved") }
                     total += usd; largest = max(largest, usd)
-                    over += max(0, usd - (reserved[id] ?? 0))
+                    guard let estimate = reserved[id] else {
+                        run.violations.append("case \(index) \(name): charge \(id) has no reservation the meter returned")
+                        continue
+                    }
+                    over += max(0, usd - estimate)
                 }
                 if over > 0 { run.windowsWithOvershoot += 1 } else { run.windowsWithoutOvershoot += 1 }
                 if !planned.overshoot, over > 1e-12 { run.violations.append("case \(index) \(name): an actual exceeded its reservation") }
@@ -327,7 +340,7 @@ import GRDB
         let rig = try Rig(caps: ProviderCaps(monthlyUSD: 10, dailyUSD: 0.05))
         do {
             let dying = Rig.meter(rig.store, clock: rig.clock)
-            _ = try dying.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, inputBytes: Self.small.bytes)
+            _ = try dying.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, body: Self.ascii(Self.small.bytes))
         }
         let next = Rig.meter(rig.store, clock: rig.clock)
         #expect(try next.recover() == 1)
@@ -335,19 +348,19 @@ import GRDB
         #expect(row.state == "estimated" && row.estimated && abs(row.usd - Self.small.usd) < 1e-12)
         #expect(try next.recover() == 0)
         #expect(abs(try rig.store.spend(companyId: rig.companyId, provider: "anthropic", period: .day, now: rig.clock.now) - Self.small.usd) < 1e-12)
-        _ = try next.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, inputBytes: Self.small.bytes)
+        _ = try next.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, body: Self.ascii(Self.small.bytes))
         Self.expectRefusal({ () throws(GatewayError) in
-            _ = try next.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: 1, inputBytes: 1)
-        }, type: "rate_limit_error", "Brahma: anthropic daily cap of $0.05 reached for \(rig.companyId)")
+            _ = try next.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: 1, body: Self.ascii(1))
+        }, type: GatewayRefusal.type, "Brahma: anthropic daily cap of $0.05 reached for \(rig.companyId)")
     }
 
-    /// `ModelGateway.start` recovers before it serves.
+    /// What `ModelGateway.start` runs before it serves (`recoverOpenReservations`, checked here without binding a port;
+    /// `ModelGatewayTests.startsAndStopsOnLoopback` checks that `start` runs it).
     @Test func gatewayStartRecoversReservations() throws {
         let rig = try ModelGatewayRig([ModelGatewayTests.ok])
-        let leftover = try rig.meter.reserve(rig.registry.admit(rig.grant().value)!, model: "claude-opus-5-5", maxTokens: 10, inputBytes: 30)
+        let leftover = try rig.meter.reserve(rig.registry.admit(rig.grant().value)!, model: "claude-opus-5-5", maxTokens: 10, body: Self.ascii(30))
         #expect(try rig.charges().map(\.state) == ["reserved"])
-        _ = try rig.gateway.start()
-        defer { rig.gateway.stop() }
+        try rig.gateway.recoverOpenReservations()
         #expect(try rig.charges().map(\.state) == ["estimated"])
         #expect(rig.logLines.contains { $0.contains("1 reservation(s) left open by an earlier gateway charged at their estimates") })
         rig.meter.settle(leftover, usage: GatewayUsage(inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0))
@@ -360,7 +373,7 @@ import GRDB
     static let deltaEvent = #"event: content_block_delta"# + "\n" + #"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"# + "\n\n"
     /// A streamed request big enough for its reservation to matter: 1000 output tokens (≈ $0.02 on Opus).
     static let streamed = #"{"model":"claude-opus-5-5","max_tokens":1000,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#
-    static var streamedEstimate: Double { GatewayMeter.estimate(opus, maxTokens: 1000, inputBytes: streamed.utf8.count) }
+    static var streamedEstimate: Double { GatewayMeter.estimate(opus, maxTokens: 1000, body: Data(streamed.utf8)) }
 
     /// Whether `task` ends within `seconds` (awake): a connection that never ends fails the test instead of hanging it.
     static func ends(_ task: Task<Void, Never>, within seconds: Int = 60) async -> Bool {
@@ -427,6 +440,16 @@ import GRDB
         feed.finish()
     }
 
+    /// Ruling 56 m5: an SSE `event: error` mid-stream (the provider overloaded), then a normal end with no terminal usage:
+    /// charged at least the reservation.
+    @Test func midStreamErrorEventChargesAtLeastTheReservation() async throws {
+        let error = "event: error\n" + #"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"# + "\n\n"
+        let rig = try ModelGatewayRig([FakeUpstream.sse(Data((Self.startEvent + error).utf8))])
+        let r = try await rig.exchange(Self.streamed, token: rig.grant())
+        #expect(r.status == 200 && r.text.contains("overloaded_error"), "\(r.text)")
+        try await Self.expectChargedTheReservation(rig)
+    }
+
     /// A stream that finishes normally — terminal usage, `message_stop` — is charged exactly its parsed usage, even far below
     /// the reservation.
     @Test func normalFinishChargesTheExactUsage() async throws {
@@ -449,7 +472,7 @@ import GRDB
     /// A response that ended early but had already reported more than its reservation is charged what it reported.
     @Test func earlyEndAboveTheReservationChargesTheUsageSeen() throws {
         let rig = try Rig()
-        let r = try rig.meter.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: 10, inputBytes: 30)
+        let r = try rig.meter.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: 10, body: Self.ascii(30))
         let seen = GatewayUsage(inputTokens: 100_000, outputTokens: 500, cacheReadTokens: 0, cacheWriteTokens: 0)
         rig.meter.settle(r, UsageOutcome(usage: seen, complete: false))
         let row = try #require(try rig.charges().first)
@@ -472,7 +495,7 @@ import GRDB
         }
         #expect(await eventually { ((try? rig.charges()) ?? []).allSatisfy { $0.state == "estimated" } })
         let refused = try await rig.exchange(Self.streamed, token: token)
-        #expect(refused.status == 400 && refused.errorType == "rate_limit_error", "\(refused.text)")
+        #expect(refused.status == 400 && refused.errorType == "invalid_request_error", "\(refused.text)")
         #expect(refused.text.contains("Brahma: anthropic daily cap of $"), "\(refused.text)")
         #expect(rig.upstream.requests.count == 3)
     }
@@ -481,7 +504,7 @@ import GRDB
     /// (Ruling 52(a): never zero).
     @Test func missingUsageChargedAtEstimate() async throws {
         let rig = try Rig()
-        let r = try rig.meter.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, inputBytes: Self.small.bytes)
+        let r = try rig.meter.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, body: Self.ascii(Self.small.bytes))
         rig.meter.settle(r, usage: nil)
         rig.meter.settle(r, usage: GatewayUsage(inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0))  // idempotent
         let row = try #require(try rig.charges().first)
@@ -493,33 +516,37 @@ import GRDB
         #expect(try await gateway.exchange(body, token: gateway.grant()).status == 200)
         let charged = try #require(try gateway.charges().first)
         #expect(charged.state == "estimated" && charged.usd > 0)
-        #expect(abs(charged.usd - GatewayMeter.estimate(Self.opus, maxTokens: 16, inputBytes: body.utf8.count)) < 1e-12)
+        #expect(abs(charged.usd - GatewayMeter.estimate(Self.opus, maxTokens: 16, body: Data(body.utf8))) < 1e-12)
     }
 
-    /// A body in Chinese and Japanese: the estimate is per byte, not per character, so each 3-byte character is reserved as
-    /// one token at the higher of the input and cache-write rates — two input-rate tokens per character at the pinned rates.
-    /// The fixture's true count is not recorded here (no model API in tests; Task 16's live run records it): the test pins
-    /// the bound the formula guarantees against the token count a per-character estimate (4 characters per token) would give.
+    /// A body in Chinese and Japanese (Ruling 54): every scalar at or above U+0080 is reserved as two input tokens, so the
+    /// estimate holds at least two tokens per CJK character; an ASCII body is still reserved at ceil(bytes / 3). The
+    /// fixture's true count is not known here (no model API in tests): Task 16's live run records `count_tokens` for
+    /// `request-cjk.json` and asserts the estimate is at least that.
     @Test func nonASCIIInputEstimateIsConservative() async throws {
         let body = try AnthropicFixture.text("request-cjk", "json").trimmingCharacters(in: .newlines)
-        let request = try CanonicalRequest.decode(Data(body.utf8))
-        guard case .text(let text) = try #require(request.messages.first).content else { Issue.record("text content"); return }
-        let cjk = text.unicodeScalars.filter { $0.value >= 0x2E80 }.count
-        #expect(cjk > 800 && body.utf8.count < 3 * cjk + 400)
-        let rig = try ModelGatewayRig([ModelGatewayTests.ok])
+        let cjk = body.unicodeScalars.filter { $0.value >= 0x2E80 }.count
+        #expect(cjk > 800)
+        let reserved = GatewayMeter.estimatedInputTokens(Data(body.utf8))
+        #expect(reserved >= 2 * cjk, "\(reserved) tokens for \(cjk) CJK characters")
+        // Under the bytes / 3 rule the same body would have reserved about one token per character.
+        #expect(reserved > (body.utf8.count + 2) / 3 + cjk / 2)
+        // Through the gateway: the row holds that reservation.
+        let rig = try ModelGatewayRig([FakeUpstream.json(200, #"{"type":"message","content":[]}"#)])   // no usage: charged the estimate
         #expect(try await rig.exchange(body, token: rig.grant()).status == 200)
-        // The reservation's input tokens, then what they are worth at the input rate.
-        let estimateRow = GatewayMeter.estimatedInputTokens(body.utf8.count)
-        #expect(estimateRow >= cjk)
-        let inputUSD = Double(estimateRow) * max(Self.opus.inPerMTok, Self.opus.cacheWriteRate) / 1e6
-        #expect(inputUSD >= Double(2 * cjk) * Self.opus.inPerMTok / 1e6, "two input-rate tokens per CJK character")
-        #expect(estimateRow >= 4 * ((text.count + 3) / 4), "four times what a characters-per-token estimate would reserve")
+        let row = try #require(try rig.charges().first)
+        #expect(row.state == "estimated" && row.inputTokens == reserved)
+        #expect(abs(row.usd - GatewayMeter.estimate(Self.opus, maxTokens: 1024, inputTokens: reserved)) < 1e-12)
+
+        // Control: an ASCII body of the same length is still ceil(bytes / 3).
+        let ascii = Self.ascii(body.utf8.count)
+        #expect(GatewayMeter.estimatedInputTokens(ascii) == (body.utf8.count + 2) / 3)
     }
 
     /// A provider's usage claiming −5 or 10¹² tokens is clamped before it is priced: the charge is finite and not negative.
     @Test func negativeOrHugeUsageClamped() async throws {
         let rig = try Rig()
-        let r = try rig.meter.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: 1, inputBytes: 1)
+        let r = try rig.meter.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: 1, body: Self.ascii(1))
         rig.meter.settle(r, usage: GatewayUsage(inputTokens: -5, outputTokens: 1_000_000_000_000, cacheReadTokens: .min, cacheWriteTokens: .max))
         let row = try #require(try rig.charges().first)
         #expect(row.state == "settled" && row.inputTokens == 0 && row.cacheReadTokens == 0)
@@ -544,18 +571,18 @@ import GRDB
         }
         let rig = try Rig(caps: ProviderCaps(monthlyUSD: 0.05, dailyUSD: 1), zone: "Asia/Kolkata", at: try at(1, 31, 23, 30))
         let g = rig.grant()
-        for _ in 0..<2 { _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, inputBytes: Self.small.bytes) }
+        for _ in 0..<2 { _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, body: Self.ascii(Self.small.bytes)) }
         let refusal = "Brahma: anthropic monthly cap of $0.05 reached for \(rig.companyId)"
-        Self.expectRefusal({ () throws(GatewayError) in _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: 1, inputBytes: 1) },
-                           type: "rate_limit_error", refusal)
+        Self.expectRefusal({ () throws(GatewayError) in _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: 1, body: Self.ascii(1)) },
+                           type: GatewayRefusal.type, refusal)
         rig.clock.now = try at(1, 31, 23, 59)
-        Self.expectRefusal({ () throws(GatewayError) in _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: 1, inputBytes: 1) },
-                           type: "rate_limit_error", refusal)
+        Self.expectRefusal({ () throws(GatewayError) in _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: 1, body: Self.ascii(1)) },
+                           type: GatewayRefusal.type, refusal)
         rig.clock.now = try at(2, 1, 0, 30)
         var utc = Calendar(identifier: .gregorian)
         utc.timeZone = try #require(TimeZone(identifier: "UTC"))
         #expect(utc.component(.month, from: rig.clock.now) == 1, "still January in UTC")
-        _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, inputBytes: Self.small.bytes)
+        _ = try rig.meter.reserve(g, model: "claude-opus-5-5", maxTokens: Self.small.maxTokens, body: Self.ascii(Self.small.bytes))
         #expect(abs(try rig.store.spend(companyId: rig.companyId, provider: "anthropic", period: .month, now: rig.clock.now) - Self.small.usd) < 1e-12)
     }
 

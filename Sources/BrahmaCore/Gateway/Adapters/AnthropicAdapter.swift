@@ -85,6 +85,9 @@ public struct AnthropicAdapter: ProviderAdapter {
         return out
     }
 
+    /// Ruling 55: Anthropic bills no errored request.
+    public func billsNothing(status: Int) -> Bool { status >= 400 }
+
     // MARK: Responses
 
     public func translate(status: Int, headers: [String: String], body: AsyncThrowingStream<Data, Error>, streamed: Bool,

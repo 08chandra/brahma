@@ -159,7 +159,8 @@ final class ModelGatewayRig: @unchecked Sendable {
     private let recorder = Recorder()
 
     init(_ script: [FakeUpstream.Reply], providers: [Provider] = [AnthropicFixture.provider()], storeKey: Bool = true,
-         caps: ProviderCaps? = ProviderCaps(monthlyUSD: 1000), maxUpstream: Int = GatewayLimits.maxUpstreamRequests) throws {
+         caps: ProviderCaps? = ProviderCaps(monthlyUSD: 1000), maxUpstream: Int = GatewayLimits.maxUpstreamRequests,
+         adapters: [any ProviderAdapter] = [AnthropicAdapter()]) throws {
         upstream = FakeUpstream(script)
         store = try Store.inMemory()
         companyId = try store.createCompany(name: "Co", goal: "g", workspacesRoot: tempDir()).id
@@ -173,7 +174,7 @@ final class ModelGatewayRig: @unchecked Sendable {
             let hook: (@Sendable () -> Void)? = recorder.lock.withLock { recorder.lookups += 1; return recorder.onLookup }
             hook?()
             return byId[id]
-        }, adapters: [AnthropicAdapter()], upstream: upstream, vault: vault, meter: meter, maxUpstream: maxUpstream, log: log)
+        }, adapters: adapters, upstream: upstream, vault: vault, meter: meter, maxUpstream: maxUpstream, log: log)
         // Connection deadlines on a clock that stands still: no load can time a connection out (Ruling 44).
         server = GatewayServer(registry: registry, handler: gateway, timing: .pinned, clock: ManualAwakeClock(), beforeDispatch: nil)
     }

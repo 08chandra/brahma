@@ -34,8 +34,12 @@ import GRDB
     @Test func migrationSeedsBuiltins() throws {
         let (store, _, _) = try store()
         let names = Migrations.migrator().migrations
-        #expect(names.last == "vX1-gateway")
+        #expect(names.last == "vX1-gateway-2")
         #expect(names.firstIndex(of: "vX1-gateway") == names.firstIndex(of: "vC-changes-quote").map { $0 + 1 })
+        #expect(names.firstIndex(of: "vX1-gateway-2") == names.firstIndex(of: "vX1-gateway").map { $0 + 1 })
+        // Ruling 56 m4: an item's gateway dollars are read through an index.
+        let indexed = try store.writer.read { db in try db.indexes(on: "gatewayCharge").map(\.columns) }
+        #expect(indexed.contains(["companyId", "itemId"]))
         let providers = try store.providers()
         #expect(providers.map(\.id) == ["anthropic", "groq", "openai", "openrouter"])
         let expected: [String: (String, String, String, String)] = [

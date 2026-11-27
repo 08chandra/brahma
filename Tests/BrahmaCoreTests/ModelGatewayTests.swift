@@ -392,7 +392,7 @@ import GRDB
     /// answer (which the provider does not bill) and `count_tokens` (free) are settled at zero.
     @Test func sentRequestsAreSettled() async throws {
         let body = Self.body("claude-opus-5-5")
-        let estimate = GatewayMeter.estimate(PriceBook.pinned["anthropic/claude-opus-5-5"]!, maxTokens: 16, inputBytes: body.utf8.count)
+        let estimate = GatewayMeter.estimate(PriceBook.pinned["anthropic/claude-opus-5-5"]!, maxTokens: 16, body: Data(body.utf8))
         for (script, state, usd) in [(FakeUpstream.Reply.fail(.upstream(status: 502, message: "Brahma: the provider could not be reached")), "estimated", estimate),
                                      (.respond(status: 302, headers: [:], chunks: [], hold: false), "estimated", estimate),
                                      (FakeUpstream.json(529, #"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#), "settled", 0),
@@ -408,6 +408,46 @@ import GRDB
         #expect(counted.status == 200)
         let row = try #require(try count.charges().first)
         #expect(row.state == "settled" && row.usd == 0)
+    }
+
+    /// Ruling 55: the adapter decides whether its provider bills an error answer. An adapter that (like Task 10's
+    /// openai-compatible one) bills nothing on 4xx but may bill a 5xx: a 400 is settled at zero, a 503 charged the estimate.
+    /// Anthropic bills no error: its 503 is zero.
+    @Test func adapterDecidesWhetherAnErrorIsBilled() async throws {
+        let body = Self.body("claude-opus-5-5")
+        let estimate = GatewayMeter.estimate(PriceBook.pinned["anthropic/claude-opus-5-5"]!, maxTokens: 16, body: Data(body.utf8))
+        let answers = [(400, "invalid_request_error"), (503, "api_error")]
+        for (status, type) in answers {
+            let reply = FakeUpstream.json(status, #"{"type":"error","error":{"type":"\#(type)","message":"no"}}"#)
+            let adapters: [(any ProviderAdapter, Bool)] = [(BillsServerErrors(), status >= 500), (AnthropicAdapter(), false)]
+            for (adapter, billed) in adapters {
+                let rig = try ModelGatewayRig([reply], adapters: [adapter])
+                #expect(try await rig.exchange(body, token: rig.grant()).status == status)
+                let row = try #require(try rig.charges().first)
+                if billed {
+                    #expect(row.state == "estimated" && abs(row.usd - estimate) < 1e-12, "\(adapter.version) \(status): \(row)")
+                } else {
+                    #expect(row.state == "settled" && row.usd == 0, "\(adapter.version) \(status): \(row)")
+                }
+            }
+        }
+        #expect(AnthropicAdapter().billsNothing(status: 400) && AnthropicAdapter().billsNothing(status: 529))
+    }
+
+    /// The anthropic adapter, except that it reports 5xx answers as possibly billed (the openai-compatible rule, Ruling 55).
+    struct BillsServerErrors: ProviderAdapter {
+        let base = AnthropicAdapter()
+        var id: AdapterId { base.id }
+        let version = "bills-5xx"
+        func upstream(_ r: CanonicalRequest, body: StrictJSON, model: String, endpoint: GatewayEndpoint, headers: [GatewayHeader],
+                      provider: Provider, key: String) throws(GatewayError) -> UpstreamRequest {
+            try base.upstream(r, body: body, model: model, endpoint: endpoint, headers: headers, provider: provider, key: key)
+        }
+        func translate(status: Int, headers: [String: String], body: AsyncThrowingStream<Data, Error>, streamed: Bool,
+                       into reply: GatewayReply, redact: @Sendable (String) -> String) async throws(GatewayError) -> UsageOutcome {
+            try await base.translate(status: status, headers: headers, body: body, streamed: streamed, into: reply, redact: redact)
+        }
+        func billsNothing(status: Int) -> Bool { status < 500 }
     }
 
     /// Ruling 52(f): at most `GatewayLimits.maxUpstreamRequests` requests upstream at once; past it a 429 rate_limit_error
@@ -472,7 +512,11 @@ import GRDB
 
     @Test func startsAndStopsOnLoopback() throws {
         let rig = try ModelGatewayRig([Self.ok])
+        // A reservation a dead gateway left open: `start` charges it at its estimate before it serves.
+        _ = try rig.meter.reserve(try #require(rig.registry.admit(rig.grant().value)), model: "claude-opus-5-5", maxTokens: 10,
+                                  body: Data("{}".utf8))
         let port = try rig.gateway.start()
+        #expect(try rig.charges().map(\.state) == ["estimated"])
         #expect(port > 0)
         #expect(try rig.gateway.start() == port)
         rig.gateway.stop()

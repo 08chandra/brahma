@@ -100,4 +100,11 @@ public protocol ProviderAdapter: Sendable {
 
     func translate(status: Int, headers: [String: String], body: AsyncThrowingStream<Data, Error>, streamed: Bool,
                    into reply: GatewayReply, redact: @Sendable (String) -> String) async throws(GatewayError) -> UsageOutcome
+
+    /// Whether the provider bills nothing for a response with this error `status` (≥ 400) (Ruling 55). True: the request is
+    /// settled at zero. False: it is charged its reservation estimate (overcount fails closed where billing is unknown).
+    /// `anthropic`: every status ≥ 400 bills nothing (Anthropic does not bill errored requests; charging would book phantom
+    /// spend on every `claude` retry). `openai-compatible` (Task 10): 4xx bills nothing, 5xx charges the estimate
+    /// (aggregators may bill partial work).
+    func billsNothing(status: Int) -> Bool
 }

@@ -61,38 +61,49 @@ public final class GatewayMeter: Sendable {
 
     // MARK: Estimate
 
-    /// The reservation, and the charge when usage is missing (pinned): input `ceil(inputBytes / 3)` tokens at the higher of
-    /// the input and cache-write rates, output `maxTokens` (at most `GatewayUsage.maxTokens`, the most any usage is metered
-    /// for) at the output rate.
-    public static func estimate(_ price: Price, maxTokens: Int, inputBytes: Int) -> Double {
-        let input = Double(estimatedInputTokens(inputBytes)) * max(price.inPerMTok, price.cacheWriteRate)
+    /// The reservation, and the charge when usage is missing: input `estimatedInputTokens(body)` tokens at the higher of the
+    /// input and cache-write rates, output `maxTokens` (at most `GatewayUsage.maxTokens`, the most any usage is metered for)
+    /// at the output rate.
+    public static func estimate(_ price: Price, maxTokens: Int, body: Data) -> Double {
+        estimate(price, maxTokens: maxTokens, inputTokens: estimatedInputTokens(body))
+    }
+
+    static func estimate(_ price: Price, maxTokens: Int, inputTokens: Int) -> Double {
+        let input = Double(max(inputTokens, 0)) * max(price.inPerMTok, price.cacheWriteRate)
         let output = Double(estimatedOutputTokens(maxTokens)) * price.outPerMTok
         return (input + output) / 1_000_000
     }
 
-    static func estimatedInputTokens(_ bytes: Int) -> Int {
-        let b = max(bytes, 0)
-        return b / 3 + (b % 3 == 0 ? 0 : 1)
+    /// The input tokens a body is reserved for (Ruling 54): `ceil(asciiBytes / 3)` plus two per Unicode scalar at or above
+    /// U+0080 — a per-byte count would reserve one token per 3-byte CJK character, which can undercount (undercount fails
+    /// open). Bytes that are not UTF-8 count as U+FFFD (two tokens each).
+    public static func estimatedInputTokens(_ body: Data) -> Int {
+        var ascii = 0, other = 0
+        for scalar in String(decoding: body, as: UTF8.self).unicodeScalars {
+            if scalar.isASCII { ascii += 1 } else { other += 1 }
+        }
+        return ascii / 3 + (ascii % 3 == 0 ? 0 : 1) + 2 * other
     }
 
     static func estimatedOutputTokens(_ maxTokens: Int) -> Int { min(max(maxTokens, 0), GatewayUsage.maxTokens) }
 
     // MARK: Reserve
 
-    /// Reserves `model` (as the request names it; routed by the grant) for one request of `inputBytes` body bytes asking for
-    /// up to `maxTokens` output tokens: the row is in the database when this returns. Refused (nothing written): an unrouted
-    /// or unpriced model, no caps for the provider, a cap reached, or a meter that cannot record.
-    public func reserve(_ g: TurnGrant, model: String, maxTokens: Int, inputBytes: Int) throws(GatewayError) -> Reservation {
+    /// Reserves `model` (as the request names it; routed by the grant) for one request with this `body` asking for up to
+    /// `maxTokens` output tokens: the row is in the database when this returns. Refused (nothing written): an unrouted or
+    /// unpriced model, no caps for the provider, a cap reached, or a meter that cannot record.
+    public func reserve(_ g: TurnGrant, model: String, maxTokens: Int, body: Data) throws(GatewayError) -> Reservation {
         let target = try ModelGateway.route(model, grant: g)
         let key = PriceBook.key(provider: target.provider, model: target.model)
         guard let price = prices().price(provider: target.provider, model: target.model) else {
             throw .policy("no price for \(key); run brahma settings model-price \(key) <in> <out>")
         }
-        let estimate = Self.estimate(price, maxTokens: maxTokens, inputBytes: inputBytes)
+        let inputTokens = Self.estimatedInputTokens(body)
+        let estimate = Self.estimate(price, maxTokens: maxTokens, inputTokens: inputTokens)
         guard estimate.isFinite, estimate >= 0 else { throw .unavailable("the estimate for \(key) is not a dollar amount") }
         let charge = GatewayCharge(
             companyId: g.companyId, turnId: g.turnId, itemId: g.itemId, agentId: g.agentId, provider: target.provider, model: target.model,
-            inputTokens: Self.estimatedInputTokens(inputBytes), outputTokens: Self.estimatedOutputTokens(maxTokens), cacheReadTokens: 0,
+            inputTokens: inputTokens, outputTokens: Self.estimatedOutputTokens(maxTokens), cacheReadTokens: 0,
             cacheWriteTokens: 0, usd: estimate, estimated: true, state: .reserved, at: clock())
         let admission = self.admission
         let id: Int64
@@ -108,8 +119,8 @@ public final class GatewayMeter: Sendable {
                                                   + "brahma billing \(g.companyId) caps \(target.provider)")
                     }
                     guard admission(split.committed, split.reserved, cap) else {
-                        throw GatewayError.refused(status: GatewayRefusal.status, type: "rate_limit_error",
-                                                   message: "Brahma: \(target.provider) \(name) cap of $\(Self.money(cap)) reached for \(g.companyId)")
+                        // Ruling 53: the one refusal vocabulary (400 invalid_request_error) `claude` was seen to end a turn on.
+                        throw GatewayError.policy("\(target.provider) \(name) cap of $\(Self.money(cap)) reached for \(g.companyId)")
                     }
                 }
             }
@@ -125,9 +136,10 @@ public final class GatewayMeter: Sendable {
 
     // MARK: Settle
 
-    /// Settles `r` with the provider's final `usage` (`settled` at its cost), or at its estimate (`estimated`) when `usage`
-    /// is nil or its cost is not a dollar amount. Idempotent: only an open reservation changes.
-    public func settle(_ r: Reservation, usage: GatewayUsage?) {
+    /// Settles `r` with the provider's **final** `usage` (`settled` at its cost), or at its estimate (`estimated`) when `usage`
+    /// is nil. Internal (Ruling 56 m2): a partial usage passed here would be charged as final; callers outside the meter's
+    /// tests settle with a `UsageOutcome`. Idempotent: only an open reservation changes.
+    func settle(_ r: Reservation, usage: GatewayUsage?) {
         settle(r, UsageOutcome(usage: usage, complete: true))
     }
 

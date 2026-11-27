@@ -13,8 +13,8 @@ import Foundation
 ///
 /// Metering (Task 9): a request that never left the gateway is released (Ruling 23); one handed to the transport is charged
 /// its final usage, or at least its estimate when there is none — usage missing (Ruling 52(a)) or a response that ended
-/// early (Ruling X1-37) — except an answer with an error status, which the provider does not bill (settled at zero), and
-/// `count_tokens`, which costs nothing. At most `GatewayLimits.maxUpstreamRequests`
+/// early (Ruling X1-37) — except an error answer its adapter says the provider does not bill (`billsNothing(status:)`,
+/// Ruling 55: settled at zero), and `count_tokens`, which costs nothing. At most `GatewayLimits.maxUpstreamRequests`
 /// requests are upstream at once; past it a request gets a 429 (Ruling 52(f): transient, so `claude` backs off and retries).
 public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     public let registry: TurnTokenRegistry
@@ -54,13 +54,19 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         let server: GatewayServer = try lock.withLock {
             guard !stopped else { throw LoopbackListenerError.setup(step: "start after stop", errno: 0) }
             if let server = self.server { return server }
-            let recovered = try meter.recover()
-            if recovered > 0 { log("gateway: \(recovered) reservation(s) left open by an earlier gateway charged at their estimates") }
+            try recoverOpenReservations()
             let made = GatewayServer(registry: registry, handler: self)
             self.server = made
             return made
         }
         return try server.start()
+    }
+
+    /// What `start` does before it serves: reservations a dead gateway left open are charged at their estimates. A seam so a
+    /// test can check it without binding a port.
+    func recoverOpenReservations() throws {
+        let recovered = try meter.recover()
+        if recovered > 0 { log("gateway: \(recovered) reservation(s) left open by an earlier gateway charged at their estimates") }
     }
 
     /// Stops the server (cutting open connections) and every token. Idempotent.
@@ -117,7 +123,7 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         guard acquireUpstreamSlot() else { throw Self.busy }
         defer { releaseUpstreamSlot() }
         // The reservation is in the database before anything goes upstream; it is settled however the request ends.
-        let reservation = try meter.reserve(grant, model: canonical.model, maxTokens: canonical.maxTokens ?? 0, inputBytes: r.body.count)
+        let reservation = try meter.reserve(grant, model: canonical.model, maxTokens: canonical.maxTokens ?? 0, body: r.body)
         var settlement = Settlement.release
         defer { settle(reservation, settlement) }
         try await forward(canonical, tree: tree, request: r, target: target, provider: provider, adapter: adapter, secret: secret, grant: grant,
@@ -192,8 +198,10 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
             // A redirect (never followed) or an informational answer: the provider is not where it is configured to be.
             throw .upstream(status: 502, message: "Brahma: the provider answered HTTP \(response.status); redirects are refused")
         }
-        // The provider bills neither an error answer nor a token count.
-        if response.status >= 400 || r.endpoint == .countTokens { settlement = .charge(Self.noUsage) }
+        // An error answer: the adapter says whether its provider bills it (Ruling 55); else the estimate stands. A token count
+        // costs nothing.
+        if response.status >= 400, adapter.billsNothing(status: response.status) { settlement = .charge(Self.noUsage) }
+        if r.endpoint == .countTokens { settlement = .charge(Self.noUsage) }
         let streamed = r.endpoint == .messages && canonical.stream == true
         let outcome: UsageOutcome
         do {

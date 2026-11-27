@@ -84,8 +84,10 @@ extension Store {
             WHERE itemId = ? AND kind = 'work' AND infra = 0 AND sessionResetReason IS NULL
               AND (stopReason IS NULL OR stopReason <> 'sessionReset')
             """, arguments: [itemId])
-        let metered = try Double.fetchOne(db, sql: "SELECT COALESCE(SUM(usd), 0) FROM gatewayCharge WHERE itemId = ?",
-                                          arguments: [itemId]) ?? 0
+        let metered = try Double.fetchOne(db, sql: """
+            SELECT COALESCE(SUM(usd), 0) FROM gatewayCharge
+            WHERE companyId = (SELECT companyId FROM workItem WHERE id = ?) AND itemId = ?
+            """, arguments: [itemId, itemId]) ?? 0
         return ItemUsage(turns: row?["turns"] ?? 0, tokens: row?["tokens"] ?? 0, costLE: row?["cost"] ?? 0, meteredUSD: metered)
     }
 }
