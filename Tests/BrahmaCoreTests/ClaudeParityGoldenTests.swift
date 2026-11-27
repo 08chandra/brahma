@@ -270,7 +270,8 @@ struct GoldenWorld {
     /// The concierge's request as `Concierge.run` builds it (Plan C Task C4c).
     func conciergeRequest() throws -> TurnRequest {
         let workdir = paths.home.appending(path: "tmp/concierge-\(conciergeRequestId)", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: workdir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(at: workdir, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])  // exec-bit fixture: the concierge workdir's mode, as Concierge.run makes it
         let mcpPath = try MCPConfig.writeConcierge(paths: paths, executable: hookExe, companyId: company.id, requestId: conciergeRequestId,
                                                    token: turnToken, environment: [:])
         let agent = Agent(id: ConciergeCaps.agentId, companyId: company.id, name: ConciergeCaps.agentId, role: "concierge",
