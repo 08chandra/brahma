@@ -52,6 +52,22 @@ import Testing
         #expect(scan.scanned == ["A", "B"] && scan.unreadable.isEmpty)
     }
 
+    /// `GitWorkspace.stablePatchId` is public: a time limit that is not a finite number of seconds above 0 (and at most an
+    /// hour) is refused before any git runs, never handed to the timer (Task 5 deferred minor).
+    @Test func stablePatchIdRefusesBadTimeout() throws {
+        let repo = try GitFixture(files: ["app.txt": "one\n"])
+        let a = try commit(repo, ["app.txt": "one\ntwo\n"], "A")
+        for bad: TimeInterval in [.nan, .infinity, -.infinity, 0, -1, 3601, 1e300] {
+            #expect(throws: PatchIdFailure.self, "\(bad)") { try repo.ws.stablePatchId(from: "\(a)^1", to: a, timeout: bad) }
+            do { _ = try repo.ws.stablePatchId(from: "\(a)^1", to: a, timeout: bad) } catch let failure as PatchIdFailure {
+                guard case .unavailable(let why) = failure else { Issue.record("\(bad): \(failure)"); continue }
+                #expect(why.contains("time limit"), "\(bad): \(why)")
+            }
+        }
+        #expect(try repo.ws.stablePatchId(from: "\(a)^1", to: a, timeout: 10) != nil)
+        #expect(try repo.ws.stablePatchId(from: "\(a)^1", to: a, timeout: 3600) != nil)
+    }
+
     /// The detector looks 30 days past a landing: an exact inverse 31 days later is not a revert of it; 29 days later it is.
     @Test func outsideThirtyDaysIgnored() throws {
         let repo = try GitFixture(files: ["app.txt": "one\n"])

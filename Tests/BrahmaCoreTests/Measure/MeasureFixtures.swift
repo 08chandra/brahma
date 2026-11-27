@@ -37,8 +37,12 @@ enum MeasureFixtures {
     /// `step` other than `done` (Task 2): the journal row as a batch that stopped there (`checked`: landCommit written, `main`
     /// not moved; `recorded`: landed, `finishedAt` not yet stamped) — the items are still marked as above.
     @discardableResult
+    /// `commits` (Task 6): the candidates are these real commits, one per item in order (the last is `landCommit`), and `base`
+    /// the batch's base, so the landing audit can walk them in a `GitFixture` repository; nil keeps the made-up shas.
     static func land(_ store: Store, company: Company, items: [WorkItem], number: Int, enqueuedAt: Date, landedAt: Date,
-                     step: MergeStep = .done) throws -> (batch: MergeBatch, requests: [MergeRequest]) {
+                     step: MergeStep = .done, commits: [String]? = nil, base: String? = nil)
+        throws -> (batch: MergeBatch, requests: [MergeRequest]) {
+        precondition(commits == nil || commits?.count == items.count)
         func sha(_ seed: String) -> String { String(seed.utf8.map { String(format: "%02x", $0) }.joined().prefix(40)).padding(toLength: 40, withPad: "0", startingAt: 0) }
         let batchId = UUID().uuidString
         var requests: [MergeRequest] = []
@@ -47,8 +51,8 @@ enum MeasureFixtures {
             var r = MergeRequest(companyId: company.id, itemId: item.id, number: number * 100 + i + 1, status: .merged,
                                  headCommit: sha("head-\(number)-\(i)"), enqueuedAt: enqueuedAt)
             r.batchId = batchId
-            r.baseCommit = sha("base-\(number)")
-            r.candidateCommit = sha("cand-\(number)-\(i)")
+            r.baseCommit = base ?? sha("base-\(number)")
+            r.candidateCommit = commits?[i] ?? sha("cand-\(number)-\(i)")
             r.mergedCommit = r.candidateCommit
             r.startedAt = enqueuedAt
             r.finishedAt = landedAt
@@ -57,7 +61,7 @@ enum MeasureFixtures {
         }
         var batch = MergeBatch(id: batchId, companyId: company.id, number: number, step: step, requestIds: requests.map(\.id),
                                startedAt: enqueuedAt)
-        batch.base = sha("base-\(number)")
+        batch.base = base ?? sha("base-\(number)")
         batch.candidates = candidates
         batch.landCommit = requests.last?.mergedCommit
         batch.landedIds = requests.map(\.id)

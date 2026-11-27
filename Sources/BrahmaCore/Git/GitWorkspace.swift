@@ -4005,8 +4005,13 @@ extension GitWorkspace {
     /// The stable patch-id of the diff `from..to` (`git diff --no-color --no-ext-diff --no-textconv <from> <to> --`, that diff on
     /// the stdin of `git patch-id --stable`), nil for an empty diff. Through `main` (its git dir is the common dir), each call
     /// limited to `timeout` seconds. `from`/`to` must be commit ids as the store records them, optionally with `^1`: nothing git
-    /// could read as an option or a path. Throws `PatchIdFailure`.
+    /// could read as an option or a path. `timeout` must be a finite number of seconds above 0 and at most
+    /// `maxPatchIdTimeout`; any other value is refused (`unavailable`) before git runs, never handed to the timer. Throws
+    /// `PatchIdFailure`.
     public func stablePatchId(from: String, to: String, timeout: TimeInterval) throws -> String? {
+        guard timeout.isFinite, timeout > 0, timeout <= Self.maxPatchIdTimeout else {
+            throw PatchIdFailure.unavailable("the git time limit must be a finite number of seconds above 0 and at most \(Int(Self.maxPatchIdTimeout))")
+        }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: gitDir.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw PatchIdFailure.unavailable("the company workspace has no repository")
@@ -4020,6 +4025,9 @@ extension GitWorkspace {
         // `<patch-id> <commit-id>`; the commit is all zeros for a diff with no commit header.
         return String(decoding: out, as: UTF8.self).split(whereSeparator: \.isWhitespace).first.map(String.init)
     }
+
+    /// The longest time limit `stablePatchId` takes for one git call: an hour.
+    public static let maxPatchIdTimeout: TimeInterval = 3600
 
     /// A commit id (7–64 hex), optionally with `^1`, and nothing after it.
     static func isPatchRevision(_ s: String) -> Bool {
@@ -4040,5 +4048,62 @@ extension GitWorkspace {
         guard out.status == 0 else { throw PatchIdFailure.unreadable("git \(args[0]) exited \(out.status)") }
         guard !out.cut else { throw PatchIdFailure.unreadable("git \(args[0]) output over the capture limit") }
         return out.stdout
+    }
+}
+
+// MARK: Landing audit (Plan X6a Task 6)
+
+extension GitWorkspace {
+    /// The most commits `firstParentHistory` lists in one call.
+    public static let maxFirstParentListing = 1_000_000
+    /// The most commits `subjects(of:)` reads in one call.
+    public static let maxSubjectLookup = 1000
+    /// The most bytes of subjects `subjects(of:)` reads in one call; past it the remaining subjects are not read.
+    static let subjectListingLimit = 1 << 20
+
+    /// `tip`'s first-parent history, newest first, `tip` included: at most `limit` commits
+    /// (`git rev-list --first-parent --max-count=<limit> --end-of-options <tip> --`). Fewer than `limit` means the walk reached
+    /// the root. `tip` must be a commit id (`head(of:)` gives one); `limit` 1…`maxFirstParentListing`. A listing that was cut,
+    /// or a line that is not a commit id, throws: an audit never works from part of a listing.
+    public func firstParentHistory(from tip: String, limit: Int) throws -> [String] {
+        try Self.validCommit(tip)
+        guard limit > 0, limit <= Self.maxFirstParentListing else {
+            throw GitError.failed(command: "rev-list --first-parent", status: -1, stderr: "invalid commit limit \(limit)")
+        }
+        let out = try main.run(["rev-list", "--first-parent", "--max-count=\(limit)", "--end-of-options", tip, "--"],
+                               maxOutput: limit * 66 + 64)
+        guard !out.cut else { throw GitError.failed(command: "rev-list --first-parent", status: -1, stderr: "the commit listing was cut") }
+        let shas = out.text.split(separator: "\n").map(String.init)
+        guard shas.allSatisfy({ $0.range(of: "^[0-9a-f]{40}([0-9a-f]{24})?\\z", options: .regularExpression) != nil }) else {
+            throw GitError.failed(command: "rev-list --first-parent", status: -1, stderr: "the commit listing holds a line that is not a commit id")
+        }
+        return shas
+    }
+
+    /// The subject (`%s`, the message's first paragraph on one line) of each of `commits` (commit ids, at most
+    /// `maxSubjectLookup`), by commit id. `git log --no-walk=unsorted -z --format=%H %s --end-of-options <ids> --`. The subjects
+    /// are agent-controlled text, returned as git stores them: the caller sanitizes them for a terminal. Past
+    /// `subjectListingLimit` bytes the remaining commits get no entry.
+    public func subjects(of commits: [String]) throws -> [String: String] {
+        guard commits.count <= Self.maxSubjectLookup else {
+            throw GitError.failed(command: "log --no-walk", status: -1, stderr: "more than \(Self.maxSubjectLookup) commits asked for")
+        }
+        for c in commits { try Self.validCommit(c) }
+        guard !commits.isEmpty else { return [:] }
+        let out = try main.run(["log", "--no-walk=unsorted", "--no-color", "--no-show-signature", "-z", "--format=%H %s", "--end-of-options"]
+                               + commits + ["--"], maxOutput: Self.subjectListingLimit)
+        var records = out.stdout.split(separator: 0, omittingEmptySubsequences: true)
+        // A cut listing's last record may be partial: dropped, never shown cut short as if whole.
+        if out.cut, !records.isEmpty { records.removeLast() }
+        let wanted = Set(commits)
+        var subjects: [String: String] = [:]
+        for record in records {
+            let text = String(decoding: record, as: UTF8.self)
+            guard let space = text.firstIndex(of: " ") else { continue }
+            let sha = String(text[..<space])
+            guard wanted.contains(sha) else { continue }
+            subjects[sha] = String(text[text.index(after: space)...])
+        }
+        return subjects
     }
 }

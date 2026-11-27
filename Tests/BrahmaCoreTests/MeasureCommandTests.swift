@@ -170,6 +170,42 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
                                          in: MeasureWindow(since: rig.company.createdAt, until: Date().addingTimeInterval(86_400))) == 30 * 60)
     }
 
+    /// `--verify-landings` (Task 6): exit 0 when every first-parent commit of `main` is verified, owner-accepted or imported;
+    /// exit 1, listing each unverified commit by short sha and subject, otherwise. The subject is agent-controlled: terminal
+    /// escapes in it are neutralised. The flag takes no write flags with it.
+    @Test func verifyLandingsExitCodes() throws {
+        let rig = try Rig()
+        let clean = try brahma(["measure", "Acme", "--verify-landings"], home: rig.home)
+        #expect(clean.status == 0, "\(clean.stderr)")
+        #expect(clean.stdout == "landings verified: none to verify (0/0); owner-accepted 0; imported 1\n", "\(clean.stdout)")
+        let js = try brahma(["measure", "Acme", "--verify-landings", "--format", "json", "--since", "all"], home: rig.home)
+        #expect(js.status == 0, "\(js.stderr)")
+        let decoded = try JSONDecoder().decode(LandingAuditResult.self, from: Data(js.stdout.utf8))
+        #expect(decoded.commits == 1 && decoded.imported.count == 1 && decoded.unverified.isEmpty, "\(decoded)")
+
+        // A commit made straight on main, outside the queue, its subject carrying terminal escapes.
+        let ws = URL(fileURLWithPath: rig.company.workspacePath, isDirectory: true)
+        try "outside\n".write(to: ws.appending(path: "outside.txt"), atomically: true, encoding: .utf8)
+        try GitFixture.plainGit(["add", "--", "outside.txt"], in: ws)
+        try GitFixture.plainGit(["commit", "-q", "--no-verify", "-m", "sneak \u{1b}[2J\u{1b}]0;owned\u{07}in"], in: ws)
+        let sha = try GitFixture.plainGit(["rev-parse", "HEAD"], in: ws)
+        let dirty = try brahma(["measure", "Acme", "--verify-landings"], home: rig.home)
+        #expect(dirty.status == 1, "\(dirty.stdout) \(dirty.stderr)")
+        #expect(dirty.stdout.hasPrefix("landings verified: 0% (0/1); owner-accepted 0; imported 1\n"), "\(dirty.stdout)")
+        #expect(dirty.stdout.contains("unverified: \(sha.prefix(7)) sneak"), "\(dirty.stdout)")
+        #expect(!dirty.stdout.contains("\u{1b}") && !dirty.stdout.contains("\u{07}"), "escapes reach the terminal: \(dirty.stdout.debugDescription)")
+
+        // Refused: with the write flags; inside an agent turn. Nothing on stdout.
+        for bad in [["--log-owner-minutes", "5"], ["--day", "2025-11-01"]] {
+            let r = try brahma(["measure", "Acme", "--verify-landings"] + bad, home: rig.home)
+            #expect(r.status != 0 && r.stdout.isEmpty, "\(bad): \(r.stdout)")
+            #expect(r.stderr.contains("--verify-landings"), "\(bad): \(r.stderr)")
+        }
+        let agent = try brahma(["measure", "Acme", "--verify-landings"], home: rig.home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(agent.status == 1 && agent.stderr.contains("owner commands can't run inside an agent turn") && agent.stdout.isEmpty)
+        #expect(try brahma(["measure", "--help"], home: rig.home).stdout.contains("--verify-landings"))
+    }
+
     /// A fresh handle on the rig's database (the CLI wrote through its own).
     func store(_ rig: Rig) throws -> Store { try Store(path: ownerPaths(rig.home).database.path) }
 

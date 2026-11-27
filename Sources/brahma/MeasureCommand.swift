@@ -6,6 +6,8 @@ import BrahmaCore
 /// every number with its denominator (`docs/measure/metrics.md`). Read-only, but it reads every agent's records, so it runs only
 /// from the owner's shell: never inside an agent turn. The one write: `--log-owner-minutes <n> [--day YYYY-MM-DD]` adds the
 /// owner's own time to that day's counter (owner ruling R7(d)), the only source of the owner-minutes metric.
+/// `--verify-landings` (Task 6): the landing audit of `main`'s first-parent history (`LandingAudit`); exit 0 when every commit is
+/// verified, owner-accepted or imported, 1 otherwise.
 struct MeasureCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "measure",
@@ -23,12 +25,19 @@ struct MeasureCommand: ParsableCommand {
     var logOwnerMinutes: Int?
     @Option(help: "With --log-owner-minutes: the day the minutes belong to (YYYY-MM-DD in your time zone). Default: today.")
     var day: String?
+    @Flag(name: .customLong("verify-landings"),
+          help: "Audit main instead of reporting: every first-parent commit back to the company's first must be a verified queue landing, owner-accepted or imported (exit 0), else each unverified commit is listed (exit 1). With --since <date>: from the last landing before it.")
+    var verifyLandings = false
 
     func run() throws {
         let owner = try requireOwnerShell(quietly: false)
         let (store, _) = try openStore()
         let c = try resolveCompanyOrExplain(store, company)
         let now = Date()
+        // The audit is read-only: the write flags are refused with it, never silently ignored.
+        guard !verifyLandings || (logOwnerMinutes == nil && day == nil) else {
+            throw fail("--verify-landings is a read-only audit; it takes no --log-owner-minutes or --day")
+        }
         if let minutes = logOwnerMinutes {
             // A log is a write, not a report: the report's flags are refused, never silently ignored.
             guard since == nil, format == nil else { throw fail("--log-owner-minutes takes only --day; it prints no report (no --since or --format)") }
@@ -40,6 +49,7 @@ struct MeasureCommand: ParsableCommand {
             return
         }
         guard day == nil else { throw fail("--day is only for --log-owner-minutes") }
+        if verifyLandings { return try audit(store, c, now: now) }
         let window: MeasureWindow
         do {
             window = try MeasureWindow.parse(since, now: now, companyCreated: c.createdAt, tz: store.ownerTimeZone())
@@ -55,6 +65,30 @@ struct MeasureCommand: ParsableCommand {
             // JSON escapes every control character itself.
             print(String(decoding: try report.json(), as: UTF8.self))
         }
+    }
+}
+
+extension MeasureCommand {
+    /// `--verify-landings`: the audit's lines through `safe()` (commit subjects are agent-controlled), or its JSON.
+    func audit(_ store: Store, _ c: Company, now: Date) throws {
+        var since: Date?
+        if let raw = self.since, raw != "all" {
+            do {
+                since = try MeasureWindow.parse(raw, now: now, companyCreated: c.createdAt, tz: store.ownerTimeZone()).since
+            } catch { throw fail("\(error)") }
+        }
+        let git = GitWorkspace(root: URL(fileURLWithPath: c.workspacePath, isDirectory: true))
+        let result: LandingAuditResult
+        do { result = try LandingAudit.run(store: store, git: git, companyId: c.id, since: since) } catch { throw fail("\(error)") }
+        switch format ?? .md {
+        case .md:
+            for line in result.lines() { print(safe(line)) }
+        case .json:
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            print(String(decoding: try encoder.encode(result), as: UTF8.self))
+        }
+        guard result.allClassified else { throw ExitCode.failure }
     }
 }
 

@@ -13,12 +13,15 @@ public enum MeasureError: Error, Equatable, CustomStringConvertible {
     case dayAfterToday(String)
     /// `--log-owner-minutes` outside 1…1440.
     case badMinutes(Int)
+    /// `--verify-landings`: the company's workspace has no `main` branch (or no repository) to audit.
+    case noMainBranch(String)
 
     public var description: String {
         switch self {
         case .badSince(let s): return "--since must be a date (YYYY-MM-DD) or 'all', not '\(s)'"
         case .sinceAfterNow(let s): return "--since '\(s)' is after today; nothing can have happened yet"
         case .unknownCompany(let id): return "no company with id \(id)"
+        case .noMainBranch(let id): return "the workspace of company \(id) has no main branch to audit"
         case .badDay(let s): return "--day must be a date (YYYY-MM-DD), not '\(s)'"
         case .dayAfterToday(let s): return "--day '\(s)' is after today; owner time can be logged only for a day that has begun"
         case .badMinutes(let n):
