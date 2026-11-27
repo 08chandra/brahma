@@ -112,8 +112,8 @@ import Testing
         let cached = GatewayUsage(inputTokens: 0, outputTokens: 0, cacheReadTokens: 1_000_000, cacheWriteTokens: 1_000_000)
         #expect(abs(plain.cost(cached) - 6) < 1e-9, "\(plain.cost(cached))")
         #expect(p.cost(GatewayUsage(inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0)) == 0)
-        // An owner row's price is that row's rates.
-        #expect(Price(owner("x", "y", 1, 2, cacheWrite: 9)) == Price(inPerMTok: 1, outPerMTok: 2, cacheReadPerMTok: nil, cacheWritePerMTok: 9))
+        // An owner row's price (through the one price rule) is that row's rates.
+        #expect(PriceBook.price(for: owner("x", "y", 1, 2, cacheWrite: 9)) == Price(inPerMTok: 1, outPerMTok: 2, cacheReadPerMTok: nil, cacheWritePerMTok: 9))
     }
 
     @Test func usageIsClampedPerField() throws {

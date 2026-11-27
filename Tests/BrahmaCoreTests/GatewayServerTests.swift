@@ -660,7 +660,7 @@ func rawRequest(method: String = "POST", target: String = "/t/v1/messages?beta=t
     @Test func freshConnectionMustSpeakFirst() async throws {
         #expect(GatewayLimits.firstByteTimeout == .seconds(5) && GatewayLimits.keepAliveIdle == .seconds(60))
         var timing = GatewayTiming.pinned
-        timing.firstByte = .milliseconds(200)
+        timing.firstByte = .seconds(1)
         let h = GatewayHarness(timing: timing)
         let token = h.mint().value
         do {
@@ -674,7 +674,7 @@ func rawRequest(method: String = "POST", target: String = "/t/v1/messages?beta=t
             let (peer, served) = h.connect()
             await peer.write(rawRequest(token: token))
             #expect(try await peer.readResponse().status == 200)
-            #expect(await peer.staysQuiet(milliseconds: 600), "an idle keep-alive connection outlives the first-byte bound")
+            #expect(await peer.staysQuiet(milliseconds: 1500), "an idle keep-alive connection outlives the first-byte bound")
             await peer.write(rawRequest(token: token))
             #expect(try await peer.readResponse().status == 200)
             peer.close()

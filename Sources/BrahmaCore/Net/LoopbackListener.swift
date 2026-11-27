@@ -10,6 +10,8 @@ public enum LoopbackListenerError: Error, Equatable, Sendable, CustomStringConve
     case setup(step: String, errno: Int32)
     /// `accept` failed (`EAGAIN` when nothing was pending on a non-blocking listener).
     case accept(errno: Int32)
+    /// A connection was accepted but could not be made close-on-exec; it was closed. The listener itself is fine.
+    case configureClient(errno: Int32)
     /// A peer that is not 127.0.0.1 connected; its socket was closed unread.
     case peerNotLoopback
 
@@ -17,6 +19,7 @@ public enum LoopbackListenerError: Error, Equatable, Sendable, CustomStringConve
         switch self {
         case .setup(let step, let code): "the gateway listener could not \(step) (errno \(code))"
         case .accept(let code): "the gateway listener could not accept a connection (errno \(code))"
+        case .configureClient(let code): "the gateway could not make an accepted connection close-on-exec (errno \(code))"
         case .peerNotLoopback: "a connection from outside 127.0.0.1 was refused"
         }
     }
@@ -74,7 +77,7 @@ public enum LoopbackListener {
         guard fcntl(client, F_SETFD, FD_CLOEXEC) == 0 else {
             let code = errno
             _ = closeSocket(client)
-            throw .accept(errno: code)
+            throw .configureClient(errno: code)
         }
         guard isLoopbackPeer(peer) else {
             _ = closeSocket(client)

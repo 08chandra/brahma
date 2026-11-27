@@ -19,6 +19,8 @@ public final class GatewayServer: @unchecked Sendable {
     private let lock = NSLock()
     private var connections: [UInt64: Wire] = [:]
     private var nextConnection: UInt64 = 0
+    /// 503 refusals in progress (capped by `GatewayLimits.maxBusyRefusals`).
+    private var busyRefusals = 0
     private var listener: (fd: Int32, port: UInt16)?
     private var accepting = false
     private var stopped = false
@@ -107,13 +109,16 @@ public final class GatewayServer: @unchecked Sendable {
                 break loop
             case .failure(.accept(let code)) where code == EINVAL || code == ENOTSOCK || code == EOPNOTSUPP:
                 break loop  // not a listening socket any more: never spin on it
+            case .failure(.configureClient), .failure(.peerNotLoopback):
+                continue  // that one connection was closed; the listener is fine
             case .failure:
-                continue  // EAGAIN, an aborted handshake, or a refused non-loopback peer (already closed).
+                continue  // EAGAIN, an aborted handshake
             }
             failures = 0
             switch register(client) {
             case .admitted(let wire): Task { await self.run(wire) }
             case .busy(let wire): Task { await self.refuseBusy(wire) }
+            case .overflow(let wire): wire.close()
             case .unusable: continue
             }
         }
@@ -130,31 +135,46 @@ public final class GatewayServer: @unchecked Sendable {
         switch register(fd) {
         case .admitted(let wire): await run(wire)
         case .busy(let wire): await refuseBusy(wire)
+        case .overflow(let wire): wire.close()
         case .unusable: return
         }
     }
 
-    private enum Admission { case admitted(Wire), busy(Wire), unusable }
+    private enum Admission { case admitted(Wire), busy(Wire), overflow(Wire), unusable }
 
-    /// Tracks a new connection. Past the cap (or after `stop`) it is to be answered 503; a socket that cannot be made
-    /// non-blocking and SIGPIPE-free is closed at once.
+    /// Tracks a new connection. Past the cap (or after `stop`) it is to be answered 503 — unless `maxBusyRefusals` 503s are
+    /// already being sent, when it is closed unanswered (so a flood cannot hold unbounded refusals); a socket that cannot be
+    /// made non-blocking and SIGPIPE-free is closed at once.
     private func register(_ fd: Int32) -> Admission {
         guard let wire = Wire(fd: fd, ioStall: timing.ioStall) else { return .unusable }
-        let admitted: Bool = lock.withLock {
-            guard !stopped, connections.count < GatewayLimits.maxConnections else { return false }
-            nextConnection += 1
-            wire.id = nextConnection
-            connections[wire.id] = wire
-            return true
+        enum Slot { case connection, refusal, none }
+        let slot: Slot = lock.withLock {
+            if !stopped, connections.count < GatewayLimits.maxConnections {
+                nextConnection += 1
+                wire.id = nextConnection
+                connections[wire.id] = wire
+                return .connection
+            }
+            guard busyRefusals < GatewayLimits.maxBusyRefusals else { return .none }
+            busyRefusals += 1
+            return .refusal
         }
-        return admitted ? .admitted(wire) : .busy(wire)
+        switch slot {
+        case .connection: return .admitted(wire)
+        case .refusal: return .busy(wire)
+        case .none: return .overflow(wire)
+        }
     }
 
     /// The 503 at the connection cap, sent like every refusal (write side shut, bounded drain), then closed.
     private func refuseBusy(_ wire: Wire) async {
         await HTTPConnection(wire: wire, timing: timing).refuse(.busy)
         wire.close()
+        lock.withLock { busyRefusals -= 1 }
     }
+
+    /// 503 refusals being sent now (tests).
+    var busyRefusalsInProgress: Int { lock.withLock { busyRefusals } }
 
     private func run(_ wire: Wire) async {
         defer {

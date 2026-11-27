@@ -12,12 +12,6 @@ public struct Price: Codable, Equatable, Sendable {
         self.cacheReadPerMTok = cacheReadPerMTok; self.cacheWritePerMTok = cacheWritePerMTok
     }
 
-    /// An owner row's rates.
-    public init(_ row: PriceRow) {
-        self.init(inPerMTok: row.inPerMTok, outPerMTok: row.outPerMTok, cacheReadPerMTok: row.cacheReadPerMTok,
-                  cacheWritePerMTok: row.cacheWritePerMTok)
-    }
-
     /// The cache-read rate in force (the input rate when unset).
     public var cacheReadRate: Double { cacheReadPerMTok ?? inPerMTok }
     /// The cache-write rate in force (the input rate when unset).

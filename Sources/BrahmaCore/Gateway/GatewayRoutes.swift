@@ -60,6 +60,8 @@ public enum GatewayLimits {
     public static let maxBodyBytes = 32 * 1024 * 1024
     /// Open client connections at once; past it a connection is answered 503 and closed.
     public static let maxConnections = 64
+    /// 503 refusals being sent at once (each takes a bounded write and drain); past it a connection is closed unanswered.
+    public static let maxBusyRefusals = 16
     /// A fresh connection whose first byte has not arrived after this long is closed (Ruling 42).
     public static let firstByteTimeout: Duration = .seconds(5)
     /// A keep-alive connection with no new request for this long is closed.

@@ -24,9 +24,9 @@ extension SettingsGroup {
         var model: String?
         @Argument(help: ArgumentHelp("USD per million input tokens.", valueName: "usd-in")) var inPerMTok: Double?
         @Argument(help: ArgumentHelp("USD per million output tokens.", valueName: "usd-out")) var outPerMTok: Double?
-        @Option(name: .customLong("cache-read"), help: ArgumentHelp("USD per million cache-read tokens (default: the input price).", valueName: "usd"))
+        @Option(name: .customLong("cache-read"), help: ArgumentHelp("USD per million cache-read tokens (default: the pinned rate, else the input price).", valueName: "usd"))
         var cacheRead: Double?
-        @Option(name: .customLong("cache-write"), help: ArgumentHelp("USD per million cache-write tokens (default: the input price).", valueName: "usd"))
+        @Option(name: .customLong("cache-write"), help: ArgumentHelp("USD per million cache-write tokens (default: the pinned rate, else the input price).", valueName: "usd"))
         var cacheWrite: Double?
 
         func run() throws {
