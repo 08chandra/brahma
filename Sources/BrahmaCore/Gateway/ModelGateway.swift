@@ -65,9 +65,10 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     }
 
     private func serve(_ r: GatewayRequest, grant: TurnGrant, reply: GatewayReply) async throws(GatewayError) {
-        try CanonicalRequest.checkObject(r.body)
-        try GatewayPolicy.check(body: r.body, headers: r.headers, grant: grant)
-        let canonical = try CanonicalRequest.decode(r.body)
+        // One strict parse (no key repeated at any depth); the policy checks this tree and the adapter sends this tree.
+        let tree = try CanonicalRequest.tree(r.body)
+        try GatewayPolicy.check(body: tree, headers: r.headers, grant: grant)
+        let canonical = try CanonicalRequest.decode(tree: tree)
         let target = try Self.route(canonical.model, grant: grant)
         if let tools = canonical.tools, !tools.isEmpty,
            grant.textOnlyModels.contains(target.model) || grant.textOnlyModels.contains(canonical.model) {
@@ -91,12 +92,12 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
             throw .unavailable("provider \(provider.id) has no key secret")
         }
         guard isLive(reply) else { return }
-        try await forward(canonical, request: r, target: target, provider: provider, adapter: adapter, secret: secret, grant: grant,
+        try await forward(canonical, tree: tree, request: r, target: target, provider: provider, adapter: adapter, secret: secret, grant: grant,
                           reply: reply)
     }
 
     /// The one scope the provider key lives in: read, swapped into the upstream request, used to redact, dropped on return.
-    private func forward(_ canonical: CanonicalRequest, request r: GatewayRequest, target: TurnGrant.RoutedTarget, provider: Provider,
+    private func forward(_ canonical: CanonicalRequest, tree: StrictJSON, request r: GatewayRequest, target: TurnGrant.RoutedTarget, provider: Provider,
                          adapter: any ProviderAdapter, secret: String, grant: TurnGrant, reply: GatewayReply) async throws(GatewayError) {
         let key: String
         do {
@@ -110,7 +111,7 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
             throw .unavailable("the provider key \(secret) could not be read")
         }
         let redact: @Sendable (String) -> String = { $0.replacingOccurrences(of: key, with: "[redacted]") }
-        let outgoing = try adapter.upstream(canonical, rawBody: r.body, model: target.model, endpoint: r.endpoint, headers: r.headers,
+        let outgoing = try adapter.upstream(canonical, body: tree, model: target.model, endpoint: r.endpoint, headers: r.headers,
                                             provider: provider, key: key)
         guard isLive(reply) else { return }
         let response: UpstreamResponse

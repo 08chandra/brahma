@@ -9,9 +9,9 @@ import Foundation
 
     static func upstream(_ body: String, model: String? = nil, endpoint: GatewayEndpoint = .messages,
                          headers: [GatewayHeader] = []) throws -> UpstreamRequest {
-        let raw = Data(body.utf8)
-        let canonical = try CanonicalRequest.decode(raw)
-        return try AnthropicAdapter().upstream(canonical, rawBody: raw, model: model ?? canonical.model, endpoint: endpoint,
+        let tree = try CanonicalRequest.tree(Data(body.utf8))
+        let canonical = try CanonicalRequest.decode(tree: tree)
+        return try AnthropicAdapter().upstream(canonical, body: tree, model: model ?? canonical.model, endpoint: endpoint,
                                                headers: headers, provider: provider, key: AnthropicFixture.key)
     }
 
@@ -69,12 +69,17 @@ import Foundation
 
     // MARK: Upstream requests
 
-    /// A granted model's body reaches the provider byte for byte; `metadata.user_id` (a device id) is the one field removed;
-    /// an alias changes only `model`. Everything else — spacing, number spelling, key order, unknown keys — is untouched.
-    @Test func passesThroughBodyByteIdentical() throws {
-        let plain = #"{ "model" : "claude-opus-5-5","max_tokens":128000, "temperature":0.70,"x_future":{"b":1,"a":[1e2]},"messages":[{"role":"user","content":"hi"}],"metadata":{"other":"kept"} }"#
+    /// Ruling X1-35 / 46: the provider gets the serialization of the policy-checked tree, never the bytes received — equal in
+    /// meaning, keys in the order received, numbers with exactly the digits received (2^63+1 and a long decimal survive),
+    /// strings re-escaped, no whitespace. `metadata.user_id` (a device id) is the one field removed; an alias changes only
+    /// `model`.
+    @Test func forwardsThePolicyCheckedTree() throws {
+        let plain = #"{ "model" : "claude-opus-5-5","max_tokens":128000, "temperature":0.70,"x_future":{"b":1,"a":[1e2, -0.0, 9223372036854775809, 0.1234567890123456789012345678901]},"messages":[{"role":"user","content":"hé \"q\" \\ \n\/"}],"metadata":{"other":"kept"} }"#
         let sent = try Self.upstream(plain)
-        #expect(sent.body == Data(plain.utf8))
+        let text = String(decoding: sent.body, as: UTF8.self)
+        #expect(text == #"{"model":"claude-opus-5-5","max_tokens":128000,"temperature":0.70,"x_future":{"b":1,"a":[1e2,-0.0,9223372036854775809,0.1234567890123456789012345678901]},"messages":[{"role":"user","content":"hé \"q\" \\ \n/"}],"metadata":{"other":"kept"}}"#)
+        #expect(try StrictJSON.parse(sent.body) == StrictJSON.parse(Data(plain.utf8)), "equal in meaning")
+        #expect(text.contains("9223372036854775809") && text.contains("0.1234567890123456789012345678901"))
         #expect(sent.url.absoluteString == "https://api.anthropic.com/v1/messages")
         #expect(sent.method == "POST")
 
@@ -91,7 +96,7 @@ import Foundation
         // An alias: only `model` is replaced (here together with `metadata.user_id`, on the same path).
         let alias = #"{"messages":[{"role":"user","content":"hi"}], "model":"brahma-standard" ,"temperature":0.70,"metadata":{"user_id":"u"},"max_tokens":32000}"#
         #expect(String(decoding: try Self.upstream(alias, model: "claude-sonnet-5-5").body, as: UTF8.self)
-                    == #"{"messages":[{"role":"user","content":"hi"}], "model":"claude-sonnet-5-5" ,"temperature":0.70,"metadata":{},"max_tokens":32000}"#)
+                    == #"{"messages":[{"role":"user","content":"hi"}],"model":"claude-sonnet-5-5","temperature":0.70,"metadata":{},"max_tokens":32000}"#)
 
         // The fixture of a real request: only the metadata member goes.
         let fixture = try AnthropicFixture.text("request-claude", "json").trimmingCharacters(in: .newlines)
@@ -134,14 +139,51 @@ import Foundation
     }
 
     @Test func providerHostMustBeOneHostName() throws {
-        let raw = Data(#"{"model":"claude-opus-5-5","max_tokens":1,"messages":[]}"#.utf8)
-        let canonical = try CanonicalRequest.decode(raw)
+        let tree = try CanonicalRequest.tree(Data(#"{"model":"claude-opus-5-5","max_tokens":1,"messages":[]}"#.utf8))
+        let canonical = try CanonicalRequest.decode(tree: tree)
         for host in ["", "*.anthropic.com", "127.0.0.1", "api.anthropic.com/evil", "api.anthropic.com:8443", "user@api.anthropic.com"] {
             #expect(throws: GatewayError.self, "\(host)") {
-                try AnthropicAdapter().upstream(canonical, rawBody: raw, model: "claude-opus-5-5", endpoint: .messages, headers: [],
+                try AnthropicAdapter().upstream(canonical, body: tree, model: "claude-opus-5-5", endpoint: .messages, headers: [],
                                                 provider: AnthropicFixture.provider(host: host), key: AnthropicFixture.key)
             }
         }
+    }
+
+    // MARK: StrictJSON (Ruling X1-35)
+
+    /// A key repeated in any object at any depth is refused, compared after unescaping, with its path.
+    @Test func strictJSONRefusesDuplicateKeysAtAnyDepth() {
+        let cases: [(String, String)] = [
+            (#"{"type":"a","type":"b"}"#, "type"),
+            (#"{"a":{"b":{"c":{"d":{"type":1,"type":2}}}}}"#, "a.b.c.d.type"),
+            (#"{"tools":[{"name":"x"},{"name":"y","type":"custom","type":"web_fetch_20250910"}]}"#, "tools[1].type"),
+            (#"{"messages":[{"content":[{"type":"text","text":"","type":"image"}]}]}"#, "messages[0].content[0].type"),
+            (#"{"m":[{"source":{"type":"base64","type":"url"}}]}"#, "m[0].source.type"),
+            (#"{"type":"text","type":"web_fetch"}"#, "type"),
+            (#"{"type":1,"type":2}"#, "type"),
+        ]
+        for (body, path) in cases {
+            #expect(throws: StrictJSON.Failure.duplicateKey(path: path), "\(body)") { try StrictJSON.parse(Data(body.utf8)) }
+        }
+        // The same key in different objects is fine.
+        #expect(throws: Never.self) { try StrictJSON.parse(Data(#"{"type":"a","b":{"type":"c"},"c":[{"type":1},{"type":2}]}"#.utf8)) }
+    }
+
+    @Test func strictJSONIsStrict() throws {
+        for bad in ["", " ", "{", #"{"a":1,}"#, "[1,]", "01", "1.", ".5", "+1", "NaN", "1e", "-", #""\ud800""#, #""\udc00x""#,
+                    "\"a\tb\"", "\"a\u{01}b\"", #""\x""#, "tru", "{} {}", #"{'a':1}"#, #"{"a" 1}"#] {
+            #expect(throws: StrictJSON.Failure.self, "\(bad)") { try StrictJSON.parse(Data(bad.utf8)) }
+        }
+        let deep = String(repeating: "[", count: StrictJSON.maxDepth + 2) + String(repeating: "]", count: StrictJSON.maxDepth + 2)
+        #expect(throws: StrictJSON.Failure.tooDeep) { try StrictJSON.parse(Data(deep.utf8)) }
+        // Escapes decode (a surrogate pair included) and re-encode as valid, meaning-equal JSON.
+        let tree = try StrictJSON.parse(Data(#"{"s":"😀 \u0007 \t é","n":[0,-1.5e-3,1E+9]}"#.utf8))
+        #expect(tree["s"] == .string("😀 \u{07} \t é"))
+        #expect(String(decoding: tree.serialized(), as: UTF8.self) == #"{"s":"😀 \u0007 \t é","n":[0,-1.5e-3,1E+9]}"#)
+        #expect(try StrictJSON.parse(tree.serialized()) == tree)
+        // Foundation reads the serialization as the same document.
+        let foundation = try JSONSerialization.jsonObject(with: tree.serialized()) as? [String: Any]
+        #expect(foundation?["s"] as? String == "😀 \u{07} \t é")
     }
 
     // MARK: Responses

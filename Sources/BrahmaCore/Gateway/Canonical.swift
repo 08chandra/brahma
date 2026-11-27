@@ -30,27 +30,35 @@ public struct CanonicalRequest: Codable, Sendable, Equatable {
         self.stopSequences = stopSequences; self.metadata = metadata; self.extra = extra
     }
 
-    /// Decodes a request body. Refused (400, Ruling 19) unless it passes `checkObject` (a repeated `model` could be routed on
-    /// one value and reach the provider with the other), then is a valid Messages request.
-    public static func decode(_ body: Data) throws(GatewayError) -> CanonicalRequest {
-        try checkObject(body)
+    /// Parses a request body strictly (`StrictJSON`: a key repeated at any depth is refused — the gateway and the provider
+    /// must read the same values) into the tree the gateway checks and forwards. Refusals are 400 (Ruling 19).
+    public static func tree(_ body: Data) throws(GatewayError) -> StrictJSON {
+        let tree: StrictJSON
         do {
-            return try JSONDecoder().decode(CanonicalRequest.self, from: body)
+            tree = try StrictJSON.parse(body)
         } catch {
-            throw .refused(status: GatewayRefusal.status, type: GatewayRefusal.type, message: "Brahma: the request body is not a Messages request")
+            switch error {
+            case .duplicateKey(let path): throw .policy("duplicate key \(path)")
+            case .tooDeep: throw .policy("the request body nests too deeply")
+            case .malformed: throw .policy("the request body is not valid JSON")
+            }
         }
+        guard case .object = tree else { throw .policy("the request body is not a JSON object") }
+        return tree
     }
 
-    /// Refuses a body that is not exactly one JSON object with no top-level key, and no key of `metadata`, appearing twice.
-    static func checkObject(_ body: Data) throws(GatewayError) {
-        let bytes = [UInt8](body)
+    /// Decodes a body: `tree(_:)`, then `decode(tree:)`.
+    public static func decode(_ body: Data) throws(GatewayError) -> CanonicalRequest {
+        try decode(tree: try tree(body))
+    }
+
+    /// The canonical request a checked tree holds (decoded from the tree's own serialization, so it reads exactly what the
+    /// provider would be sent).
+    public static func decode(tree: StrictJSON) throws(GatewayError) -> CanonicalRequest {
         do {
-            let top = try JSONObjectScan.members(of: bytes)
-            if let metadata = top.first(where: { $0.key == "metadata" }), bytes[metadata.value.lowerBound] == UInt8(ascii: "{") {
-                _ = try JSONObjectScan.members(of: bytes, objectAt: metadata.value.lowerBound)
-            }
+            return try JSONDecoder().decode(CanonicalRequest.self, from: tree.serialized())
         } catch {
-            throw .refused(status: GatewayRefusal.status, type: GatewayRefusal.type, message: "Brahma: the request body is not one JSON object with unique keys")
+            throw .policy("the request body is not a Messages request")
         }
     }
 
@@ -263,125 +271,5 @@ public enum CanonicalStreamEvent: Sendable, Equatable {
             let parts = members.sorted { $0.key < $1.key }.map { Data(("\"" + GatewayRefusal.jsonEscaped($0.key) + "\":").utf8) + encode($0.value) }
             return Data("{".utf8) + parts.joined(separator: Data(",".utf8)) + Data("}".utf8)
         }
-    }
-}
-
-/// The byte ranges of one JSON object's members, without decoding the values: what the `anthropic` adapter edits in place so
-/// every byte it does not mean to change reaches the provider unchanged. Strict where it matters: one object, nothing but
-/// whitespace after it, string keys (escapes decoded before comparing), and no key twice.
-enum JSONObjectScan {
-    struct Member: Equatable {
-        /// The decoded key.
-        let key: String
-        /// From the key's opening quote to the end of its value.
-        let range: Range<Int>
-        let value: Range<Int>
-    }
-
-    struct Malformed: Error {}
-
-    /// The members of the top-level object; `bytes` must hold that object and nothing else but whitespace.
-    static func members(of bytes: [UInt8]) throws(Malformed) -> [Member] {
-        let start = skipSpace(bytes, 0)
-        let (members, end) = try object(bytes, at: start)
-        guard skipSpace(bytes, end) == bytes.count else { throw Malformed() }
-        return members
-    }
-
-    /// The members of the object that starts at `start` (a nested object).
-    static func members(of bytes: [UInt8], objectAt start: Int) throws(Malformed) -> [Member] {
-        try object(bytes, at: start).members
-    }
-
-    private static func object(_ b: [UInt8], at start: Int) throws(Malformed) -> (members: [Member], end: Int) {
-        guard start < b.count, b[start] == UInt8(ascii: "{") else { throw Malformed() }
-        var i = skipSpace(b, start + 1)
-        var members: [Member] = []
-        var seen: Set<String> = []
-        if i < b.count, b[i] == UInt8(ascii: "}") { return ([], i + 1) }
-        while true {
-            let keyStart = i
-            let keyEnd = try string(b, at: i)
-            let key = try decodeKey(Array(b[keyStart..<keyEnd]))
-            guard seen.insert(key).inserted else { throw Malformed() }
-            i = skipSpace(b, keyEnd)
-            guard i < b.count, b[i] == UInt8(ascii: ":") else { throw Malformed() }
-            let valueStart = skipSpace(b, i + 1)
-            let valueEnd = try value(b, at: valueStart)
-            members.append(Member(key: key, range: keyStart..<valueEnd, value: valueStart..<valueEnd))
-            i = skipSpace(b, valueEnd)
-            guard i < b.count else { throw Malformed() }
-            if b[i] == UInt8(ascii: "}") { return (members, i + 1) }
-            guard b[i] == UInt8(ascii: ",") else { throw Malformed() }
-            i = skipSpace(b, i + 1)
-        }
-    }
-
-    /// The end (just past the closing quote) of the string starting at `start`.
-    private static func string(_ b: [UInt8], at start: Int) throws(Malformed) -> Int {
-        guard start < b.count, b[start] == UInt8(ascii: "\"") else { throw Malformed() }
-        var i = start + 1
-        while i < b.count {
-            switch b[i] {
-            case UInt8(ascii: "\""): return i + 1
-            case UInt8(ascii: "\\"): i += 2
-            case 0..<0x20: throw Malformed()
-            default: i += 1
-            }
-        }
-        throw Malformed()
-    }
-
-    /// The end of the value starting at `start` (strings and nesting followed; scalars are runs of their characters — the
-    /// decoder validates values afterwards).
-    private static func value(_ b: [UInt8], at start: Int) throws(Malformed) -> Int {
-        guard start < b.count else { throw Malformed() }
-        switch b[start] {
-        case UInt8(ascii: "\""):
-            return try string(b, at: start)
-        case UInt8(ascii: "{"), UInt8(ascii: "["):
-            var depth = 0, i = start
-            while i < b.count {
-                switch b[i] {
-                case UInt8(ascii: "\""): i = try string(b, at: i); continue
-                case UInt8(ascii: "{"), UInt8(ascii: "["): depth += 1
-                case UInt8(ascii: "}"), UInt8(ascii: "]"):
-                    depth -= 1
-                    if depth == 0 { return i + 1 }
-                default: break
-                }
-                i += 1
-            }
-            throw Malformed()
-        default:
-            var i = start
-            while i < b.count, isScalarByte(b[i]) { i += 1 }
-            guard i > start else { throw Malformed() }
-            return i
-        }
-    }
-
-    private static func isScalarByte(_ c: UInt8) -> Bool {
-        (UInt8(ascii: "a")...UInt8(ascii: "z")).contains(c) || (UInt8(ascii: "A")...UInt8(ascii: "Z")).contains(c)
-            || (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(c) || c == UInt8(ascii: "-") || c == UInt8(ascii: "+") || c == UInt8(ascii: ".")
-    }
-
-    private static func decodeKey(_ quoted: [UInt8]) throws(Malformed) -> String {
-        guard quoted.contains(UInt8(ascii: "\\")) else {
-            guard let s = String(bytes: quoted.dropFirst().dropLast(), encoding: .utf8) else { throw Malformed() }
-            return s
-        }
-        do {
-            guard let s = try JSONSerialization.jsonObject(with: Data(quoted), options: .fragmentsAllowed) as? String else { throw Malformed() }
-            return s
-        } catch {
-            throw Malformed()
-        }
-    }
-
-    static func skipSpace(_ b: [UInt8], _ start: Int) -> Int {
-        var i = start
-        while i < b.count, b[i] == 0x20 || b[i] == 0x09 || b[i] == 0x0a || b[i] == 0x0d { i += 1 }
-        return i
     }
 }

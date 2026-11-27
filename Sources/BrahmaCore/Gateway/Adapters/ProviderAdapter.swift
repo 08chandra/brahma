@@ -72,9 +72,10 @@ public protocol ProviderAdapter: Sendable {
     /// Bumped when the adapter's translation changes (the capability probe keys its record by it, Task 13).
     var version: String { get }
 
-    /// The request to send. `rawBody` is the client's body as received (already decoded into `r`); `model` is the upstream
+    /// The request to send. `body` is the policy-checked tree of the client's body (`r` is decoded from it): an adapter
+    /// sends a serialization of it (or of its translation), never the bytes received (Ruling X1-35). `model` is the upstream
     /// model the grant routed to; `headers` are the client's (credentials already removed by the server).
-    func upstream(_ r: CanonicalRequest, rawBody: Data, model: String, endpoint: GatewayEndpoint, headers: [GatewayHeader],
+    func upstream(_ r: CanonicalRequest, body: StrictJSON, model: String, endpoint: GatewayEndpoint, headers: [GatewayHeader],
                   provider: Provider, key: String) throws(GatewayError) -> UpstreamRequest
 
     func translate(status: Int, headers: [String: String], body: AsyncThrowingStream<Data, Error>, streamed: Bool,

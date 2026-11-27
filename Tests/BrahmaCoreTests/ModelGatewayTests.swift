@@ -188,6 +188,39 @@ import Foundation
         #expect(rig.upstream.requests.count == 1)
     }
 
+    /// Ruling X1-35: a repeated key at any depth — where the policy and the provider could read different values — is refused
+    /// with its path, and nothing goes upstream.
+    @Test func duplicateKeysAtAnyDepthRefused() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let token = rig.grant()
+        let cases: [(String, String)] = [
+            (#"{"model":"claude-opus-5-5","max_tokens":16,"messages":[],"type":"a","type":"b"}"#, "type"),
+            (#"{"model":"claude-opus-5-5","max_tokens":16,"messages":[],"tools":[{"name":"Read","input_schema":{"type":"object"},"type":"custom","type":"web_fetch_20250910"}]}"#, "tools[0].type"),
+            (#"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":[{"type":"text","text":"hi","type":"document"}]}]}"#, "messages[0].content[0].type"),
+            (#"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO","type":"url"}}]}]}"#, "messages[0].content[0].source.type"),
+            (#"{"model":"claude-opus-5-5","max_tokens":16,"messages":[],"output_config":{"a":{"b":{"c":{"effort":"low","effort":"max"}}}}}"#, "output_config.a.b.c.effort"),
+            (#"{"model":"claude-opus-5-5","max_tokens":16,"messages":[],"tools":[{"name":"Read","input_schema":{},"type":"custom","type":"web_search_20260209"}]}"#, "tools[0].type"),
+            (#"{"model":"brahma-standard","max_tokens":16,"messages":[],"model":"claude-fable-5-1"}"#, "model"),
+        ]
+        for (body, path) in cases {
+            let r = try await rig.exchange(body, token: token)
+            #expect(r.status == 400 && r.errorType == "invalid_request_error", "\(path): \(r.text)")
+            #expect(r.text.contains("Brahma: duplicate key \(path)"), "\(r.text)")
+        }
+        #expect(rig.upstream.requests.isEmpty)
+    }
+
+    /// The provider gets the checked tree re-serialized: a request with a 2^63+1 integer and a long decimal arrives equal in
+    /// meaning, keys in order, numbers exact.
+    @Test func upstreamGetsTheCheckedTree() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let body = #"{ "model": "claude-opus-5-5", "max_tokens": 16, "messages": [ {"role": "user", "content": "hé"} ], "metadata": {"n": 9223372036854775809, "d": 3.14159265358979323846264338327950288, "user_id": "x"} }"#
+        #expect(try await rig.exchange(body, token: rig.grant()).status == 200)
+        let sent = try #require(rig.upstream.requests.first)
+        #expect(String(decoding: sent.body, as: UTF8.self)
+                    == #"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":"hé"}],"metadata":{"n":9223372036854775809,"d":3.14159265358979323846264338327950288}}"#)
+    }
+
     @Test func malformedOrRepeatedKeysRefusedBeforeRouting() async throws {
         let rig = try ModelGatewayRig([Self.ok])
         let token = rig.grant()

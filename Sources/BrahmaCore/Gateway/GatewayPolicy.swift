@@ -50,19 +50,15 @@ public enum GatewayPolicy {
         .refused(status: 403, type: "permission_error", message: "Brahma: " + reason)
     }
 
-    /// Refuses (throws) a request the policy does not allow; `body` must already have passed `CanonicalRequest.decode`'s
-    /// object scan (one object, unique keys).
-    static func check(body: Data, headers: [GatewayHeader], grant: TurnGrant) throws(GatewayError) {
-        let top: [String: JSONValue]
-        do {
-            top = try JSONDecoder().decode([String: JSONValue].self, from: body)
-        } catch {
-            throw .policy("the request body is not a Messages request")
-        }
+    /// Refuses (throws) a request the policy does not allow. `body` is the strictly parsed tree (`CanonicalRequest.tree`: no
+    /// key repeated at any depth), the same tree the adapter serializes upstream, so what is checked is what is sent.
+    static func check(body: StrictJSON, headers: [GatewayHeader], grant: TurnGrant) throws(GatewayError) {
+        guard case .object(let members) = body else { throw .policy("the request body is not a JSON object") }
+        let top = Dictionary(uniqueKeysWithValues: members.map { ($0.key, $0.value) })
         if top["mcp_servers"] != nil { throw forbidden("mcp_servers would let the provider reach the network; it is not allowed") }
         if top["fallbacks"] != nil { throw .policy("fallbacks is not priced") }
         for (key, standard) in standardOnly.sorted(by: { $0.key < $1.key }) {
-            if let value = top[key], value != .string(standard.value) { throw .policy(standard.reason) }
+            if let value = top[key], value.stringValue != standard.value { throw .policy(standard.reason) }
         }
         for key in top.keys.sorted() where !bodyKeys.contains(key) && standardOnly[key] == nil {
             throw forbidden("the request field \(shown(key)) is not allowed")
@@ -70,8 +66,8 @@ public enum GatewayPolicy {
         if let tools = top["tools"] {
             guard case .array(let list) = tools else { throw .policy("tools must be a list") }
             for tool in list {
-                guard case .object(let fields) = tool else { throw .policy("tools must be a list of objects") }
-                guard let type = fields["type"] else { continue }
+                guard case .object = tool else { throw .policy("tools must be a list of objects") }
+                guard let type = tool["type"] else { continue }
                 guard case .string(let name) = type else { throw .policy("a tool type must be a string") }
                 if name == clientToolType || grant.serverTools.contains(name) { continue }
                 throw forbidden("server tool \(shown(name)) would let the provider reach the network; it is not allowed")
@@ -91,15 +87,15 @@ public enum GatewayPolicy {
     }
 
     /// Whether any object under `value` is a content `source` of type `url`.
-    static func hasURLSource(_ value: JSONValue) -> Bool {
+    static func hasURLSource(_ value: StrictJSON) -> Bool {
         switch value {
         case .array(let items):
             return items.contains(where: hasURLSource)
         case .object(let fields):
-            if case .object(let source)? = fields["source"], source["type"] == .string("url") { return true }
+            if let source = value["source"], case .object = source, source["type"]?.stringValue == "url" { return true }
             // A tool call's `input` is the model's arguments to a client tool, not content the provider fetches.
-            let isToolUse = fields["type"] == .string("tool_use")
-            return fields.contains { key, value in !(isToolUse && key == "input") && hasURLSource(value) }
+            let isToolUse = value["type"]?.stringValue == "tool_use"
+            return fields.contains { !(isToolUse && $0.key == "input") && hasURLSource($0.value) }
         default:
             return false
         }

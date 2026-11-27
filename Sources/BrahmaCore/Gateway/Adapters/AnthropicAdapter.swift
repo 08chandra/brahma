@@ -1,9 +1,9 @@
 import Foundation
 
-/// The `anthropic` adapter (Plan X1 Task 8): the client already speaks the provider's API, so the body goes through as sent
-/// except for two fields — `model`, replaced by the routed model when the request named an alias, and `metadata.user_id` (a
-/// device id: identifying, not needed upstream), removed (Ruling 43). Both are edited in place in the raw bytes, so every
-/// other byte reaches the provider unchanged. The client's credential is never forwarded: the provider key goes in
+/// The `anthropic` adapter (Plan X1 Task 8): the client already speaks the provider's API, so the body goes through as the
+/// policy checked it — the serialization of the checked `StrictJSON` tree, never the bytes received (Ruling X1-35: keys in
+/// the order received, numbers exactly as received) — with two fields changed: `model`, replaced by the routed model when the
+/// request named an alias, and `metadata.user_id` (a device id: identifying, not needed upstream), removed (Ruling 43). The client's credential is never forwarded: the provider key goes in
 /// `x-api-key`, and only the allowlisted headers go with it. The response streams through unchanged while a tap reads the usage.
 public struct AnthropicAdapter: ProviderAdapter {
     public let id = AdapterId.anthropic
@@ -34,7 +34,7 @@ public struct AnthropicAdapter: ProviderAdapter {
 
     // MARK: Requests
 
-    public func upstream(_ r: CanonicalRequest, rawBody: Data, model: String, endpoint: GatewayEndpoint, headers: [GatewayHeader],
+    public func upstream(_ r: CanonicalRequest, body: StrictJSON, model: String, endpoint: GatewayEndpoint, headers: [GatewayHeader],
                          provider: Provider, key: String) throws(GatewayError) -> UpstreamRequest {
         guard provider.host == provider.host.lowercased(), !provider.host.hasPrefix("*."), DomainMatcher.isValidPattern(provider.host),
               DomainMatcher.isHostName(provider.host) else {
@@ -44,8 +44,8 @@ public struct AnthropicAdapter: ProviderAdapter {
         guard let url = URL(string: "https://\(provider.host)\(path)"), url.host == provider.host else {
             throw .unavailable("provider \(provider.id) has no valid host")
         }
-        let body = try Self.body(rawBody, model: model == r.model ? nil : model)
-        return UpstreamRequest(url: url, method: "POST", headers: Self.headers(from: headers, key: key), body: body)
+        return UpstreamRequest(url: url, method: "POST", headers: Self.headers(from: headers, key: key),
+                               body: Self.body(body, model: model == r.model ? nil : model).serialized())
     }
 
     /// The allowlisted client headers whose values are short printable ASCII (`anthropic-beta`: `^[a-z0-9,._-]{1,512}$`), plus
@@ -75,38 +75,14 @@ public struct AnthropicAdapter: ProviderAdapter {
             || $0 == UInt8(ascii: ",") || $0 == UInt8(ascii: ".") || $0 == UInt8(ascii: "_") || $0 == UInt8(ascii: "-") }
     }
 
-    /// `raw` with `model` replaced (when `model` is given) and `metadata.user_id` removed; byte for byte `raw` when neither applies.
-    static func body(_ raw: Data, model: String?) throws(GatewayError) -> Data {
-        let bytes = [UInt8](raw)
-        let malformed = GatewayError.policy("the request body is not one JSON object with unique keys")
-        var edits: [(range: Range<Int>, with: [UInt8])] = []
-        do {
-            let top = try JSONObjectScan.members(of: bytes)
-            if let model {
-                guard let member = top.first(where: { $0.key == "model" }) else { throw malformed }
-                edits.append((member.value, Array(("\"" + GatewayRefusal.jsonEscaped(model) + "\"").utf8)))
-            }
-            if let metadata = top.first(where: { $0.key == "metadata" }), bytes[metadata.value.lowerBound] == UInt8(ascii: "{") {
-                let inner = try JSONObjectScan.members(of: bytes, objectAt: metadata.value.lowerBound)
-                if let j = inner.firstIndex(where: { $0.key == "user_id" }) {
-                    let removed: Range<Int>
-                    if inner.count == 1 {
-                        removed = (metadata.value.lowerBound + 1)..<(metadata.value.upperBound - 1)
-                    } else if j < inner.count - 1 {
-                        removed = inner[j].range.lowerBound..<inner[j + 1].range.lowerBound
-                    } else {
-                        removed = inner[j - 1].value.upperBound..<inner[j].range.upperBound
-                    }
-                    edits.append((removed, []))
-                }
-            }
-        } catch {
-            throw malformed
+    /// The tree to send: `model` replaced when `model` is given, `metadata.user_id` removed; everything else as checked.
+    static func body(_ tree: StrictJSON, model: String?) -> StrictJSON {
+        var out = tree
+        if let model { out = out.setting("model", to: .string(model)) }
+        if let metadata = out["metadata"], case .object = metadata, metadata["user_id"] != nil {
+            out = out.setting("metadata", to: metadata.removing("user_id"))
         }
-        guard !edits.isEmpty else { return raw }
-        var out = bytes
-        for edit in edits.sorted(by: { $0.range.lowerBound > $1.range.lowerBound }) { out.replaceSubrange(edit.range, with: edit.with) }
-        return Data(out)
+        return out
     }
 
     // MARK: Responses
