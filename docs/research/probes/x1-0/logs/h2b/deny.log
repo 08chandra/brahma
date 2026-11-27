@@ -1,0 +1,3 @@
+{"deny_proxy": "start", "port": 58606, "t": 1795762191.081}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 1, "t": 1795762191.42, "target": "api.anthropic.com:443"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 2, "t": 1795762191.944, "target": "api.anthropic.com:443"}

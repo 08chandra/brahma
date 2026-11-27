@@ -1,0 +1,5 @@
+{"deny_proxy": "start", "port": 57719, "t": 1795761672.333}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 1, "t": 1795761672.634, "target": "api.anthropic.com:443"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 2, "t": 1795761672.834, "target": "api.anthropic.com:443"}
+{"header_names": ["Proxy-Connection", "Accept", "Content-Type", "User-Agent", "X-Claude-Code-Session-Id", "X-Stainless-Arch", "X-Stainless-Lang", "X-Stainless-OS", "X-Stainless-Package-Version", "X-Stainless-Retry-Count", "X-Stainless-Runtime", "X-Stainless-Runtime-Version", "X-Stainless-Timeout", "anthropic-beta", "anthropic-dangerous-direct-browser-access", "anthropic-version", "x-api-key", "x-app", "Connection", "Host", "Accept-Encoding", "Content-Length"], "host": "stub.invalid:1", "method": "POST", "n": 3, "t": 1795761672.99, "target": "http://stub.invalid:1/v1/messages?beta=true"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 4, "t": 1795761673.017, "target": "api.anthropic.com:443"}

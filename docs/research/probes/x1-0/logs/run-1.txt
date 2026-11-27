@@ -1,0 +1,23 @@
+[01:37:07] a1: exit 0; stub requests: 1; deny requests: 3
+[01:37:08] a2: exit 0; stub requests: 1; deny requests: 3
+[01:37:08] b: exit 0; stub requests: 1; deny requests: 0
+0
+[01:39:09] c: exit 124; stub requests: 9; deny requests: 17
+[01:39:09] d: exit 1; stub requests: 6; deny requests: 3
+[01:41:09] e: exit 124; stub requests: 9; deny requests: 17
+[01:41:10] f1: exit 0; stub requests: 1; deny requests: 3
+[01:41:11] f2: exit 0; stub requests: 1; deny requests: 3
+[01:41:12] f3: exit 0; stub requests: 1; deny requests: 3
+[01:41:13] g: exit 1; stub requests: 0
+0; deny requests: 4
+[01:41:13] tool: exit 0; stub requests: 2; deny requests: 3
+[01:41:14] j: exit 0; stub requests: 1; deny requests: 3
+[01:41:15] k2: exit 0; stub requests: 1; deny requests: 3
+[01:41:16] k3: exit 0; stub requests: 1; deny requests: 3
+[01:41:17] run1: exit 0; stub requests: 1; deny requests: 3
+[01:41:17] run2: exit 0; stub requests: 1; deny requests: 3
+[01:41:20] h1: exit 0; stub requests: 1; deny requests: 10
+[01:41:23] h2: exit 0; stub requests: 1; deny requests: 15
+[01:43:23] h3: exit 124; stub requests: 9; deny requests: 18
+[01:45:23] h4: exit 124; stub requests: 9; deny requests: 22
+done: /Users/chandra/agent-company/.claude/worktrees/planX1-build/docs/research/probes/x1-0/logs

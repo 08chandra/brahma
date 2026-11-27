@@ -1,0 +1,11 @@
+{"deny_proxy": "start", "port": 57761, "t": 1795761678.105}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 1, "t": 1795761678.402, "target": "api.anthropic.com:443"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 2, "t": 1795761678.601, "target": "api.anthropic.com:443"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 3, "t": 1795761678.729, "target": "api.anthropic.com:443"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 4, "t": 1795761678.729, "target": "api.anthropic.com:443"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 5, "t": 1795761678.73, "target": "api.anthropic.com:443"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 6, "t": 1795761678.733, "target": "api.anthropic.com:443"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 7, "t": 1795761679.179, "target": "api.anthropic.com:443"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.github.com:443", "method": "CONNECT", "n": 8, "t": 1795761679.714, "target": "api.github.com:443"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "http-intake.logs.us5.datadoghq.com:443", "method": "CONNECT", "n": 9, "t": 1795761680.254, "target": "http-intake.logs.us5.datadoghq.com:443"}
+{"header_names": ["Host", "Proxy-Connection"], "host": "api.anthropic.com:443", "method": "CONNECT", "n": 10, "t": 1795761680.254, "target": "api.anthropic.com:443"}

@@ -1,0 +1,10 @@
+[01:49:49] cb: exit 124; stub requests: 9; deny requests: 0
+0
+[01:49:50] h1b: exit 0; stub requests: 1; deny requests: 0
+0
+[01:49:53] h2b: exit 0; stub requests: 1; deny requests: 2
+[01:51:53] h3b: exit 124; stub requests: 9; deny requests: 0
+0
+[01:53:53] h4b: exit 124; stub requests: 9; deny requests: 0
+0
+done: /Users/chandra/agent-company/.claude/worktrees/planX1-build/docs/research/probes/x1-0/logs

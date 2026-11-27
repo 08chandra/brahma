@@ -1,0 +1,20 @@
+cwd: /Users/chandra/agent-company/.claude/worktrees/planX1-build/docs/research/probes/x1-0/logs/d/cwd
+config: fresh   api-key: yes (64-hex runtime token, value not recorded)   base: http://127.0.0.1:57507/t/
+argv: claude -p Reply with exactly: ok --output-format stream-json --verbose
+env names:
+  PATH=/Users/chandra/.local/bin:/usr/bin:/bin
+  HOME=/Users/chandra
+  USER=chandra
+  LOGNAME=chandra
+  LANG=en_US.UTF-8
+  TERM=dumb
+  TMPDIR=/Users/chandra/agent-company/.claude/worktrees/planX1-build/docs/research/probes/x1-0/logs/d/tmp
+  HTTPS_PROXY=http://127.0.0.1:57508
+  HTTP_PROXY=http://127.0.0.1:57508
+  https_proxy=http://127.0.0.1:57508
+  http_proxy=http://127.0.0.1:57508
+  NO_PROXY=127.0.0.1,localhost
+  no_proxy=127.0.0.1,localhost
+  ANTHROPIC_BASE_URL=http://127.0.0.1:57507/t/
+  ANTHROPIC_API_KEY (redacted)
+  CLAUDE_CONFIG_DIR=/Users/chandra/agent-company/.claude/worktrees/planX1-build/docs/research/probes/x1-0/logs/d/cfg
