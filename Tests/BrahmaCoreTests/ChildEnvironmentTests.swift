@@ -140,4 +140,29 @@ private let turnToken = String(repeating: "0123456789abcdef", count: 4)
             #expect(!SecretName.isInjectable(name), "\(name)")
         }
     }
+
+    /// Plan X1 Task 11: provider keys may be stored engine-held, but the injection path can never hand one to a child. A
+    /// secrets map holding them (a row written by other means) is dropped and reported for every purpose, with or without a
+    /// gateway; a gateway turn keeps its turn token, never the provider key.
+    @Test func providerKeysNeverInjected() {
+        let providerKey = ["sk", "ant", "provider"].joined(separator: "-")
+        let names = ["ANTHROPIC_API_KEY", "BRAHMA_KEY_OPENROUTER", "BRAHMA_KEY_" + String(repeating: "A", count: 40)]
+        let secrets = Dictionary(uniqueKeysWithValues: names.map { ($0, providerKey) }).merging(["STRIPE_TEST_KEY": "test-v"]) { $1 }
+        for name in names {
+            #expect(Provider.isKeyName(name), "\(name)")
+            #expect(!SecretName.isInjectable(name), "\(name)")
+        }
+        #expect(ChildEnvironment.droppedSecretNames(secrets) == names.sorted())
+        let gateway = ["ANTHROPIC_BASE_URL": "http://127.0.0.1:4100/t/", "ANTHROPIC_API_KEY": turnToken]
+        for purpose in [ChildEnvironment.Purpose.claude, .general, .check] {
+            for g in [[:], gateway] {
+                let env = ChildEnvironment.make(base: ["PATH": "/bin", "HOME": "/h"], extra: ["BRAHMA_AGENT_ID": "a1"], purpose: purpose,
+                                                secrets: secrets, gateway: g)
+                #expect(!env.values.contains(providerKey), "\(purpose) gateway=\(!g.isEmpty): \(env.keys.sorted())")
+                for name in names where name != "ANTHROPIC_API_KEY" { #expect(env[name] == nil, "\(purpose): \(name)") }
+                #expect(env["ANTHROPIC_API_KEY"] == (purpose == .claude && !g.isEmpty ? turnToken : nil), "\(purpose)")
+                #expect(env["STRIPE_TEST_KEY"] == "test-v")
+            }
+        }
+    }
 }

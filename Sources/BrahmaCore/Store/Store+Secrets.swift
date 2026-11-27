@@ -740,9 +740,14 @@ extension Store {
     func validateSecret(companyId: String, name: String, value: String, isTest: Bool) throws {
         guard SecretName.isValid(name) else { throw SecretError.invalidName }
         if isTest {
+            // A provider key never reaches an agent (Plan X1 Task 11); `isInjectable` refuses its families anyway.
+            guard !Provider.isKeyName(name) else { throw SecretError.providerKeyNotTest }
             // A test key goes into agents' environments: only names `SecretName.isInjectable` accepts.
             guard SecretName.isInjectable(name) else { throw SecretError.notInjectable }
-        } else {
+        } else if !Provider.isKeyName(name) {
+            // Plan X1 Task 11: exactly the provider key names (`ANTHROPIC_API_KEY`, `^BRAHMA_KEY_[A-Z0-9_]{1,40}$`) may be stored
+            // engine-held though their families are reserved — only the gateway reads them, and no injection path takes them
+            // (`SecretName.isInjectable` denies `ANTHROPIC_*` and `BRAHMA_*`). Every other reserved name stays refused.
             guard !ChildEnvironment.isReserved(name) else { throw SecretError.reservedName }
         }
         guard !value.isEmpty else { throw SecretError.emptyValue }

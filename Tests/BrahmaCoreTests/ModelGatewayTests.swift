@@ -281,6 +281,62 @@ import GRDB
         #expect(try await none.exchange(Self.body("claude-opus-5-5"), token: none.grant()).text.contains("Brahma: unavailable: provider anthropic is not configured"))
     }
 
+    /// Plan X1 Task 11 (defence in depth): a provider key whose secret row is flagged test is refused before the key is read —
+    /// no such row can be created (`Store.validateSecret`), but one written by other means never reaches a provider. A flag
+    /// that cannot be read refuses too (fail closed).
+    @Test func testFlaggedKeyRefused() async throws {
+        let rig = try ModelGatewayRig([Self.ok])
+        let store = rig.store, companyId = rig.companyId
+        func execute(_ sql: String, _ arguments: StatementArguments = []) throws {
+            try store.writer.write { db in try db.execute(sql: sql, arguments: arguments) }
+        }
+        let insert = "INSERT INTO secret (id, companyId, name, isTest, createdAt, updatedAt) VALUES (?, ?, ?, 1, ?, ?)"
+        try execute(insert, ["s1", companyId, Provider.anthropicKeyName, Date(), Date()])
+        #expect(try store.isTestSecret(companyId: companyId, name: Provider.anthropicKeyName))
+        let response = try await rig.exchange(Self.body("claude-opus-5-5"), token: rig.grant())
+        #expect(response.status == 400 && response.errorType == "invalid_request_error", "\(response.text)")
+        #expect(response.text.contains("Brahma: unavailable: the provider key \(Provider.anthropicKeyName) is flagged as a test key"), "\(response.text)")
+        #expect(rig.upstream.requests.isEmpty)
+        #expect(try rig.charges().isEmpty, "refused before the meter")
+        // Engine-held (the flag cleared), the same request is served.
+        try execute("UPDATE secret SET isTest = 0")
+        #expect(try !store.isTestSecret(companyId: companyId, name: Provider.anthropicKeyName))
+        #expect(try await rig.exchange(Self.body("claude-opus-5-5"), token: rig.grant()).status == 200)
+        #expect(rig.upstream.requests.count == 1)
+        // Another company's test row of that name does not flag this company's key.
+        let other = try store.createCompany(name: "Other", goal: "g", workspacesRoot: tempDir())
+        try execute(insert, ["s2", other.id, Provider.anthropicKeyName, Date(), Date()])
+        #expect(try !store.isTestSecret(companyId: companyId, name: Provider.anthropicKeyName))
+
+        struct Unreadable: Error {}
+        let failing = try ModelGatewayRig([Self.ok], isTestSecret: { _, _ in throw Unreadable() })
+        let refused = try await failing.exchange(Self.body("claude-opus-5-5"), token: failing.grant())
+        #expect(refused.status == 400 && refused.text.contains("Brahma: unavailable: the provider key \(Provider.anthropicKeyName) could not be checked"),
+                "\(refused.text)")
+        #expect(failing.upstream.requests.isEmpty)
+    }
+
+    /// Plan X1 Task 11 (defence in depth): a provider record that fails the pinned-host rules (`ProviderHost.validate`), or
+    /// whose host is not its base URL's, is refused at request time too — a row written below the store never reaches upstream.
+    @Test func tamperedProviderRecordRefused() async throws {
+        func provider(_ url: String, host: String, adapter: String = "anthropic", lan: Bool = false) -> Provider {
+            Provider(id: "anthropic", adapter: adapter, baseURL: URL(string: url)!, host: host, keySecret: Provider.anthropicKeyName,
+                     lan: lan, builtin: true, createdAt: Date(timeIntervalSince1970: 0))
+        }
+        for (record, why) in [
+            (provider("http://api.anthropic.com", host: "api.anthropic.com"), "provider anthropic: a provider's base URL must be https"),
+            (provider("https://evil.example.com", host: "api.anthropic.com"), "provider anthropic's host does not match its base URL"),
+            (provider("https://127.0.0.1", host: "127.0.0.1"), "provider anthropic: a provider's base URL must name its host"),
+            (provider("https://api.anthropic.com?x=1", host: "api.anthropic.com"), "provider anthropic: a provider's base URL must not hold a query"),
+            (provider("https://api.anthropic.com", host: "api.anthropic.com", lan: true), "provider anthropic: LAN providers arrive with local servers in X1b"),
+        ] {
+            let rig = try ModelGatewayRig([Self.ok], providers: [record])
+            let r = try await rig.exchange(Self.body("claude-opus-5-5"), token: rig.grant())
+            #expect(r.status == 400 && r.text.contains("Brahma: unavailable: \(why)"), "\(record.baseURL): \(r.text)")
+            #expect(rig.upstream.requests.isEmpty)
+        }
+    }
+
     /// A transport failure, an upstream that answers with a redirect, or a broken body are errors the client sees — never an
     /// empty 200 — and a redirect is never followed.
     @Test func upstreamUnavailableIsAnError() async throws {

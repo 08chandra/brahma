@@ -811,7 +811,8 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         #expect(!SecretName.isInjectable(name), "\(name)")
         let w = try W()
         if SecretName.isValid(name) {
-            #expect(throws: SecretError.notInjectable) {
+            // A provider key name says why it is refused (Plan X1 Task 11); every other name is not injectable.
+            #expect(throws: Provider.isKeyName(name) ? SecretError.providerKeyNotTest : SecretError.notInjectable) {
                 try w.store.setSecret(companyId: w.company.id, name: name, value: "some-value-123", isTest: true, vault: w.vault)
             }
         }
@@ -845,6 +846,81 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
             try w.store.setSecret(companyId: w.company.id, name: "PLAIN_NAME", value: "some-value-123", isTest: true, vault: w.vault)
         }
         #expect(try w.store.secrets(companyId: w.company.id).map(\.isTest) == [false])
+    }
+
+    // MARK: provider keys (Plan X1 Task 11)
+
+    /// Provider keys are stored engine-held: `ANTHROPIC_API_KEY` and `^BRAHMA_KEY_[A-Z0-9_]{1,40}$`, though their families are
+    /// reserved. The gateway reads them from the vault; no agent or check is ever given one.
+    @Test func providerKeyNamesAcceptedEngineHeld() throws {
+        let w = try W()
+        let forty = "BRAHMA_KEY_" + String(repeating: "Z", count: 40)
+        for name in ["ANTHROPIC_API_KEY", "BRAHMA_KEY_OPENROUTER", "BRAHMA_KEY_OPEN_ROUTER2", forty] {
+            try w.store.setSecret(companyId: w.company.id, name: name, value: "provider-value-123", isTest: false, vault: w.vault)
+            #expect(try w.vault.value(companyId: w.company.id, name: name) == "provider-value-123")
+        }
+        #expect(try w.store.secrets(companyId: w.company.id).map(\.name) == ["ANTHROPIC_API_KEY", "BRAHMA_KEY_OPENROUTER", "BRAHMA_KEY_OPEN_ROUTER2", forty])
+        #expect(try w.store.secrets(companyId: w.company.id).allSatisfy { !$0.isTest })
+        // Outside the exact rule the family stays reserved.
+        for name in [forty + "Z", "BRAHMA_KEY_", "BRAHMA_KEYS", "ANTHROPIC_API_KEY_2", "ANTHROPIC_KEY"] {
+            #expect(throws: SecretError.reservedName, "\(name)") {
+                try w.store.setSecret(companyId: w.company.id, name: name, value: "provider-value-123", isTest: false, vault: w.vault)
+            }
+        }
+        // The owner provides one an agent asked for, engine-held, the same way.
+        let ask = try w.store.requestSecret(companyId: w.company.id, agentId: w.eng.id, name: "BRAHMA_KEY_GROQ", reason: "r", test: false).ask
+        try w.store.provideSecret(askId: ask.id, value: "groq-value-1234", isTest: false, vault: w.vault)
+        #expect(try w.store.secrets(companyId: w.company.id).first { $0.name == "BRAHMA_KEY_GROQ" }?.isTest == false)
+    }
+
+    /// A provider key can never be a test key (test keys are put in agents' environments): refused for both name forms, and
+    /// an engine-held one cannot be turned into a test key later, by `setSecret` or by providing a request.
+    @Test func providerKeyNamesNeverTestKeys() throws {
+        let w = try W()
+        for name in ["ANTHROPIC_API_KEY", "BRAHMA_KEY_OPENROUTER"] {
+            #expect(!SecretName.isInjectable(name))
+            #expect(throws: SecretError.providerKeyNotTest, "\(name)") {
+                try w.store.setSecret(companyId: w.company.id, name: name, value: "provider-value-123", isTest: true, vault: w.vault)
+            }
+            #expect(try w.vault.value(companyId: w.company.id, name: name) == nil, "refused before the vault is touched")
+            try w.store.setSecret(companyId: w.company.id, name: name, value: "provider-value-123", isTest: false, vault: w.vault)
+            #expect(throws: SecretError.providerKeyNotTest, "\(name)") {
+                try w.store.setSecret(companyId: w.company.id, name: name, value: "provider-value-456", isTest: true, vault: w.vault)
+            }
+            #expect(try w.vault.value(companyId: w.company.id, name: name) == "provider-value-123")
+        }
+        #expect(try w.store.secrets(companyId: w.company.id).allSatisfy { !$0.isTest })
+        #expect(SecretError.providerKeyNotTest.message.contains("engine-held"))
+        // An agent cannot ask for one as a test key either.
+        #expect(throws: WorkError.self) {
+            try w.store.requestSecret(companyId: w.company.id, agentId: w.eng.id, name: "BRAHMA_KEY_NEW", reason: "r", test: true)
+        }
+    }
+
+    /// Ordinary test keys are unchanged: `OPENAI_API_KEY --test` is still accepted and still injected.
+    @Test func existingTestKeysUnchanged() throws {
+        let w = try W()
+        try w.store.setSecret(companyId: w.company.id, name: "OPENAI_API_KEY", value: "test-value-123", isTest: true, vault: w.vault)
+        #expect(try w.store.secrets(companyId: w.company.id).map(\.isTest) == [true])
+        let env = ChildEnvironment.make(base: ["PATH": "/bin"], purpose: .claude, secrets: ["OPENAI_API_KEY": "test-value-123"])
+        #expect(env["OPENAI_API_KEY"] == "test-value-123")
+        #expect(ChildEnvironment.droppedSecretNames(["OPENAI_API_KEY": "v"]).isEmpty)
+    }
+
+    /// Every other reserved name stays refused, engine-held or test.
+    @Test func otherReservedNamesStillRefused() throws {
+        let w = try W()
+        for name in ["BRAHMA_DEV", "CLAUDE_CODE_OAUTH_TOKEN", "BRAHMA_AGENT_ID", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                     "CLAUDE_CONFIG_DIR", "PATH", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS"] {
+            #expect(throws: SecretError.reservedName, "\(name)") {
+                try w.store.setSecret(companyId: w.company.id, name: name, value: "some-value-123", isTest: false, vault: w.vault)
+            }
+            #expect(throws: SecretError.notInjectable, "\(name)") {
+                try w.store.setSecret(companyId: w.company.id, name: name, value: "some-value-123", isTest: true, vault: w.vault)
+            }
+        }
+        #expect(try w.store.secrets(companyId: w.company.id).isEmpty)
+        #expect(ChildEnvironment.isReserved("ANTHROPIC_API_KEY") && ChildEnvironment.isReserved("BRAHMA_KEY_OPENROUTER"), "isReserved is unchanged")
     }
 
     // MARK: CLI input
@@ -955,6 +1031,24 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         #expect(again.status == 1); #expect(again.stderr.contains("already approved"), "\(again.stderr)")
         let db = try Data(contentsOf: paths.database)
         #expect(db.range(of: Data("provided-cli-value-77".utf8)) == nil)
+    }
+
+    /// Plan X1 Task 11: `brahma secret set acme ANTHROPIC_API_KEY` and `BRAHMA_KEY_OPENROUTER` store engine-held keys;
+    /// `--test` is refused for both, with the reason.
+    @Test func providerKeysThroughTheCLI() throws {
+        let owner = try OwnerTestHome(); let home = owner.url
+        #expect(try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home).status == 0)
+        for name in ["ANTHROPIC_API_KEY", "BRAHMA_KEY_OPENROUTER"] {
+            let test = try brahma(["secret", "set", "acme", name, "--test"], home: home, stdin: "provider-cli-value-1\n")
+            #expect(test.status == 1, "\(name): \(test.stdout)")
+            #expect(test.stderr.contains(SecretError.providerKeyNotTest.message), "\(name): \(test.stderr)")
+            let set = try brahma(["secret", "set", "acme", name], home: home, stdin: "provider-cli-value-1\n")
+            #expect(set.status == 0, "\(name): \(set.stderr)")
+            #expect(set.stdout.contains("stored \(name) for Acme (engine-held: agents never receive it)"), "\(set.stdout)")
+        }
+        let list = try brahma(["secret", "list", "acme"], home: home).stdout
+        #expect(list.contains("ANTHROPIC_API_KEY  engine-held") && list.contains("BRAHMA_KEY_OPENROUTER  engine-held"), "\(list)")
+        #expect(!list.contains("provider-cli-value-1"))
     }
 
     // None of these reach the Keychain: they fail before the vault is touched, or only read metadata.

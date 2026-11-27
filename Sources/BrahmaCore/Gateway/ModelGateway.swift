@@ -21,6 +21,7 @@ import Foundation
 public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     public let registry: TurnTokenRegistry
     private let providers: @Sendable (String) throws -> Provider?
+    private let isTestSecret: @Sendable (_ companyId: String, _ name: String) throws -> Bool
     private let adapters: [AdapterId: any ProviderAdapter]
     private let upstream: any UpstreamTransport
     private let vault: any SecretVault
@@ -32,20 +33,24 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     private var stopped = false
     private var upstreamInFlight = 0
 
-    /// `providers` looks a provider up by id (the store's `provider(id:)`); `log` gets one line per refused, failed or served
-    /// request (never a key); `meter` reserves and settles every request sent upstream.
+    /// `providers` looks a provider up by id (the store's `provider(id:)`); `isTestSecret` says whether a company's secret is
+    /// flagged test (the store's `isTestSecret(companyId:name:)`; a provider key so flagged is refused, Task 11); `log` gets
+    /// one line per refused, failed or served request (never a key); `meter` reserves and settles every request sent upstream.
     public convenience init(registry: TurnTokenRegistry, providers: @escaping @Sendable (String) throws -> Provider?,
+                            isTestSecret: @escaping @Sendable (String, String) throws -> Bool,
                             adapters: [any ProviderAdapter] = [AnthropicAdapter(), OpenAICompatibleAdapter()], upstream: any UpstreamTransport,
                             vault: any SecretVault,
                             meter: GatewayMeter, log: @escaping @Sendable (String) -> Void = { _ in }) {
-        self.init(registry: registry, providers: providers, adapters: adapters, upstream: upstream, vault: vault, meter: meter,
+        self.init(registry: registry, providers: providers, isTestSecret: isTestSecret, adapters: adapters, upstream: upstream, vault: vault, meter: meter,
                   maxUpstream: GatewayLimits.maxUpstreamRequests, log: log)
     }
 
-    init(registry: TurnTokenRegistry, providers: @escaping @Sendable (String) throws -> Provider?, adapters: [any ProviderAdapter],
+    init(registry: TurnTokenRegistry, providers: @escaping @Sendable (String) throws -> Provider?,
+         isTestSecret: @escaping @Sendable (String, String) throws -> Bool, adapters: [any ProviderAdapter],
          upstream: any UpstreamTransport, vault: any SecretVault, meter: GatewayMeter, maxUpstream: Int,
          log: @escaping @Sendable (String) -> Void) {
-        self.registry = registry; self.providers = providers; self.upstream = upstream; self.vault = vault; self.meter = meter
+        self.registry = registry; self.providers = providers; self.isTestSecret = isTestSecret
+        self.upstream = upstream; self.vault = vault; self.meter = meter
         self.maxUpstream = maxUpstream; self.log = log
         self.adapters = Dictionary(adapters.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     }
@@ -117,12 +122,28 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         } catch {
             throw .unavailable("provider \(target.provider) could not be read")
         }
-        guard !provider.lan else { throw .unavailable("LAN providers arrive in X1b") }
+        // The record is checked again on every request (Task 11, defence in depth): a row written below the store's rules
+        // (LAN, a base URL off the pinned-host rules, a host that is not the URL's) never reaches upstream.
+        switch ProviderHost.validate(baseURL: provider.baseURL, adapter: AdapterId(rawValue: provider.adapter), lan: provider.lan) {
+        case .failure(let refusal): throw .unavailable("provider \(provider.id): \(refusal.reason)")
+        case .success(let pinned): guard pinned == provider.host else { throw .unavailable("provider \(provider.id)'s host does not match its base URL") }
+        }
         guard let adapter = adapters[AdapterId(rawValue: provider.adapter)] else {
             throw .unavailable("no adapter \(provider.adapter) for provider \(provider.id)")
         }
         guard let secret = provider.keySecret, Provider.isKeyName(secret) else {
             throw .unavailable("provider \(provider.id) has no key secret")
+        }
+        // A provider key is engine-held only; a row flagged test (agents may be given it) is refused, and so is a flag that
+        // cannot be read (Task 11, defence in depth: `Store.validateSecret` never makes one).
+        let flaggedTest: Bool
+        do {
+            flaggedTest = try isTestSecret(grant.companyId, secret)
+        } catch {
+            throw .unavailable("the provider key \(secret) could not be checked")
+        }
+        guard !flaggedTest else {
+            throw .unavailable("the provider key \(secret) is flagged as a test key; a provider key must be engine-held")
         }
         if r.endpoint == .countTokens, let count = adapter.countTokensLocally(tree) {
             // Answered here: nothing goes upstream, so no key is read and nothing is reserved or charged (it costs nothing).

@@ -8,6 +8,8 @@ public enum SecretError: Error, Equatable, Sendable, CustomStringConvertible {
     case reservedName
     /// A test key's name must be one `SecretName.isInjectable` accepts: it is put in agents' environments.
     case notInjectable
+    /// A provider key (`Provider.isKeyName`: `ANTHROPIC_API_KEY`, `BRAHMA_KEY_*`) is engine-held only: never a test key.
+    case providerKeyNotTest
     case emptyValue
     /// The value's bytes are not UTF-8 (refused at input; a stored one fails to load).
     case notUTF8
@@ -26,6 +28,7 @@ public enum SecretError: Error, Equatable, Sendable, CustomStringConvertible {
         case .invalidName: "invalid secret name: use A-Z, 0-9 and _, starting with a letter (2 to 64 characters)"
         case .reservedName: "that name is reserved: the engine sets it in every child's environment"
         case .notInjectable: "a test key's name must contain KEY, TOKEN or SECRET and must not be a variable that changes how programs run (GIT_*, SSH_*, DYLD_*, LD_*, NODE_*, PYTHON*, ...*PATH, ...*_OPTIONS, ...)"
+        case .providerKeyNotTest: "a provider key (ANTHROPIC_API_KEY, BRAHMA_KEY_*) is engine-held only: it can never be a test key, which agents are given"
         case .emptyValue: "the secret value is empty"
         case .notUTF8: "the secret value is not valid UTF-8 text"
         case .unknownCompany: "no such company"

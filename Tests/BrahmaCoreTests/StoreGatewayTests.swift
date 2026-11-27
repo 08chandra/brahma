@@ -249,6 +249,59 @@ import GRDB
         #expect(!Provider.isKeyName("BRAHMA_KEY_lower") && !Provider.isKeyName("OPENAI_API_KEY") && !Provider.isKeyName("ANTHROPIC_AUTH_TOKEN"))
     }
 
+    /// Ruling 60 (Task 5 minor, fixed in Task 11): `addProvider` fails closed through `ProviderHost.validate` — LAN, a base URL
+    /// that is not `https://<host name>` on 443, and a host that is not the base URL's are refused — and on the key: the
+    /// Anthropic key goes only to Anthropic's host, and a name that is a test key in any company is refused.
+    @Test func addProviderFailsClosedOnHostAndKey() throws {
+        let (store, acme, _) = try store()
+        func provider(_ id: String, _ url: String, host: String, adapter: String = "openai-compatible", key: String? = nil,
+                      lan: Bool = false) -> Provider {
+            Provider(id: id, adapter: adapter, baseURL: URL(string: url)!, host: host, keySecret: key, lan: lan,
+                     createdAt: Date(timeIntervalSince1970: 1_790_000_000))
+        }
+        let refused: [(Provider, String)] = [
+            (provider("lan", "https://llm.example.com/v1", host: "llm.example.com", lan: true), "LAN providers arrive with local servers in X1b"),
+            (provider("plain", "http://llm.example.com/v1", host: "llm.example.com"), "a provider's base URL must be https"),
+            (provider("ip", "https://10.0.0.2/v1", host: "10.0.0.2"), "a provider's base URL must name its host"),
+            (provider("port", "https://llm.example.com:8443/v1", host: "llm.example.com"), "port 443"),
+            (provider("query", "https://llm.example.com/v1?k=1", host: "llm.example.com"), "query or a fragment"),
+            (provider("user", "https://u@llm.example.com/v1", host: "llm.example.com"), "user name or password"),
+            (provider("other-host", "https://llm.example.com/v1", host: "evil.example.com"),
+             "provider other-host's host must be its base URL's host (llm.example.com)"),
+            (provider("upper-host", "https://llm.example.com/v1", host: "LLM.example.com"),
+             "provider upper-host's host must be its base URL's host (llm.example.com)"),
+            (provider("local", "https://llm.example.com/v1", host: "llm.example.com", adapter: "local"), "no adapter local"),
+            (provider("proxy", "https://proxy.example.com", host: "proxy.example.com", adapter: "anthropic", key: "ANTHROPIC_API_KEY"),
+             "ANTHROPIC_API_KEY is sent only to api.anthropic.com"),
+            (provider("a", "https://llm.example.com/v1", host: "llm.example.com"), "a provider id is 2-32 of a-z, 0-9 and -, starting with a letter"),
+            (provider("9lives", "https://llm.example.com/v1", host: "llm.example.com"), "a provider id is 2-32"),
+            (provider("long-key", "https://llm.example.com/v1", host: "llm.example.com", key: "BRAHMA_KEY_" + String(repeating: "A", count: 41)),
+             "a provider key is named ANTHROPIC_API_KEY or BRAHMA_KEY_<PROVIDER>"),
+        ]
+        for (p, why) in refused {
+            do {
+                try store.addProvider(p)
+                Issue.record("\(p.id) was added")
+            } catch {
+                #expect((error as? WorkError)?.message.contains(why) == true, "\(p.id): \(error)")
+            }
+            #expect(try store.provider(id: p.id) == nil, "\(p.id)")
+        }
+        // The Anthropic key to Anthropic's own host is fine (an owner copy of the built-in, say).
+        try store.addProvider(provider("anthropic-2", "https://api.anthropic.com", host: "api.anthropic.com", adapter: "anthropic", key: "ANTHROPIC_API_KEY"))
+        // A key name that is a test key in some company (written by other means) is refused, naming the company.
+        try store.writer.write { db in
+            try db.execute(sql: "INSERT INTO secret (id, companyId, name, isTest, createdAt, updatedAt) VALUES ('s1', ?, 'BRAHMA_KEY_TAINTED', 1, ?, ?)",
+                           arguments: [acme.id, Date(), Date()])
+        }
+        #expect(try store.isTestSecret(companyId: acme.id, name: "BRAHMA_KEY_TAINTED"))
+        #expect(throws: WorkError.conflict("BRAHMA_KEY_TAINTED is a test key in Acme; a provider key must be engine-held (brahma secret set <company> BRAHMA_KEY_TAINTED, without --test)")) {
+            try store.addProvider(provider("tainted", "https://llm.example.com/v1", host: "llm.example.com", key: "BRAHMA_KEY_TAINTED"))
+        }
+        try store.addProvider(provider("clean", "https://llm.example.com/v1", host: "llm.example.com", key: "BRAHMA_KEY_CLEAN"))
+        #expect(try store.provider(id: "clean")?.host == "llm.example.com")
+    }
+
     @Test func removeProviderRefusedWhileRouted() throws {
         let (store, acme, beta) = try store()
         try store.addProvider(custom())
@@ -464,5 +517,48 @@ import GRDB
         #expect(outcome.warnings.contains { $0.contains("provider gone, removed after the snapshot, stays removed with the routes and caps naming it") },
                 "\(outcome.warnings)")
         #expect(outcome.warnings.contains { $0.contains("provider edge kept at https://b.example.com/v1 (host b.example.com") }, "\(outcome.warnings)")
+    }
+
+    /// Ruling 60 (Task 5 minor, fixed in Task 11): a restore follows the live set for `adapter` too, and for `lan` the stricter
+    /// value wins (off): a snapshot's LAN flag never comes back over a live provider without it, and a live one is cleared
+    /// when the snapshot had it off. Rows the store refuses today are written below it, as an older or tampered database would.
+    @Test func restoreFollowsTheLiveLanAndAdapter() throws {
+        let env = try BackupEnv()
+        func insert(_ id: String, adapter: String, lan: Bool) throws {
+            try env.store.writer.write { db in
+                try db.execute(sql: """
+                    INSERT INTO provider (id, adapter, baseURL, host, keySecret, lan, builtin, createdAt)
+                    VALUES (?, ?, 'https://llm.example.com/v1', 'llm.example.com', NULL, ?, 0, ?)
+                    """, arguments: [id, adapter, lan, Date(timeIntervalSince1970: 1_790_000_000)])
+            }
+        }
+        func set(_ id: String, adapter: String, lan: Bool) throws {
+            try env.store.writer.write { db in
+                try db.execute(sql: "UPDATE provider SET adapter = ?, lan = ? WHERE id = ?", arguments: [adapter, lan, id])
+            }
+        }
+        try insert("was-lan", adapter: "openai-compatible", lan: true)
+        try insert("now-lan", adapter: "openai-compatible", lan: false)
+        try insert("swapped", adapter: "anthropic", lan: false)
+        try insert("same", adapter: "openai-compatible", lan: false)
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try set("was-lan", adapter: "openai-compatible", lan: false)
+        try set("now-lan", adapter: "openai-compatible", lan: true)
+        try set("swapped", adapter: "openai-compatible", lan: false)
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        #expect(try restored.provider(id: "was-lan")?.lan == false, "the snapshot's LAN flag never returns over a live provider without it")
+        #expect(try restored.provider(id: "now-lan")?.lan == false, "off wins: the snapshot had it off")
+        #expect(try restored.provider(id: "swapped")?.adapter == "openai-compatible", "the adapter follows the live set")
+        let same = try #require(try restored.provider(id: "same"))
+        #expect(same.adapter == "openai-compatible" && !same.lan)
+        #expect(outcome.warnings.contains { $0.contains("provider was-lan kept at https://llm.example.com/v1 (host llm.example.com, key none, adapter openai-compatible) (the snapshot had https://llm.example.com/v1 (host llm.example.com, key none, adapter openai-compatible, LAN))") },
+                "\(outcome.warnings)")
+        #expect(outcome.warnings.contains { $0.contains("provider swapped kept at https://llm.example.com/v1 (host llm.example.com, key none, adapter openai-compatible) (the snapshot had https://llm.example.com/v1 (host llm.example.com, key none, adapter anthropic))") },
+                "\(outcome.warnings)")
+        #expect(!outcome.warnings.contains { $0.contains("provider now-lan") }, "the snapshot's stricter value is kept as it is: \(outcome.warnings)")
+        #expect(!outcome.warnings.contains { $0.contains("provider same") })
     }
 }

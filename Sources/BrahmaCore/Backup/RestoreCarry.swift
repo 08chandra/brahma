@@ -304,8 +304,8 @@ struct RestoreCarry {
                 try db.execute(sql: "DELETE FROM providerCap WHERE provider = ?", arguments: [id])
                 try db.execute(sql: "DELETE FROM provider WHERE id = ? AND builtin = 0", arguments: [id])
             case .changed(let id, let endpoint, _):
-                try db.execute(sql: "UPDATE provider SET baseURL = ?, host = ?, keySecret = ? WHERE id = ? AND builtin = 0",
-                               arguments: [endpoint.baseURL, endpoint.host, endpoint.keySecret, id])
+                try db.execute(sql: "UPDATE provider SET baseURL = ?, host = ?, keySecret = ?, adapter = ?, lan = ? WHERE id = ? AND builtin = 0",
+                               arguments: [endpoint.baseURL, endpoint.host, endpoint.keySecret, endpoint.adapter, endpoint.lan, id])
             }
         }
         // S36: the narrower auto-merge folder list.
@@ -548,6 +548,8 @@ extension RestoreCarry {
             var baseURL: String
             var host: String
             var keySecret: String?
+            var adapter: String
+            var lan: Bool
         }
 
         /// Every `ownerSettings` column, classified for restores (S36; `OwnerSettingsSecurityTests` fails on a new column in
@@ -567,8 +569,9 @@ extension RestoreCarry {
         ]
 
         /// Plan X1 (Ruling 35): what a restore changes so the owner-added providers follow the live set — a restored one absent
-        /// live is removed (with the routes and caps naming it); one whose endpoint or key name differs takes the live values. A
-        /// provider only live is not added back. Nothing when either database has no `provider` table.
+        /// live is removed (with the routes and caps naming it); one whose endpoint, key name or adapter differs takes the live
+        /// values, and its LAN flag is the stricter of the two (off unless both are on; Ruling 60). A provider only live is not
+        /// added back. Nothing when either database has no `provider` table.
         enum ProviderChange: Equatable {
             case removed(String)
             case changed(String, live: ProviderEndpoint, restored: ProviderEndpoint)
@@ -578,7 +581,9 @@ extension RestoreCarry {
                 case .removed(let id):
                     return "provider \(id), removed after the snapshot, stays removed with the routes and caps naming it"
                 case .changed(let id, let live, let restored):
-                    func show(_ e: ProviderEndpoint) -> String { "\(e.baseURL) (host \(e.host), key \(e.keySecret ?? "none"))" }
+                    func show(_ e: ProviderEndpoint) -> String {
+                        "\(e.baseURL) (host \(e.host), key \(e.keySecret ?? "none"), adapter \(e.adapter)\(e.lan ? ", LAN" : ""))"
+                    }
                     return "provider \(id) kept at \(show(live)) (the snapshot had \(show(restored)))"
                 }
             }
@@ -587,7 +592,8 @@ extension RestoreCarry {
         static func providerChanges(live: Settings, restored: Settings) -> [ProviderChange] {
             guard let liveProviders = live.providers, let restoredProviders = restored.providers else { return [] }
             return restoredProviders.sorted { $0.key < $1.key }.compactMap { id, then in
-                guard let now = liveProviders[id] else { return .removed(id) }
+                guard var now = liveProviders[id] else { return .removed(id) }
+                now.lan = now.lan && then.lan
                 return now == then ? nil : .changed(id, live: now, restored: then)
             }
         }
@@ -627,8 +633,9 @@ extension RestoreCarry {
             }
             if try db.tableExists("provider") {
                 var providers: [String: ProviderEndpoint] = [:]
-                for row in try Row.fetchAll(db, sql: "SELECT id, baseURL, host, keySecret FROM provider WHERE builtin = 0") {
-                    providers[row["id"]] = ProviderEndpoint(baseURL: row["baseURL"], host: row["host"], keySecret: row["keySecret"])
+                for row in try Row.fetchAll(db, sql: "SELECT id, baseURL, host, keySecret, adapter, lan FROM provider WHERE builtin = 0") {
+                    providers[row["id"]] = ProviderEndpoint(baseURL: row["baseURL"], host: row["host"], keySecret: row["keySecret"],
+                                                            adapter: row["adapter"], lan: row["lan"])
                 }
                 s.providers = providers
             }

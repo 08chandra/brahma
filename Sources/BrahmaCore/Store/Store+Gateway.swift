@@ -79,19 +79,38 @@ extension Store {
         try writer.read { db in try Row.fetchOne(db, sql: "SELECT * FROM provider WHERE id = ?", arguments: [id]).map(Self.provider(from:)) }
     }
 
-    /// Adds an owner provider (never built-in, whatever `p.builtin` says). Refused: an id that is not 1–32 of `a-z0-9-` or is
-    /// taken, an empty adapter or host, and a key name that is not a provider key name (`Provider.isKeyName`). The base URL and
-    /// host rules are the gateway's (`ProviderHost`).
+    /// Adds an owner provider (never built-in, whatever `p.builtin` says). Makes no network call. Refused (fail closed, Ruling
+    /// 60): an id outside `Provider.isValidId` or taken; a record `ProviderHost.validate` refuses (LAN, a base URL that is not
+    /// `https://<host name>` on 443 without user info, query or fragment, an unknown adapter) or whose `host` is not the
+    /// host its base URL pins; a key name that is not a provider key name (`Provider.isKeyName`); the Anthropic key for any
+    /// host but Anthropic's; and a key name that is a test key in any company (test keys reach agents).
     public func addProvider(_ p: Provider) throws {
         try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
-        guard Provider.isValidId(p.id) else { throw WorkError.invalid("provider id must be 1-32 of a-z, 0-9 and -") }
-        guard !p.adapter.isEmpty, !p.host.isEmpty else { throw WorkError.invalid("provider \(p.id) needs an adapter and a host") }
-        if let key = p.keySecret, !Provider.isKeyName(key) {
-            throw WorkError.invalid("a provider key is named \(Provider.anthropicKeyName) or \(Provider.keyNamePrefix)<PROVIDER>")
+        guard Provider.isValidId(p.id) else { throw WorkError.invalid(Provider.idRule) }
+        switch ProviderHost.validate(baseURL: p.baseURL, adapter: AdapterId(rawValue: p.adapter), lan: p.lan) {
+        case .failure(let refusal):
+            throw WorkError.invalid(refusal.reason)
+        case .success(let pinned):
+            guard p.host == pinned else { throw WorkError.invalid("provider \(p.id)'s host must be its base URL's host (\(pinned))") }
+        }
+        if let key = p.keySecret {
+            guard Provider.isKeyName(key) else {
+                throw WorkError.invalid("a provider key is named \(Provider.anthropicKeyName) or \(Provider.keyNamePrefix)<PROVIDER>")
+            }
+            guard key != Provider.anthropicKeyName || p.host == ProviderHost.anthropicHost else {
+                throw WorkError.invalid("\(Provider.anthropicKeyName) is sent only to \(ProviderHost.anthropicHost); name this provider's key "
+                                        + "\(Provider.keyNamePrefix)<PROVIDER>")
+            }
         }
         try writer.write { db in
             guard try Row.fetchOne(db, sql: "SELECT 1 FROM provider WHERE id = ?", arguments: [p.id]) == nil else {
                 throw WorkError.conflict("provider \(p.id) already exists")
+            }
+            if let key = p.keySecret, let company = try String.fetchOne(db, sql: """
+                SELECT c.name FROM secret s JOIN company c ON c.id = s.companyId WHERE s.name = ? AND s.isTest = 1 ORDER BY c.name LIMIT 1
+                """, arguments: [key]) {
+                throw WorkError.conflict("\(key) is a test key in \(company); a provider key must be engine-held "
+                                         + "(brahma secret set <company> \(key), without --test)")
             }
             try db.execute(sql: """
                 INSERT INTO provider (id, adapter, baseURL, host, keySecret, lan, builtin, createdAt) VALUES (?, ?, ?, ?, ?, ?, 0, ?)
@@ -113,6 +132,15 @@ extension Store {
                 throw WorkError.conflict("provider \(id) is still named by \(routes) route(s) and \(caps) cap(s); clear them first")
             }
             try db.execute(sql: "DELETE FROM provider WHERE id = ?", arguments: [id])
+        }
+    }
+
+    /// Whether the company's secret `name` is flagged test (agents may be given it). The gateway refuses a provider key so
+    /// flagged (defence in depth: `validateSecret` never makes one).
+    public func isTestSecret(companyId: String, name: String) throws -> Bool {
+        try writer.read { db in
+            try Row.fetchOne(db, sql: "SELECT 1 FROM secret WHERE companyId = ? AND name = ? AND isTest = 1",
+                             arguments: [companyId, name]) != nil
         }
     }
 

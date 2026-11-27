@@ -27,18 +27,24 @@ public struct Provider: Codable, Equatable, Sendable {
     /// Every other provider's key is `BRAHMA_KEY_<PROVIDER>` (`BRAHMA_*` is never injectable).
     public static let keyNamePrefix = "BRAHMA_KEY_"
 
-    /// Whether `name` is a provider key name: `ANTHROPIC_API_KEY`, or `BRAHMA_KEY_` followed by upper-case letters, digits and
-    /// underscores. Such a name can never be a test key, so no provider key reaches an agent or a check.
+    /// Whether `name` is a provider key name: `ANTHROPIC_API_KEY`, or `^BRAHMA_KEY_[A-Z0-9_]{1,40}$` (ASCII). The one rule
+    /// (`ProviderHost.isProviderKeyName`, Ruling 60). Such a name is stored engine-held only and can never be a test key
+    /// (`Store.validateSecret`), so no provider key reaches an agent or a check.
     public static func isKeyName(_ name: String) -> Bool {
         if name == anthropicKeyName { return true }
         guard name.hasPrefix(keyNamePrefix) else { return false }
-        let rest = name.dropFirst(keyNamePrefix.count)
-        return !rest.isEmpty && rest.allSatisfy { ($0 >= "A" && $0 <= "Z") || ($0 >= "0" && $0 <= "9") || $0 == "_" }
+        let rest = name.utf8.dropFirst(keyNamePrefix.utf8.count)
+        return (1...40).contains(rest.count)
+            && rest.allSatisfy { (0x41...0x5A).contains($0) || (0x30...0x39).contains($0) || $0 == 0x5F }
     }
 
-    /// A provider id: 1–32 of lower-case letters, digits and `-`, starting with a letter or digit.
+    /// A provider id: `^[a-z][a-z0-9-]{1,31}$` (2–32 of lower-case letters, digits and `-`, starting with a letter).
     public static func isValidId(_ id: String) -> Bool {
-        guard let first = id.first, id.count <= 32, first != "-" else { return false }
-        return id.allSatisfy { ($0 >= "a" && $0 <= "z") || ($0 >= "0" && $0 <= "9") || $0 == "-" }
+        let bytes = Array(id.utf8)
+        guard (2...32).contains(bytes.count), (0x61...0x7A).contains(bytes[0]) else { return false }
+        return bytes.allSatisfy { (0x61...0x7A).contains($0) || (0x30...0x39).contains($0) || $0 == 0x2D }
     }
+
+    /// Why `id` is refused as a provider id.
+    public static let idRule = "a provider id is 2-32 of a-z, 0-9 and -, starting with a letter"
 }

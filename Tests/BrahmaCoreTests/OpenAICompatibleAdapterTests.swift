@@ -455,7 +455,7 @@ enum OpenAIFixture {
     /// The gateway serves `openai-compatible` providers by default.
     @Test func registeredByDefault() throws {
         let gateway = ModelGateway(registry: TurnTokenRegistry(clock: ManualAwakeClock()), providers: { _ in nil },
-                                   upstream: FakeUpstream([FakeUpstream.json(200, "{}")]), vault: MemoryVault(),
+                                   isTestSecret: { _, _ in true }, upstream: FakeUpstream([FakeUpstream.json(200, "{}")]), vault: MemoryVault(),
                                    meter: GatewayMeter(store: try Store.inMemory(), prices: { PriceBook(owner: []) }, clock: { Date() }))
         #expect(gateway.adapterIds == [.anthropic, .openAICompatible])
     }
