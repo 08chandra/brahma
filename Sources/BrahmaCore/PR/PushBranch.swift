@@ -54,9 +54,24 @@ public struct PushBranchStage: Sendable {
         { companyId in try TokenHandle.load(companyId: companyId, name: LandingSwitch.tokenSecretName, store: store, vault: vault) }
     }
 
-    /// Pushes `verifiedSHA` (already rebased onto `base`, the remote `main` it was verified on) for `item` to `repo`.
-    public func run(item: WorkItem, repo: GitHubRepoRef, verifiedSHA: String, base: String, git: GitWorkspace) async -> PushBranchOutcome {
-        let named = PRBranch.name(key: item.key, title: item.title)
+    /// The same stage deciding through `gate` (the landing machine's: Task 3 answers an owner-approved ask through it).
+    func gated(by gate: any PRActionGate) -> PushBranchStage {
+        PushBranchStage(store: store, github: github, gate: gate, push: push, blobs: blobs, token: token, knownValues: knownValues, clock: clock,
+                        blocking: blocking)
+    }
+
+    /// Pushes `verifiedSHA` (already rebased onto `base`, the remote `main` it was verified on) for `item` to `repo`. `branch`:
+    /// the landing's branch when it has one (a resubmit updates the same branch even if the item was renamed); it must be a
+    /// valid `brahma/` branch, else the name is derived from the item (`PRBranch.name`).
+    public func run(item: WorkItem, repo: GitHubRepoRef, verifiedSHA: String, base: String, git: GitWorkspace,
+                    branch existing: String? = nil) async -> PushBranchOutcome {
+        let named: PRDecision<String>
+        if let existing, existing.hasPrefix(PRBranch.prefix), existing.count > PRBranch.prefix.count, PRBranch.isValidBranchName(existing),
+           PRBranch.ref(existing).utf8.count <= PRBranch.maxRefBytes {
+            named = .allowed(existing)
+        } else {
+            named = PRBranch.name(key: item.key, title: item.title)
+        }
         guard case .allowed(let branch) = named else { return .refused(named.refusal ?? "no branch name") }
         let target = PushTarget(itemKey: item.key, ref: PRBranch.ref(branch), url: repo.pushURL)
         // 1. The scans, before any request exists.
@@ -78,7 +93,7 @@ public struct PushBranchStage: Sendable {
         let request: PRActionRequest
         do {
             request = PRActionRequest(type: .pushBranch, companyId: item.companyId, itemId: item.id, payload: payload,
-                                      taintedSession: try sessionTainted(item), itemTainted: item.taintedOrigin, externalInput: false,
+                                      taintedSession: try Self.sessionTainted(item, store: store), itemTainted: item.taintedOrigin, externalInput: false,
                                       firstUse: !(try store.hasPushedPRLanding(companyId: item.companyId)), repoVisibility: visibility)
         } catch {
             return .refused("could not read the item's state: \(Store.flat("\(error)", max: 200))")
@@ -121,7 +136,8 @@ public struct PushBranchStage: Sendable {
         }
     }
 
-    private func sessionTainted(_ item: WorkItem) throws -> Bool {
+    /// Whether the session that produced the item's change is tainted (its owner agent's session).
+    static func sessionTainted(_ item: WorkItem, store: Store) throws -> Bool {
         guard let owner = item.ownerId else { return false }
         // An owner the store no longer has cannot be shown clean: tainted.
         guard let agent = try store.agent(id: owner) else { return true }

@@ -268,6 +268,9 @@ extension Store {
         case .other:
             // The engine's Simulator ask (Plan 4a): the iOS preview loses the owner's approval.
             try reverseSimulatorApproval(db, ask: ask, now: now)
+        case .prAction:
+            // Plan X8 Ruling 26: an approval of a GitHub action not yet used is withdrawn.
+            try reversePRActionEffects(db, ask: ask)
         default:
             break
         }

@@ -32,8 +32,12 @@ public struct AskKind: RawRepresentable, Hashable, Codable, Sendable, DatabaseVa
     public static let role = AskKind("role")
     /// An extension install, update, removal or binding (Task 5a): reserved, owner-only under every preset.
     public static let `extension` = AskKind("extension")
+    /// A GitHub action of PR mode the gate asked about (Plan X8 Ruling 26: `push-branch`, `open-pr`, later `merge-pr`), filed
+    /// by the engine: reserved, owner-only under every preset; the owner's approval runs exactly that action once.
+    public static let prAction = AskKind("prAction")
 
-    public static let reserved: [AskKind] = [.request, .grant, .deploy, .humanTask, .outbox, .spend, .staffing, .stage, .role, .extension]
+    public static let reserved: [AskKind] = [.request, .grant, .deploy, .humanTask, .outbox, .spend, .staffing, .stage, .role, .extension,
+                                             .prAction]
     public static let gates: [AskKind] = [.prd, .architecture, .sprintPlan, .release]
 
     public var isReservedKind: Bool { Self.reserved.contains(self) }
@@ -62,6 +66,7 @@ public struct AskKind: RawRepresentable, Hashable, Codable, Sendable, DatabaseVa
         case "stage": "Stage"
         case "role": "Role"
         case "extension": "Extension"
+        case "prAction": "GitHub action"
         default: rawValue
         }
     }

@@ -192,6 +192,8 @@ struct RestoreCarry {
             }
             // Plan X8: no live landing state to keep, so no snapshot landing is resumed (none is active again by a restore).
             if try db.tableExists("prLanding") { try db.execute(sql: "DELETE FROM prLanding") }
+            // Plan X8 Ruling 26: no owner approval of a GitHub action can be checked against the live database: none is kept.
+            if try db.tableExists("prActionApproval") { try db.execute(sql: "DELETE FROM prActionApproval") }
             try markEveryOpenItemsCommits(db, now: now)
             try recordRestoreEpochs(db, now: now, gitTempRoot: gitTempRoot)
             notes.append("the current database could not be read (\(Store.flat(why, max: 160))): every grant was revoked and every "
@@ -330,6 +332,7 @@ struct RestoreCarry {
     /// untrusted), and keeps each issue link at the stricter of the live and the restored one.
     static func keepNarrowerTrust(_ live: Settings, into db: Database) throws {
         try keepLivePRLandings(live, into: db)
+        try keepNarrowerPRActionApprovals(live, into: db)
         if try db.tableExists("trustedLogin") {
             for key in Set(try Settings.readTrustedLogins(db)).subtracting(live.trustedLogins).sorted() {
                 let (companyId, login) = Settings.split(key)
@@ -370,6 +373,23 @@ struct RestoreCarry {
             let itemHere = try Bool.fetchOne(db, sql: "SELECT EXISTS (SELECT 1 FROM workItem WHERE id = ? AND companyId = ?)",
                                              arguments: [itemId, current.companyId]) == true
             if itemHere { try current.insert(db) }
+        }
+    }
+
+    /// Plan X8 Ruling 26 (`prActionApproval`): live wins and snapshot-only rows are dropped, and an approval is never widened —
+    /// a row stays approved only if both databases have it approved, and it is used up if either used it. A card filed after
+    /// the snapshot is not carried (its ask is not in the snapshot either): the engine asks again.
+    static func keepNarrowerPRActionApprovals(_ live: Settings, into db: Database) throws {
+        guard try db.tableExists("prActionApproval") else { return }
+        for restored in try PRActionApproval.fetchAll(db) {
+            guard let current = live.prActionApprovals[restored.askId] else {
+                _ = try restored.delete(db)
+                continue
+            }
+            var kept = current
+            kept.approvedAt = restored.approvedAt == nil ? nil : current.approvedAt
+            kept.consumedAt = current.consumedAt ?? restored.consumedAt
+            if kept != restored { try kept.save(db) }
         }
     }
 
@@ -588,6 +608,8 @@ extension RestoreCarry {
         var issueLinks: [String: IssueLinkSetting] = [:]
         /// Plan X8: item id → its PR landing (`keepLivePRLandings`: live state wins).
         var prLandings: [String: PRLanding] = [:]
+        /// Plan X8 Ruling 26: ask id → the owner card's one-shot approval (`keepNarrowerPRActionApprovals`).
+        var prActionApprovals: [String: PRActionApproval] = [:]
 
         /// What a restore compares of an issue link (`IssueLink` without its poll state).
         struct IssueLinkSetting: Equatable {
@@ -663,6 +685,9 @@ extension RestoreCarry {
             if try db.tableExists("prLanding") {
                 s.prLandings = Dictionary(try PRLanding.fetchAll(db).map { ($0.itemId, $0) }, uniquingKeysWith: { a, _ in a })
             }
+            if try db.tableExists("prActionApproval") {
+                s.prActionApprovals = Dictionary(try PRActionApproval.fetchAll(db).map { ($0.askId, $0) }, uniquingKeysWith: { a, _ in a })
+            }
             if try db.tableExists("ownerSettings"), try db.columns(in: "ownerSettings").contains(where: { $0.name == "autoMerge" }) {
                 s.ownerAutoMerge = try Bool.fetchOne(db, sql: "SELECT autoMerge FROM ownerSettings WHERE id = 1")
                 s.ownerAutoMergePaths = try String.fetchOne(db, sql: "SELECT autoMergePaths FROM ownerSettings WHERE id = 1")
@@ -725,6 +750,13 @@ extension RestoreCarry {
                 if now.state != landing.state {
                     out.append("\(companyName(landing.companyId)): the PR landing of \(now.branch) stays \(now.state.rawValue) (the snapshot had \(landing.state.rawValue))")
                 }
+            }
+            // Plan X8 Ruling 26: an approval the snapshot holds unused stands only if the live database still holds it unused.
+            for (askId, approval) in restored.prActionApprovals.sorted(by: { $0.key < $1.key }) where approval.isUsable {
+                let now = live.prActionApprovals[askId]
+                guard now?.isUsable != true else { continue }
+                let why = now == nil ? "gone after the snapshot" : (now?.consumedAt != nil ? "used after the snapshot" : "withdrawn after the snapshot")
+                out.append("\(companyName(approval.companyId)): your approval of \(approval.action) at \(approval.sha.prefix(7)), \(why), is not carried over")
             }
             if restored.ownerAutoMerge != false, live.ownerAutoMerge == false { out.append("owner-wide auto-merge kept off (the snapshot had it on)") }
             let paths = narrowerAutoMergePaths(live: live.ownerAutoMergePaths, restored: restored.ownerAutoMergePaths)

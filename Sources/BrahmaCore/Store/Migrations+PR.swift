@@ -58,5 +58,23 @@ extension Migrations {
             }
             try db.execute(sql: "CREATE UNIQUE INDEX workItem_origin ON workItem(companyId, originURL) WHERE originURL IS NOT NULL")
         }
+        // Task 3 (Ruling 26): the owner card for a GitHub action the gate asked about, and its one-shot approval
+        // (`PRActionApproval`): one per (company, item, action, sha).
+        m.registerMigration("vX5-pr-2") { db in
+            try db.execute(sql: """
+                CREATE TABLE prActionApproval (
+                    askId TEXT PRIMARY KEY NOT NULL REFERENCES ask(id) ON DELETE CASCADE,
+                    companyId TEXT NOT NULL REFERENCES company(id) ON DELETE CASCADE,
+                    itemId TEXT NOT NULL REFERENCES workItem(id) ON DELETE CASCADE,
+                    action TEXT NOT NULL,
+                    sha TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    approvedAt DATETIME,
+                    consumedAt DATETIME,
+                    createdAt DATETIME NOT NULL
+                )
+                """)
+            try db.execute(sql: "CREATE UNIQUE INDEX prActionApproval_tuple ON prActionApproval(companyId, itemId, action, sha)")
+        }
     }
 }

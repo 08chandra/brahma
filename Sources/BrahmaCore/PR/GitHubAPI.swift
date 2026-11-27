@@ -56,4 +56,12 @@ public protocol GitHubAPI: Sendable {
     func repo(_ repo: GitHubRepoRef) async throws -> RepoInfo
     /// Nil when the branch does not exist (404).
     func branch(_ repo: GitHubRepoRef, name: String) async throws -> GitHubBranch?
+    /// The `open-pr` action: `POST /repos/{o}/{r}/pulls` with `request` as the body (`maintainer_can_modify` always false).
+    /// Throws `GitHubAPIError.rejected` when GitHub refused it; any other error leaves the outcome unknown.
+    func openPR(_ repo: GitHubRepoRef, _ request: OpenPullRequest) async throws -> GitHubPR
+    /// `GET /repos/{o}/{r}/pulls?head=<head>&state=<state>`: `head` is `<owner>:<branch>`, `state` `open`, `closed` or `all`.
+    /// How an unknown `open-pr` is reconciled.
+    func pulls(_ repo: GitHubRepoRef, head: String, state: String) async throws -> [GitHubPR]
+    /// `GET /repos/{o}/{r}/pulls/{number}`; nil when there is none (404).
+    func pull(_ repo: GitHubRepoRef, number: Int) async throws -> GitHubPR?
 }

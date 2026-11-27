@@ -160,4 +160,83 @@ import GRDB
         let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
         #expect(try restored.openPRLandings(companyId: acme.id).isEmpty)
     }
+
+    /// Plan X8 Ruling 26: a restore never widens the owner's approval of a GitHub action. Live wins and a snapshot-only row is
+    /// dropped (its landing's cards were voided live); one used live stays used; one pending in the snapshot stays unapproved
+    /// though approved live (the owner sees the card again); one approved and unused in both stays usable.
+    @Test func restoreDropsASnapshotOnlyApproval() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        func card(_ title: String, _ sha: String) throws -> (WorkItem, Ask) {
+            let item = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(type: .task, title: title))
+            let ask = try env.store.filePRActionCard(companyId: acme.id, itemId: item.id, action: .pushBranch, sha: sha, reason: "first push",
+                                                     card: PRActionCard(title: "push-branch \(title)", summary: "first push",
+                                                                        payload: AskPayload(details: "Action: push-branch")), now: Self.now)
+            return (item, ask)
+        }
+        let (a, b, c, d) = (String(repeating: "a", count: 40), String(repeating: "b", count: 40), String(repeating: "c", count: 40),
+                            String(repeating: "d", count: 40))
+        let (gone, goneAsk) = try card("gone", a), (_, usedAsk) = try card("used", b), (later, laterAsk) = try card("later", c)
+        let (_, keptAsk) = try card("kept", d)
+        for ask in [goneAsk, usedAsk, keptAsk] { try env.store.ownerDecide(askId: ask.id, approve: true) }
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        // After the snapshot: gone's cards are voided (its landing abandoned), used's approval runs, later's card is approved.
+        try env.store.writer.write { db in try env.store.voidPRActionCards(db, itemId: gone.id, keepingSHA: nil, now: Self.now) }
+        try env.store.consumePRActionApproval(askId: usedAsk.id)
+        try env.store.ownerDecide(askId: laterAsk.id, approve: true)
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        let rows = try restored.writer.read { db in Dictionary(uniqueKeysWithValues: try PRActionApproval.fetchAll(db).map { ($0.askId, $0) }) }
+        #expect(rows[goneAsk.id] == nil, "a snapshot-only approval came back")
+        #expect(rows[usedAsk.id]?.consumedAt != nil && rows[usedAsk.id]?.isUsable == false, "a used approval came back unused")
+        #expect(rows[laterAsk.id] != nil && rows[laterAsk.id]?.approvedAt == nil, "an approval given after the snapshot was widened into it")
+        #expect(rows[keptAsk.id]?.isUsable == true)
+        #expect(try restored.prActionCardState(companyId: acme.id, itemId: gone.id, action: .pushBranch, sha: a) == .none)
+        #expect(try restored.prActionCardState(companyId: acme.id, itemId: later.id, action: .pushBranch, sha: c) == .waiting(reason: "first push"))
+        for line in ["Acme: your approval of push-branch at aaaaaaa, gone after the snapshot, is not carried over",
+                     "Acme: your approval of push-branch at bbbbbbb, used after the snapshot, is not carried over"] {
+            #expect(outcome.warnings.contains { $0.contains(line) }, "\(line): \(outcome.warnings)")
+        }
+        #expect(!outcome.warnings.contains { $0.contains("ddddddd") || $0.contains("ccccccc") }, "\(outcome.warnings)")
+    }
+
+    /// An unreadable live database: no approval of a GitHub action can be checked, so none is kept.
+    @Test func unreadableLiveDatabaseKeepsNoApproval() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        let item = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(type: .task, title: "t"))
+        let ask = try env.store.filePRActionCard(companyId: acme.id, itemId: item.id, action: .openPR, sha: String(repeating: "e", count: 40),
+                                                 reason: "tainted", card: PRActionCard(title: "open-pr t", summary: "tainted",
+                                                                                       payload: AskPayload(details: "Action: open-pr")), now: Self.now)
+        try env.store.ownerDecide(askId: ask.id, approve: true)
+        let waiting = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(type: .task, title: "w"))
+        let pendingCard = PRActionCard(title: "push-branch w", summary: "first push", payload: AskPayload(details: "Action: push-branch"))
+        let pending = try env.store.filePRActionCard(companyId: acme.id, itemId: waiting.id, action: .pushBranch, sha: String(repeating: "f", count: 40),
+                                                     reason: "first push", card: pendingCard, now: Self.now)
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try env.store.close()
+        for suffix in ["-wal", "-shm"] where FileManager.default.fileExists(atPath: env.paths.database.path + suffix) {
+            try FileManager.default.removeItem(atPath: env.paths.database.path + suffix)
+        }
+        try Data(repeating: 0x5a, count: 8192).write(to: env.paths.database)
+        _ = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        #expect(try restored.writer.read { db in try PRActionApproval.fetchCount(db) } == 0)
+        // Asked again: the approved card does not count (a new card, its request id numbered), and the card still pending is
+        // the owner's open card again (no second one).
+        #expect(try restored.prActionCardState(companyId: acme.id, itemId: item.id, action: .openPR, sha: String(repeating: "e", count: 40)) == .none)
+        let again = try restored.filePRActionCard(companyId: acme.id, itemId: item.id, action: .openPR, sha: String(repeating: "e", count: 40),
+                                                  reason: "tainted", card: PRActionCard(title: "open-pr t", summary: "tainted",
+                                                                                        payload: AskPayload(details: "Action: open-pr")), now: Self.now)
+        #expect(again.id != ask.id && again.status == .pendingOwner)
+        #expect(again.requestId == "pr-open-pr-\(item.id)-\(String(repeating: "e", count: 40))-2")
+        let same = try restored.filePRActionCard(companyId: acme.id, itemId: waiting.id, action: .pushBranch, sha: String(repeating: "f", count: 40),
+                                                 reason: "first push", card: pendingCard, now: Self.now)
+        #expect(same.id == pending.id)
+        #expect(try restored.prActionCardState(companyId: acme.id, itemId: waiting.id, action: .pushBranch,
+                                               sha: String(repeating: "f", count: 40)) == .waiting(reason: "first push"))
+    }
 }

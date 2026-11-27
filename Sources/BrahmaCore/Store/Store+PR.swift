@@ -56,10 +56,12 @@ extension Store {
     static let pushedEvidence: [PRLandingState] = [.pushed, .opening, .open, .checksFailed, .changesRequested, .mergeable, .merging, .merged]
 
     /// Whether some push of the company is known to have reached GitHub: the company's first push asks
-    /// (`GitHubRules.firstPushAsks`) until one has.
+    /// (`GitHubRules.firstPushAsks`) until one has. A landing with a PR number is evidence too, whatever its state: GitHub
+    /// opened a PR on a pushed branch (Task 3: a resubmit takes an open landing back to `pushing`, keeping its PR).
     public func hasPushedPRLanding(companyId: String) throws -> Bool {
         try writer.read { db in
-            try PRLanding.filter(Column("companyId") == companyId && Self.pushedEvidence.map(\.rawValue).contains(Column("state"))).fetchCount(db) > 0
+            try PRLanding.filter(Column("companyId") == companyId
+                                 && (Self.pushedEvidence.map(\.rawValue).contains(Column("state")) || Column("prNumber") != nil)).fetchCount(db) > 0
         }
     }
 
