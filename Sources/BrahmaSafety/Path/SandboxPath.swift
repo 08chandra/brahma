@@ -156,7 +156,7 @@ public enum SandboxPath {
 
     /// Roots compared by identity: whatever spelling a path uses, it overlaps a root when it is the root, lies inside it, or
     /// contains it.
-    public struct IdentityRoots {
+    public struct IdentityRoots: Sendable {
         private let roots: [(path: String, id: Identity, lineage: Set<Identity>)]
 
         /// Each root's lineage is built from its resolved path (a root spelled through a link is the place it names). A root

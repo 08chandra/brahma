@@ -103,7 +103,7 @@ extension SandboxedRunner {
             box.value = await run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, policy: policy)
             box.done.signal()
         }
-        guard box.done.wait(timeout: .now() + Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18 + 30) == .success, let value = box.value else {
+        guard box.done.wait(timeout: .now() + (Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18) + 30) == .success, let value = box.value else {
             return CheckOutcome(exitCode: nil, timedOut: true, tail: "the sandboxed run never reported back")
         }
         return value
@@ -211,13 +211,13 @@ public struct SandboxBaseline: Equatable, Sendable {
         return urls.filter { seen.insert($0.path).inserted }
     }
 
+    /// `/private/tmp/b-<uid>`: the root of every sandboxed agent's private Claude temp directory, in every company.
+    public static var defaultClaudeTmpRoot: URL { URL(fileURLWithPath: "/private/tmp/b-\(getuid())", isDirectory: false) }
+
     /// Claude Code's temp places under `/tmp`, in both spellings (final review I1): the owner's own sessions
     /// (`claude-<uid>`: edit diffs of the owner's files, background task output), `claude-tool-results`, `claude`, and the
     /// root of every sandboxed agent's private temp directory in every company (`b-<uid>`, `SandboxEnvironment`). No
     /// sandboxed command reads them, as no sandboxed turn does (`SandboxScope.forTurn`).
-    /// `/private/tmp/b-<uid>`: the root of every sandboxed agent's private Claude temp directory, in every company.
-    public static var defaultClaudeTmpRoot: URL { URL(fileURLWithPath: "/private/tmp/b-\(getuid())", isDirectory: false) }
-
     static var claudeTempPlaces: [URL] {
         // Fix-wave F4: Claude Code's daemon-control and pty socket folders too.
         let names = ["claude-\(getuid())", "claude-tool-results", "claude", defaultClaudeTmpRoot.lastPathComponent,
