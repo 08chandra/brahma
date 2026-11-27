@@ -230,14 +230,14 @@ extension Orchestrator {
             attempt {
                 try EngineAlerts.raise(store: store, text: "Fast mode is not off for @\(agent.name) (\(fast)). Fast mode bills outside "
                                        + "your usage windows; check ~/.claude/settings.json, then run `brahma doctor`.",
-                                       now: now, reason: "fast-mode")
+                                       now: now, reason: "fast-mode", scope: .allCompanies(.cli))
             }
         }
         if !f.unexpectedModels.isEmpty {
             let models = f.unexpectedModels.joined(separator: ", ")
             attempt {
                 try EngineAlerts.raise(store: store, text: "A turn of @\(agent.name) billed an unexpected model (\(models)). Its next turn "
-                                       + "waits until `brahma doctor` passes again.", now: now, reason: "model")
+                                       + "waits until `brahma doctor` passes again.", now: now, reason: "model", scope: .allCompanies(.cli))
                 try store.holdForDoctor(agentId: agent.id, reason: "unexpected model \(models)", now: now)
             }
         }

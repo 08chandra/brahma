@@ -720,7 +720,7 @@ extension Store {
                                           && Column("status") == AskStatus.pendingOwner.rawValue
                                           && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
                 guard open == 0 else { return }
-                try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: reason, companyId: companyId)
+                try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: reason, scope: .company(companyId))
             }
         } catch {
             FileHandle.standardError.write(Data("brahma: could not alert the owner that a ref holds a stored secret: \(error)\n".utf8))

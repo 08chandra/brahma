@@ -253,7 +253,8 @@ import GRDB
         #expect(acked?.acknowledgedAt != nil)
         #expect(w.model.work.fyi.isEmpty)
         // An engine alert is acknowledged the same way and then counts as answered.
-        try EngineAlerts.raise(store: w.store, text: "Claude Code is logged out.", now: Date(), reason: "account")
+        try EngineAlerts.raise(store: w.store, text: "Claude Code is logged out.", now: Date(), reason: "account",
+                               scope: HoldReason.account.alertScope)
         await w.refresh()
         let alert = try #require(w.model.inboxRows.first { $0.kind == .engineAlert })
         #expect(alert.canAcknowledge && !alert.canDecide && alert.requester == "Brahma")

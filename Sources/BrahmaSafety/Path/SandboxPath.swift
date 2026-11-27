@@ -185,7 +185,14 @@ public enum SandboxPath {
             let mine = SandboxPath.lineage(path)
             let inside = Set(mine)
             let id = SandboxPath.identity(path)
-            if let hit = roots.first(where: { inside.contains($0.id) || (id.map($0.lineage.contains) ?? false) }) { return hit.path }
+            let hit = roots.first { root in
+                if inside.contains(root.id) { return true }
+                // `path` contains the root only when `path` exists (has an identity) and is in the root's lineage. A path with
+                // no identity is missing, and a missing path contains no existing root.
+                guard let id else { return false }
+                return root.lineage.contains(id)
+            }
+            if let hit { return hit.path }
             // A missing root: `path` contains it when `path` is an existing ancestor of it.
             return id.flatMap { id in missing.first { $0.lineage.contains(id) }?.path }
         }
@@ -211,9 +218,16 @@ public enum SandboxPath {
     }
 
     /// The names in a directory (not following a link at `path`), sorted; empty when it is missing or not a real directory.
-    public static func entries(_ path: String) -> [String] {
-        guard kind(path) == .directory, let names = try? FileManager.default.contentsOfDirectory(atPath: path) else { return [] }
-        return names.sorted()
+    /// Throws when it is a real directory that cannot be listed: the callers deny, refuse or protect per entry, so an
+    /// unreadable directory is never taken for an empty one (fail closed, spec §6.7). One that went away meanwhile is missing.
+    public static func entries(_ path: String) throws -> [String] {
+        guard kind(path) == .directory else { return [] }
+        do {
+            return try FileManager.default.contentsOfDirectory(atPath: path).sorted()
+        } catch {
+            if kind(path) != .directory { return [] }
+            throw error
+        }
     }
 }
 

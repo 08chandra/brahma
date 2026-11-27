@@ -566,7 +566,7 @@ import GRDB
                          clock: TestClock().function, vault: MemoryVault(), restoreHooks: hooks)
         let stale = String(repeating: "a", count: 40)
         try m.exec("UPDATE company SET pendingMainCommit = ? WHERE id = ?", [stale, m.company.id])
-        try EngineAlerts.raise(store: m.store, text: "older alert", now: m.now, reason: Store.mainAlertReason(m.company.id), companyId: m.company.id)
+        try EngineAlerts.raise(store: m.store, text: "older alert", now: m.now, reason: Store.mainAlertReason(m.company.id), scope: .company(m.company.id))
         let event = RestoreEvent(companyId: m.company.id, companyName: m.company.name, workspace: m.root, mainHead: head, snapshotName: "snap")
         for hook in hooks.afterRestore { try await hook(event) }
         #expect(try recorded(m) == head)

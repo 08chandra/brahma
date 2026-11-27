@@ -1584,7 +1584,8 @@ public actor Orchestrator {
                 if agent.consecutiveFailures == 0 {
                     attempt {
                         try EngineAlerts.raise(store: store, text: "@\(agent.name)'s turns do not start: \(notLaunched.reason). Set an "
-                                               + "allowed model (haiku, sonnet, opus or auto).", now: now, reason: "model-pin")
+                                               + "allowed model (haiku, sonnet, opus or auto).", now: now, reason: "model-pin",
+                                               scope: .company(agent.companyId))
                     }
                 }
                 end = .failed(notLaunched.reason)
@@ -1800,7 +1801,7 @@ public actor Orchestrator {
         if let why = abortReason {
             attempt {
                 try EngineAlerts.raise(store: store, text: "A turn of @\(agent.name) was stopped at start: \(why). Its next turn "
-                                       + "waits until `brahma doctor` passes again.", now: now, reason: "init")
+                                       + "waits until `brahma doctor` passes again.", now: now, reason: "init", scope: .allCompanies(.cli))
                 try store.holdForDoctor(agentId: agent.id, reason: why, now: now)
             }
         } else if let r = result, let sentRequest {
@@ -1826,7 +1827,7 @@ public actor Orchestrator {
                     text: "@\(agent.name)'s last \(Self.maxUnrecordedTurns) turns were stopped before they ran: the engine could not "
                         + "record their process (its start time could not be read, or the record could not be written). It keeps "
                         + "retrying every \(Int(EngineHealth.infraCooldown)) s. If this goes on, relaunch Brahma.",
-                    now: now, reason: Self.unrecordedTurnReason, companyId: agent.companyId)
+                    now: now, reason: Self.unrecordedTurnReason, scope: .company(agent.companyId))
             }
         }
         let outcome = end.outcome

@@ -7,7 +7,7 @@ import FoundationNetworking
 public enum InfraClass: Equatable, Sendable { case none, network, account }
 
 /// Why the whole engine is paused. Raw value order is not precedence; see `rank`.
-public enum HoldReason: String, Codable, Equatable, Sendable {
+public enum HoldReason: String, Codable, Equatable, Sendable, CaseIterable {
     case network, account, cli, disk
 
     /// A higher reason replaces a lower one: account > cli > disk > network.

@@ -59,7 +59,7 @@ extension Store {
         if open == 0 {
             try EngineAlerts.raise(store: self, text: "The main branch of \(company.name) changed outside Brahma (it was moved, rewritten or reset). "
                 + "Brahma starts no new work and merges nothing there until you have reviewed main and accepted it.", now: Store.now(), reason: reason,
-                companyId: company.id)
+                scope: .company(company.id))
         }
         throw WorkError.conflict(Self.mainChangedMessage)
     }
@@ -163,7 +163,7 @@ extension Store {
         let name = Self.flat(company.name, max: 100)
         try EngineAlerts.raise(store: self, text: "The main branch of \(name) has no recorded head: Brahma adopts nothing by itself. "
             + "It starts no new work and merges nothing there until you have reviewed main and accepted it: brahma merge adopt-main \(name)",
-            now: now, reason: reason, companyId: company.id)
+            now: now, reason: reason, scope: .company(company.id))
     }
 
     /// The main guard put `main` back (`MainGuard.check`): the company's feed, one owner notice, and, with the root checkout off
@@ -270,7 +270,8 @@ extension Store {
             let text = "\(company.name): \(full) moved after Brahma asked you about it (\(now7); Brahma recorded \(commit)). "
                 + "Nothing was merged. Review the recorded commit with: git --no-replace-objects diff \(expected) \(commit)"
             try writer.write { db in
-                try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: Self.quarantineMovedAlertReason(companyId))
+                try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: Self.quarantineMovedAlertReason(companyId),
+                                       scope: .company(companyId))
             }
             throw WorkError.conflict("\(full) moved since Brahma recorded it (\(now7); recorded \(commit.prefix(12))); nothing was merged")
         case .merged(let head):

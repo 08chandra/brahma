@@ -138,7 +138,7 @@ import GRDB
             #expect(!body.contains(absent), "\(absent)")
         }
         // Engine alerts never appear.
-        try EngineAlerts.raise(store: w.store, text: "the osprey alert", now: w.at(400), reason: "doctor", companyId: w.company.id)
+        try EngineAlerts.raise(store: w.store, text: "the osprey alert", now: w.at(400), reason: "doctor", scope: .company(w.company.id))
         try w.store.writer.write { db in
             try db.execute(sql: "UPDATE ask SET status = 'approved', decidedBy = 'owner', ownerDecidedAt = ? WHERE kind = 'engineAlert'",
                            arguments: [w.at(410)])

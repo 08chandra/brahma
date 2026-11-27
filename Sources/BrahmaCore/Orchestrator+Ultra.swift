@@ -98,7 +98,8 @@ extension Orchestrator {
                 let open = try Ask.filter(Column("kind") == AskKind.engineAlert && Column("status") == AskStatus.pendingOwner.rawValue
                                           && Column("subjectId") == EngineAlerts.askSubject(reason: Self.planTierAlertReason)).fetchCount(db)
                 guard open == 0 else { return }
-                try EngineAlerts.raise(store: store, db: db, text: "Plan tier: \(text).", now: now, reason: Self.planTierAlertReason)
+                try EngineAlerts.raise(store: store, db: db, text: "Plan tier: \(text).", now: now, reason: Self.planTierAlertReason,
+                                       scope: .allCompanies(.cli))
             }
         }
     }

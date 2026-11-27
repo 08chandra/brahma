@@ -370,9 +370,15 @@ public enum GroupRun {
         var isSet: Bool { lock.withLock { value } }
     }
 
+    /// A run that never started: the failed outcome carries `message`, and the output file gets it too. A file that cannot be
+    /// written is reported on stderr; the outcome (no exit code: never a pass) does not depend on it.
     public static func fail(_ message: String, outputURL: URL) -> CheckOutcome {
-        try? FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? message.write(to: outputURL, atomically: true, encoding: .utf8)
+        func report(_ error: any Error) {
+            FileHandle.standardError.write(Data("brahma: could not write a failed run's output to \(outputURL.path): \(error)\n".utf8))
+        }
+        do { try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true) }
+        catch { report(error) }
+        do { try message.write(to: outputURL, atomically: true, encoding: .utf8) } catch { report(error) }
         return CheckOutcome(exitCode: nil, timedOut: false, tail: message)
     }
 
@@ -477,7 +483,9 @@ public enum GroupRun {
         // The leader is gone (still unreaped): whatever it left in its group goes too, then it is reaped.
         let status = child.finish()
         let tail = tailText(capture.finish(drain: 2))
-        let outputEnded = capped?.finish(drain: 2) ?? true
+        // With no standard output apart there is no second stream whose end is in question (it shares `capture`).
+        let outputEnded: Bool
+        if let capped { outputEnded = capped.finish(drain: 2) } else { outputEnded = true }
         if capped?.exceeded == true { overOutput = true }
 
         if overMemory { return CheckOutcome(exitCode: nil, timedOut: false, tail: (tail.isEmpty ? "" : tail + "\n") + memoryExceeded) }

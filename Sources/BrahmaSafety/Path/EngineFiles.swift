@@ -38,8 +38,9 @@ public enum EngineFiles {
     // MARK: Sizes
 
     /// The bytes of every entry under `root` (`lstat` sizes; a link counts as itself and is never followed, nothing is opened
-    /// or read), summed until the total passes `stopAbove`. A directory that vanishes or cannot be read counts as what was
-    /// seen of it. For the import's size cap (Plan L Task 14): the engine's own fresh repository, while git fills it.
+    /// or read), summed until the total passes `stopAbove`. A directory that vanishes counts as what was seen of it; one that
+    /// is still there but cannot be listed makes the total `Int64.max` (over every cap: fail closed, spec §6.7). For the
+    /// import's size cap (Plan L Task 14): the engine's own fresh repository, while git fills it.
     public static func treeBytes(_ root: URL, stopAbove: Int64 = .max) -> Int64 {
         var total: Int64 = 0
         var pending = [root.path]
@@ -47,7 +48,13 @@ public enum EngineFiles {
             var st = stat()
             guard lstat(dir, &st) == 0 else { continue }
             total += Int64(st.st_size)
-            guard st.st_mode & S_IFMT == S_IFDIR, let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
+            guard st.st_mode & S_IFMT == S_IFDIR else { continue }
+            let names: [String]
+            do { names = try FileManager.default.contentsOfDirectory(atPath: dir) } catch {
+                // Gone meanwhile (git renames its temporary directories): what was seen. Still a directory: unmeasurable.
+                guard lstat(dir, &st) == 0, st.st_mode & S_IFMT == S_IFDIR else { continue }
+                return .max
+            }
             for name in names {
                 let path = dir + "/" + name
                 guard lstat(path, &st) == 0 else { continue }
@@ -329,7 +336,10 @@ public enum EngineFiles {
         var removed: [String] = []
         var budget = maxEntries
         func walk(_ fd: Int32, _ prefix: String, depth: Int) {
-            guard depth < maxDepth, budget > 0, let names = try? entryNames(fd: fd, shown: prefix, limit: budget) else { return }
+            guard depth < maxDepth, budget > 0 else { return }
+            // Removal only (stale locks): a directory that cannot be listed keeps its files, and nothing is decided on it.
+            var names: [String] = []
+            bestEffort("listing a directory for files to remove") { names = try entryNames(fd: fd, shown: prefix, limit: budget) }
             budget -= names.count
             for name in names.sorted() {
                 let rel = prefix.isEmpty ? name : "\(prefix)/\(name)"
@@ -374,7 +384,12 @@ public enum EngineFiles {
         defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0, copyProblem(st) == nil else { return nil }
-        return try? readAll(fd: fd, limit: limit, shown: url.path)
+        do {
+            return try readAll(fd: fd, limit: limit, shown: url.path)
+        } catch {
+            // A read error part-way: nil, as every refusal above (never the part that was read).
+            return nil
+        }
     }
 
     /// The file `<root>/<relative>` opened with `flags` (plus `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`) relative to a descriptor
@@ -447,7 +462,7 @@ public enum EngineFiles {
         /// The `fstatat(AT_SYMLINK_NOFOLLOW)` of `name` in it (never following a link); nil when it is not there or the name is
         /// not a valid entry name.
         public func status(of name: String) -> stat? {
-            guard (try? EngineFiles.checkName(name, shown.appending(path: name).path)) != nil else { return nil }
+            guard EngineFiles.isValidName(name) else { return nil }
             var st = stat()
             guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { return nil }
             return st
@@ -455,7 +470,7 @@ public enum EngineFiles {
 
         /// The target bytes of the symbolic link `name` in it (`readlinkat`, never followed); nil when it is not a link.
         public func linkTarget(of name: String) -> [UInt8]? {
-            guard (try? EngineFiles.checkName(name, shown.appending(path: name).path)) != nil else { return nil }
+            guard EngineFiles.isValidName(name) else { return nil }
             var buffer = [UInt8](repeating: 0, count: Int(PATH_MAX) + 1)
             let n = readlinkat(fd, name, &buffer, buffer.count - 1)
             guard n > 0 else { return nil }
@@ -662,9 +677,12 @@ public enum EngineFiles {
     }
 
     private static func checkName(_ name: String, _ shown: String) throws {
-        guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else {
-            throw UnsafeEngineFile(path: shown, problem: "is not a valid file name")
-        }
+        guard isValidName(name) else { throw UnsafeEngineFile(path: shown, problem: "is not a valid file name") }
+    }
+
+    /// A single entry name: not empty, `.` or `..`, without `/` or NUL (what `checkName` accepts).
+    fileprivate static func isValidName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\0")
     }
 
     /// The directory, opened: the workspace resolved (it may sit behind a link the owner chose), then every part under it
@@ -786,8 +804,9 @@ public enum EngineFiles {
         let base = logical(workspace, relative)
         if let name {
             try checkName(name, base.appending(path: name).path)
-            // A failure here is handled below: what is left (under `name` or a `.brahma-removing-*` name) is cleared.
-            do { try removeEntry(dfd: dfd, name: name, shown: base.appending(path: name).path) } catch {}
+            // A failure here is handled below: what is left (under `name` or a `.brahma-removing-*` name) is cleared, and
+            // `residue` decides the clearance.
+            bestEffort("removing an entry before clearing it") { try removeEntry(dfd: dfd, name: name, shown: base.appending(path: name).path) }
         }
         var targets: [String] = []
         if let name, exists(dfd, name) { targets.append(name) }
@@ -795,19 +814,19 @@ public enum EngineFiles {
         var worst = Clearance.removed
         for target in targets {
             let shown = base.appending(path: target).path
-            do {
+            // A failed removal is made inert and tried again; `residue` (not the error) says what, if anything, stays readable.
+            var gone = false
+            bestEffort("removing a leftover") {
                 try removeTree(dfd: dfd, name: target, shown: shown, depth: 0)
-                if !exists(dfd, target) { continue }
-            } catch {
-                // Made inert and tried again below; `residue` says what, if anything, stays readable.
+                gone = !exists(dfd, target)
             }
+            if gone { continue }
             makeInert(dfd: dfd, name: target, depth: 0)
-            do {
+            bestEffort("removing a leftover made inert") {
                 try removeTree(dfd: dfd, name: target, shown: shown, depth: 0)
-                if !exists(dfd, target) { continue }
-            } catch {
-                // Reported through `residue`.
+                gone = !exists(dfd, target)
             }
+            if gone { continue }
             if let why = residue(dfd: dfd, name: target, shown: shown, depth: 0) {
                 worst = .failed(why)
             } else if worst == .removed {

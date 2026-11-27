@@ -100,7 +100,7 @@ extension Orchestrator {
         if own.isEmpty {
             extensionPlaces.append(reviewDir)
         } else {
-            for name in SandboxPath.entries(reviewDir.resolvedForSandbox.path) where !own.contains("\(ExtensionLibrary.reviewDir)/\(name)") {
+            for name in try SandboxPath.entries(reviewDir.resolvedForSandbox.path) where !own.contains("\(ExtensionLibrary.reviewDir)/\(name)") {
                 extensionPlaces.append(reviewDir.appending(path: name))
             }
         }
@@ -162,7 +162,7 @@ extension Orchestrator {
                                           && Column("status") == AskStatus.pendingOwner.rawValue
                                           && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
                 if open == 0 {
-                    try EngineAlerts.raise(store: store, db: db, text: text, now: now, reason: reason, companyId: company.id)
+                    try EngineAlerts.raise(store: store, db: db, text: text, now: now, reason: reason, scope: .company(company.id))
                 } else {
                     try ActivityEvent(companyId: company.id, agentId: agent.id, turnId: nil, kind: .error, text: try store.redact(text),
                                       createdAt: now).insert(db)

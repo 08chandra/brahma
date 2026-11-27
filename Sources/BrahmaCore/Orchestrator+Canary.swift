@@ -217,7 +217,7 @@ extension Orchestrator {
                 guard open == 0 else { return }
                 try EngineAlerts.raise(store: store, db: db,
                                        text: "Sandbox check failed: \(Store.flat(detail, max: 600)). Agents in sandboxed companies are paused; run brahma doctor.",
-                                       now: now, reason: EngineAlerts.sandboxCheckReason)
+                                       now: now, reason: EngineAlerts.sandboxCheckReason, scope: .allCompanies(.sandboxCheck))
             }
         }
     }

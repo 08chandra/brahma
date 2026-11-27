@@ -662,7 +662,7 @@ extension Store {
                 let text = "Brahma can't read the branch item/\(item.key) in \(company.name) (\(Store.flat("\(error)", max: 300))), so "
                     + "every item's changes there are treated as outside content until it can. Something may have reset it onto "
                     + "unrelated history; run `git log item/\(item.key)` in \(Store.flat(company.workspacePath, max: 200)) to check."
-                try EngineAlerts.raise(store: self, db: db, text: text, now: Store.now(), reason: reason, companyId: companyId)
+                try EngineAlerts.raise(store: self, db: db, text: text, now: Store.now(), reason: reason, scope: .company(companyId))
             }
         } catch {
             FileHandle.standardError.write(Data("brahma: item/\(item.key) can't be read for the taint check (\(error)); the alert failed too\n".utf8))
@@ -931,7 +931,7 @@ extension Store {
         let text = "The commits a session that read outside content made\(key.map { " on \($0)" } ?? "") could not all be recorded: \(what). "
             + (key.map { "\($0) is treated as tainted until it is merged or you vouch for it." } ?? "Check the items this agent worked on.")
         do {
-            try EngineAlerts.raise(store: self, text: text, now: now, reason: "taint-record:\(itemId ?? companyId)", companyId: companyId)
+            try EngineAlerts.raise(store: self, text: text, now: now, reason: "taint-record:\(itemId ?? companyId)", scope: .company(companyId))
         } catch {
             FileHandle.standardError.write(Data("brahma: \(text) (the alert failed too: \(error))\n".utf8))
         }

@@ -609,9 +609,15 @@ public enum LabProvenance {
             default: throw refuse("\(dir) is not a real directory (a link or a file)")
             }
         }
+        // A directory that cannot be listed could hide a repository: refused, never walked past (spec §6.7).
+        func entries(_ rel: String) throws -> [String] {
+            do { return try SandboxPath.entries(rel.isEmpty ? ws.path : ws.appending(path: rel).path) } catch {
+                throw refuse("\(rel.isEmpty ? "the workspace" : Store.flat(rel, max: 200)) cannot be listed")
+            }
+        }
         var out: [String] = []
         for (dir, suffix) in [(".brahma/labs", ""), (".brahma/ext-try", "/lab")] {
-            for name in SandboxPath.entries(ws.appending(path: dir).path) {
+            for name in try entries(dir) {
                 guard !SandboxPath.isUnsafe(name) else {
                     throw refuse("\(dir)/\(Store.flat(name.debugDescription, max: 120)) has a name Brahma cannot handle safely")
                 }
@@ -624,8 +630,7 @@ public enum LabProvenance {
         var stack = [""]
         var seen = 0
         while let rel = stack.popLast() {
-            let url = rel.isEmpty ? ws : ws.appending(path: rel)
-            let names = SandboxPath.entries(url.path)
+            let names = try entries(rel)
             // A bare repository: HEAD, objects and refs side by side (the known `.git` dirs are never entered).
             if names.contains("HEAD"), names.contains("objects"), names.contains("refs"), !rel.isEmpty {
                 throw refuse("\(Store.flat(rel, max: 200)) is a git repository outside the known layout")
@@ -753,7 +758,7 @@ public enum LabProvenance {
     private static func refuse(store: Store, companyId: String, agentId: String, handle: String, why: String, now: Date) -> Outcome {
         try? store.markTainted(agentId: agentId, source: "lab-git: refused", now: now)
         try? EngineAlerts.raise(store: store, text: "@\(handle)'s lab could not be read for provenance (\(Store.flat(why, max: 200))); "
-                                + "its session is treated as tainted.", now: now, reason: alertReason, companyId: companyId)
+                                + "its session is treated as tainted.", now: now, reason: alertReason, scope: .company(companyId))
         return .refused(why)
     }
 }

@@ -169,7 +169,7 @@ public enum HandbookExporter {
             if outcome != .removed {
                 alertOnce(store: store, companyId: companyId, key: "cleared \(problem.description) \(outcome)") { db in
                     try EngineAlerts.raise(store: store, db: db, text: clearedText(because: problem, outcome), now: now,
-                                           reason: mirrorAlertReason, companyId: companyId)
+                                           reason: mirrorAlertReason, scope: .company(companyId))
                 }
             }
             return result
@@ -199,7 +199,7 @@ public enum HandbookExporter {
                 leftoversClear = false
                 alertOnce(store: store, companyId: companyId, key: "leftover \(leftover)") { db in
                     try EngineAlerts.raise(store: store, db: db, text: leftoverText(leftover), now: now, reason: mirrorAlertReason,
-                                           companyId: companyId)
+                                           scope: .company(companyId))
                 }
             }
         } catch let problem as UnsafeEngineFile {
@@ -359,7 +359,7 @@ public enum HandbookExporter {
         let reason = Store.flat("\(error)", max: 300)
         let text = "The handbook mirror in .brahma/kb could not be rebuilt (\(reason)); \(outcomeText(outcome)). The next refresh tries again."
         alertOnce(store: store, companyId: companyId, key: "failed \(reason) \(outcome)") { db in
-            try EngineAlerts.raise(store: store, db: db, text: text, now: now, reason: mirrorAlertReason, companyId: companyId)
+            try EngineAlerts.raise(store: store, db: db, text: text, now: now, reason: mirrorAlertReason, scope: .company(companyId))
         }
     }
 

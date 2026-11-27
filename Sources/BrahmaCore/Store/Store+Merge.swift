@@ -191,7 +191,7 @@ extension Store {
         try? EngineAlerts.raise(
             store: self, text: "\(company.name): Brahma repaired the workspace repository so merges into main could go on (\(names)). "
                 + "These held merges into main and Brahma did not leave them; something with access to the workspace did.",
-            now: now, reason: Self.mergeTamperAlertReason(company.id))
+            now: now, reason: Self.mergeTamperAlertReason(company.id), scope: .company(company.id))
     }
 
     /// A merge check's export worked (A1): the company's merge hold alert, if one is open, is resolved.
@@ -209,7 +209,7 @@ extension Store {
         guard open == 0 else { return }
         try EngineAlerts.raise(
             store: self, text: "\(company.name): main checkout is on \(ref ?? "a detached HEAD"); switch it back to main. "
-                + "Brahma merges nothing there until you do.", now: now, reason: reason, companyId: company.id)
+                + "Brahma merges nothing there until you do.", now: now, reason: reason, scope: .company(company.id))
     }
 
     // MARK: Recording

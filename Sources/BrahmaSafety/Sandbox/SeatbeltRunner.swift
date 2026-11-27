@@ -113,7 +113,9 @@ public struct SeatbeltRunner: SandboxedRunner {
     /// opened O_NOFOLLOW, and the removal itself works on descriptors only.
     static func removeTemp(_ policy: SandboxPolicy) {
         guard let first = policy.writable.first else { return }
-        _ = try? EngineFiles.removeNoFollow(first.appending(path: tmpName), under: first.deletingLastPathComponent())
+        bestEffort("removing a check's TMPDIR") {
+            _ = try EngineFiles.removeNoFollow(first.appending(path: tmpName), under: first.deletingLastPathComponent())
+        }
     }
 
     public func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
@@ -285,7 +287,10 @@ public final class SeatbeltProcess: SandboxedProcess, @unchecked Sendable {
         if !child.hasExited() {
             child.signalGroup(SIGTERM)
             let deadline = AwakeTime.deadline(after: grace)
-            while !child.hasExited(), AwakeTime.now < deadline { try? await AwakeTime.sleep(for: .milliseconds(20)) }
+            while !child.hasExited(), AwakeTime.now < deadline {
+                // Cancelled: the grace still runs out on the clock and the group is SIGKILLed below (paced, not spun).
+                do { try await AwakeTime.sleep(for: .milliseconds(20)) } catch { usleep(20_000) }
+            }
             if !child.hasExited() { child.signalGroup(SIGKILL) }
         }
         // Wait for the reaper (which finishes the leader and runs the straggler sweep).

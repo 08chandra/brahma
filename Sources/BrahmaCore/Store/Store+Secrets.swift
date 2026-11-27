@@ -247,7 +247,7 @@ extension Store {
                   + "is merged or you vouch for it.")
         do {
             try EngineAlerts.raise(store: self, text: text, now: now, reason: Self.autoCommitTaintAlertReason(companyId: companyId, key: key),
-                                   companyId: companyId)
+                                   scope: .company(companyId))
         } catch let alertError {
             FileHandle.standardError.write(Data("brahma: \(text) (the alert failed too: \(alertError))\n".utf8))
         }
@@ -300,7 +300,7 @@ extension Store {
                                 alsoNotify: flagged == nil ? [] : [agent.managerId].compactMap { $0 }, now: now)
         }
         try EngineAlerts.raise(store: self, db: db, text: "\(item.key): \(text)", now: now,
-                               reason: Self.branchMovedAlertReason(item.id), companyId: item.companyId)
+                               reason: Self.branchMovedAlertReason(item.id), scope: .company(item.companyId))
     }
 
     static func branchMovedAlertReason(_ itemId: String) -> String { "branch-moved:\(itemId)" }

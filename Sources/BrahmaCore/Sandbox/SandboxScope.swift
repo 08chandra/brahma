@@ -430,7 +430,7 @@ public struct SandboxScope: Equatable, Sendable {
         // target keeps its own rules); a name no profile may carry is left out and reported, never fatal.
         var readable: [URL] = []
         var skipped: [String] = []
-        for name in SandboxPath.entries(ws.path) where name != ".brahma" {
+        for name in try SandboxPath.entries(ws.path) where name != ".brahma" {
             let entry = l(name)
             if SandboxPath.isUnsafe(name) { skipped.append(entry.path); continue }
             guard SandboxPath.kind(entry.path) != .link else { continue }
@@ -488,7 +488,7 @@ public struct SandboxScope: Equatable, Sendable {
         // name no profile may carry denies the whole directory instead; where the turn's own carve-out shares it, only this
         // turn is refused.
         func denyEntries(of dir: URL, keeping keep: Set<String>, carveOut: Bool) throws {
-            let names = SandboxPath.entries(dir.path).filter { !keep.contains($0) }
+            let names = try SandboxPath.entries(dir.path).filter { !keep.contains($0) }
             if !carveOut { denyWrite += both(dir) }
             if let bad = names.first(where: SandboxPath.isUnsafe) {
                 if carveOut { throw SandboxError.unsafePathCharacter(dir.appending(path: bad).path) }

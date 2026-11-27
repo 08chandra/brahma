@@ -2,8 +2,8 @@ import Testing
 import Foundation
 @testable import BrahmaCore
 
-/// Plan S's safety lint (spec §6.8.2): a static scan of `Sources/BrahmaCore` and `Sources/brahma` for the raw APIs the plan
-/// retires (spawns, policy literals, descriptors, file APIs, directory walks, loopback HTTP, fail-open shapes, unscoped alerts,
+/// Plan S's safety lint (spec §6.8.2): a static scan of `Sources/BrahmaCore`, `Sources/brahma` and the kernel
+/// `Sources/BrahmaSafety` (Ruling S3-2: a zero scope there needs it scanned) for the raw APIs the plan retires (spawns, policy literals, descriptors, file APIs, directory walks, loopback HTTP, fail-open shapes, unscoped alerts,
 /// turn scopes). The counts are frozen in a checked-in baseline (`Fixtures/safety-lint-baseline.json`, rule → file → count)
 /// that may only shrink: a count above its baseline fails, a file not in the baseline with a hit fails, a `zero` scope with a
 /// hit fails, and a count below its baseline fails too, printing the baseline to paste, so a drop is recorded the moment it
@@ -13,7 +13,8 @@ enum SafetyLint {
         case spawn, sandboxPolicy, descriptor, fileAPI, dirWalk, loopbackHTTP, failOpen, alertScope, turnScope
 
         /// The code-only pattern (spec §6.8.2). `alertScope` is matched by `alertScopeHits` instead, which reads the argument
-        /// list up to the matching `)`.
+        /// list up to the matching `)`. `failOpen` also holds spec §6.7's two other bans (S4): a `catch` with an empty body
+        /// (a comment-only body is empty once comments are blanked) and a `catch` body that ends in `return true`.
         var pattern: String {
             switch self {
             case .spawn: return #"\bProcess\(\)|\bposix_spawn\(|"/usr/bin/env"|\[\s*"git""#
@@ -22,18 +23,23 @@ enum SafetyLint {
             case .fileAPI: return #"FileManager\.default|Data\(contentsOf:|String\(contentsOf|\.write\(to:|FileHandle\(for"#
             case .dirWalk: return #"enumerator\(at:|contentsOfDirectory\(|\bopendir\(|\bfdopendir\(|\breaddir\("#
             case .loopbackHTTP: return #"URLSessionHTTPProbe|URLSession|HTTPProbing"#
-            case .failOpen: return #"\?\?\s*true\b|\?\?\s*false\b|\btry\?"#
+            case .failOpen:
+                return #"\?\?\s*true\b|\?\?\s*false\b|\btry\?|\bcatch\b[^{}\n]*\{\s*\}|\bcatch\b[^{}\n]*\{[^{}]*\breturn\s+true\s*\}"#
             case .alertScope: return #"\bEngineAlerts\.raise\("#
             case .turnScope: return #"\bSandboxScope\.forTurn\("#
             }
         }
 
-        /// Repo-relative directory prefixes where the rule must have no hit at all. S3 emptied `Verify/` and `Sandbox/` of
-        /// spawns (the process primitives and the Seatbelt runtime moved to `BrahmaSafety`); S7, S9–S12 and S15 fill the rest.
+        /// Repo-relative directory prefixes where the rule must have no hit at all; each lies under a `scanned` root. S3 emptied
+        /// `Verify/` and `Sandbox/` of spawns (the process primitives and the Seatbelt runtime moved to `BrahmaSafety`); S4
+        /// emptied the kernel and `Principal/` of fail-open shapes and every scanned file of unscoped alerts; S7, S9–S12 and S15
+        /// fill the rest.
         var zero: [String] {
             switch self {
             case .spawn: return ["Sources/BrahmaCore/Verify/", "Sources/BrahmaCore/Sandbox/"]
-            case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope:
+            case .failOpen: return ["Sources/BrahmaSafety/", "Sources/BrahmaCore/Principal/"]
+            case .alertScope: return SafetyLint.scanned.map { $0 + "/" }
+            case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .turnScope:
                 return []
             }
         }
@@ -58,7 +64,7 @@ enum SafetyLint {
         var description: String { "\(path):\(line): \(text)" }
     }
 
-    static let scanned = ["Sources/BrahmaCore", "Sources/brahma"]
+    static let scanned = ["Sources/BrahmaCore", "Sources/brahma", "Sources/BrahmaSafety"]
     static let baselinePath = "Tests/BrahmaCoreTests/Fixtures/safety-lint-baseline.json"
 
     /// Every hit of every rule, by rule, over `scanned` under `root` (the package root). Comments are blanked first.
@@ -115,6 +121,15 @@ enum SafetyLint {
     static func zeroOffenders(_ hits: [Hit], zero: [String], exempt: [String: String] = [:]) -> [Hit] {
         let dirs = zero.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
         return hits.filter { hit in dirs.contains { hit.path.hasPrefix($0) } && exempt[hit.path] == nil }
+    }
+
+    /// The prefixes of `zero` that lie under none of `roots` (a zero scope outside the scan would pass vacuously). A prefix
+    /// lies under a root when it is the root or starts with the root and `/`.
+    static func unscanned(_ zero: [String], roots: [String] = scanned) -> [String] {
+        zero.filter { prefix in
+            let dir = prefix.hasSuffix("/") ? String(prefix.dropLast()) : prefix
+            return !roots.contains { dir == $0 || dir.hasPrefix($0 + "/") }
+        }
     }
 
     /// The checked-in baseline, or nil when there is none yet.
@@ -315,13 +330,43 @@ enum SafetyLint {
         #expect(SafetyLint.zeroOffenders(synthetic, zero: ["Sources/BrahmaCore/Git", "Sources/brahma"]).map(\.path) == ["Sources/BrahmaCore/Git/C.swift"])
     }
 
-    /// The scan is live: known sites are found, and the `alertScope` argument-list matcher reads to the matching `)`.
+    /// Ruling S3-2: a zero scope (or an exemption) outside the scanned roots would pass whatever its directory holds.
+    @Test func zeroScopesLieUnderScannedRoots() {
+        for rule in SafetyLint.Rule.allCases {
+            #expect(SafetyLint.unscanned(rule.zero).isEmpty, "\(rule.rawValue): \(SafetyLint.unscanned(rule.zero)) is not scanned")
+            #expect(SafetyLint.unscanned(Array(rule.zeroExempt.keys)).isEmpty, "\(rule.rawValue): an exemption outside the scan")
+        }
+        #expect(SafetyLint.Rule.failOpen.zero.contains("Sources/BrahmaSafety/"), "the kernel is a failOpen zero scope")
+        // Whole path components only, with or without the trailing `/`.
+        let roots = ["Sources/BrahmaCore", "Sources/BrahmaSafety"]
+        #expect(SafetyLint.unscanned(["Sources/BrahmaCore/Refs/", "Sources/BrahmaSafety", "Sources/BrahmaSafety/", "Sources/BrahmaCore/A.swift"],
+                                     roots: roots).isEmpty)
+        #expect(SafetyLint.unscanned(["Sources/BrahmaSafetyX/", "Sources/brahma/", "Sources/", "Tests/BrahmaCoreTests/"], roots: roots)
+                == ["Sources/BrahmaSafetyX/", "Sources/brahma/", "Sources/", "Tests/BrahmaCoreTests/"])
+    }
+
+    /// The scan is live: known sites are found (the kernel included), and the `alertScope` argument-list matcher reads to the
+    /// matching `)`.
     @Test func scanFindsKnownSites() throws {
         let counts = try SafetyLint.scan(root: Self.root)
         #expect((counts[.spawn]?["Sources/BrahmaCore/Git/GitWorkspace.swift"] ?? 0) > 0, "spawn: GitWorkspace starts git")
         #expect((counts[.sandboxPolicy]?["Sources/BrahmaCore/Sandbox/SandboxedCheckRunner.swift"] ?? 0) > 0,
                 "sandboxPolicy: the check runner builds a policy")
-        #expect((counts[.alertScope]?.count ?? 0) >= 17, "alertScope: \(counts[.alertScope]?.count ?? 0) files, expected the 17+ of spec §7.7")
+        #expect((counts[.descriptor]?["Sources/BrahmaSafety/Path/EngineFiles.swift"] ?? 0) > 0, "descriptor: the kernel is scanned")
+        // S4: every `EngineAlerts.raise` names its scope (the compiler requires it too).
+        #expect(counts[.alertScope]?.isEmpty ?? true, "alertScope: \(counts[.alertScope] ?? [:])")
+
+        // `failOpen`: the three shapes of spec §6.8.2 plus spec §6.7's empty `catch` and `catch` ending in `return true`.
+        func failOpen(_ code: String) -> Int { SafetyLint.regexHits(in: code, pattern: SafetyLint.Rule.failOpen.pattern).count }
+        #expect(failOpen("let x = try? f()") == 1)
+        #expect(failOpen("let ok = flag ?? true\nlet no = flag ??  false") == 2)
+        #expect(failOpen("do { try f() } catch {}") == 1)
+        #expect(failOpen("do { try f() } catch let e as Boom {\n    \n}") == 1)
+        #expect(failOpen("do { try f() } catch {\n    log(error)\n    return true\n}") == 1)
+        #expect(failOpen("do { try f() } catch { return false }") == 0)
+        #expect(failOpen("do { try f() } catch { log(error) }") == 0)
+        #expect(failOpen("do { try f() } catch { return trueish }") == 0)
+        #expect(failOpen("let entry? = x; let y = a ?? trueValue") == 0)
 
         // The matcher: no `scope:` → a hit; `scope:` anywhere in the argument list, across lines and nested calls → none;
         // parentheses in string literals and interpolations do not end the list early.

@@ -957,7 +957,7 @@ import GRDB
         }
         defer { try? cf.store.writer.write { db in try db.execute(sql: "DROP TABLE IF EXISTS temp.leaseClaim") } }
         // R5-3: a turn-record alert already open for the item neither absorbs nor suppresses the auto-commit's.
-        try EngineAlerts.raise(store: cf.store, text: "a turn's taint record failed", now: now, reason: "taint-record:\(itemId)", companyId: cId)
+        try EngineAlerts.raise(store: cf.store, text: "a turn's taint record failed", now: now, reason: "taint-record:\(itemId)", scope: .company(cId))
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         try cf.fx.git.write("src/leftover.ts", "left\n", in: wt)
         let git = cf.store.gitWorkspace(root: cf.workspace, companyId: cId)

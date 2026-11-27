@@ -934,8 +934,8 @@ import GRDB
     @Test func engineAlertAskFiledAndResolved() throws {
         let w = try W()
         #expect(try w.store.setHold(reason: .disk, detail: "1.0 GB free", now: w.now))
-        try EngineAlerts.raise(store: w.store, text: "Disk space is low (1.0 GB free).", now: w.now)
-        try EngineAlerts.raise(store: w.store, text: "Disk space is low (0.9 GB free).", now: w.now)
+        try EngineAlerts.raise(store: w.store, text: "Disk space is low (1.0 GB free).", now: w.now, scope: HoldReason.disk.alertScope)
+        try EngineAlerts.raise(store: w.store, text: "Disk space is low (0.9 GB free).", now: w.now, scope: HoldReason.disk.alertScope)
         let alerts = try w.store.asks(companyId: w.company.id).filter { $0.kind == .engineAlert }
         #expect(alerts.count == 1)
         let a = try #require(alerts.first)
@@ -948,7 +948,7 @@ import GRDB
         #expect(try w.store.ownerWaitingCount(companyId: w.company.id) == 0)
         // A later hold files a new ask.
         #expect(try w.store.setHold(reason: .account, detail: "logged out", now: w.now))
-        try EngineAlerts.raise(store: w.store, text: "Claude Code is logged out.", now: w.now)
+        try EngineAlerts.raise(store: w.store, text: "Claude Code is logged out.", now: w.now, scope: HoldReason.account.alertScope)
         let again = try w.store.asks(companyId: w.company.id).filter { $0.kind == .engineAlert }
         #expect(again.count == 2); #expect(again.last?.status == .pendingOwner)
         // The owner acknowledging it also closes it.

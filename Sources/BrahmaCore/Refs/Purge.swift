@@ -300,7 +300,7 @@ extension Store {
                 + (incomplete ? "Remove what still holds it, then purge it again." : "Purge it again.")
             do {
                 try EngineAlerts.raise(store: self, text: text, now: now, reason: "purge-incomplete:\(StableHash.fnv1a64(companyId + "\u{0}" + canonical))",
-                                       companyId: companyId)
+                                       scope: .company(companyId))
             } catch {
                 FileHandle.standardError.write(Data("brahma: \(text) (the alert failed too: \(error))\n".utf8))
             }

@@ -457,7 +457,8 @@ private struct GateWorld {
                                && Column("subjectId") == EngineAlerts.askSubject(reason: EngineAlerts.sandboxCheckReason)).fetchCount(db)
             }
         }
-        try EngineAlerts.raise(store: store, text: "Sandbox check failed", now: Date(), reason: EngineAlerts.sandboxCheckReason)
+        try EngineAlerts.raise(store: store, text: "Sandbox check failed", now: Date(), reason: EngineAlerts.sandboxCheckReason,
+                               scope: .allCompanies(.sandboxCheck))
         #expect(try open() >= 1)
         try store.recordCanary(SandboxCanaryKey(fingerprint: "a", shape: "s", osVersion: "o"), detail: "t", resolveAlert: false)
         #expect(try open() >= 1)

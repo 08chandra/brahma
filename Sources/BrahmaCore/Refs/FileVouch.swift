@@ -98,7 +98,7 @@ extension Store {
                     + "A vouch skips only this check. For a PDF, what Brahma then shares is a flattened re-render of its visible "
                     + "pages, checked again like any file (the original is never shared); for other files Brahma still scans what "
                     + "it can read and refuses a stored secret or a secret pattern in it. Any change to the file ends the vouch."
-                try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: reasonKey, companyId: companyId)
+                try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: reasonKey, scope: .company(companyId))
             }
         } catch {
             FileHandle.standardError.write(Data("brahma: could not record a file refused for its structure: \(error)\n".utf8))

@@ -656,7 +656,7 @@ public actor MergeQueue: EmergencyStopObserver {
                         store: store, text: "\(company.name): merges into main are held (\(Store.flat("\(error)", max: 300))); "
                             + "\(Self.maxAttempts) attempts in a row failed for Brahma's own reasons. The approved items keep their approval and "
                             + "their place in the queue; Brahma tries again and the queue moves as soon as the fault clears.",
-                        now: clock(), reason: Store.mergeHoldAlertReason(company.id))
+                        now: clock(), reason: Store.mergeHoldAlertReason(company.id), scope: .company(company.id))
                 }
             } else {
                 for r in requests where !ledger.settled.contains(r.id) {
@@ -910,7 +910,8 @@ public actor MergeQueue: EmergencyStopObserver {
         let shown = Store.flat(why, max: 300)
         try? EngineAlerts.raise(
             store: store, text: "\(company.name): an interrupted merge batch could not be finished (\(shown)); \(n) attempts in a row failed. "
-                + "Merges wait until it can; Brahma keeps trying with a growing pause.", now: clock(), reason: Store.mergeHoldAlertReason(company.id))
+                + "Merges wait until it can; Brahma keeps trying with a growing pause.", now: clock(), reason: Store.mergeHoldAlertReason(company.id),
+            scope: .company(company.id))
         try? store.notifyOwner(companyId: company.id, title: "Merge recovery is failing",
                                body: "Brahma could not finish an interrupted merge batch in \(company.name) after \(n) tries (\(shown)). Merges there wait. "
                                    + "It keeps trying with a growing pause and needs no command: merges go on by themselves once it succeeds. "

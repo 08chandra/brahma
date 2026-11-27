@@ -668,7 +668,7 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
 
         // Activity events, raw and engine alerts and holds.
         try w.store.appendEvent(ActivityEvent(companyId: w.company.id, agentId: nil, turnId: nil, kind: .error, text: "boom \(s)", createdAt: w.now))
-        try EngineAlerts.raise(store: w.store, text: "alert \(s)", now: w.now)
+        try EngineAlerts.raise(store: w.store, text: "alert \(s)", now: w.now, scope: .allCompanies(.secrets))
         try w.store.setHold(reason: .cli, detail: "probe said \(s)", now: w.now)
 
         // Turn summary (success and failure) and the activity line that echoes it.

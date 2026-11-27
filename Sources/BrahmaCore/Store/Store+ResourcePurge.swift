@@ -533,7 +533,7 @@ extension Store {
         let text = "The resource mirror in .brahma/resources met \(Store.flat(problem.description, max: 300)); \(left)."
         HandbookExporter.alertOnce(store: self, companyId: companyId, key: "cleared \(problem.description) \(outcome)",
                                    cursor: Self.resourceMirrorAlertCursor, what: "resource mirror") { db in
-            try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: Self.resourceMirrorAlertReason, companyId: companyId)
+            try EngineAlerts.raise(store: self, db: db, text: text, now: now, reason: Self.resourceMirrorAlertReason, scope: .company(companyId))
         }
     }
 

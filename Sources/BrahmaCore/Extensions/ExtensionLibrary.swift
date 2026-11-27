@@ -577,7 +577,7 @@ public enum ExtensionLibrary {
                       + "Roll it back or install it again."
                     : "Extension \(id) in \(company.name) was changed on disk after it was approved; Brahma stopped mounting it. "
                       + "Remove it and install it again from a trusted source."
-                try EngineAlerts.raise(store: store, db: db, text: text, now: now, reason: reason, companyId: company.id)
+                try EngineAlerts.raise(store: store, db: db, text: text, now: now, reason: reason, scope: .company(company.id))
             }
         }
     }

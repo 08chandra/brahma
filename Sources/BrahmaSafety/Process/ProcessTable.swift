@@ -40,7 +40,12 @@ public enum ProcessTable {
         }
         return []
         #else
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else { return [] }
+        let names: [String]
+        do { names = try FileManager.default.contentsOfDirectory(atPath: "/proc") } catch {
+            // Not read: the empty table, which every reader takes for "unreadable", never for "nothing runs"
+            // (`SandboxSweep.run`: fail closed, N1), as the Darwin branch's failed `sysctl` does.
+            return []
+        }
         return names.compactMap { pid_t($0) }.compactMap(linuxEntry)
         #endif
     }

@@ -74,15 +74,32 @@ public struct ChildGroups: Sendable {
         }
     }
 
+    /// No directory yet: no records. One that cannot be listed, or a record that cannot be decoded, is reported on stderr
+    /// (`brahma stop` shows it): the stop then cannot vouch for the checks and merges it would have named.
     private static func records(in dir: URL) -> [(url: URL, value: ChildGroupRecord)] {
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        let names: [String]
+        do { names = try FileManager.default.contentsOfDirectory(atPath: dir.path) } catch {
+            var st = stat()
+            if lstat(dir.path, &st) != 0 && errno == ENOENT { return [] }
+            report("could not list the child-group records in \(dir.path): \(error)")
+            return []
+        }
         return names.filter { $0.hasSuffix(".group") && !$0.hasPrefix(".") }.compactMap { name in
             let url = dir.appending(path: name)
             var st = stat()
             guard lstat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_uid == getuid(), st.st_size < 4096,
-                  let data = FileManager.default.contents(atPath: url.path),
-                  let value = try? JSONDecoder().decode(ChildGroupRecord.self, from: data), value.leader > 1 else { return nil }
+                  let data = FileManager.default.contents(atPath: url.path) else { return nil }
+            let value: ChildGroupRecord
+            do { value = try JSONDecoder().decode(ChildGroupRecord.self, from: data) } catch {
+                report("skipped the damaged child-group record \(url.path): \(error)")
+                return nil
+            }
+            guard value.leader > 1 else { return nil }
             return (url, value)
         }
+    }
+
+    private static func report(_ problem: String) {
+        FileHandle.standardError.write(Data("brahma: \(problem)\n".utf8))
     }
 }

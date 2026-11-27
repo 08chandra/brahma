@@ -158,7 +158,7 @@ public final class Store: Sendable {
             try? EngineAlerts.raise(
                 store: self, text: "The worktree of \(key) in \(name) was repointed (\(detail)). Brahma refused to commit, merge or reset "
                 + "there and put it back from its own records. An agent probably rewrote it; look at what \(key) is doing.",
-                now: Store.now(), reason: "worktree:\(companyId):\(key)")
+                now: Store.now(), reason: "worktree:\(companyId):\(key)", scope: .company(companyId))
         }
         git.onUnsafeEngineFile = { [self] problem in alertEngineFile(problem, companyId: companyId) }
         git.onUnsafeRepository = { [self] detail in
@@ -173,7 +173,7 @@ public final class Store: Sendable {
                                           && Column("status") == AskStatus.pendingOwner.rawValue
                                           && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
                 guard open == 0 else { return }
-                try EngineAlerts.raise(store: self, db: db, text: text, now: Store.now(), reason: reason)
+                try EngineAlerts.raise(store: self, db: db, text: text, now: Store.now(), reason: reason, scope: .company(companyId))
             }
         }
         return git
@@ -374,7 +374,7 @@ public final class Store: Sendable {
             try? EngineAlerts.raise(store: self, text: "Before @\(handle) was hired in \(company.name), something had already created its "
                                     + "places.\(what)\(refusal) Check what put them there: on the Workspace and Full profiles any agent can "
                                     + "write another's places.", now: now, reason: "pre-hire-places:\(company.id):\(handle):\(batch)",
-                                    companyId: company.id)
+                                    scope: .company(company.id))
         }
         if let failed { throw WorkError.conflict("\(failed) already exists and could not be moved aside; nothing was hired") }
         guard !moved.isEmpty else { return }

@@ -233,7 +233,7 @@ private func value(_ a: [String], _ flag: String) -> String? { a.firstIndex(of: 
             let alert = try #require(try w.ownerAlerts().last, "\(what)")
             #expect(alert.summary.contains("repaired"), "\(what): \(alert.summary)")
             if what != "lab .git link" {
-                #expect(!SandboxPath.entries(w.trash.path).isEmpty, "\(what): moved to the trash, not deleted")
+                #expect(!(try SandboxPath.entries(w.trash.path)).isEmpty, "\(what): moved to the trash, not deleted")
             }
         }
     }

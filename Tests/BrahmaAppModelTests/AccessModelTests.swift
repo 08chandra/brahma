@@ -121,12 +121,12 @@ import GRDB
         await a.w.refresh()
         #expect(a.w.model.sandboxBanner == nil)
         try EngineAlerts.raise(store: a.store, text: "a link where the sandbox expects a directory", now: Date(),
-                               reason: "sandbox-link:\(a.w.company.id):123", companyId: a.w.company.id)
+                               reason: "sandbox-link:\(a.w.company.id):123", scope: .company(a.w.company.id))
         await a.w.refresh()
         #expect(a.w.model.work.inbox.contains { $0.kind == .engineAlert })
         #expect(a.w.model.sandboxBanner == nil)
         try EngineAlerts.raise(store: a.store, text: "Sandbox check failed for claude 2.1.0", now: Date(),
-                               reason: EngineAlerts.sandboxCheckReason, companyId: a.w.company.id)
+                               reason: EngineAlerts.sandboxCheckReason, scope: .company(a.w.company.id))
         await a.w.refresh()
         #expect(a.w.model.sandboxBanner == "Sandbox check failed or pending for claude ? — see Inbox")
         // Acknowledging the alert clears it.

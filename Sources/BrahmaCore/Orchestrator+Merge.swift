@@ -91,7 +91,7 @@ extension Orchestrator {
                     + "\(count) attempts in a row failed for Brahma's own reasons (git \(gitVersion ?? "version unknown")). "
                     + "\(item.key) keeps its approval and its place in the queue; Brahma tries again every minute and the queue moves "
                     + "as soon as the fault clears.",
-                now: now, reason: Store.mergeHoldAlertReason(company.id))
+                now: now, reason: Store.mergeHoldAlertReason(company.id), scope: .company(company.id))
         } catch {
             log("could not raise the merge hold alert: \(error)")
         }

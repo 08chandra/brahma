@@ -139,7 +139,7 @@ public final class SafeFS: @unchecked Sendable {
             for name in ["artifacts", "progress", "handoffs", "home"] { _ = try hold(brahma, name, as: name) }
             if let resources = try hold(brahma, "resources", as: "resources") { _ = try hold(resources, "company", as: "resources/company") }
             if let notes = try hold(brahma, "notes", as: "notes") { _ = try hold(notes, "agents", as: "notes/agents") }
-            if let labs = try hold(brahma, "labs", as: "labs"), let ownHandle, (try? Self.checkComponent(ownHandle)) != nil {
+            if let labs = try hold(brahma, "labs", as: "labs"), let ownHandle, Self.isComponent(ownHandle) {
                 _ = try hold(labs, ownHandle, as: "ownLab")
             }
         } catch let e as UnsafeEngineFile {
@@ -264,7 +264,11 @@ public final class SafeFS: @unchecked Sendable {
     /// The state after entering `directory` (named `name` by the agent) from `state`: by its inode alone.
     private func classify(directory: EngineFiles.OpenDirectory, name: String, under state: State) throws -> State {
         let id = try directory.identity()
-        func same(_ key: String) -> Bool { children[key].map { $0.dev == id.dev && $0.ino == id.ino } ?? false }
+        // A place the engine did not hold at open (missing, or not a real directory then) matches nothing: not allowed.
+        func same(_ key: String) -> Bool {
+            guard let held = children[key] else { return false }
+            return held.dev == id.dev && held.ino == id.ino
+        }
         switch state {
         case .root:
             guard id.dev == brahmaId.dev, id.ino == brahmaId.ino else { throw SafeFSError.notInPlace }
@@ -302,6 +306,16 @@ public final class SafeFS: @unchecked Sendable {
     }
 
     /// Refuses `..`, `.`, an empty component, NUL, C0 and C1 controls, DEL, bidi and zero-width characters.
+    /// Whether `name` passes `checkComponent`. A handle that does not gets no own lab (its lab is never held: not allowed).
+    static func isComponent(_ name: String) -> Bool {
+        do {
+            try checkComponent(name)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     static func checkComponent(_ name: String) throws {
         guard !name.isEmpty, name != ".", name != ".." else { throw SafeFSError.badPath }
         for scalar in name.unicodeScalars {
