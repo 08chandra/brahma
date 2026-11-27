@@ -95,11 +95,26 @@ import Testing
         let la = TimeZone(identifier: "America/Los_Angeles")!
         let now = Date(timeIntervalSince1970: 1_764_250_000.75) // 2025-11-27T13:26:40.75Z
         let created = Date(timeIntervalSince1970: 1_700_000_000.5)
-        // Default: the last 28 days, whole seconds.
+        // Default: the last 28 days, from the owner's midnight (ruling R44: the window and the daily counters cover the same days),
+        // until now in whole seconds.
         let d = try MeasureWindow.parse(nil, now: now, companyCreated: created, tz: utc)
         #expect(d.until == Date(timeIntervalSince1970: 1_764_250_000))
-        #expect(d.since == Date(timeIntervalSince1970: 1_764_250_000 - 28 * 86_400))
+        #expect(d.since == Date(timeIntervalSince1970: 1_761_782_400)) // 2025-10-30T00:00:00Z, the day of now - 28 d
         #expect(MeasureWindow.defaultDays == 28)
+        // In Los Angeles: midnight PDT of 2025-10-30 (now - 28 d is 06:26 there).
+        let laDefault = try MeasureWindow.parse(nil, now: now, companyCreated: created, tz: la)
+        #expect(laDefault.since == Date(timeIntervalSince1970: 1_761_782_400 + 7 * 3600), "\(laDefault.since)")
+        #expect(laDefault.until == d.until)
+        // The window's first instant is the first instant of a counter day: the day before it is not in the window.
+        for (w, zone) in [(d, utc), (laDefault, la)] {
+            #expect(Store.measureDay(w.since, in: zone) == "2025-10-30")
+            #expect(Store.measureDay(w.since.addingTimeInterval(-1), in: zone) == "2025-10-29")
+        }
+        // Any span (the app's 7 days): the same rule.
+        let week = MeasureWindow.lastDays(7, now: now, tz: la)
+        #expect(week.since == Date(timeIntervalSince1970: 1_763_596_800 + 8 * 3600), "\(week.since)") // 2025-11-20 00:00 PST
+        #expect(week.until == d.until)
+        #expect(MeasureWindow.lastDays(MeasureWindow.defaultDays, now: now, tz: utc) == d)
         // all: the company's creation (whole seconds).
         let all = try MeasureWindow.parse("all", now: now, companyCreated: created, tz: utc)
         #expect(all.since == Date(timeIntervalSince1970: 1_700_000_000) && all.until == d.until)

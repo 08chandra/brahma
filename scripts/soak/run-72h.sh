@@ -193,11 +193,16 @@ if [ "$RESUME" -eq 1 ]; then
     verify "$(cat "$STATE/last-checkpoint")" "reboot-h$HOUR"
 else
     [ -f "$STATE/started-at" ] && { echo "run-72h.sh: $STATE already holds a soak; use --resume or another --state" >&2; exit 2; }
+    # The start day in the owner's time zone (ownerSettings), the zone `--mission --since` reads; the system zone may differ.
+    DAY="$("$BRAHMA" measure "$CO" --print-day)" || { echo "run-72h.sh: brahma measure $CO --print-day failed" >&2; exit 2; }
+    case "$DAY" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) echo "run-72h.sh: brahma measure --print-day printed '$DAY', not a day" >&2; exit 2 ;;
+    esac
     START="$(date +%s)"
     echo "$START" > "$STATE/started-at"
     echo "$HOURS $KILL_AT" > "$STATE/params"
-    # The owner's local day: `--mission --since` reads a day in the owner's time zone.
-    date +%F > "$STATE/started-day"
+    echo "$DAY" > "$STATE/started-day"
     HOUR=0
     log "soak of $CO: $HOURS h, kill at h$KILL_AT, reboot at h$REBOOT_AT, state $STATE"
     [ -n "$(engine_pid)" ] || start_engine

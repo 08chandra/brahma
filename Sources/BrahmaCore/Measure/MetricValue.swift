@@ -134,7 +134,7 @@ public struct MetricValue: Codable, Equatable, Sendable {
         precondition(unit.isRate, "rate(…) takes a rate unit; use count(…) or seconds(…)")
         let counted = events.map(Double.init) ?? (unit == .perUSD || unit == .perHour ? numerator : denominator)
         let finite = counted.isFinite && numerator.isFinite && denominator.isFinite
-        let n = finite && denominator > 0 ? max(0, Int(counted.rounded(.down))) : 0
+        let n = finite && denominator > 0 ? Self.whole(counted) : 0
         let status: MetricStatus = n >= minEvents ? .ok : .insufficient(n: n)
         return MetricValue(id: id, label: label ?? id.label, numerator: numerator, denominator: denominator, unit: unit, basis: basis,
                            detail: detail, status: status)
@@ -147,11 +147,21 @@ public struct MetricValue: Codable, Equatable, Sendable {
                     status: .ok, target: target)
     }
 
-    /// A duration in seconds (`ok` always).
+    /// A sum of seconds (`ok` always), such as the idle seconds of one cause: a plain number, no statistic. A median or
+    /// percentile is `duration(…)`, which carries its n.
     public static func seconds(_ id: MetricId, label: String? = nil, _ seconds: Double, basis: String, detail: [MetricValue] = [])
         -> MetricValue {
         MetricValue(id: id, label: label ?? id.label, numerator: seconds, denominator: 0, unit: .seconds, basis: basis, detail: detail,
                     status: .ok)
+    }
+
+    /// A duration statistic (a median, a percentile) over `n` events, shown with its n: `20.5 s (n=40)`. Like a rate, it is
+    /// `insufficient(n:)` below `minEvents` events (ruling R44): a median of three requests is not a queue time.
+    public static func duration(_ id: MetricId, label: String? = nil, _ seconds: Double, n: Int, basis: String,
+                                detail: [MetricValue] = []) -> MetricValue {
+        let events = max(0, n)
+        return MetricValue(id: id, label: label ?? id.label, numerator: seconds, denominator: Double(events), unit: .seconds,
+                           basis: basis, detail: detail, status: events >= minEvents ? .ok : .insufficient(n: events))
     }
 
     /// The source does not exist on this build.
@@ -182,9 +192,13 @@ public struct MetricValue: Codable, Equatable, Sendable {
         switch unit {
         case .count:
             let n = Self.plain(numerator)
-            return target.map { "\(n) (target \(Self.plain($0)))" } ?? n
+            // A target that is not a number is not shown: printing it as 0 would state a target nobody set.
+            guard let target, target.isFinite else { return n }
+            return "\(n) (target \(Self.plain(target)))"
         case .seconds:
-            return "\(Self.plain(numerator)) s"
+            // A statistic over events carries its n (`duration`); a plain sum of seconds has no denominator.
+            return denominator > 0 && denominator.isFinite ? "\(Self.plain(numerator)) s (n=\(Self.plain(denominator)))"
+                : "\(Self.plain(numerator)) s"
         case .ratio, .usd, .perUSD, .perHour, .perItem:
             guard denominator > 0, numerator.isFinite, denominator.isFinite else { return "insufficient data (n=0)" }
             let q = numerator / denominator
@@ -201,17 +215,26 @@ public struct MetricValue: Codable, Equatable, Sendable {
 
     /// `38/39` when both are whole, else both with two decimals.
     static func pair(_ n: Double, _ d: Double) -> String {
-        n.isFinite && d.isFinite && n == n.rounded() && d == d.rounded() ? "\(Int(n))/\(Int(d))" : "\(fixed(n, 2))/\(fixed(d, 2))"
+        n.isFinite && d.isFinite && n == n.rounded() && d == d.rounded() ? "\(plain(n))/\(plain(d))" : "\(fixed(n, 2))/\(fixed(d, 2))"
     }
 
-    /// A whole number as an integer, else with up to two decimals (`20.5`, `0.75`). A non-finite number prints `0`: `Int(Double)` traps.
+    /// A whole number without decimals, else with up to two (`20.5`, `0.75`). A non-finite number prints `0`. Whole numbers are
+    /// formatted with `%.0f`, never through `Int(Double)`, which traps at |x| ≥ 2^63 (final review #15).
     static func plain(_ x: Double) -> String {
         guard x.isFinite else { return "0" }
-        if x == x.rounded() { return "\(Int(x))" }
+        if x == x.rounded() { return x == 0 ? "0" : fixed(x, 0) }
         var s = fixed(x, 2)
         while s.hasSuffix("0") { s.removeLast() }
         if s.hasSuffix(".") { s.removeLast() }
         return s
+    }
+
+    /// `x` rounded down to a whole count of events, clamped to `0…Int.max` (a non-finite `x` is 0): never `Int(Double)` on a
+    /// number it cannot hold.
+    static func whole(_ x: Double) -> Int {
+        guard x.isFinite, x > 0 else { return 0 }
+        let down = x.rounded(.down)
+        return down >= 9.2e18 ? Int.max : Int(down)
     }
 
     /// Fixed decimals, always with a `.` (never the process locale); a non-finite number prints `0`.

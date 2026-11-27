@@ -63,11 +63,21 @@ public struct MeasureWindow: Codable, Equatable, Sendable {
 
     public init(since: Date, until: Date) { self.since = since.wholeSeconds; self.until = until.wholeSeconds }
 
-    /// `nil`: the last `defaultDays` days. `all`: since the company was created. `YYYY-MM-DD`: midnight of that day in the owner's
+    /// The last `days` days until `now`, starting at midnight in `tz` (the owner's zone) of the day `days` × 24 h before `now`
+    /// (ruling R44): the window's first instant is the first instant of a daily counter day, so landings, asks and the daily
+    /// counters (`measureCounter`, keyed by the owner's day) cover the same days. The CLI's default and the app's 7 and 28 days.
+    public static func lastDays(_ days: Int, now: Date, tz: TimeZone) -> MeasureWindow {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = tz
+        let until = now.wholeSeconds
+        return MeasureWindow(since: calendar.startOfDay(for: until.addingTimeInterval(-Double(days) * 86_400)), until: until)
+    }
+
+    /// `nil`: the last `defaultDays` days from the owner's midnight (`lastDays`). `all`: since the company was created. `YYYY-MM-DD`: midnight of that day in the owner's
     /// time zone (`ownerSettings.timeZone`). `until` is always `now`.
     public static func parse(_ since: String?, now: Date, companyCreated: Date, tz: TimeZone) throws -> MeasureWindow {
         let until = now.wholeSeconds
-        guard let since else { return MeasureWindow(since: until.addingTimeInterval(-Double(defaultDays) * 86_400), until: until) }
+        guard let since else { return lastDays(defaultDays, now: until, tz: tz) }
         // Given but empty is a mistake, not the default.
         let raw = since.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { throw MeasureError.badSince(since) }

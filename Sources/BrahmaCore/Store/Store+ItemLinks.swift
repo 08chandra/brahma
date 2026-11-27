@@ -105,7 +105,7 @@ extension Store {
     }
 
     /// The company's links of one kind whose `createdAt` falls in the window, oldest first.
-    public func itemLinks(companyId: String, kind: ItemLinkKind, in window: MeasureWindow) throws -> [ItemLink] {
+    func itemLinks(companyId: String, kind: ItemLinkKind, in window: MeasureWindow) throws -> [ItemLink] {
         try writer.read { db in
             try ItemLink.fetchAll(db, sql: """
                 SELECT * FROM workItemLink WHERE companyId = ? AND kind = ? AND createdAt >= ? AND createdAt < ?
@@ -153,7 +153,7 @@ extension Store {
     /// The sum of the company's `name` counter over the days whose calendar day (in `tz`, default the owner's zone) overlaps the
     /// window: the day of `since` through the day of `until`, except that a window ending exactly at midnight does not reach into
     /// that day. Nothing recorded is 0.
-    public func counters(companyId: String, name: String, in window: MeasureWindow, tz: TimeZone? = nil) throws -> Double {
+    func counters(companyId: String, name: String, in window: MeasureWindow, tz: TimeZone? = nil) throws -> Double {
         let zone = tz ?? ownerTimeZone()
         return try writer.read { db in try Self.counterTotal(db, companyId: companyId, name: name, in: window, tz: zone).sum }
     }

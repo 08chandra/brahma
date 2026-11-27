@@ -178,6 +178,41 @@ import GRDB
         #expect(try recorded(m) == accepted.head)
     }
 
+    /// Final review #3 (the C6-4 interim guard): an owner acceptance of `main` — `adoptMain(by: .owner)` and both forms of
+    /// `acceptMainCommit` — is refused in an agent process before anything is read or written: no `mainAccept` row, the record
+    /// unchanged. The engine's own re-affirmation (`.system`) is not an owner write and is not refused.
+    @Test func ownerMainAcceptsRefusedInAgentProcess() throws {
+        let m = try MergeFixture()
+        func acceptRows() throws -> Int {
+            try m.store.writer.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM mainAccept WHERE companyId = ?", arguments: [m.company.id]) ?? 0
+            }
+        }
+        let before = try main(m)
+        let owners = try foreignCommit(m, file: "owner.txt", message: "the owner's commit")
+        try OwnerPrincipal.simulatingAgentProcess { () throws -> Void in
+            #expect(throws: WorkError.forbidden(OwnerPrincipal.refusal)) { try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) }
+            #expect(throws: WorkError.forbidden(OwnerPrincipal.refusal)) { try m.store.adoptMain(companyId: m.company.id, by: .owner, commit: owners, now: m.now) }
+            #expect(throws: WorkError.forbidden(OwnerPrincipal.refusal)) { try m.store.acceptMainCommit(companyId: m.company.id) }
+            #expect(throws: WorkError.forbidden(OwnerPrincipal.refusal)) {
+                try m.store.acceptMainCommit(companyId: m.company.id, ref: "refs/brahma/quarantine/20260101-000000")
+            }
+            // An unknown company is refused the same way: nothing is looked up first.
+            #expect(throws: WorkError.forbidden(OwnerPrincipal.refusal)) { try m.store.acceptMainCommit(companyId: "no-such-company") }
+            #expect(try acceptRows() == 0)
+            #expect(try recorded(m) == before)
+            #expect(try !mergeActivity(m).contains("main adopted at \(owners.prefix(7)) by the owner"))
+        }
+        // Outside an agent process the owner's adopt still works and writes its row.
+        #expect(try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) == owners)
+        #expect(try acceptRows() == 1)
+        // The engine's re-affirmation of the recorded head is not an owner write.
+        try OwnerPrincipal.simulatingAgentProcess { () throws -> Void in
+            #expect(try m.store.adoptMain(companyId: m.company.id, by: .system, now: m.now) == owners)
+        }
+        #expect(try acceptRows() == 1)
+    }
+
     /// Round 2: `brahma main accept` (3a's `acceptMainCommit`) and `adopt-main` share one guard: a symbolic `main`, a `main` that
     /// names no commit and an open merge batch refuse both; the plain accept records the head as an adoption by the owner.
     @Test func mainAcceptSharesTheAdoptGuard() throws {

@@ -10,7 +10,8 @@ public enum ProcessRole: Equatable, Sendable {
     /// generic refusal (`WorkError.forbidden`) in an agent process, before any lookup; silent in an owner's. Called first thing by
     /// the public entry points of the owner decisions (`ownerDecide`, `ownerAnswer`, `ownerRescind`, `acknowledge`), the vouches
     /// (`vouchFile`, `vouchResource`, `vouchItem` takes the token), `purgeResource`, `setResourceScope`, `approveAccess`,
-    /// `provideSecret`, `declineFileRequest` and `answerFileRequest`. The `db:` overloads the engine's own presets use are not guarded.
+    /// `provideSecret`, `declineFileRequest`, `answerFileRequest`, and the owner's acceptances of `main` (`adoptMain(by: .owner)`,
+    /// `acceptMainCommit`; Plan X6a final review #3). The `db:` overloads the engine's own presets use are not guarded.
     public static func refuseInAgentProcess() throws {
         guard OwnerPrincipal.processRole != .agent else { throw WorkError.forbidden(OwnerPrincipal.refusal) }
     }

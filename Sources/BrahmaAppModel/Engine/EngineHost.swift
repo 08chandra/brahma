@@ -61,6 +61,11 @@ public final class EngineHost {
     @ObservationIgnored private let freshProbe: @Sendable (String) async -> DoctorReport
     @ObservationIgnored private let tickInterval: Duration
     @ObservationIgnored private var lock: OrchestratorLock?
+    /// Takes the engine lock with this many busy retries (`OrchestratorLock.acquire`). Internal for tests, which record the
+    /// retries each start asked for.
+    @ObservationIgnored var acquireLock: (BrahmaPaths, Int) throws -> OrchestratorLock = { paths, retries in
+        try OrchestratorLock.acquire(paths: paths, busyRetries: retries)
+    }
     @ObservationIgnored private var engineTask: Task<Void, Never>?
     /// The running orchestrator (its litestream and caffeinate end inside its own bounded shutdown; `stop` only cancels and waits).
     @ObservationIgnored private var engine: Orchestrator?
@@ -103,6 +108,12 @@ public final class EngineHost {
     }
 
     public func start(tools: Result<EngineTools, EngineSetupError>) async {
+        await start(tools: tools, lockRetries: OrchestratorLock.busyRetries)
+    }
+
+    /// `lockRetries`: the lock's busy retries (5 × 20 ms at launch). The takeover poll passes 0: it runs on the main actor
+    /// about every 5 s, so a held lock is refused at once and the next poll tries again (final review #5).
+    private func start(tools: Result<EngineTools, EngineSetupError>, lockRetries: Int) async {
         guard status != .embedded else { return }
         rememberedTools = tools
         // Owner CLI commands are default-deny without a verified owner key; only the app and `brahma owner init` create it.
@@ -123,7 +134,7 @@ public final class EngineHost {
         }
         let acquired: OrchestratorLock
         do {
-            acquired = try OrchestratorLock.acquire(paths: paths)
+            acquired = try acquireLock(paths, lockRetries)
         } catch OrchestratorLockError.alreadyRunning {
             status = .external
             return
@@ -162,7 +173,7 @@ public final class EngineHost {
     /// Re-attempts the lock while a terminal `brahma run` holds it.
     public func retryTakeover() async {
         guard status == .external, let tools = rememberedTools else { return }
-        await start(tools: tools)
+        await start(tools: tools, lockRetries: 0)
     }
 
     /// How long `stop` waits for the engine by default: the engine bounds its own shutdown at `EngineShutdown.bound` (litestream

@@ -112,6 +112,30 @@ private let passingReport = DoctorReport(cliVersion: "2.1.306", items: [DoctorIt
         await h2.stop()
     }
 
+    /// Final review #5: the takeover poll (`retryTakeover`, every ~5 s on the main actor) tries the lock once, with no busy
+    /// retries, so a held lock never stalls the main actor for the 5 × 20 ms the launch's retries take; the launch keeps them.
+    @Test func takeoverPollDoesNotRetryTheLock() async throws {
+        let (store, paths) = try makeHome()
+        let h1 = host(paths, store), h2 = host(paths, store)
+        var asked: [Int] = []
+        h2.acquireLock = { paths, retries in
+            asked.append(retries)
+            return try OrchestratorLock.acquire(paths: paths, busyRetries: retries)
+        }
+        await h1.start(tools: tools)
+        await h2.start(tools: tools)
+        #expect(h2.status == .external)
+        let started = AwakeTime.uptime()
+        await h2.retryTakeover()
+        #expect(h2.status == .external)
+        #expect(AwakeTime.uptime() - started < 5, "hang guard")
+        await h1.stop()
+        await h2.retryTakeover()
+        #expect(h2.status == .embedded)
+        #expect(asked == [OrchestratorLock.busyRetries, 0, 0], "\(asked)")
+        await h2.stop()
+    }
+
     @Test func stopInterruptsTurnAndReturnsAgentReady() async throws {
         let (store, paths) = try makeHome()
         let (acme, ceo, _, _) = try seedAcme(store, paths)

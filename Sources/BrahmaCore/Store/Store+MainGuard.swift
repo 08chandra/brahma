@@ -83,6 +83,8 @@ extension Store {
     /// `adoptMain`, its refusals worded for the command the owner ran (`adopt` for `brahma merge adopt-main`, `accept` for
     /// `brahma main accept`): the rules are the same, only the verb differs (N5).
     func adoptMain(companyId: String, by sender: Sender, commit: String?, now: Date, command: String) throws -> String {
+        // Ruling C6-4 (final review #3): the owner's acceptance writes a `mainAccept` record; never from an agent process.
+        if sender == .owner { try ProcessRole.refuseInAgentProcess() }
         if case .agent = sender { throw WorkError.forbidden("only the owner can adopt main") }
         guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
         let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
@@ -201,6 +203,7 @@ extension Store {
     ///   quarantine that is already merged changes nothing (`alreadyMerged`).
     @discardableResult
     public func acceptMainCommit(companyId: String, ref: String? = nil, note: String? = nil) throws -> MainAcceptance {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process (final review #3)
         guard let company = try company(id: companyId) else { throw WorkError.notFound("no such company") }
         let git = gitWorkspace(root: URL(fileURLWithPath: company.workspacePath, isDirectory: true), companyId: company.id)
         guard let ref else {

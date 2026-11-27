@@ -37,13 +37,18 @@ public enum UsageMetrics {
             let n = Double(rows.count)
             let cost = rows.reduce(0) { $0 + $1.costLE }, reviewCost = rows.reduce(0) { $0 + $1.reviewCostLE }
             let turns = rows.reduce(0) { $0 + Double($1.turnsUsed) }, tokens = rows.reduce(0) { $0 + Double($1.tokensUsed) }
-            let awake = rows.reduce(0) { $0 + Double($1.cycleActiveSeconds ?? 0) }
-            let neverClaimed = rows.filter { $0.cycleActiveSeconds == nil }.count
+            // A never-claimed item has no awake time: it is left out of this leg's denominator, never counted as 0.
+            let claimed = rows.compactMap(\.cycleActiveSeconds)
+            let awake = claimed.reduce(0) { $0 + Double($1) }
+            let neverClaimed = rows.count - claimed.count
             var basis = "$LE (subscription): Σ itemFact.costLE of the landed items in the window with an item fact (\(rows.count)) ÷ "
                 + "those items; review $LE shown beside it; one denominator for every leg; $ (gateway) not applicable (\(gatewayAbsent))"
             basis += excludedWithoutFact(landed.count - rows.count)
-            var awakeBasis = "Σ itemFact.cycleActiveSeconds (company-active seconds from first claim to completion) ÷ the same items"
-            if neverClaimed > 0 { awakeBasis += "; \(LandingMetrics.plural(neverClaimed, "item")) never claimed contribute 0" }
+            var awakeBasis = "Σ itemFact.cycleActiveSeconds (company-active seconds from first claim to completion) ÷ the same items "
+                + "with an awake time recorded (\(claimed.count))"
+            if neverClaimed > 0 {
+                awakeBasis += "; \(LandingMetrics.plural(neverClaimed, "item")) never claimed (no awake time recorded) excluded"
+            }
             let detail: [MetricValue] = [
                 .rate(.usagePerLanded, label: "$LE (subscription)", numerator: cost, denominator: n, unit: .usd,
                       basis: "Σ itemFact.costLE (the item's counted work turns) ÷ landed items with a fact"),
@@ -54,7 +59,8 @@ public enum UsageMetrics {
                       basis: "Σ itemFact.turnsUsed (work turns; infra failures and session resets excluded) ÷ the same items"),
                 .rate(.usagePerLanded, label: "tokens", numerator: tokens, denominator: n, unit: .perItem,
                       basis: "Σ itemFact.tokensUsed (input + output + cache creation; ultra turns and cache reads excluded) ÷ the same items"),
-                .rate(.usagePerLanded, label: "awake seconds", numerator: awake, denominator: n, unit: .perItem, basis: awakeBasis),
+                .rate(.usagePerLanded, label: "awake seconds", numerator: awake, denominator: Double(claimed.count), unit: .perItem,
+                      basis: awakeBasis),
             ]
             return .rate(.usagePerLanded, numerator: cost, denominator: n, unit: .usd, basis: basis, detail: detail)
         }
@@ -210,7 +216,8 @@ public enum UsageMetrics {
             let idle = try seconds(MeasureCounter.idleActionableSeconds)
             var basis = "company-active seconds with no running turn while an agent waited on usage (blocked by the five-hour gate, or "
                 + "ready but held by the weekly pace or the owner reserve) ÷ company-active seconds, from the recorder's daily counters "
-                + "; n = days with active-seconds records (\(active.rows)); cap closures (X1) absent"
+                + "; n = days with active-seconds records (\(active.rows)); cap closures (X1) absent; a tick whose scheduling failed after "
+                + "its active seconds were counted records no idle seconds for that tick (an under-count of idle, never an over-count)"
             basis += try recordedSince(db, companyId: ctx.companyId, window: ctx.window, tz: tz)
             let detail: [MetricValue] = [
                 .seconds(.idleActionable, label: "five-hour gate", try seconds(MeasureCounter.idleUsageLimitSeconds),
@@ -281,8 +288,9 @@ public enum UsageMetrics {
 
     // MARK: Owner minutes
 
-    /// Σ the owner's logged minutes in the window ÷ landed items in the window. A count of the owner's own log: never
-    /// insufficient; with no log in the window, not measured.
+    /// Σ the owner's logged minutes in the window ÷ landed items in the window: a rate under the 20-event rule with n = the
+    /// landed items (rulings R19, R44), so fewer than 20 landed items is `insufficient data (n=…)`; the logged minutes stay in
+    /// the detail. With no log in the window, not measured.
     public static func ownerMinutes(_ ctx: MeasureContext) throws -> MetricValue {
         let tz = ctx.store.ownerTimeZone()
         return try ctx.store.writer.read { db in
@@ -297,10 +305,9 @@ public enum UsageMetrics {
                        basis: "owner-logged minutes on \(LandingMetrics.plural(logged.rows, "day")) of the window"),
             ]
             let basis = "owner-logged minutes in the window (\(MetricValue.plain(minutes))) ÷ landed items in the window (\(landed.count)); "
-                + "a count of the owner's own log, never insufficient; \(source)"
+                + "n = the landed items (insufficient below \(MetricValue.minEvents)); \(source)"
             guard !landed.isEmpty else { return .notMeasured(.ownerMinutes, reason: noLandings, basis: basis, detail: detail) }
-            return MetricValue(id: .ownerMinutes, label: MetricId.ownerMinutes.label, numerator: minutes, denominator: Double(landed.count),
-                               unit: .perItem, basis: basis, detail: detail, status: .ok)
+            return .rate(.ownerMinutes, numerator: minutes, denominator: Double(landed.count), unit: .perItem, basis: basis, detail: detail)
         }
     }
 

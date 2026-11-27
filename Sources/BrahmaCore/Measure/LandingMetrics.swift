@@ -39,8 +39,8 @@ public enum LandingMetrics {
                 if verdict.reasons.isEmpty {
                     green += 1
                 } else {
-                    // One row per non-green landing; its value is that one landing.
-                    detail.append(.count(.greenMain, label: "M-\(landing.number): \(verdict.reasons.joined(separator: "; "))", 1,
+                    // One row per non-green landing; its value is that one landing. `B-<n>` is the batch, as everywhere in measure.
+                    detail.append(.count(.greenMain, label: "B-\(landing.number): \(verdict.reasons.joined(separator: "; "))", 1,
                                          basis: "not green; landed \(landing.landCommit.prefix(7)) at \(MeasureReport.iso(landing.finishedAt))"))
                 }
             }
@@ -177,7 +177,8 @@ public enum LandingMetrics {
         }
     }
 
-    /// Approval → land, median and p95, as two `seconds` rows; `not measured` with no merged request.
+    /// Approval → land, median and p95, as two `duration` rows carrying their n: `insufficient data (n=…)` below
+    /// `MetricValue.minEvents` requests (ruling R44); `not measured` with no merged request.
     static func durations(_ db: Database, ctx: MeasureContext, landed: [(item: LandedItem, landedAt: Date)]) throws -> [MetricValue] {
         guard !landed.isEmpty else {
             return [.notMeasured(.queueHealth, label: "approval → land", reason: "no merged requests in the window")]
@@ -206,8 +207,8 @@ public enum LandingMetrics {
             + "landing (mergeRequest.finishedAt, else the batch's); n=\(seconds.count)"
         if excluded > 0 { basis += "; \(excluded) excluded (enqueued after the landing or no enqueue time)" }
         return [
-            .seconds(.queueHealth, label: "approval → land, median", median(seconds), basis: basis),
-            .seconds(.queueHealth, label: "approval → land, p95", nearestRank(seconds, 0.95), basis: basis),
+            .duration(.queueHealth, label: "approval → land, median", median(seconds), n: seconds.count, basis: basis),
+            .duration(.queueHealth, label: "approval → land, p95", nearestRank(seconds, 0.95), n: seconds.count, basis: basis),
         ]
     }
 

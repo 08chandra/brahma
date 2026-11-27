@@ -45,6 +45,20 @@ import Foundation
     withExtendedLifetime(first) {}
 }
 
+/// Final review #5: a caller that polls (the app's takeover check, every ~5 s on the main actor) asks with no retries, so a held
+/// lock is refused at once instead of stalling its caller for the 5 × 20 ms the retries take.
+@Test(.scratch) func noRetryAcquireRefusesAtOnce() throws {
+    let root = try tempDir()
+    let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+    let first = try OrchestratorLock.acquire(paths: paths)
+    #expect(OrchestratorLock.busyRetries == 5)
+    let started = AwakeTime.uptime()
+    #expect(throws: OrchestratorLockError.alreadyRunning) { _ = try OrchestratorLock.acquire(paths: paths, busyRetries: 0) }
+    let waited = AwakeTime.uptime() - started
+    #expect(waited < 0.09, "refused after \(waited) s; the retries would take 0.1 s")
+    withExtendedLifetime(first) {}
+}
+
 /// The flake behind `secondOrchestratorLockFailsUntilFirstIsReleased` under load: while another thread of this process is
 /// spawning a child, the child briefly holds a copy of every descriptor (`O_CLOEXEC` ones too, until its exec closes them),
 /// so a lock that was only `close`d stayed held by that copy and the very next acquire saw `.alreadyRunning`. Releasing

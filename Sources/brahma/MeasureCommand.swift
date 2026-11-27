@@ -10,7 +10,8 @@ import BrahmaCore
 /// verified, owner-accepted or imported, 1 otherwise.
 /// Task 7: `--mission` (the mission subset), `--compare <baseline>` (the single-agent baseline side by side, ruling R7(e)),
 /// `--soak-checkpoint <file>` and `--soak-verify <file>` (the soak harness; `scripts/soak/run-72h.sh` runs them). The modes are
-/// exclusive (`--mission --compare` excepted); a combination is refused with exit 2.
+/// exclusive (`--mission --compare` excepted); a combination is refused with exit 2. `--print-day` prints today in the owner's
+/// time zone, the day `--since` reads (the soak script records its start day with it).
 struct MeasureCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "measure",
@@ -41,9 +42,12 @@ struct MeasureCommand: ParsableCommand {
     @Option(name: .customLong("soak-verify"),
             help: "Soak harness: judge the company now against the checkpoint in <file>: exit 0 pass, 1 fail, 3 wait (the engine is not running or has not settled), 2 could not verify.")
     var soakVerify: String?
+    @Flag(name: .customLong("print-day"),
+          help: "Print today's date (YYYY-MM-DD) in your time zone, the zone --since reads, and nothing else.")
+    var printDay = false
 
     /// The audit and the soak modes say "could not run" with exit 2 (ruling R38): their exit 1 means unverified or failed.
-    var exitTwoMode: Bool { verifyLandings || soakCheckpoint != nil || soakVerify != nil }
+    var exitTwoMode: Bool { verifyLandings || soakCheckpoint != nil || soakVerify != nil || printDay }
 
     func run() throws {
         // Combinations are refused before anything is read or written.
@@ -81,6 +85,10 @@ struct MeasureCommand: ParsableCommand {
             return
         }
         guard day == nil else { throw fail("--day is only for --log-owner-minutes") }
+        if printDay {
+            print(Store.measureDay(now, in: store.ownerTimeZone()))
+            return
+        }
         if verifyLandings { return try audit(store, c, paths: paths, now: now) }
         if let file = soakCheckpoint { return try checkpoint(store, c, paths: paths, file: file, now: now) }
         if let file = soakVerify { return try soak(store, c, paths: paths, file: file, now: now) }
@@ -117,6 +125,7 @@ struct MeasureCommand: ParsableCommand {
         if soakVerify != nil { modes.append("--soak-verify") }
         if mission { modes.append("--mission") }
         if compare != nil { modes.append("--compare") }
+        if printDay { modes.append("--print-day") }
         if modes.count > 1, Set(modes) != ["--mission", "--compare"] {
             if verifyLandings, logOwnerMinutes != nil, modes.count == 2 {
                 return "--verify-landings is a read-only audit; it takes no --log-owner-minutes or --day"
@@ -129,6 +138,7 @@ struct MeasureCommand: ParsableCommand {
         }
         if soakVerify != nil, since != nil || day != nil { return "--soak-verify judges the company now; it takes no --since or --day" }
         if mission || compare != nil, day != nil { return "--day is only for --log-owner-minutes" }
+        if printDay, since != nil || format != nil || day != nil { return "--print-day prints one date; it takes no --since, --format or --day" }
         return nil
     }
 }

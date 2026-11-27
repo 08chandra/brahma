@@ -53,31 +53,48 @@ public enum ReviewMetrics {
     /// The items with a confirmed catch whose confirming check finished in the window, and the change requests made in the
     /// window that no resubmission and passing check has confirmed.
     static func catches(_ db: Database, ctx: MeasureContext) throws -> (caught: Int, unconfirmed: Int) {
-        let rows = try Row.fetchAll(db, sql: """
-            SELECT id, itemId, kind, createdAt FROM workItemEvent
-            WHERE companyId = ? AND kind IN ('changesRequested', 'submitted') AND createdAt < ?
-            ORDER BY itemId, createdAt, id
-            """, arguments: [ctx.companyId, ctx.window.until])
+        let found = try confirmedCatches(db, companyId: ctx.companyId, itemIds: nil, window: ctx.window)
+        return (found.caught.count, found.unconfirmed)
+    }
+
+    /// The one confirmed-catch rule (metrics.md vocabulary), shared by the review catch rate and model ranking's reviewer rows
+    /// (final review #9). Every `changesRequested` event created before `window.until` is a round; the round is confirmed by
+    /// the earliest passing check of the item (`passingChecks`, any time) that finished after the next `submitted` event. An
+    /// item is caught, once, when one of its rounds was confirmed in the window; a round requested in the window with no
+    /// resubmission and passing check is unconfirmed. `itemIds` nil reads every item of the company. The review catch rate
+    /// passes its own window; model ranking passes everything up to the report's end, because a catch confirmed before the
+    /// window began still says something about a reviewer whose item landed in it.
+    static func confirmedCatches(_ db: Database, companyId: String, itemIds: [String]?, window: MeasureWindow) throws
+        -> (caught: Set<String>, unconfirmed: Int) {
         var events: [String: [(requested: Bool, at: Date)]] = [:]
-        for row in rows {
-            events[row["itemId"] as String, default: []].append((requested: (row["kind"] as String) == WorkEventKind.changesRequested.rawValue,
-                                                                 at: row["createdAt"] as Date))
+        let select = """
+            SELECT itemId, kind, createdAt FROM workItemEvent
+            WHERE companyId = ? AND kind IN ('changesRequested', 'submitted') AND createdAt < ?
+            """
+        func collect(_ sql: String, _ arguments: StatementArguments) throws {
+            for row in try Row.fetchAll(db, sql: sql + " ORDER BY itemId, createdAt, id", arguments: arguments) {
+                events[row["itemId"] as String, default: []].append(
+                    (requested: (row["kind"] as String) == WorkEventKind.changesRequested.rawValue, at: row["createdAt"] as Date))
+            }
         }
-        let itemIds = events.filter { $0.value.contains { $0.requested } }.keys.sorted()
-        let passed = try passingChecks(db, companyId: ctx.companyId, itemIds: itemIds)
-        var caught = 0, unconfirmed = 0
-        for itemId in itemIds {
-            guard let sequence = events[itemId] else { continue }
-            var counted = false
+        if let itemIds {
+            for chunk in LandingMetrics.chunks(itemIds) {
+                let marks = chunk.map { _ in "?" }.joined(separator: ", ")
+                try collect(select + " AND itemId IN (\(marks))", [companyId, window.until] + StatementArguments(chunk))
+            }
+        } else {
+            try collect(select, [companyId, window.until])
+        }
+        let candidates = events.filter { $0.value.contains { $0.requested } }.keys.sorted()
+        let passed = try passingChecks(db, companyId: companyId, itemIds: candidates)
+        var caught: Set<String> = [], unconfirmed = 0
+        for itemId in candidates {
+            let sequence = events[itemId, default: []]
             for (i, event) in sequence.enumerated() where event.requested {
                 let resubmitted = sequence[(i + 1)...].first { !$0.requested }
-                let confirmed = resubmitted.flatMap { s in passed[itemId, default: []].filter { $0 > s.at }.min() }
-                if let confirmed {
-                    if !counted, confirmed >= ctx.window.since, confirmed < ctx.window.until {
-                        caught += 1
-                        counted = true
-                    }
-                } else if event.at >= ctx.window.since {
+                if let confirmed = resubmitted.flatMap({ s in passed[itemId, default: []].filter { $0 > s.at }.min() }) {
+                    if confirmed >= window.since, confirmed < window.until { caught.insert(itemId) }
+                } else if event.at >= window.since {
                     unconfirmed += 1
                 }
             }

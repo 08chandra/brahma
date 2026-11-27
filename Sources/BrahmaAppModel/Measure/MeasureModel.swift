@@ -111,7 +111,8 @@ public final class MeasureModel {
         guard let company = try store.company(id: companyId) else { throw MeasureError.unknownCompany(companyId) }
         let window: MeasureWindow
         switch span {
-        case .days7: window = MeasureWindow(since: now.addingTimeInterval(-7 * 86_400), until: now)
+        // Both spans start at the owner's midnight (ruling R44), as the CLI's default does.
+        case .days7: window = MeasureWindow.lastDays(7, now: now, tz: store.ownerTimeZone())
         case .days28: window = try MeasureWindow.parse(nil, now: now, companyCreated: company.createdAt, tz: store.ownerTimeZone())
         case .all: window = try MeasureWindow.parse("all", now: now, companyCreated: company.createdAt, tz: store.ownerTimeZone())
         }
@@ -142,23 +143,34 @@ public final class MeasureModel {
         await load()
     }
 
-    /// A work or usage change (ruling R43): measures at once when the last run started at least `throttle.interval` ago, else
-    /// queues one run for the end of the interval (a run already queued absorbs this change).
+    /// A work or usage change (ruling R43): a run already queued absorbs this change; else it measures at once when the last
+    /// run started at least `throttle.interval` ago, else queues one run for the end of the interval.
     public func changed() {
         guard companyId != nil else { return }
+        // Checked first: the queued run measures this change; measuring now as well would be a second run (final review #4(b)).
+        guard delayed == nil else { return }
         let now = throttle.uptime()
         guard let last = lastMeasured, now - last < throttle.interval else {
             Task { await load() }
             return
         }
-        guard delayed == nil else { return }
         let (wait, sleep) = (throttle.interval - (now - last), throttle.sleep)
         delayed = Task { [weak self] in
-            do { try await sleep(wait) } catch { return }   // cancelled: another company was shown
-            guard let self else { return }
+            do { try await sleep(wait) } catch { return }   // cancelled: another company was shown, or a run measured first
+            // A sleep that did not end on cancellation still never measures for a cancelled queue (final review #4(c)).
+            guard !Task.isCancelled, let self else { return }
             self.delayed = nil
             await self.load()
         }
+    }
+
+    /// Stops the run in flight and the queued run (`AppModel.reopenStore`: the store they read is being replaced). Nothing they
+    /// would have shown arrives later; a cancelled run is not an error.
+    public func cancel() {
+        current?.task.cancel()
+        delayed?.cancel()
+        delayed = nil
+        reloadPending = false
     }
 
     /// Measures the shown company over the shown window now (Refresh), off the main actor. A load of the same company and window
@@ -172,6 +184,9 @@ public final class MeasureModel {
             return
         }
         current?.task.cancel()
+        // This run measures now: the queued one has nothing left to measure (final review #4(a); Refresh absorbs it).
+        delayed?.cancel()
+        delayed = nil
         reloadPending = false
         generation += 1
         let mine = generation

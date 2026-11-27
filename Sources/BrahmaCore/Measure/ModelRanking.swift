@@ -43,7 +43,9 @@ extension UsageMetrics {
             let firstSubmit = try firstSubmits(db, companyId: ctx.companyId, itemIds: itemIds)
             let reviews = try turnModels(db, companyId: ctx.companyId, itemIds: itemIds, kind: .review)
             let reviewers = try reviewerFallback(db, companyId: ctx.companyId, itemIds: itemIds, agents: agents)
-            let caught = try confirmedCatches(db, companyId: ctx.companyId, itemIds: itemIds, until: ctx.window.until)
+            // The one confirmed-catch rule (`ReviewMetrics.confirmedCatches`), confirmed any time up to the window's end.
+            let caught = try ReviewMetrics.confirmedCatches(db, companyId: ctx.companyId, itemIds: itemIds,
+                                                            window: MeasureWindow(since: .distantPast, until: ctx.window.until)).caught
             let escaped = Set(try ReviewMetrics.escapes(db, companyId: ctx.companyId, landed: landed).map(\.target.itemId))
 
             var owned: [Pair: [Fact]] = [:]
@@ -51,6 +53,8 @@ extension UsageMetrics {
             var reviewed: [Pair: (caught: Int, escaped: Int)] = [:]
             var reviewNoMajority = 0
             for itemId in itemIds {
+                // A run the app cancelled (another company or window) stops here, not after the whole scan.
+                if Task.isCancelled { throw CancellationError() }
                 guard let fact = facts[itemId] else { continue }
                 if let ownerId = fact.ownerId, let owner = agents[ownerId] {
                     switch attribute(work[itemId, default: []].map(\.models), agentModel: owner.model) {
@@ -208,33 +212,5 @@ extension UsageMetrics {
             }
         }
         return out
-    }
-
-    /// The items with a confirmed catch (metrics.md vocabulary: a `changesRequested`, a later `submitted`, then a passing check of
-    /// the item after it), whenever up to `until`.
-    static func confirmedCatches(_ db: Database, companyId: String, itemIds: [String], until: Date) throws -> Set<String> {
-        var events: [String: [(requested: Bool, at: Date)]] = [:]
-        for chunk in LandingMetrics.chunks(itemIds) {
-            let marks = chunk.map { _ in "?" }.joined(separator: ", ")
-            for row in try Row.fetchAll(db, sql: """
-                SELECT itemId, kind, createdAt FROM workItemEvent
-                WHERE companyId = ? AND kind IN ('changesRequested', 'submitted') AND createdAt < ? AND itemId IN (\(marks))
-                ORDER BY createdAt, id
-                """, arguments: [companyId, until] + StatementArguments(chunk)) {
-                events[row["itemId"] as String, default: []].append(
-                    (requested: (row["kind"] as String) == WorkEventKind.changesRequested.rawValue, at: row["createdAt"] as Date))
-            }
-        }
-        let candidates = events.filter { $0.value.contains { $0.requested } }.keys.sorted()
-        let passed = try ReviewMetrics.passingChecks(db, companyId: companyId, itemIds: candidates)
-        var caught: Set<String> = []
-        for itemId in candidates {
-            let sequence = events[itemId, default: []]
-            for (i, event) in sequence.enumerated() where event.requested {
-                guard let resubmitted = sequence[(i + 1)...].first(where: { !$0.requested }) else { continue }
-                if passed[itemId, default: []].contains(where: { $0 > resubmitted.at && $0 < until }) { caught.insert(itemId); break }
-            }
-        }
-        return caught
     }
 }

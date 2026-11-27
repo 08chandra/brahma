@@ -69,6 +69,26 @@ import GRDB
                 == .notMeasured(reason: "no item facts for the landed items in the window"))
     }
 
+    /// Final review #7: a never-claimed item has no awake time (`cycleActiveSeconds` null). It is left out of the awake-seconds
+    /// row's denominator, never counted as 0, and the basis says how many; the other legs keep every item with a fact.
+    @Test func awakeSecondsExcludeNeverClaimed() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.seed(store, name: "Acme", landed: 24, now: t0)   // 600 s each
+        try store.writer.write { db in
+            try db.execute(sql: """
+                UPDATE itemFact SET cycleActiveSeconds = NULL
+                WHERE companyId = ? AND itemId IN (SELECT itemId FROM itemFact WHERE companyId = ? ORDER BY itemId LIMIT 4)
+                """, arguments: [acme.id, acme.id])
+        }
+        let m = try UsageMetrics.usagePerLanded(try ctx(store, acme))
+        #expect(m.denominator == 24)
+        #expect(try row(m, "turns").denominator == 24)
+        let awake = try row(m, "awake seconds")
+        #expect(awake.numerator == 12_000 && awake.denominator == 20, "\(awake)")
+        #expect(awake.status == .ok && awake.display == "600.00 per landed item (12000/20)", "\(awake.display)")
+        #expect(awake.basis.contains("4 items never claimed (no awake time recorded) excluded"), "\(awake.basis)")
+    }
+
     /// Ruling R4: X1's metered columns do not exist, so no turn is a gateway turn. Every gateway leg (usage, items per dollar,
     /// model ranking's routed model) says `not applicable: X1 gateway columns absent` with that basis; a turn's own costUSD never
     /// becomes a gateway dollar.
@@ -284,6 +304,43 @@ import GRDB
         #expect(m.detail.allSatisfy { !$0.label.contains("Item ") })
     }
 
+    /// Final review #4(e): model ranking walks every landed item; a cancelled run (the app left the company or window) stops in
+    /// that loop with `CancellationError`, never finishes the scan.
+    @Test func modelRankingStopsWhenCancelled() async throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.seed(store, name: "Acme", landed: 3, now: t0)
+        let c = try ctx(store, acme)
+        let task = Task.detached { () throws -> MetricValue in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try UsageMetrics.modelRanking(c)
+        }
+        await #expect(throws: CancellationError.self) { try await task.value }
+    }
+
+    /// Final review #9: the reviewer row counts a confirmed catch whenever it was confirmed up to the window's end, even before
+    /// the window began (the item landed in the window); the review catch rate counts only catches confirmed in the window.
+    /// One confirmed-catch rule serves both.
+    @Test func reviewerCatchesUseOneRuleWithTheirOwnWindow() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme", createdAt: t0.addingTimeInterval(-30 * day))
+        let eng = try MeasureFixtures.agent(store, company: acme, name: "eng", role: "engineer", model: "sonnet")
+        let rev = try MeasureFixtures.agent(store, company: acme, name: "rev", role: "reviewer", model: "opus")
+        let item = try MeasureFixtures.items(store, company: acme, count: 1, now: t0.addingTimeInterval(-20 * day))[0]
+        let at = t0.addingTimeInterval(-15 * day)
+        try MeasureFixtures.event(store, item: item, kind: .changesRequested, at: at, actor: rev.id)
+        try MeasureFixtures.event(store, item: item, kind: .submitted, at: at.addingTimeInterval(100), actor: eng.id)
+        try MeasureFixtures.verificationRun(store, company: acme, item: item, finishedAt: at.addingTimeInterval(200))
+        try MeasureFixtures.landEach(store, company: acme, items: [item], at: [t0.addingTimeInterval(-4 * day)])
+        try MeasureFixtures.fact(store, item: item, ownerId: eng.id, reviewerId: rev.id)
+        let c = try ctx(store, acme, since: t0.addingTimeInterval(-10 * day))
+        let ranking = try UsageMetrics.modelRanking(c)
+        let catchRate = try #require(try row(ranking, "reviewer · opus").detail.first { $0.label == "review catch (as reviewer)" })
+        #expect(catchRate.numerator == 1 && catchRate.denominator == 1, "\(catchRate)")
+        let review = try ReviewMetrics.reviewCatch(c)
+        #expect(try row(review, "confirmed catches").numerator == 0, "confirmed before the window began")
+        #expect(try ReviewMetrics.reviewCatch(try ctx(store, acme)).detail.first { $0.label == "confirmed catches" }?.numerator == 1)
+    }
+
     /// An agent whose model is not one of the three families is ranked under that model (as a safe token); an `auto` agent with no
     /// turn naming a model is excluded with that reason, never "no model recorded".
     @Test func modelRankingUnknownAndAutoModels() throws {
@@ -378,6 +435,9 @@ import GRDB
         // Ruling R32: n is the days with an active-seconds record, not seconds.
         #expect(idle.status == .insufficient(n: 1) && idle.numerator == 250 && idle.denominator == 1000 && idle.unit == .ratio)
         #expect(idle.basis.contains("n = days with active-seconds records (1)"), "\(idle.basis)")
+        // Final review #11: the one known under-count is stated.
+        #expect(idle.basis.contains("a tick whose scheduling failed after its active seconds were counted records no idle seconds"),
+                "\(idle.basis)")
         #expect(try row(idle, "five-hour gate").numerator == 200)
         #expect(try row(idle, "weekly pace").numerator == 50)
         #expect(try row(idle, "owner reserve").numerator == 0)
@@ -448,7 +508,8 @@ import GRDB
         #expect(m.display == "not measured: no owner-time records")
     }
 
-    /// Σ ownerInterventionSeconds ÷ 60 ÷ landed items in the window. A count, never insufficient: 5 landed items still show.
+    /// Σ ownerInterventionSeconds ÷ 60 ÷ landed items in the window: a rate under the 20-event rule, n = landed items (ruling R44);
+    /// 5 landed items are `insufficient data (n=5)`, with the logged minutes still shown in the detail.
     @Test func ownerMinutesPerItemFromLog() throws {
         let store = try Store.inMemory()
         let acme = try MeasureFixtures.seed(store, name: "Acme", landed: 30, now: t0)
@@ -465,7 +526,15 @@ import GRDB
         let small = try MeasureFixtures.seed(store, name: "Small", landed: 5, now: t0)
         try store.logOwnerMinutes(companyId: small.id, minutes: 10, day: Store.measureDay(t0.addingTimeInterval(-day), in: Self.utc), owner: try OwnerPrincipal.mint())
         let few = try UsageMetrics.ownerMinutes(try ctx(store, small, since: t0.addingTimeInterval(-10 * day)))
-        #expect(few.status == .ok && few.display == "2.00 per landed item (10/5)")
+        #expect(few.status == .insufficient(n: 5) && few.display == "insufficient data (n=5)", "\(few.display)")
+        #expect(few.numerator == 10 && few.denominator == 5)
+        #expect(try row(few, "owner minutes logged").numerator == 10)
+        #expect(try row(few, "owner minutes logged").display == "10")
+        // Exactly twenty landed items: measured.
+        let twenty = try MeasureFixtures.seed(store, name: "Twenty", landed: 20, now: t0)
+        try store.logOwnerMinutes(companyId: twenty.id, minutes: 30, day: Store.measureDay(t0.addingTimeInterval(-day), in: Self.utc), owner: try OwnerPrincipal.mint())
+        let enough = try UsageMetrics.ownerMinutes(try ctx(store, twenty, since: t0.addingTimeInterval(-10 * day)))
+        #expect(enough.status == .ok && enough.display == "1.50 per landed item (30/20)", "\(enough.display)")
         // Logged minutes with no landing: not measured, the minutes shown in the detail.
         let idle = try MeasureFixtures.company(store, name: "Idle", createdAt: t0.addingTimeInterval(-30 * day))
         try store.logOwnerMinutes(companyId: idle.id, minutes: 20, day: Store.measureDay(t0.addingTimeInterval(-day), in: Self.utc), owner: try OwnerPrincipal.mint())

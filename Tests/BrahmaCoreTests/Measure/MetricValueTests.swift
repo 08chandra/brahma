@@ -75,11 +75,44 @@ import Testing
             #expect(MetricValue.rate(.greenMain, numerator: 30, denominator: bad, unit: .ratio, basis: "").display == "insufficient data (n=0)")
             #expect(MetricValue.rate(.itemsPerDollar, numerator: bad, denominator: 40, unit: .perUSD, basis: "").display == "insufficient data (n=0)")
             #expect(MetricValue.count(.safety, label: "x", bad, basis: "").display == "0")
-            #expect(MetricValue.count(.safety, label: "x", 2, basis: "", target: bad).display == "2 (target 0)")
+            // A target that is not a number is not shown: printing it as 0 would state a target nobody set.
+            #expect(MetricValue.count(.safety, label: "x", 2, basis: "", target: bad).display == "2")
             #expect(MetricValue.seconds(.queueHealth, label: "x", bad, basis: "").display == "0 s")
             let forced = MetricValue(id: .greenMain, label: "x", numerator: bad, denominator: bad, unit: .ratio, basis: "", status: .ok)
             #expect(forced.display == "insufficient data (n=0)")
         }
+    }
+
+    /// Final review #15: `Int(Double)` traps at |x| ≥ 2^63, so a huge (but finite) number is printed with `%.0f`, never converted.
+    @Test func hugeNumbersNeverTrap() throws {
+        let huge = 1e19
+        #expect(MetricValue.count(.safety, label: "x", huge, basis: "").display == "10000000000000000000")
+        #expect(MetricValue.count(.safety, label: "x", -huge, basis: "").display == "-10000000000000000000")
+        #expect(MetricValue.count(.safety, label: "x", 0, basis: "", target: huge).display == "0 (target 10000000000000000000)")
+        #expect(MetricValue.count(.safety, label: "x", 0, basis: "", target: .nan).display == "0")
+        #expect(MetricValue.seconds(.queueHealth, label: "x", huge, basis: "").display == "10000000000000000000 s")
+        let ratio = MetricValue.rate(.greenMain, numerator: huge, denominator: huge, unit: .ratio, basis: "")
+        #expect(ratio.status == .ok)
+        #expect(ratio.display == "100.0% (10000000000000000000/10000000000000000000)")
+        let perItem = MetricValue.rate(.ownerTouches, numerator: huge, denominator: 40, unit: .perItem, basis: "")
+        #expect(perItem.display.hasSuffix("(10000000000000000000/40)"), "\(perItem.display)")
+        // The inverted units count the numerator as events: a huge count is clamped, never trapped on.
+        let perUSD = MetricValue.rate(.itemsPerDollar, numerator: huge, denominator: 2, unit: .perUSD, basis: "")
+        #expect(perUSD.status == .ok)
+        #expect(perUSD.display.hasSuffix("(10000000000000000000/2.00)"), "\(perUSD.display)")
+        #expect(MetricValue.rate(.itemsPerDollar, numerator: 3, denominator: 2, unit: .perUSD, basis: "", events: Int.max).status == .ok)
+    }
+
+    /// Final review #2 (ruling R44): a duration over requests is shown with its n, and below `minEvents` it is insufficient.
+    @Test func durationCarriesItsN() throws {
+        let d = MetricValue.duration(.queueHealth, label: "approval → land, median", 20.5, n: 40, basis: "merged requests")
+        #expect(d.status == .ok && d.unit == .seconds && d.numerator == 20.5 && d.denominator == 40)
+        #expect(d.display == "20.5 s (n=40)")
+        #expect(MetricValue.duration(.queueHealth, label: "x", 90, n: 20, basis: "").display == "90 s (n=20)")
+        let few = MetricValue.duration(.queueHealth, label: "x", 90, n: 3, basis: "")
+        #expect(few.status == .insufficient(n: 3))
+        #expect(few.display == "insufficient data (n=3)")
+        #expect(MetricValue.duration(.queueHealth, label: "x", .nan, n: 40, basis: "").display == "0 s (n=40)")
     }
 
     @Test func insufficientBelowTwenty() throws {

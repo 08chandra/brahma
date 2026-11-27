@@ -232,6 +232,8 @@ public final class AppModel {
     public func closeStore() async {
         stopPolling()
         chat = nil
+        // MEASURE's run reads this store: stopped before it closes (`reopenStore` drops the model).
+        measure?.cancel()
         // A live map reads this store: it stops for good, and the next `ensureMapController()` after `reopenStore()` builds
         // one whose cursors start at the restored database's maxima.
         storeClosed = true
@@ -260,6 +262,8 @@ public final class AppModel {
             digest = DigestModel(store: reopened)
             handbook = nil
             storage = nil
+            // Its run reads the closed store: stopped, never left to finish over the reopened one.
+            measure?.cancel()
             measure = nil
             replay = nil
             wireSubmodels()

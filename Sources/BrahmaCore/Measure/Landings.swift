@@ -44,7 +44,7 @@ extension Store {
     }
 
     /// True when `itemId` is a landed item of one of the company's landings (ruling R24: its request merged by that batch).
-    public func hasLanded(companyId: String, itemId: String) throws -> Bool {
+    func hasLanded(companyId: String, itemId: String) throws -> Bool {
         try writer.read { db in try Self.hasLanded(db, companyId: companyId, itemId: itemId) }
     }
 

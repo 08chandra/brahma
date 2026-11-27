@@ -10,11 +10,13 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 ## Reading a number
 
 - **A number is never shown without its denominator.** A ratio prints as `97.4% (38/39)`; a per-item value as
-  `$1.20 per landed item (24.00/20)`; a duration as `median 4m 10s · p95 31m (n=38)`.
+  `$1.20 per landed item (24.00/20)`; items per dollar as `0.83 per $LE (20/24.00)`; a duration statistic (a median or a p95,
+  one row each) as `20.5 s (n=40)`; a plain sum of seconds (idle seconds by cause) as `250 s`.
 - **Status vocabulary.** Each metric carries exactly one:
   - `ok` — measured; the value and its denominator are shown.
-  - `insufficient data (n=<n>)` — a **rate** whose denominator has fewer than 20 events. The count is shown, the percentage is
-    not. Counts (safety counts, owner minutes) are never "insufficient": a count of 0 prints `0`.
+  - `insufficient data (n=<n>)` — a **rate** (or a duration statistic) over fewer than 20 events. The count is shown, the
+    value is not. Owner minutes per landed item is a rate over landed items (ruling R44). Counts (safety counts, the minutes
+    logged) are never "insufficient": a count of 0 prints `0`.
   - `not applicable: <reason>` — the **source does not exist** on this build (a column, table or feature not merged, or a
     company setting that is off, such as no main check). Nothing could have been recorded.
   - `not measured: <reason>` — the source exists but **no data was recorded** (no owner-time log, no baseline company, no
@@ -23,8 +25,10 @@ is estimated, sampled or inferred from text. This page is the definition of reco
   2 landings before links existed excluded`). Rows from before a record existed are excluded with the basis stated, never
   counted as zero.
 - **Window.** `--since <date>` is midnight in the owner's time zone (`ownerSettings.timeZone`); the default window is the
-  last 28 days and `--since all` starts at `company.createdAt` (both plan X6a pinned numbers: `MeasureWindow.defaultDays`
-  = 28; `all` = since the company was created). A metric is windowed on the time its *event* happened: landings
+  last 28 days **from the owner's midnight** (midnight, in the owner's zone, of the day 28 × 24 h before now; the app's 7 and 28
+  days the same way, ruling R44), so the window and the daily counters (keyed by the owner's day) cover the same days; `--since
+  all` starts at `company.createdAt` (both plan X6a pinned numbers: `MeasureWindow.defaultDays` = 28; `all` = since the company
+  was created). `brahma measure <co> --print-day` prints today in the owner's zone, the day `--since` reads. A metric is windowed on the time its *event* happened: landings
   on the landing time, asks on the decision time, messages on `createdAt`, counters on their day.
 - **Scope.** Every query is `WHERE companyId = ?`; git-derived metrics read only the company's own workspace repository
   (`company.workspacePath`). Two companies sharing a history never see each other's rows.
@@ -55,7 +59,7 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 |---|---|
 | **Definition** | landings after which the main check passed on the first run ÷ landings judged. **Controller's call (rulings R17, R23):** a landing is judged by the runs **at its land commit** (`candidateCommit = landCommit`; a bisected batch's runs at other candidates never judge it): (1) when the batch has `main`-kind `mergeRun`s (recorded only while `company.mainCheck` is set), by the `main` run at the land commit; (2) else by the batch's own verification — the `item`-kind `mergeRun`s at the land commit for the landed requests (a landed item with no check of its own is not evidence). Either way a run is green only when `attempt = 1` passed, was not flaky, and no later attempt passed (the merge queue records every passing re-run flagged flaky); **and** no `mainSmokeRun` with `reason = 'merge'` for `landCommit` failed. `mainAtBase` runs never judge a landing. |
 | **Numerator** | judged landings in the window whose runs at the land commit (main, else item) all passed at `attempt = 1`, un-flaky, with no passing re-run, and with no `mainSmokeRun` where `reason = 'merge'`, `commit = landCommit`, `status = 'failed'`. |
-| **Denominator** | landings in the window with a `main`-kind `mergeRun`, else at least one `item`-kind `mergeRun` at the land commit. A landing with neither is excluded and counted in the basis; with no landing judged the metric is `not measured: no check run recorded …`. A batch with main runs but none at the land commit is judged not green and named in the detail. The basis names the source (`main check runs`, `no main check run recorded; verification runs (item checks at the land commit)`, or the split) — from the runs, never from the company's current `mainCheck` setting. A `mainSmokeRun` at `error` (superseded, could not run) says nothing and does not fail the landing. Detail: one row per non-green landing, value 1, labelled `M-<n>: <why>`. |
+| **Denominator** | landings in the window with a `main`-kind `mergeRun`, else at least one `item`-kind `mergeRun` at the land commit. A landing with neither is excluded and counted in the basis; with no landing judged the metric is `not measured: no check run recorded …`. A batch with main runs but none at the land commit is judged not green and named in the detail. The basis names the source (`main check runs`, `no main check run recorded; verification runs (item checks at the land commit)`, or the split) — from the runs, never from the company's current `mainCheck` setting. A `mainSmokeRun` at `error` (superseded, could not run) says nothing and does not fail the landing. Detail: one row per non-green landing, value 1, labelled `B-<n>: <why>` (`B-<n>` is the merge batch, as everywhere in `measure`). |
 | **Source** | `mergeBatch.landCommit/step/landedIds`, `mergeRequest.status/batchId`, `mergeRun.batchId/requestId/kind/candidateCommit/attempt/status/flaky`, `mainSmokeRun.reason/commit/status` |
 
 ### 2. Revert rate (spec §8.6.1; owner addition 11/24: 7, 14 and 30 days)
@@ -100,7 +104,7 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 | **`$ (gateway)`** | `not applicable: X1 gateway columns absent` (ruling R4). When X1 lands this leg reads `itemFact.meteredUSD` / `turn.meteredUSD`. |
 | **turns** | Σ `itemFact.turnsUsed` ÷ the denominator (work turns: `turn.kind = 'work'`, not infra, not session resets, outcome succeeded or failed). |
 | **tokens** | Σ `itemFact.tokensUsed` ÷ the denominator (input + output + cache creation; ultra turns excluded, cache reads excluded). |
-| **awake time** | Σ `itemFact.cycleActiveSeconds` ÷ the denominator: **company-active seconds** from first claim to completion, the engine's awake clock, never wall-clock. A never-claimed item has a null value and contributes 0; the basis names how many. |
+| **awake time** | Σ `itemFact.cycleActiveSeconds` ÷ the items of the denominator **that have one**: **company-active seconds** from first claim to completion, the engine's awake clock, never wall-clock. A never-claimed item has a null value: it is excluded from this leg (never counted as 0) and the basis names how many. |
 | **Source** | `itemFact.costLE/reviewCostLE/turnsUsed/tokensUsed/cycleActiveSeconds/completedAt`; landings |
 
 ### 6. Owner touches per landed item (spec §8.6.1)
@@ -126,7 +130,7 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 
 | | |
 |---|---|
-| **approval → land** | median and p95 (nearest rank) of `mergeRequest.finishedAt − mergeRequest.enqueuedAt` over the landed items (requests `merged` by that batch, ruling R24) of the landings in the window — the landing is windowed on the batch's `finishedAt` (else `updatedAt`), the duration ends at the request's `finishedAt` (else the batch's); n = that count, less any request enqueued after its landing (excluded and counted, never clamped). **Controller's call:** approval time is `enqueuedAt`. `enqueuedAt` is the merge request's: an owner retry (`brahma merge retry`) leaves the old request as it is (its status unchanged, `retryRequestedAt` stamped) and inserts a fresh request with `enqueuedAt` = the retry time, so approval → land measures the latest enqueue of the item, not its first approval; only requests that reached `merged` are in the sample. |
+| **approval → land** | median and p95 (nearest rank) of `mergeRequest.finishedAt − mergeRequest.enqueuedAt` over the landed items (requests `merged` by that batch, ruling R24) of the landings in the window — the landing is windowed on the batch's `finishedAt` (else `updatedAt`), the duration ends at the request's `finishedAt` (else the batch's); n = that count, less any request enqueued after its landing (excluded and counted, never clamped). Each row shows its n (`20.5 s (n=40)`); below 20 requests both rows are `insufficient data (n=…)` (ruling R44). **Controller's call:** approval time is `enqueuedAt`. `enqueuedAt` is the merge request's: an owner retry (`brahma merge retry`) leaves the old request as it is (its status unchanged, `retryRequestedAt` stamped) and inserts a fresh request with `enqueuedAt` = the retry time, so approval → land measures the latest enqueue of the item, not its first approval; only requests that reached `merged` are in the sample. |
 | **bisect isolations** | a count: requests bounced (`mergeRequest.status = 'bounced'`, `failure` in `itemCheckFailed`, `mainCheckFailed`) with `finishedAt` (the bounce time) in the window, from a batch of **≥ 2 checked candidates** (`mergeBatch.candidates`, written at `rebased` for the members that rebased cleanly — not `requestIds`, which also holds requests bounced on a conflict before any check). A request bounced from a batch of one checked candidate is not an isolation and is counted in the basis. |
 | **flake rate** | flaky ÷ finished runs (`status` in `passed`, `failed`, `timedOut`) finishing in the window, over **both** run tables: `mergeRun` with `kind` in `main`, `item` (never `mainAtBase`) **plus** `verificationRun`; the basis shows each table's flaky/finished pair. |
 | **Headline and windowing** | the headline is the count of merged requests of the landings in the window. Landings are windowed on the batch's `finishedAt` (else `updatedAt`); the approval → land durations end at each request's own `finishedAt` (else the batch's). Wall seconds, with the basis saying why (ruling R22). |
@@ -174,13 +178,14 @@ The headline of Safety is the sum of the measured target-0 rows (turns wasted on
 | **Denominator** | Σ `measureCounter.activeSeconds` over the same days — for every window, `--since all` included: the daily counters only, never `companyActivity`'s running total (ruling R31). |
 | **Events (n)** | the **days** with an active-seconds record in the window, not the seconds (ruling R32): below 20 such days the metric is `insufficient data (n=<days>)`, and the basis says n counts days. |
 | **Status** | `not measured: no active-seconds records in window` when no day of the window has a counter row; days before the recorder first ran are stated in the basis (`recorded since <day>`). |
+| **Known under-count** | the clock counts a tick's active seconds when the tick starts; the recorder counts its idle seconds last. A tick whose scheduling throws in between records its active seconds but no idle seconds, so idle can only be under-counted, never over-counted; the basis says so. |
 | **Detail** | the share of idle seconds by cause: five-hour gate (`usageLimit`), weekly pace (`paceClosed`), reserve (`paceStrict`). |
 
 ### 13. Merged items per dollar and per plan-hour (owner addition 11/24)
 
 | | |
 |---|---|
-| **items per dollar** | landed items in the window ÷ Σ `itemFact.costLE` of those items, labelled **`$LE (subscription)`**. `$ (gateway)`: `not applicable: X1 gateway columns absent`. With Σ cost = 0 (no fact rows, or facts without cost): `not measured: no cost recorded for the landed items`. Printed as `<n> items per $LE 100 (n/Σ)`. |
+| **items per dollar** | landed items in the window ÷ Σ `itemFact.costLE` of those items, labelled **`$LE (subscription)`**. `$ (gateway)`: `not applicable: X1 gateway columns absent`. With Σ cost = 0 (no fact rows, or facts without cost): `not measured: no cost recorded for the landed items`. Printed as `0.83 per $LE (20/24.00)`: items per one $LE, then landed items / Σ $LE. The 20-event rule counts the landed items (ruling R19). |
 | **items per plan-hour** | landed items in the window ÷ company-active hours in the window (Σ `measureCounter.activeSeconds` ÷ 3600, the daily counters only, `--since all` included — ruling R31). "Plan-hour" is an hour the company was awake under the owner's plan, never wall-clock. Items that landed **before the first day with an active-seconds record** are left out of the numerator (their hours were never counted) and the basis says how many. With no active-time record for the window: `not measured: no active-seconds records in window`. The 20-event rule counts the landed items (the numerator, ruling R19). |
 | **Source** | landings, `itemFact.costLE`, `measureCounter.activeSeconds` |
 
@@ -190,7 +195,7 @@ The headline of Safety is the sum of the measured target-0 rows (turns wasted on
 |---|---|
 | **Definition** | Σ `measureCounter.ownerInterventionSeconds` in the window ÷ 60 ÷ landed items in the window. |
 | **Source** | **the owner's own log only**: `brahma measure <co> --log-owner-minutes <n> [--day YYYY-MM-DD]` adds `n × 60` to that day's counter (today in the owner's time zone when `--day` is omitted; `n` is 1–1440 per log; a day that has not begun is refused). **Owner-only:** it runs only from the owner's shell (refused inside an agent turn) and the store write takes the owner principal (`Store.logOwnerMinutes(…owner:)`); the generic counter path refuses this counter (ruling R32), so no agent can write owner minutes. It prints one line and no report. |
-| **Status** | with no rows in the window: `not measured: no owner-time records`. Otherwise a count (never `insufficient`) ÷ landed items. |
+| **Status** | with no rows in the window: `not measured: no owner-time records`; with no landing in the window: `not measured: no landings in the window`. Otherwise a **rate** over landed items (rulings R19, R44): fewer than 20 landed items is `insufficient data (n=<landed>)`; from 20, `1.50 per landed item (30/20)`. The detail row `owner minutes logged` always shows the minutes (a count). |
 | **Plainly** | Brahma records no owner time on its own and never estimates it. Inbox decisions and messages are counted in metric 6 as touches, not as minutes. If the owner logs nothing, this row says so. |
 
 ### 15. Single-agent baseline (owner addition 11/24; spec §8.6.4 "Baselines" is the authority)
@@ -259,7 +264,7 @@ while something holds the `flock` on `<home>/orchestrator.lock`, and it started 
      hold (owner-wide), and it has started a turn since the engine's restart. The pause, alert and hold checks come first and
      fail it whether or not the engine restarted; with no restart since the checkpoint there is nothing to count turns from, so
      a check with no problem is **wait**, never pass.
-- `--mission`, `--compare`, `--verify-landings`, `--log-owner-minutes`, `--soak-checkpoint` and `--soak-verify` are exclusive
+- `--mission`, `--compare`, `--verify-landings`, `--log-owner-minutes`, `--soak-checkpoint`, `--soak-verify` and `--print-day` are exclusive
   (`--mission --compare` excepted); a combination is refused with exit 2.
 
 `scripts/soak/run-72h.sh <co> [--hours 72] [--kill-at 24] [--state <dir>] [--resume]` is the owner's 72-hour run. It refuses
@@ -271,7 +276,8 @@ command line is `brahma run` and sends SIGKILL to that pid only, starts `brahma 
 settle time; at hour 48 it prints the reboot instruction and exits, and `--resume` (after the reboot and login) verifies against
 the last checkpoint and continues (with the run's saved `--hours` and `--kill-at`, each checked to be a whole number; the
 pre-reboot pid is discarded). Ctrl-C stops the script, never the engine, and says how to stop it (`kill -TERM <pid>`) or resume. At the end it stops its engine with SIGTERM (after the
-same check), prints `--mission` over the soak's days (from its local start day) and every verdict. It writes only under
+same check), prints `--mission` over the soak's days (from its start day in the owner's time zone, recorded at the start with
+`brahma measure <co> --print-day`, never the system zone's) and every verdict. It writes only under
 `--state` (default `~/.brahma-soak/<co>`; the company must be a plain name, no `/` or `..`).
 
 ### 17. The landing audit (`--verify-landings`; spec §10 row 2 (3))

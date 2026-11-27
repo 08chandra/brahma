@@ -14,12 +14,14 @@ public final class OrchestratorLock: @unchecked Sendable {
 
     private init(fd: Int32) { self.fd = fd }
 
-    public static func acquire(paths: BrahmaPaths) throws -> OrchestratorLock {
+    /// `busyRetries`: how often a busy lock is tried again, 20 ms apart, before `alreadyRunning`. A caller that polls (the app's
+    /// takeover check on the main actor) passes 0: a refusal costs it nothing, and its next poll tries again.
+    public static func acquire(paths: BrahmaPaths, busyRetries: Int = OrchestratorLock.busyRetries) throws -> OrchestratorLock {
         try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
         let path = paths.home.appending(path: "orchestrator.lock").path
         let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw OrchestratorLockError.cannotOpen(errno: errno) }
-        // A busy lock is tried again `busyRetries` times, `busyRetryDelay` apart (ruling R42(b)): a reader that holds a shared
+        // A busy lock is tried again `busyRetries` times (default 5), `busyRetryDelay` apart (ruling R42(b)): a reader that holds a shared
         // lock for an instant (the soak's liveness probe, `SoakEngine.startedAt`) must never refuse a real start. A second engine
         // that really holds it is still refused, about 100 ms later.
         var retries = 0
@@ -36,8 +38,9 @@ public final class OrchestratorLock: @unchecked Sendable {
         return OrchestratorLock(fd: fd)
     }
 
-    /// How often `acquire` tries a busy lock again before it says another engine is running, and how long it waits between tries.
-    static let busyRetries = 5
+    /// How often `acquire` tries a busy lock again by default before it says another engine is running, and how long it waits
+    /// between tries.
+    public static let busyRetries = 5
     static let busyRetryDelay: useconds_t = 20_000
 
     /// Unlocked before it is closed. `close` alone frees the lock only once every copy of the descriptor is gone, and a

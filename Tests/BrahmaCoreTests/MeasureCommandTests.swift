@@ -107,7 +107,10 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let all = try window(["--since", "all"])
         #expect(all.since == Date(timeIntervalSince1970: rig.company.createdAt.timeIntervalSince1970.rounded(.down)))
         let dflt = try window([])
-        #expect(abs(dflt.until.timeIntervalSince(dflt.since) - 28 * 86_400) < 1)
+        // Ruling R44: 28 days back to the owner's (UTC) midnight: at least 28 days, less than 29.
+        let span = dflt.until.timeIntervalSince(dflt.since)
+        #expect(span >= 28 * 86_400 && span < 29 * 86_400, "\(span)")
+        #expect(dflt.since.timeIntervalSince1970.truncatingRemainder(dividingBy: 86_400) == 0, "\(dflt.since)")
         // The markdown header shows the window in the owner's zone.
         let md = try brahma(["measure", "Acme", "--since", "2025-11-01"], home: rig.home)
         #expect(md.stdout.hasPrefix("# measure Acme — 2025-11-01 00:00…"), "\(md.stdout)")
@@ -431,6 +434,61 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: file)
         let linked = try brahma(["measure", "Acme", "--soak-verify", link.path], home: rig.home)
         #expect(linked.status == 2 && linked.stdout.isEmpty && linked.stderr.contains("symbolic link"), "\(linked.stderr)")
+        // Final review #14: a checkpoint written onto a planted symbolic link replaces the link with the checkpoint (0600) and
+        // never writes through it: the file it pointed at is untouched.
+        let target = state.appending(path: "owners-notes.txt")
+        try Data("the owner's own file\n".utf8).write(to: target)
+        let planted = state.appending(path: "planted.json")
+        try FileManager.default.createSymbolicLink(at: planted, withDestinationURL: target)
+        let over = try brahma(["measure", "Acme", "--soak-checkpoint", planted.path], home: rig.home)
+        #expect(over.status == 0, "\(over.stderr)")
+        let kind = try FileManager.default.attributesOfItem(atPath: planted.path)[.type] as? FileAttributeType
+        #expect(kind == .typeRegular, "the link was replaced by the checkpoint, not followed")
+        #expect(try String(contentsOf: target, encoding: .utf8) == "the owner's own file\n")
+        #expect(try SoakCheckpoint.read(from: planted).companyId == rig.company.id)
+        let plantedMode = try #require(try FileManager.default.attributesOfItem(atPath: planted.path)[.posixPermissions] as? NSNumber)
+        #expect(plantedMode.intValue & 0o777 == 0o600)
+    }
+
+    /// Ruling R44: the default window starts at the owner's midnight (in the zone the daily counters use), so the window and
+    /// the counters cover the same days.
+    @Test func defaultWindowStartsAtOwnerMidnight() throws {
+        let rig = try Rig()
+        for zone in ["UTC", "Asia/Kolkata"] {
+            try rig.store.setOwnerTimeZone(zone)
+            let r = try brahma(["measure", "Acme", "--format", "json"], home: rig.home)
+            #expect(r.status == 0, "\(r.stderr)")
+            let report = try MeasureReport.decode(Data(r.stdout.utf8))
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = try #require(TimeZone(identifier: zone))
+            let expected = calendar.startOfDay(for: report.window.until.addingTimeInterval(-28 * 86_400))
+            #expect(report.window.since == expected, "\(zone): \(report.window.since) vs \(expected)")
+        }
+    }
+
+    /// Final review #16: `--print-day` prints today's day in the owner's time zone (the zone `--since` reads), one line, so the
+    /// soak script records its start day in that zone, not the system's. Owner shell only; it takes no other flag.
+    @Test func printDayIsTheOwnersToday() throws {
+        let rig = try Rig()
+        for zone in ["Pacific/Kiritimati", "Pacific/Pago_Pago"] {   // UTC+14 and UTC-11: never the same day as each other
+            try rig.store.setOwnerTimeZone(zone)
+            let tz = try #require(TimeZone(identifier: zone))
+            let before = Store.measureDay(Date(), in: tz)
+            let r = try brahma(["measure", "Acme", "--print-day"], home: rig.home)
+            let after = Store.measureDay(Date(), in: tz)
+            #expect(r.status == 0, "\(r.stderr)")
+            #expect(r.stdout == "\(before)\n" || r.stdout == "\(after)\n", "\(zone): \(r.stdout)")
+            // What it prints is what --since accepts.
+            let day = r.stdout.trimmingCharacters(in: .newlines)
+            #expect(try brahma(["measure", "Acme", "--since", day, "--format", "json"], home: rig.home).status == 0)
+        }
+        for bad in [["--print-day", "--since", "all"], ["--print-day", "--format", "json"], ["--print-day", "--mission"],
+                    ["--print-day", "--day", "2025-11-01"], ["--print-day", "--verify-landings"]] {
+            let r = try brahma(["measure", "Acme"] + bad, home: rig.home)
+            #expect(r.status == 2 && r.stdout.isEmpty, "\(bad): \(r.stdout) \(r.stderr)")
+        }
+        let agent = try brahma(["measure", "Acme", "--print-day"], home: rig.home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(agent.status != 0 && agent.stdout.isEmpty, "\(agent.stdout)")
     }
 
     /// The modes are exclusive where combining makes no sense: refused with exit 2 and nothing on stdout. `--mission --compare`

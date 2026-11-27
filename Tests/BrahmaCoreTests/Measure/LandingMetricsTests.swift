@@ -60,7 +60,7 @@ import Testing
         #expect(m.status == .ok)
         #expect(m.numerator == 18 && m.denominator == 20)
         #expect(m.display == "90.0% (18/20)")
-        #expect(detailLabels(m) == ["M-19: main run failed", "M-20: main run flaky (passed on attempt 2)"], "\(detailLabels(m))")
+        #expect(detailLabels(m) == ["B-19: main run failed", "B-20: main run flaky (passed on attempt 2)"], "\(detailLabels(m))")
         #expect(m.detail.allSatisfy { $0.numerator == 1 && $0.display == "1" }, "\(m.detail.map(\.display))")
         #expect(m.basis.contains("main check runs"), "\(m.basis)")
     }
@@ -81,7 +81,7 @@ import Testing
         #expect(m.status == .ok)
         #expect(m.numerator == 19 && m.denominator == 20)
         let labels = detailLabels(m)
-        #expect(labels.count == 1 && labels[0].hasPrefix("M-7: ") && labels[0].contains("flaky"), "\(labels)")
+        #expect(labels.count == 1 && labels[0].hasPrefix("B-7: ") && labels[0].contains("flaky"), "\(labels)")
     }
 
     /// A failed `merge` smoke of the land commit makes an otherwise green landing not green. A failed smoke for another reason
@@ -102,7 +102,7 @@ import Testing
         let m = try LandingMetrics.greenMain(context(store, acme))
         #expect(m.status == .ok)
         #expect(m.numerator == 19 && m.denominator == 20)
-        #expect(detailLabels(m) == ["M-3: merge smoke failed"], "\(detailLabels(m))")
+        #expect(detailLabels(m) == ["B-3: merge smoke failed"], "\(detailLabels(m))")
     }
 
     /// With no smoke check configured (no `mainSmokeRun` rows at all) the main run alone decides: every landing is green.
@@ -146,7 +146,7 @@ import Testing
         #expect(m.basis.contains("no main check run recorded; verification runs"), "\(m.basis)")
         #expect(m.basis.contains("2 landings with no check run excluded"), "\(m.basis)")
         let labels = detailLabels(m)
-        #expect(labels.count == 1 && labels[0].hasPrefix("M-11: ") && labels[0].contains("flaky"), "\(labels)")
+        #expect(labels.count == 1 && labels[0].hasPrefix("B-11: ") && labels[0].contains("flaky"), "\(labels)")
     }
 
     /// A bisected batch: the whole-batch candidate failed both attempts, the prefix that landed passed first time. The landing is
@@ -233,13 +233,31 @@ import Testing
         #expect(m.basis.contains("batch finishedAt") && m.basis.contains("request's finishedAt"), "\(m.basis)")
         let median = m.detail.first { $0.label.contains("median") }
         let p95 = m.detail.first { $0.label.contains("p95") }
-        #expect(median?.unit == .seconds && median?.numerator == 20.5, "\(String(describing: median))")
-        #expect(p95?.unit == .seconds && p95?.numerator == 38, "\(String(describing: p95))")
-        #expect(median?.display == "20.5 s" && p95?.display == "38 s")
+        #expect(median?.unit == .seconds && median?.numerator == 20.5 && median?.denominator == 40, "\(String(describing: median))")
+        #expect(p95?.unit == .seconds && p95?.numerator == 38 && p95?.denominator == 40, "\(String(describing: p95))")
+        #expect(median?.status == .ok && p95?.status == .ok)
+        #expect(median?.display == "20.5 s (n=40)" && p95?.display == "38 s (n=40)")
         for row in [median, p95] {
             #expect(row?.basis.contains("wall seconds (company-active time is recorded per day, not per request)") == true, "\(row?.basis ?? "nil")")
             #expect(row?.basis.contains("n=40") == true, "\(row?.basis ?? "nil")")
             #expect(row?.basis.contains("1 excluded") == true, "\(row?.basis ?? "nil")")
+        }
+    }
+
+    /// Ruling R44 (final review #2): the durations are statistics over requests, so below 20 requests they are
+    /// `insufficient data (n=…)`, never a median of three.
+    @Test func queueDurationsInsufficientBelowTwenty() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme")
+        _ = try landings(store, acme, count: 3) { n in Double(n) * 60 }
+
+        let m = try LandingMetrics.queueHealth(context(store, acme))
+        #expect(m.numerator == 3)
+        for label in ["approval → land, median", "approval → land, p95"] {
+            let row = try #require(m.detail.first { $0.label == label }, "\(m.detail.map(\.label))")
+            #expect(row.status == .insufficient(n: 3), "\(row)")
+            #expect(row.display == "insufficient data (n=3)")
+            #expect(row.basis.contains("n=3"), "\(row.basis)")
         }
     }
 
