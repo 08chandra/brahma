@@ -139,8 +139,7 @@ import Foundation
         // m-2: the watched root is re-checked right before the stream is made: a real directory named for the key directly in
         // `.brahma/wt`, never a link (to anywhere), a file, a missing path or a key that walks out.
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appending(path: "c7c-root-\(UUID().uuidString)", directoryHint: .isDirectory)
-        defer { try? fm.removeItem(at: root) }
+        let root = try tempDir()
         let wt = root.appending(path: ".brahma/wt", directoryHint: .isDirectory)
         try fm.createDirectory(at: wt.appending(path: "ENG-1"), withIntermediateDirectories: true)
         let outside = root.appending(path: "elsewhere", directoryHint: .isDirectory)
