@@ -50,14 +50,17 @@ public enum PRActionCardState: Equatable, Sendable {
 }
 
 /// The digest an owner card binds its approval to (Rulings X8-21 and 29): the canonical request the owner saw — the action,
-/// the item, the commit, the ref (the head for `open-pr`), the base, the PR title and body (digested), every fact the gate
-/// decides on (visibility, taint, external input, first use, `.github/workflows/`) and the reason it asked. Any change to any
-/// of it is a different request: a fresh card.
+/// the item, the repository, the commit, the ref (the head for `open-pr`), the base, the PR title and body (digested), for a
+/// push its diffstat and changed paths (digested), every fact the gate decides on (visibility, taint, external input, first
+/// use, `.github/workflows/`) and the reason it asked. Any change to any of it is a different request: a fresh card. Rows filed
+/// under an earlier form of this digest never match.
 public enum PRActionDigest {
     struct Canonical: Encodable {
         var action: String
         var itemId: String
         var companyId: String
+        var repo: String
+        var change: String
         var sha: String
         var ref: String
         var base: String
@@ -71,10 +74,15 @@ public enum PRActionDigest {
         var reason: String
     }
 
-    /// For `push-branch` the commit and ref come from the request's payload; for `open-pr`, from `open` and `sha`.
-    public static func of(_ r: PRActionRequest, reason: String, sha: String, open: OpenPullRequest?) -> String {
+    /// For `push-branch` the repository, commit, ref and change come from the request's payload; for `open-pr`, from `repoURL`,
+    /// `sha` and `open`.
+    public static func of(_ r: PRActionRequest, reason: String, sha: String, repoURL: String, open: OpenPullRequest?) -> String {
         let ref = open.map { PRBranch.ref($0.head) } ?? r.payload.map(\.ref) ?? "-"
-        let canonical = Canonical(action: r.type.name, itemId: r.itemId, companyId: r.companyId, sha: r.payload.map(\.sha) ?? sha, ref: ref,
+        let change = r.payload.map { p in
+            PRBody.hex(SHA256.hash(Data((Store.flat(p.diffstat, max: 500) + "\u{0}" + p.paths.joined(separator: "\u{0}")).utf8)))
+        } ?? "-"
+        let canonical = Canonical(action: r.type.name, itemId: r.itemId, companyId: r.companyId, repo: r.payload.map(\.url) ?? repoURL,
+                                  change: change, sha: r.payload.map(\.sha) ?? sha, ref: ref,
                                   base: open.map(\.base) ?? "-", content: open.map { PRBody.contentDigest(title: $0.title, body: $0.body) } ?? "-",
                                   repoVisibility: r.repoVisibility, taintedSession: r.taintedSession, itemTainted: r.itemTainted,
                                   externalInput: r.externalInput, firstUse: r.firstUse,

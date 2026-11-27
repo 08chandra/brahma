@@ -425,8 +425,9 @@ import GRDB
                                               externalInput: false, firstUse: false, repoVisibility: "private")
         let inner = RulesGate(granted: [])
         guard case .ask(let reason) = await inner.decide(approvedRequest) else { Issue.record("the rules did not ask"); return }
-        let approval = (askId: "A", digest: PRActionDigest.of(approvedRequest, reason: reason, sha: sha, open: nil))
-        let cardGate = CardGate(inner: inner, action: .pushBranch, itemId: item.id, sha: sha, open: nil, approved: approval)
+        let url = Self.repo.pushURL
+        let approval = (askId: "A", digest: PRActionDigest.of(approvedRequest, reason: reason, sha: sha, repoURL: url, open: nil))
+        let cardGate = CardGate(inner: inner, action: .pushBranch, itemId: item.id, sha: sha, repoURL: url, open: nil, approved: approval)
         #expect(await cardGate.decide(approvedRequest) == .auto)
         var other = approvedRequest
         other.itemId = "another"
@@ -437,8 +438,22 @@ import GRDB
         var changed = approvedRequest
         changed.repoVisibility = "public"
         guard case .ask = await cardGate.decide(changed) else { Issue.record("a changed request was answered"); return }
-        let refusing = CardGate(inner: RulesGate(killSwitch: true), action: .pushBranch, itemId: item.id, sha: sha, open: nil, approved: approval)
+        let refusing = CardGate(inner: RulesGate(killSwitch: true), action: .pushBranch, itemId: item.id, sha: sha, repoURL: url, open: nil,
+                                approved: approval)
         #expect(await refusing.decide(approvedRequest) == .refuse(rule: "kill switch"))
+        // Fix round 2 (M1): another repository is another request.
+        let elsewhere = CardGate(inner: inner, action: .pushBranch, itemId: item.id, sha: sha, repoURL: "https://github.com/acme/other.git",
+                                 open: nil, approved: approval)
+        #expect(await elsewhere.decide(approvedRequest) == .ask(reason: reason))
+        // And for a push, the change itself (diffstat, paths) is part of what was approved.
+        let payload = PushPayload(sha: sha, ref: "refs/heads/brahma/X", url: url, itemKey: item.key, diffstat: " 1 file changed", paths: ["a.txt"],
+                                  touchesWorkflows: false)
+        var withPayload = approvedRequest
+        withPayload.payload = payload
+        var otherPaths = withPayload
+        otherPaths.payload?.paths = ["b.txt"]
+        #expect(PRActionDigest.of(withPayload, reason: reason, sha: sha, repoURL: url, open: nil)
+                != PRActionDigest.of(otherPaths, reason: reason, sha: sha, repoURL: url, open: nil))
     }
 
     /// A `pushing` landing (a failed or unconfirmed push, a crash after sending) reads the branch on GitHub before pushing
@@ -620,6 +635,25 @@ import GRDB
         try v.store.ownerDecide(askId: fresh[1].id, approve: true)
         await v.machine.advance(itemId: pushed.id)
         #expect(v.runner.pushes.count == 1)
+
+        // Fix round 2 (M1): the company's repository is relinked after the owner approved a push: no push to the other
+        // repository on that approval; a fresh card names it.
+        let r = try World(firstPushDone: false)
+        let (moved, movedSHA) = try r.handedOff("Relinked", ["r.txt": "r\n"])
+        await r.machine.begin(item: moved, verifiedSHA: movedSHA)
+        let approvedCard = try #require(try r.cards().first)
+        try r.store.ownerDecide(askId: approvedCard.id, approve: true)
+        let otherRepo = GitHubRepoRef(owner: "acme", name: "other")
+        let otherGitHub = FakeGitHub(otherRepo)
+        let relinked = PRLandingMachine(store: r.store, github: otherGitHub, gate: r.gate,
+                                        push: r.env.stage(github: otherGitHub, gate: NoChannelGate(), push: GitPush(runner: r.runner, tempRoot: try tempDir())),
+                                        repo: { _ in otherRepo })
+        await relinked.advance(itemId: moved.id)
+        #expect(r.runner.pushes.isEmpty, "the approval named acme/app")
+        let relinkCards = try r.cards()
+        try #require(relinkCards.count == 2)
+        #expect(relinkCards[1].status == .pendingOwner && relinkCards[1].payload?.details?.contains("Repository: https://github.com/acme/other.git") == true)
+        #expect(try r.approvals().map(\.askId) == [relinkCards[1].id])
     }
 
     /// I4: whatever the agent text, the card fits the ask's limit and files; it shows every engine line of the body (the

@@ -233,10 +233,59 @@ import GRDB
                                                                                         payload: AskPayload(details: "Action: open-pr")), now: Self.now)
         #expect(again.id != ask.id && again.status == .pendingOwner)
         #expect(again.requestId == "pr-open-pr-\(item.id)-\(String(repeating: "e", count: 40))-2")
+        // The card still pending lost its record: nothing says what it showed, so it is superseded and a fresh one is filed.
         let same = try restored.filePRActionCard(companyId: acme.id, itemId: waiting.id, action: .pushBranch, sha: String(repeating: "f", count: 40),
                                                  reason: "first push", digest: "d", card: pendingCard, now: Self.now)
-        #expect(same.id == pending.id)
+        #expect(same.id != pending.id && same.status == .pendingOwner)
+        #expect(try restored.ask(id: pending.id)?.status == .superseded)
         #expect(try restored.prActionCardState(companyId: acme.id, itemId: waiting.id, action: .pushBranch,
                                                sha: String(repeating: "f", count: 40)) == .waiting(reason: "first push"))
+    }
+
+    /// Fix round 2 (N1): a card still pending when a restore drops its record (an unreadable live database, or a record only the
+    /// snapshot had) can answer nothing. Asked again — here after the item was renamed — the old card is superseded and a
+    /// fresh one shows the new title; approving the old one is refused, so it runs nothing.
+    @Test func stalePendingCardIsSupersededAfterARestore() throws {
+        for unreadable in [true, false] {
+            let env = try BackupEnv()
+            let acme = try env.company("Acme")
+            let item = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Old title"))
+            let sha = String(repeating: "a", count: 40)
+            func card(_ title: String) -> PRActionCard {
+                PRActionCard(title: "open-pr \(item.key)", summary: "open-pr asks",
+                             payload: AskPayload(details: "Title (from the item: agent-influenced, untrusted): \(item.key): \(title)"))
+            }
+            let old = try env.store.filePRActionCard(companyId: acme.id, itemId: item.id, action: .openPR, sha: sha, reason: "open-pr asks",
+                                                     digest: "digest-old", card: card("Old title"), now: Self.now)
+            let service = env.service()
+            let snapshot = try service.snapshot(reason: .manual)
+            if unreadable {
+                try env.store.close()
+                for suffix in ["-wal", "-shm"] where FileManager.default.fileExists(atPath: env.paths.database.path + suffix) {
+                    try FileManager.default.removeItem(atPath: env.paths.database.path + suffix)
+                }
+                try Data(repeating: 0x5a, count: 8192).write(to: env.paths.database)
+            } else {
+                // Live, the card's record went (its landing moved to another commit): the snapshot alone has it.
+                try env.store.writer.write { db in try env.store.voidPRActionCards(db, itemId: item.id, keepingSHA: nil, now: Self.now) }
+                try env.store.close()
+            }
+            _ = try service.restore(try service.planRestore(snapshot: snapshot))
+            let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+            #expect(try restored.ask(id: old.id)?.status == .pendingOwner, "the snapshot's card is back, pending")
+            #expect(try restored.prActionCardState(companyId: acme.id, itemId: item.id, action: .openPR, sha: sha) == .none, "with no record")
+            _ = try restored.updateWorkItem(id: item.id, by: .owner, patch: WorkItemPatch(title: "New title"))
+            let fresh = try restored.filePRActionCard(companyId: acme.id, itemId: item.id, action: .openPR, sha: sha, reason: "open-pr asks",
+                                                      digest: "digest-new", card: card("New title"), now: Self.now)
+            #expect(fresh.id != old.id && fresh.status == .pendingOwner, "unreadable \(unreadable)")
+            #expect(fresh.payload?.details?.contains("\(item.key): New title") == true)
+            #expect(try restored.ask(id: old.id)?.status == .superseded)
+            #expect(throws: WorkError.self) { try restored.ownerDecide(askId: old.id, approve: true) }
+            let rows = try restored.writer.read { db in try PRActionApproval.fetchAll(db) }
+            #expect(rows.map(\.askId) == [fresh.id] && rows.map(\.digest) == ["digest-new"] && rows.allSatisfy { $0.approvedAt == nil })
+            try restored.ownerDecide(askId: fresh.id, approve: true)
+            #expect(try restored.prActionCardState(companyId: acme.id, itemId: item.id, action: .openPR, sha: sha)
+                    == .approved(askId: fresh.id, digest: "digest-new"))
+        }
     }
 }

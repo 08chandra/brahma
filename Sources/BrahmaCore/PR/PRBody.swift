@@ -127,12 +127,20 @@ public enum PRBody {
         return t.replacingOccurrences(of: "(?i)(gh)-(?=[0-9])", with: "$1" + neutralizer + "-", options: .regularExpression)
     }
 
-    /// What proves a PR's content is the engine's (Ruling 28): SHA-256 of the title and the body, line endings normalized to
-    /// `\n` and trailing whitespace dropped (GitHub may store CRLF or trim).
+    /// What proves a PR's content is the engine's (Ruling 28): SHA-256 of the title and the body after exactly this
+    /// normalization of each: `\r\n` and a lone `\r` become `\n`; trailing spaces and tabs (U+0020, U+0009 only) are removed
+    /// from every line; trailing `\n`s at the end are removed. Nothing else (no leading whitespace, no Unicode spaces).
     public static func contentDigest(title: String, body: String) -> String {
         func norm(_ s: String) -> String {
-            s.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let lines = s.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+                .components(separatedBy: "\n").map { line in
+                    var l = Substring(line)
+                    while l.last == " " || l.last == "\t" { l = l.dropLast() }
+                    return String(l)
+                }
+            var joined = lines.joined(separator: "\n")
+            while joined.hasSuffix("\n") { joined.removeLast() }
+            return joined
         }
         return hex(SHA256.hash(Data((norm(title) + "\u{0}" + norm(body)).utf8)))
     }
@@ -158,19 +166,27 @@ public enum PRBody {
 
     /// The agent's text as one fenced code block inside a blockquote, at most `budget` UTF-8 bytes rendered (every line counted
     /// with its `> ` prefix and newline), cut on a character boundary; and whether anything was cut.
+    ///
+    /// The fence is the shortest one (at least three backticks) that outlasts every backtick run in the text it keeps: the kept
+    /// text shrinks as the fence grows (two fence lines take room), so its longest run never grows — the smallest valid fence is
+    /// found by bisection, and a fence of `budget / 2 - 3` keeps nothing, so one always exists within the budget.
     static func fencedQuote(_ text: String, budget: Int) -> (lines: [String], cut: Bool) {
         let clean = normalized(text)
-        var fence = 3
-        while true {
-            let available = budget - 2 * (2 + fence + 1)
-            let (kept, cut) = prefix(clean, bytes: available)
-            let run = longestBacktickRun(kept)
-            if run >= fence { fence = run + 1; continue }   // a longer fence leaves less room: the kept text only shrinks
-            let f = String(repeating: "`", count: fence)
-            var body = kept.isEmpty ? [] : kept.components(separatedBy: "\n")
-            while body.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { body.removeLast() }
-            return (["> " + f] + body.map { $0.isEmpty ? ">" : "> " + $0 } + ["> " + f], cut)
+        func kept(_ fence: Int) -> (String, Bool) { prefix(clean, bytes: budget - 2 * (2 + fence + 1)) }
+        func fits(_ fence: Int) -> Bool { longestBacktickRun(kept(fence).0) < fence }
+        var low = 3, high = max(3, budget / 2 - 3)
+        if !fits(low) {
+            while high - low > 1 {
+                let mid = (low + high) / 2
+                if fits(mid) { high = mid } else { low = mid }
+            }
+            low = high
         }
+        let (text, cut) = kept(low)
+        let f = String(repeating: "`", count: max(3, longestBacktickRun(text) + 1))
+        var body = text.isEmpty ? [] : text.components(separatedBy: "\n")
+        while body.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { body.removeLast() }
+        return (["> " + f] + body.map { $0.isEmpty ? ">" : "> " + $0 } + ["> " + f], cut)
     }
 
     /// The longest prefix of `text` whose lines, each rendered as `> <line>\n`, take at most `bytes` bytes.

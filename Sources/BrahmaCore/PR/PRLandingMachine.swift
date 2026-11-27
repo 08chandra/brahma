@@ -134,7 +134,8 @@ public actor PRLandingMachine: PRLandingBeginning {
         } catch {
             return hold(landing, "the hand-off could not be read: \(Store.flat("\(error)", max: 200))")
         }
-        let cardGate = CardGate(inner: gate, action: .pushBranch, itemId: item.id, sha: landing.pushedSHA, open: nil, approved: card.approval)
+        let cardGate = CardGate(inner: gate, action: .pushBranch, itemId: item.id, sha: landing.pushedSHA, repoURL: repo.pushURL, open: nil,
+                                approved: card.approval)
         switch await push.gated(by: cardGate).run(item: item, repo: repo, verifiedSHA: landing.pushedSHA, base: base, git: git,
                                                     branch: landing.branch) {
         case .pushed:
@@ -189,13 +190,14 @@ public actor PRLandingMachine: PRLandingBeginning {
         } catch {
             return hold(landing, "could not prepare the pull request: \(Store.flat("\(error)", max: 200))")
         }
-        let cardGate = CardGate(inner: gate, action: .openPR, itemId: item.id, sha: landing.pushedSHA, open: request, approved: card.approval)
+        let cardGate = CardGate(inner: gate, action: .openPR, itemId: item.id, sha: landing.pushedSHA, repoURL: repo.pushURL, open: request,
+                                approved: card.approval)
         switch await cardGate.decide(action) {
         case .refuse(let rule):
             return hold(landing, rule)
         case .ask(let reason):
             return fileCard(landing, action: .openPR, reason: reason,
-                            digest: PRActionDigest.of(action, reason: reason, sha: landing.pushedSHA, open: request), replacing: card,
+                            digest: PRActionDigest.of(action, reason: reason, sha: landing.pushedSHA, repoURL: repo.pushURL, open: request), replacing: card,
                             card: PRActionCard.openPR(item: item, repo: repo, request: request, body: bodyLines, sha: landing.pushedSHA,
                                                       reason: reason))
         case .auto:
@@ -355,14 +357,17 @@ final class CardGate: PRActionGate, @unchecked Sendable {
     let action: GitHubActionType
     let itemId: String
     let sha: String
+    /// The repository the action is for (a push's own payload names it too).
+    let repoURL: String
     let open: OpenPullRequest?
     let approved: (askId: String, digest: String)?
     private let lock = NSLock()
     private var lastAsk: String?
 
-    init(inner: any PRActionGate, action: GitHubActionType, itemId: String, sha: String, open: OpenPullRequest?,
+    init(inner: any PRActionGate, action: GitHubActionType, itemId: String, sha: String, repoURL: String, open: OpenPullRequest?,
          approved: (askId: String, digest: String)?) {
-        self.inner = inner; self.action = action; self.itemId = itemId; self.sha = sha; self.open = open; self.approved = approved
+        self.inner = inner; self.action = action; self.itemId = itemId; self.sha = sha; self.repoURL = repoURL; self.open = open
+        self.approved = approved
     }
 
     /// The digest of the last ask about this action of this item.
@@ -371,7 +376,7 @@ final class CardGate: PRActionGate, @unchecked Sendable {
     func decide(_ r: PRActionRequest) async -> PRActionDecision {
         let decision = await inner.decide(r)
         guard case .ask(let reason) = decision, r.type == action, r.itemId == itemId else { return decision }
-        let digest = PRActionDigest.of(r, reason: reason, sha: sha, open: open)
+        let digest = PRActionDigest.of(r, reason: reason, sha: sha, repoURL: repoURL, open: open)
         lock.withLock { lastAsk = digest }
         if let approved, approved.digest == digest { return .auto }
         return decision

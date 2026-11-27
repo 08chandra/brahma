@@ -38,8 +38,9 @@ extension Store {
         try writer.read { db in try PRLanding.fetchOne(db, key: itemId) }
     }
 
-    /// Writes the item's landing (one row per item: a resubmit replaces it).
-    public func upsertPRLanding(_ landing: PRLanding) throws {
+    /// Writes the item's landing whole, with no state check (one row per item). Not an engine path: the landing machine and the
+    /// push stage write through the compare-and-set `casPRLanding`/`recordPushStage`; this is for tests and fixtures.
+    func upsertPRLanding(_ landing: PRLanding) throws {
         try writer.write { db in try landing.save(db) }
     }
 

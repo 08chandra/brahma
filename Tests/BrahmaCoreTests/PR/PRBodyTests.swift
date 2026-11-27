@@ -116,7 +116,9 @@ import Testing
             }
         }
         let padded = [lines.joined(separator: "\n"), String(repeating: "&", count: 100 * 1024),
-                      Array(repeating: "x", count: 2000).joined(separator: "\n"), String(repeating: "<&>\n", count: 25_000)]
+                      Array(repeating: "x", count: 2000).joined(separator: "\n"), String(repeating: "<&>\n", count: 25_000),
+                      // Fix round 2 (M2): one long backtick run makes a long fence, never a block past the cap.
+                      String(repeating: "`", count: 3000), String(repeating: "`", count: 4000), "lead\n" + String(repeating: "`", count: 5000)]
         for note in padded {
             let body = Self.render(notes: ExternalText(text: note, source: "review note"))
             let block = Self.block(body)
@@ -124,6 +126,8 @@ import Testing
             #expect(!block.isEmpty && rendered.utf8.count <= PRBody.notesCap, "\(rendered.utf8.count)")
             #expect(rendered.utf8.count > PRBody.notesCap - 200, "the cap is used, not wasted: \(rendered.utf8.count)")
             #expect(block.allSatisfy { $0.hasPrefix(">") })
+            let fence = block.first.map { $0.dropFirst(2).count } ?? 0
+            #expect(fence >= 3 && block.dropFirst().dropLast().allSatisfy { PRBody.longestBacktickRun($0) < fence }, "the fence outlasts every run")
             #expect(body.contains("(the notes were cut to 4 KiB rendered; they had \(note.utf8.count) bytes)"))
             #expect(!Self.parsed(body).contains { $0.contains("Ignore the checks") || $0.contains("octocat") || $0.contains("&&") })
         }
@@ -169,6 +173,19 @@ import Testing
         #expect(body.contains("- Title: ```Login Fixes #11 GH-2 o/r#3 @user ``[x](http://evil)`` ![i](http://evil/p.png)```"), "\(body)")
         #expect(body.contains("- [ ] ``` `tick` `` ```"), "\(body)")
         #expect(body.contains("| ``check \\| @user [x](http://evil)`` |") || body.contains("| `check \\| @user [x](http://evil)` |"), "\(body)")
+    }
+
+    /// Ruling 28's normalization, exactly: CRLF and a lone CR are LF, trailing spaces and tabs of each line and trailing newlines
+    /// at the end go; nothing else (leading whitespace, Unicode spaces) is ignored.
+    @Test func contentDigestNormalizesOnlyLineEndingsAndTrailingBlanks() {
+        let d = { (t: String, b: String) in PRBody.contentDigest(title: t, body: b) }
+        #expect(d("t", "a\r\nb\r\n") == d("t", "a\nb"))
+        #expect(d("t", "a\rb") == d("t", "a\nb"))
+        #expect(d("t ", "a \t\nb\t\n\n") == d("t", "a\nb"))
+        #expect(d("t", " a\nb") != d("t", "a\nb"), "leading whitespace counts")
+        #expect(d("t", "a\u{00A0}\nb") != d("t", "a\nb"), "a Unicode space is content")
+        #expect(d("t", "a\n\nb") != d("t", "a\nb"), "inner blank lines count")
+        #expect(d("t1", "a") != d("t2", "a") && d("t", "a") != d("ta", ""))
     }
 
     /// The PR title is plain text on GitHub (no markdown; a closing keyword there closes nothing), but GitHub links `#n`, `GH-n`,

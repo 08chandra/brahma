@@ -39,11 +39,11 @@ extension Store {
             let earlier = try Ask.filter(Column("companyId") == companyId && Column("requesterId") == "system" && Column("kind") == AskKind.prAction
                                          && Column("itemId") == itemId).order(Column("number")).fetchAll(db)
                 .filter { $0.requestId?.hasPrefix(base) == true }
-            // A card for the tuple still pending whose record a restore dropped: the owner's open card is that one again.
-            if let pending = earlier.first(where: { $0.status.isPending }) {
-                try PRActionApproval(askId: pending.id, companyId: companyId, itemId: itemId, action: action.name, sha: sha,
-                                     reason: Store.flat(reason, max: 500), createdAt: now, digest: digest).insert(db)
-                return pending
+            // A card for the tuple still pending without its record (a restore dropped it: an unreadable live database, or a
+            // record only the snapshot had): nothing says which request it showed, so it can answer none. It is superseded —
+            // the owner can no longer approve it — and a fresh card shows the request asked about now (fix round 2, N1).
+            for var stale in earlier where stale.status.isPending {
+                try settle(db, ask: &stale, status: .superseded, decidedBy: "system", tellRequesterToo: false, now: now)
             }
             let requestId = earlier.isEmpty ? base : "\(base)-\(earlier.count + 1)"
             let ask = try propose(db: db, companyId: companyId, by: .system, kind: .prAction, risk: nil, category: nil, title: card.title,
