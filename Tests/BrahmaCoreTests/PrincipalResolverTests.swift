@@ -374,11 +374,12 @@ import GRDB
         #expect(!resolver.resolve(.preview(surfaceId: surface.id)).hasUnknown, "control")
         try Self.exec(s.store, "ALTER TABLE agent RENAME TO agent_unreachable")
         #expect(throws: (any Error).self) { try s.store.agent(id: s.eng.id) }
-        for subject: ActionSubject in [.verificationRun(runId: run.id), .preview(surfaceId: surface.id),
-                                       .worktree(companyId: s.company.id, key: item.key),
+        // The id-based rows are `IdSubject` (internal, M-2), the others `ActionSubject`: both resolved here.
+        let byId: [IdSubject] = [.verificationRun(runId: run.id), .preview(surfaceId: surface.id)]
+        let others: [ActionSubject] = [.worktree(companyId: s.company.id, key: item.key),
                                        .publish(companyId: s.company.id, agentId: s.eng.id),
-                                       .vaultBlob(companyId: s.company.id, provenance: .agent(s.eng.id))] {
-            let set = resolver.resolve(subject)
+                                       .vaultBlob(companyId: s.company.id, provenance: .agent(s.eng.id))]
+        for (subject, set) in byId.map({ ("\($0)", resolver.resolve($0)) }) + others.map({ ("\($0)", resolver.resolve($0)) }) {
             #expect(set.hasUnknown && !Self.full(set), "\(subject)")
             #expect(Self.unknownReasons(set).allSatisfy { $0.hasPrefix("the lookup failed") }, "\(subject): \(Self.unknownReasons(set))")
         }
@@ -400,15 +401,15 @@ import GRDB
         try Self.exec(s.store, "UPDATE company SET smokeCheckSetById = ? WHERE id = ?", [s.eng.id, s.company.id])
         let merge = MergeRun(companyId: s.company.id, kind: .item, itemId: item.id, status: .running)
         try await s.store.writer.write { try merge.insert($0) }
-        let subjects: [ActionSubject] = [.verificationRun(runId: run.id), .mergeRun(runId: merge.id), .preview(surfaceId: surface.id),
-                                         .mainSmoke(companyId: s.company.id),
-                                         .worktree(companyId: s.company.id, key: item.key), .publish(companyId: s.company.id, agentId: s.eng.id),
-                                         .vaultBlob(companyId: s.company.id, provenance: .agent(s.eng.id))]
+        // The id-based rows are `IdSubject` (internal, M-2), the others `ActionSubject`: both resolved under each ceiling.
+        let byId: [IdSubject] = [.verificationRun(runId: run.id), .mergeRun(runId: merge.id), .preview(surfaceId: surface.id),
+                                 .mainSmoke(companyId: s.company.id)]
+        let others: [ActionSubject] = [.worktree(companyId: s.company.id, key: item.key), .publish(companyId: s.company.id, agentId: s.eng.id),
+                                       .vaultBlob(companyId: s.company.id, provenance: .agent(s.eng.id))]
         for (ceiling, expected) in [(nil, PermissionProfile.full), (.full, .full), (.workspace, .workspace), (.sandboxed, .sandboxed)]
             as [(PermissionProfile?, PermissionProfile)] {
             let resolver = PrincipalResolver(store: s.store, ceiling: ceiling)
-            for subject in subjects {
-                let set = resolver.resolve(subject)
+            for (subject, set) in byId.map({ ("\($0)", resolver.resolve($0)) }) + others.map({ ("\($0)", resolver.resolve($0)) }) {
                 #expect(set.ownerProfile == expected && Self.profiles(set) == [expected], "\(subject) under \(String(describing: ceiling))")
                 #expect(Self.full(set) == (expected == .full))
             }
@@ -905,6 +906,8 @@ import GRDB
         #expect(try !flagged(SandboxPatch(roleProfiles: [:])), "the role widened back")
         #expect(try flagged(SandboxPatch(allowLocalBinding: false)), "local binding withdrawn")
         #expect(try !flagged(SandboxPatch(allowLocalBinding: true)), "local binding given")
+        #expect(try !flagged(SandboxPatch(toolchainReadPaths: ["/opt/homebrew", "/opt/local"])), "toolchain read paths added")
+        #expect(try flagged(SandboxPatch(toolchainReadPaths: ["/opt/homebrew"])), "a toolchain read path removed")
         // The profile: the running Full preview restarts, in the sandbox.
         try x.store.updateSandbox(companyId: x.company.id, SandboxPatch(profile: .sandboxed), userHome: home)
         #expect(try x.state().restartRequestedAt != nil, "a narrowed profile flags the running preview")
@@ -915,6 +918,54 @@ import GRDB
         // Nothing running: not flagged (its next start decides from the live records anyway).
         await x.stop()
         #expect(try !flagged(SandboxPatch(profile: .sandboxed)), "a stopped preview is not flagged")
+    }
+
+    /// S6 fix 3 (I-1): a narrowed sandbox is enforced before the build gates. Under memory pressure (no start may begin), the
+    /// owner narrows a Full company to Sandboxed: the same pass stops the running unsandboxed server at once and records it
+    /// idle with its restart still requested; nothing new starts until the pressure lifts, and then it starts sandboxed.
+    @Test func s6f3NarrowedSandboxStopsARunningPreviewUnderMemoryPressure() async throws {
+        let x = try PreviewRunnerTests.Fx(profile: .full)
+        await x.pass()
+        #expect(try x.state().status == .running && x.unsandboxed.calls.count == 1 && x.spawns.isEmpty, "control: running Full")
+        let pid = try #require(try x.state().pid)
+        let process = try #require(x.deps.processes.process(pid), "the unsandboxed server is the runner's")
+        x.memory.set(true)
+        try x.store.updateSandbox(companyId: x.company.id, SandboxPatch(profile: .sandboxed), userHome: try tempDir())
+        await x.pass()
+        #expect(!process.isAlive(), "the unsandboxed server was stopped in the same pass")
+        #expect(x.deps.processes.count == 0, "nothing of the run is left")
+        #expect(x.spawns.isEmpty && x.unsandboxed.calls.count == 1, "nothing started under pressure")
+        let held = try x.state()
+        #expect(held.status == .idle && held.pid == nil && held.restartRequestedAt != nil, "\(held)")
+        #expect(held.message == PreviewRunner.pressureMessage, "\(held)")
+        // Pressure lifts: it starts again, in the sandbox.
+        x.memory.set(false)
+        await x.pass()
+        #expect(try x.state().status == .running && !x.spawns.isEmpty && x.unsandboxed.calls.count == 1, "restarted sandboxed")
+        await x.stop()
+    }
+
+    /// S6 fix 3 (I-1): an ordinary restart request under memory pressure (nothing about the sandbox changed) still waits with
+    /// the old server running, as before.
+    @Test func s6f3OrdinaryRestartUnderMemoryPressureKeepsTheServer() async throws {
+        let x = try PreviewRunnerTests.Fx(profile: .full)
+        await x.pass()
+        #expect(try x.state().status == .running && x.unsandboxed.calls.count == 1, "control: running Full")
+        let pid = try #require(try x.state().pid)
+        let process = try #require(x.deps.processes.process(pid))
+        x.memory.set(true)
+        try x.store.requestPreviewRestart(surfaceId: try x.surface("web").id, by: .owner, now: x.now)
+        await x.pass()
+        #expect(process.isAlive() && x.deps.processes.count == 1, "the server keeps running while the restart waits")
+        let waiting = try x.state()
+        #expect(waiting.status == .running && waiting.pid == pid && waiting.restartRequestedAt != nil, "\(waiting)")
+        #expect(waiting.message == PreviewRunner.pressureMessage, "\(waiting)")
+        #expect(x.unsandboxed.calls.count == 1 && x.spawns.isEmpty, "nothing started under pressure")
+        x.memory.set(false)
+        await x.pass()
+        #expect(try x.state().status == .running && x.unsandboxed.calls.count == 2, "restarted on the same Full route")
+        #expect(!process.isAlive())
+        await x.stop()
     }
 
     // MARK: B1 negatives (M2)

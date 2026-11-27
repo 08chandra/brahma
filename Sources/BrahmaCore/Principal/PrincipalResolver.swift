@@ -23,19 +23,9 @@ public struct PrincipalResolver: Sendable {
     }
 
     /// Total: never throws, never returns an empty set (see the type's notes).
-    ///
-    /// The id-based rows `.verificationRun(runId:)`, `.mergeRun(runId:)`, `.preview(surfaceId:)`, `.mainSmoke(companyId:)` and
-    /// `.release(releaseId:)` are for tests and diagnostics only: every production caller of those actions holds the record
-    /// its command comes from and resolves it with `resolve(holding:)` (S6-c1, S6-c2). `SafetyLint`'s `idSubject` zero rule
-    /// bans a `resolve(` of those rows anywhere in the scanned sources (this file included).
     public func resolve(_ subject: ActionSubject) -> PrincipalSet {
         Self.resolveCount?.add()
         switch subject {
-        case .verificationRun(let runId): return verificationRun(runId)
-        case .mergeRun(let runId): return mergeRun(runId)
-        case .preview(let surfaceId): return preview(surfaceId)
-        case .mainSmoke(let companyId): return mainSmoke(companyId)
-        case .release(let releaseId): return release(releaseId)
         case .worktree(let companyId, let key): return worktree(companyId: companyId, key: key)
         case .publish(let companyId, let agentId):
             return withCompany(companyId) { scope in [agentId.map(scope.agent) ?? .owner(companyId: companyId)] }
@@ -53,6 +43,21 @@ public struct PrincipalResolver: Sendable {
             return PrincipalSet(companyId: "", members: [.external(source: source)], ownerProfile: Self.narrowest)
         case .engine:
             return PrincipalSet(companyId: "", members: [.engine], ownerProfile: Self.narrowest)
+        }
+    }
+
+    /// The id-based rows (`IdSubject`): tests and diagnostics only, internal (S6 fix round 3, M-2). Every production caller
+    /// of those actions holds the record its command comes from and resolves it with `resolve(holding:)` (S6-c1, S6-c2);
+    /// `SafetyLint`'s `idSubject` zero rule bans a `resolve(` of these rows anywhere in the scanned sources (this file
+    /// included). Total, as `resolve(_: ActionSubject)`.
+    func resolve(_ subject: IdSubject) -> PrincipalSet {
+        Self.resolveCount?.add()
+        switch subject {
+        case .verificationRun(let runId): return verificationRun(runId)
+        case .mergeRun(let runId): return mergeRun(runId)
+        case .preview(let surfaceId): return preview(surfaceId)
+        case .mainSmoke(let companyId): return mainSmoke(companyId)
+        case .release(let releaseId): return release(releaseId)
         }
     }
 

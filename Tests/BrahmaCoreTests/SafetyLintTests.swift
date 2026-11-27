@@ -20,7 +20,9 @@ enum SafetyLint {
         /// ban on new `public func … -> Bool` in the policy and principal code (Ruling S4-B), a decision there being a
         /// `Decision`. `idSubject` (S6 fix round 2, M-e) bans a new id-based resolution of an action whose caller holds the
         /// record its command comes from (`resolve(.preview(surfaceId:` / `.mainSmoke(companyId:` / `.release(releaseId:` /
-        /// `.verificationRun(` / `.mergeRun(`): those callers use `resolve(holding:)` (S6-c1, S6-c2). Zero in every scanned
+        /// `.verificationRun(` / `.mergeRun(`): those callers use `resolve(holding:)` (S6-c1, S6-c2). Those rows are
+        /// `IdSubject`, internal to BrahmaCore (S6 fix round 3, M-2), so the compiler keeps every other module off them; this
+        /// rule is the guard inside BrahmaCore itself. Zero in every scanned
         /// root, the resolver's own file included: it switches over those rows (`case .preview(let surfaceId)`) but never
         /// calls `resolve(` on one, so it needs no exemption.
         var pattern: String {

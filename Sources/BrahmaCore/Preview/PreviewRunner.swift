@@ -20,6 +20,8 @@ import Glibc
 /// - under memory pressure no build or start begins (`"waiting: memory pressure"`);
 /// - when `main` has moved and the new head has been seen for `debounce` seconds, running surfaces restart on it;
 /// - a surface changed since its start, or flagged by the owner or its setter (`restartRequestedAt`), restarts alone;
+/// - a flagged run that the live records no longer start the same way (a narrowed sandbox: another Full route, policy or app
+///   policy, or a denial) is stopped at once, before the memory and build gates; its restart then waits for them (`stopIfNarrowed`);
 /// - a dead server is restarted after `backoff[exits - 1]`; the `crashLimit`-th exit within `crashWindow` is `failed`;
 /// - a removed surface's process is stopped;
 /// - starts run one at a time engine-wide (`maxConcurrentBuilds`), in company then `position` order, each a tracked task that
@@ -180,7 +182,7 @@ public actor PreviewRunner: EmergencyStopObserver {
             let mainSettled = settledCompany == company.id || now.timeIntervalSince(mainSeen[company.id]?.at ?? now) >= Self.debounce
             for surface in surfaces {
                 guard let kind = surface.previewKind, kind != .artifact else { continue }
-                let state = states[surface.id] ?? PreviewState(surfaceId: surface.id, companyId: company.id, updatedAt: now)
+                var state = states[surface.id] ?? PreviewState(surfaceId: surface.id, companyId: company.id, updatedAt: now)
                 // The iOS gate (fix 4): no Simulator preview runs, or keeps running, without the owner's approval.
                 if kind == .ios, surface.outsideSandboxApprovedAt == nil {
                     await holdForOwner(surface: surface, state: state, now: now)
@@ -191,6 +193,10 @@ public actor PreviewRunner: EmergencyStopObserver {
                 if await noticeExit(surface: surface, company: company, state: state, epoch: epoch, now: now) {
                     guard epoch == stopEpoch else { return }
                     continue
+                }
+                if state.restartRequestedAt != nil, let held = await stopIfNarrowed(surface.id, epoch: epoch, now: now) {
+                    guard epoch == stopEpoch else { return }
+                    state = held
                 }
                 guard let fresh = wantsStart(surface: surface, state: state, main: main, mainSettled: mainSettled, now: now) else { continue }
                 if pressured {
@@ -213,6 +219,36 @@ public actor PreviewRunner: EmergencyStopObserver {
     /// Whether the owner's stop holds now; a database error reads as stopped (nothing starts by mistake).
     var ownerStopHolds: Bool {
         do { return try store.engineStopped() != nil } catch { return true }
+    }
+
+    /// S6 fix 3 (I-1): a flagged run whose route or policy the live records no longer give is stopped now, before the memory
+    /// and build gates, which never stop the old process. The run's start is decided again (`redecided`, against the live
+    /// records); when that is denied, or its Full route, policy or app policy is not the running one's, the run is stopped
+    /// and the surface recorded `idle` with its restart still requested, and the restart itself waits for the gates as any
+    /// other. A flagged run whose decision is unchanged (an ordinary restart) keeps running until its restart begins.
+    /// Returns the recorded state when it stopped the run (an idle stand-in when that write failed, or when a `stopAll`
+    /// overtook the pass, whose record it then leaves as the stop wrote it); nil when it left the run running.
+    private func stopIfNarrowed(_ id: String, epoch: Int, now: Date) async -> PreviewState? {
+        guard let run = runs[id], let context = run.context else { return nil }
+        if let again = redecided(context, kind: run.kind), again.unsandboxed == context.unsandboxed, again.policy == context.policy,
+           again.appPolicy == context.appPolicy {
+            return nil
+        }
+        await stopRun(id)
+        restartAt[id] = nil
+        let standIn = PreviewState(surfaceId: id, companyId: run.company.id, status: .idle, restartRequestedAt: now, updatedAt: now)
+        guard epoch == stopEpoch else { return standIn }
+        do {
+            if let held = try store.updatePreviewState(surfaceId: id, now: clock(), {
+                $0.status = .idle; $0.message = nil; $0.pid = nil; $0.resolvedURL = nil; $0.simulatorId = nil
+                $0.restartRequestedAt = $0.restartRequestedAt ?? now
+            }) {
+                return held
+            }
+        } catch {
+            FileHandle.standardError.write(Data("brahma preview: could not record the stop of a narrowed preview (\(error))\n".utf8))
+        }
+        return standIn
     }
 
     /// Nil: leave it. Otherwise start it; `true` when the start is a new one (main moved, changed or flagged, never started),
