@@ -66,6 +66,13 @@ public enum CompanySecurity {
             merged.unattendedSubscriptionAt = live.unattendedSubscriptionAt
             return "unattended subscription runs kept at off (the snapshot had on)"
         },
+        // Plan X1 (Ruling 35): how turns are paid for has no order (either direction puts the company on a spending path the
+        // owner left), so the live mode always wins.
+        Field(name: "billingMode") { merged, live, restored in
+            guard live.billingMode != restored.billingMode else { return nil }
+            merged.billingMode = live.billingMode
+            return "billing kept at \(live.billingMode.rawValue) (the snapshot had \(restored.billingMode.rawValue))"
+        },
     ] }
 
     /// Every other stored property of `Company`, and why a restore may take the snapshot's value.
@@ -88,9 +95,6 @@ public enum CompanySecurity {
         "mainCheck": "agent-set check command, not an owner switch; it runs sandboxed", "mainCheckSetById": "who set the main check",
         "mergeBatchSize": "queue throughput, not a permission", "mergeStrategy": "how approved work lands; every merge is still approved",
         "mergeHold": "engine bookkeeping: why the queue is held",
-        // Plan X1: how turns are paid for. Subscription turns stay gated by the owner-wide provider policy and the unattended
-        // opt-in, which a restore keeps at the stricter value; key spend stays under the company's provider caps.
-        "billingMode": "billing route, not a permission; subscription use is gated by settings a restore keeps stricter",
         "unattendedSubscriptionAt": "when the unattended opt-in was recorded; follows unattendedSubscription",
     ]
 

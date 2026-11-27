@@ -272,7 +272,8 @@ struct RestoreCarry {
     }
 
     /// S35: every security-relevant company setting (`CompanySecurity.fields`) and the owner-wide auto-merge and provider-policy
-    /// (`subscriptionAllowed`) switches keep the stricter of the live and the restored value. Rows (agents, extensions, presets, secrets) are reported only.
+    /// (`subscriptionAllowed`) switches keep the stricter of the live and the restored value; owner-added providers follow the
+    /// live set (`Settings.providerChanges`, Ruling 35). Rows (agents, extensions, presets, secrets) are reported only.
     ///
     /// Where auto-merge is kept off (owner-wide, or a company's), the snapshot's auto-approvals that have not landed are taken
     /// back exactly as switching it off live does (`Store.revokeAutoApprovals`), so none lands on a switch the owner turned off.
@@ -294,6 +295,18 @@ struct RestoreCarry {
         if live.ownerSubscriptionAllowed == false, try db.tableExists("ownerSettings") {
             try Store.ensureOwnerSettings(db)
             try db.execute(sql: "UPDATE ownerSettings SET subscriptionAllowed = 0 WHERE id = 1")
+        }
+        // Plan X1 (Ruling 35): owner-added providers follow the live set (built-ins are untouched).
+        for change in Settings.providerChanges(live: live, restored: try Settings.read(db)) {
+            switch change {
+            case .removed(let id):
+                try db.execute(sql: "DELETE FROM modelRoute WHERE provider = ?", arguments: [id])
+                try db.execute(sql: "DELETE FROM providerCap WHERE provider = ?", arguments: [id])
+                try db.execute(sql: "DELETE FROM provider WHERE id = ? AND builtin = 0", arguments: [id])
+            case .changed(let id, let endpoint, _):
+                try db.execute(sql: "UPDATE provider SET baseURL = ?, host = ?, keySecret = ? WHERE id = ? AND builtin = 0",
+                               arguments: [endpoint.baseURL, endpoint.host, endpoint.keySecret, id])
+            }
         }
         // S36: the narrower auto-merge folder list.
         if try db.tableExists("ownerSettings") {
@@ -527,6 +540,15 @@ extension RestoreCarry {
         var ownerAutoMergePaths: [String]?
         /// `ownerSettings.subscriptionAllowed` (Plan X1, Ruling 7b): the provider-policy switch for subscription turns.
         var ownerSubscriptionAllowed: Bool?
+        /// The owner-added (non-built-in) providers by id (Plan X1, Ruling 35); nil when the database has no `provider` table.
+        /// Their hosts are the gateway's upstream allowlist, so a restore follows the live set.
+        var providers: [String: ProviderEndpoint]?
+
+        struct ProviderEndpoint: Equatable {
+            var baseURL: String
+            var host: String
+            var keySecret: String?
+        }
 
         /// Every `ownerSettings` column, classified for restores (S36; `OwnerSettingsSecurityTests` fails on a new column in
         /// neither list). Security-relevant ones keep the stricter value (`keepStricterSettings`).
@@ -543,6 +565,32 @@ extension RestoreCarry {
             "pacingPreset": "spend pacing", "dayStartUtil": "spend pacing (the daily share's baseline)",
             "dayStartDate": "spend pacing (the daily share's baseline)",
         ]
+
+        /// Plan X1 (Ruling 35): what a restore changes so the owner-added providers follow the live set — a restored one absent
+        /// live is removed (with the routes and caps naming it); one whose endpoint or key name differs takes the live values. A
+        /// provider only live is not added back. Nothing when either database has no `provider` table.
+        enum ProviderChange: Equatable {
+            case removed(String)
+            case changed(String, live: ProviderEndpoint, restored: ProviderEndpoint)
+
+            var line: String {
+                switch self {
+                case .removed(let id):
+                    return "provider \(id), removed after the snapshot, stays removed with the routes and caps naming it"
+                case .changed(let id, let live, let restored):
+                    func show(_ e: ProviderEndpoint) -> String { "\(e.baseURL) (host \(e.host), key \(e.keySecret ?? "none"))" }
+                    return "provider \(id) kept at \(show(live)) (the snapshot had \(show(restored)))"
+                }
+            }
+        }
+
+        static func providerChanges(live: Settings, restored: Settings) -> [ProviderChange] {
+            guard let liveProviders = live.providers, let restoredProviders = restored.providers else { return [] }
+            return restoredProviders.sorted { $0.key < $1.key }.compactMap { id, then in
+                guard let now = liveProviders[id] else { return .removed(id) }
+                return now == then ? nil : .changed(id, live: now, restored: then)
+            }
+        }
 
         /// S36: the narrower auto-merge folder list. Both set: their intersection (in the live order); one set: the live list.
         static func narrowerAutoMergePaths(live: [String]?, restored: [String]?) -> [String]? {
@@ -576,6 +624,13 @@ extension RestoreCarry {
             }
             if try db.tableExists("ownerSettings"), try db.columns(in: "ownerSettings").contains(where: { $0.name == "subscriptionAllowed" }) {
                 s.ownerSubscriptionAllowed = try Bool.fetchOne(db, sql: "SELECT subscriptionAllowed FROM ownerSettings WHERE id = 1")
+            }
+            if try db.tableExists("provider") {
+                var providers: [String: ProviderEndpoint] = [:]
+                for row in try Row.fetchAll(db, sql: "SELECT id, baseURL, host, keySecret FROM provider WHERE builtin = 0") {
+                    providers[row["id"]] = ProviderEndpoint(baseURL: row["baseURL"], host: row["host"], keySecret: row["keySecret"])
+                }
+                s.providers = providers
             }
             return s
         }
@@ -620,6 +675,7 @@ extension RestoreCarry {
             if restored.ownerSubscriptionAllowed != false, live.ownerSubscriptionAllowed == false {
                 out.append("owner-wide subscription turns kept off by provider policy (the snapshot had them on)")
             }
+            out += providerChanges(live: live, restored: restored).map(\.line)
             let paths = narrowerAutoMergePaths(live: live.ownerAutoMergePaths, restored: restored.ownerAutoMergePaths)
             if paths != restored.ownerAutoMergePaths {
                 func show(_ p: [String]?) -> String { p.map { $0.isEmpty ? "none" : $0.joined(separator: ", ") } ?? "the pack's list" }

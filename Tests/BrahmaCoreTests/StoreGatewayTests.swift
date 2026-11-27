@@ -393,4 +393,57 @@ import GRDB
         #expect(outcome.warnings.contains { $0.contains("owner-wide subscription turns kept off") }, "\(outcome.warnings)")
         #expect(outcome.warnings.contains { $0.contains("Acme: unattended subscription runs kept at off") }, "\(outcome.warnings)")
     }
+
+    /// Ruling 35: the billing mode has no stricter direction, so a restore keeps the live mode either way, and says so.
+    @Test func restoreKeepsTheLiveBillingMode() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme"), beta = try env.company("Beta")
+        try env.store.setBillingMode(.apiKey, companyId: beta.id)
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try env.store.setBillingMode(.apiKey, companyId: acme.id)          // snapshot subscription, live api-key
+        try env.store.setBillingMode(.subscription, companyId: beta.id)    // snapshot api-key, live subscription
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        #expect(try restored.billingMode(companyId: acme.id) == .apiKey)
+        #expect(try restored.billingMode(companyId: beta.id) == .subscription)
+        #expect(outcome.warnings.contains { $0.contains("Acme: billing kept at api-key (the snapshot had subscription)") }, "\(outcome.warnings)")
+        #expect(outcome.warnings.contains { $0.contains("Beta: billing kept at subscription (the snapshot had api-key)") }, "\(outcome.warnings)")
+    }
+
+    /// Ruling 35: owner-added providers follow the live set. One removed after the snapshot stays removed with its routes and
+    /// caps; one re-added with another host keeps the live host; the built-ins are untouched.
+    @Test func restoreFollowsTheLiveProviders() throws {
+        let env = try BackupEnv()
+        let acme = try env.company("Acme")
+        func provider(_ id: String, host: String) -> Provider {
+            Provider(id: id, adapter: "openai-compatible", baseURL: URL(string: "https://\(host)/v1")!, host: host,
+                     keySecret: "BRAHMA_KEY_\(id.uppercased())", createdAt: Date(timeIntervalSince1970: 1_790_000_000))
+        }
+        try env.store.addProvider(provider("gone", host: "gone.example.com"))
+        try env.store.addProvider(provider("edge", host: "a.example.com"))
+        try env.store.setRoute(ModelRoute(companyId: acme.id, scope: .company, subject: "", modelClass: "fast", provider: "gone", model: "m"))
+        try env.store.setProviderCaps(ProviderCaps(monthlyUSD: 10), companyId: acme.id, provider: "gone")
+        let service = env.service()
+        let snapshot = try service.snapshot(reason: .manual)
+        try env.store.clearRoutes(companyId: acme.id, scope: .company, subject: "")
+        try env.store.writer.write { db in try db.execute(sql: "DELETE FROM providerCap WHERE provider = 'gone'") }
+        try env.store.removeProvider(id: "gone")
+        try env.store.removeProvider(id: "edge")
+        try env.store.addProvider(provider("edge", host: "b.example.com"))
+        try env.store.close()
+        let outcome = try service.restore(try service.planRestore(snapshot: snapshot))
+        let restored = try Store(path: env.paths.database.path, backupsDir: env.paths.backupsDir)
+        #expect(try restored.provider(id: "gone") == nil)
+        #expect(try restored.routes(companyId: acme.id).isEmpty)
+        #expect(try restored.providerCaps(companyId: acme.id, provider: "gone") == nil)
+        let edge = try #require(try restored.provider(id: "edge"))
+        #expect(edge.host == "b.example.com" && edge.baseURL.absoluteString == "https://b.example.com/v1")
+        #expect(try restored.providers().filter(\.builtin).map(\.id) == ["anthropic", "groq", "openai", "openrouter"])
+        #expect(try !restored.providerKeyNames().contains("BRAHMA_KEY_GONE"))
+        #expect(outcome.warnings.contains { $0.contains("provider gone, removed after the snapshot, stays removed with the routes and caps naming it") },
+                "\(outcome.warnings)")
+        #expect(outcome.warnings.contains { $0.contains("provider edge kept at https://b.example.com/v1 (host b.example.com") }, "\(outcome.warnings)")
+    }
 }
