@@ -121,13 +121,16 @@ enum SourceLint {
 }
 
 /// Spec §8.1.1, §8.1.6: a `RuntimeId` is constructed only in the runtime catalog's own directory (`Sources/BrahmaCore/Runtime/`;
-/// decoding through `Codable` is the only other way in), and no source compares a `rawValue` with a string literal: a runtime
-/// is named through `RuntimeCatalog`, never by its spelling.
+/// decoding through `Codable` is the only other way in), and no source compares a `rawValue` with a string literal (`==` or `!=`,
+/// either side): a runtime is named through `RuntimeCatalog`, never by its spelling.
 @Suite(.scratch) struct RuntimeIdLintTests {
     static let sources = SourceLint.packageRoot.appending(path: "Sources", directoryHint: .isDirectory)
     static let runtimeDir = "BrahmaCore/Runtime/"
-    static let construction = #"\bRuntimeId\s*(\(|\.\s*init\b)"#
-    static let rawValueLiteral = #"\brawValue\s*==\s*"|"\s*==\s*[A-Za-z_][A-Za-z0-9_.]*\.rawValue\b"#
+    /// `RuntimeId(`, `RuntimeId.init`, and the implicit-member form `.init(rawValue: "…")` of any type (fix round 1: `let id:
+    /// RuntimeId = .init(rawValue:)` and `runtime(.init(rawValue:))` name no type).
+    static let construction = #"\bRuntimeId\s*(\(|\.\s*init\b)|\.init\s*\(\s*rawValue:\s*""#
+    /// `rawValue == "…"`, `rawValue != "…"` and the reversed `"…" == x.rawValue` / `"…" != x.rawValue`.
+    static let rawValueLiteral = #"\brawValue\s*[!=]=\s*"|"\s*[!=]=\s*[A-Za-z_][A-Za-z0-9_.]*\.rawValue\b"#
     static func excluded(_ path: String) -> Bool { path.hasPrefix(runtimeDir) }
 
     static func offenders(under root: URL) throws -> [String] {
@@ -159,16 +162,24 @@ enum SourceLint {
                 static let b = RuntimeId .init(rawValue: "other")
                 static func c(_ id: RuntimeId) -> Bool { id.rawValue == "claude" }
                 static func d(_ id: RuntimeId) -> Bool { "claude" == id.rawValue }
+                static let e: RuntimeId = .init(rawValue: "other")
+                static func f() -> Bool { RuntimeCatalog.runtime(.init(rawValue: "other")) != nil }
+                static func g(_ id: RuntimeId) -> Bool { id.rawValue != "claude" }
+                static func h(_ id: RuntimeId) -> Bool { "claude" != id.rawValue }
             }
             """, at: "BrahmaCore/Somewhere/Offender.swift", under: copy)
         try SourceLint.plant("let inCatalog = RuntimeId(rawValue: \"claude\")\n", at: "BrahmaCore/Runtime/Planted.swift", under: copy)
         let offenders = try Self.offenders(under: copy)
-        #expect(offenders.count == 4, "\(offenders)")
+        #expect(offenders.count == 8, "\(offenders)")
         #expect(offenders.allSatisfy { $0.hasPrefix("BrahmaCore/Somewhere/Offender.swift:") }, "\(offenders)")
         #expect(offenders.contains { $0.hasSuffix(":8: RuntimeId(") })
         #expect(offenders.contains { $0.hasSuffix(":9: RuntimeId .init") })
         #expect(offenders.contains { $0.hasSuffix(":10: rawValue == \"") })
         #expect(offenders.contains { $0.hasSuffix(":11: \" == id.rawValue") })
+        #expect(offenders.contains { $0.hasSuffix(":12: .init(rawValue: \"") })
+        #expect(offenders.contains { $0.hasSuffix(":13: .init(rawValue: \"") })
+        #expect(offenders.contains { $0.hasSuffix(":14: rawValue != \"") })
+        #expect(offenders.contains { $0.hasSuffix(":15: \" != id.rawValue") })
     }
 
     /// The blanker: comments and string insides go, quotes and newlines stay, lengths are kept.

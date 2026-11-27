@@ -80,14 +80,15 @@ public struct CanaryInputs: Sendable {
     }
 }
 
-/// The canary a turn shape needs: its key (what a pass is recorded under) and how to build the canary's request. Equatable on
-/// `shapeKey` alone. `request` throws as today's builder does (it plants files and compiles the turn; a failure must surface,
-/// never be swallowed).
+/// The canary a turn shape needs: its key (what a pass is recorded under) and how to build the canary's turn. Equatable on
+/// `shapeKey` alone. `request` yields what today's builder yields (Ruling 29): `SandboxCanary.Prepared` — the request, its
+/// compiled settings, the token and the planted places the canary leak-matches and cleans up — and throws as the builder does
+/// (it plants files and compiles the turn; a failure must surface, never be swallowed).
 public struct CanaryTurnShape: Sendable, Equatable {
     public var shapeKey: String
-    public var request: @Sendable (CanaryInputs) throws -> TurnRequest
+    public var request: @Sendable (CanaryInputs) throws -> SandboxCanary.Prepared
 
-    public init(shapeKey: String, request: @escaping @Sendable (CanaryInputs) throws -> TurnRequest) {
+    public init(shapeKey: String, request: @escaping @Sendable (CanaryInputs) throws -> SandboxCanary.Prepared) {
         self.shapeKey = shapeKey; self.request = request
     }
 
