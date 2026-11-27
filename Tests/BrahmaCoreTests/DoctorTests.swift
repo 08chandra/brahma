@@ -48,12 +48,12 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
 @Suite(.scratch) struct DoctorTests {
     @Test func allPass() async {
         let runner = ProbeRunner(good())
-        let r = await Doctor.run(claudePath: "claude", runner: runner, exec: exec(), now: t0)
+        let r = await Doctor.run(claudePath: "claude", runner: runner, exec: exec(), now: t0, environment: [:])
         #expect(r.ok, "\(r.items)")
         #expect(r.cliVersion == "2.1.312")
-        // Plan C Task C4c adds `collab-tools` (the tool-schema budget).
+        // Plan C Task C4c adds `collab-tools` (the tool-schema budget); Plan X1 Task 4 `ambient-claude-auth`.
         #expect(r.items.map(\.name) == ["version", "flags", "probe", "resume-keeps-role", "overage", "tools-present", "sideload-allowed",
-                                        "collab-tools"])
+                                        "collab-tools", "ambient-claude-auth"])
         #expect(r.items.allSatisfy { $0.status == .pass }, "\(r.items)")
         let reqs = runner.requests
         #expect(reqs.count == 2)
@@ -105,6 +105,16 @@ private func item(_ r: DoctorReport, _ name: String) -> DoctorItem? { r.items.fi
         #expect(!r2.ok)
         // Without a sandbox runner the item is not run (the doctor command always passes one).
         #expect(item(await Doctor.run(claudePath: inert.path, runner: ProbeRunner(good()), exec: exec(), now: t0), "plugin-details-inert") == nil)
+    }
+
+    /// Plan X1 Task 4: the doctor reads the engine's environment it is given, never the test process's, and an ignored login only
+    /// warns (the report stays ok).
+    @Test func ambientAuthReadsTheGivenEnvironment() async {
+        let r = await Doctor.run(claudePath: "claude", runner: ProbeRunner(good()), exec: exec(), now: t0,
+                                 environment: ["CLAUDE_CODE_OAUTH_TOKEN": "owner-oauth"])
+        #expect(item(r, "ambient-claude-auth")?.status == .warn)
+        #expect(item(r, "ambient-claude-auth")?.detail.contains("CLAUDE_CODE_OAUTH_TOKEN is set") == true)
+        #expect(r.ok, "\(r.items)")
     }
 
     @Test func sandboxFlagsAreRequired() async {

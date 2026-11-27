@@ -139,7 +139,7 @@ let plan1Settings = "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disa
         let engine = ["CLAUDE_CODE_EFFORT_LEVEL": "low", "CLAUDE_CODE_DISABLE_FAST_MODE": "1", "CLAUDE_CODE_OAUTH_TOKEN": "t", "MAX_THINKING_TOKENS": "1", "OTHER": "x"]
         let env = ChildEnvironment.make(base: base, extra: [:], engineClaudeVars: engine, purpose: .claude)
         #expect(env["CLAUDE_CODE_DISABLE_FAST_MODE"] == "1"); #expect(env["CLAUDE_CODE_EFFORT_LEVEL"] == nil, "never passed, even engine-set (W1)")
-        #expect(env["CLAUDE_CODE_OAUTH_TOKEN"] == nil, "auth comes only from the base environment")
+        #expect(env["CLAUDE_CODE_OAUTH_TOKEN"] == nil, "auth never comes from the engine's controls")
         #expect(env["MAX_THINKING_TOKENS"] == nil); #expect(env["OTHER"] == nil)
         #expect(env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == nil)
         #expect(ChildEnvironment.make(base: base, extra: [:], engineClaudeVars: engine, purpose: .general)["CLAUDE_CODE_DISABLE_FAST_MODE"] == nil)
@@ -168,7 +168,8 @@ let plan1Settings = "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disa
         }
         #expect(env["PATH"] == "/bin"); #expect(env["HOME"] == "/h"); #expect(env["LANG"] == "en_US.UTF-8")
         #expect(env["LC_ALL"] == "C"); #expect(env["BRAHMA_AGENT_ID"] == "a1")
-        #expect(env["ANTHROPIC_API_KEY"] == "k"); #expect(env["CLAUDE_CODE_OAUTH_TOKEN"] == "t")
+        // Plan X1 Task 4: a turn no longer inherits the owner's Claude auth (ChildEnvironmentTests.ambientAuthNeverPassed).
+        #expect(env["ANTHROPIC_API_KEY"] == nil); #expect(env["CLAUDE_CODE_OAUTH_TOKEN"] == nil)
         for (name, value) in ["HTTPS_PROXY": "http://p:3128", "no_proxy": "localhost", "SSL_CERT_FILE": "/c.pem",
                               "NODE_EXTRA_CA_CERTS": "/ca.pem", "CLAUDE_CONFIG_DIR": "/cfg"] {
             #expect(env[name] == value, "\(name) missing")

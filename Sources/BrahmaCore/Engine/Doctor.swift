@@ -78,7 +78,8 @@ public enum Doctor {
                            managedSettingsPath: String = Doctor.managedSettingsPath,
                            managedPreferencesPath: String? = nil,
                            sandbox: (any SandboxedRunner)? = nil,
-                           canary: (any SandboxCanaryRunning)? = nil, canaryPaths: BrahmaPaths? = nil) async -> DoctorReport {
+                           canary: (any SandboxCanaryRunning)? = nil, canaryPaths: BrahmaPaths? = nil,
+                           environment: [String: String] = ProcessInfo.processInfo.environment) async -> DoctorReport {
         let found = await versionOutcome(claudePath: claudePath, exec: exec)
         guard let version = found.version else {
             let detail = found.timedOut?.description ?? "can't run '\(claudePath) --version'; is Claude Code installed?"
@@ -91,6 +92,7 @@ public enum Doctor {
         items.append(toolsItem(probe.tools))
         items.append(sideloadItem(path: managedSettingsPath, preferences: managedPreferencesPath.map { [$0] } ?? managedPreferencePaths()))
         items.append(collabToolsItem())
+        items.append(ambientAuthItem(environment: environment))
         if let sandbox { items.append(await pluginDetailsItem(claudePath: claudePath, sandbox: sandbox)) }
         // The sandbox canary (Task 3): `sandbox-backend`, `sandbox-canary-local`, `sandbox-canary`, `sandbox-helpers`. The doctor only reports them; the
         // engine's per-launch gate records a pass for the shapes its turns use.
@@ -121,6 +123,21 @@ public enum Doctor {
             ? DoctorItem(name: "collab-tools", status: .pass, detail: "\(tokens) added tokens per turn (budget \(CollabToolBudget.maxTokens))")
             : DoctorItem(name: "collab-tools", status: .fail,
                          detail: "\(tokens) added tokens per turn, over the budget of \(CollabToolBudget.maxTokens)")
+    }
+
+    /// The Claude login variables a shell may carry. Turns never inherit them (Plan X1 Task 4, spec §8.2.2).
+    static let ambientAuthVariables = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
+
+    /// Plan X1 Task 4: names a Claude login in the engine's own environment, which every turn now ignores (it used to switch
+    /// turns to API billing). `environment` is the engine's environment (injected; production passes this process's).
+    public static func ambientAuthItem(environment: [String: String]) -> DoctorItem {
+        let set = ambientAuthVariables.filter { !(environment[$0] ?? "").isEmpty }
+        guard !set.isEmpty else {
+            return DoctorItem(name: "ambient-claude-auth", status: .pass, detail: "none in the engine's environment")
+        }
+        return DoctorItem(name: "ambient-claude-auth", status: .warn,
+                          detail: "ignored (\(set.joined(separator: " and ")) \(set.count == 1 ? "is" : "are") set in your environment; "
+                              + "Brahma uses only the company key; see brahma billing)")
     }
 
     /// Reuses the stored report when it passed, is fresh, and was made by the same CLI version.

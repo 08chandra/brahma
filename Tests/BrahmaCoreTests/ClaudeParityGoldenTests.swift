@@ -57,7 +57,14 @@ enum ParityShapes {
     /// (`conciergeProfile`) and the doctor's mode canary (`ModeCanary.shapes()`, through the runner's `control` argv).
     static let conciergeName = "concierge"
     static func modeCanaryName(_ shape: String) -> String { "mode-canary-\(shape)" }
-    static var specialNames: [String] { [conciergeName] + ModeCanary.shapes().map { modeCanaryName($0.0) } }
+    /// Plan X1 Task 4 (`workSandboxedAmbientAuth`): a sandboxed work turn compiled while the owner's environment carries Claude
+    /// auth and gateway variables (`GoldenWorld.ambientAuthEnvironment`); its golden shows none of them.
+    static let workSandboxedAmbientAuth = "work-sandboxed-ambient-auth"
+    /// The cell the ambient-auth shape compiles: only its base environment differs.
+    static let ambientAuthCell = ParityCell(profile: .sandboxed, kind: .work, mode: .standard, launch: .none, network: .default, item: .item)
+    static var specialNames: [String] {
+        [conciergeName, workSandboxedAmbientAuth] + ModeCanary.shapes().map { modeCanaryName($0.0) }
+    }
 
     /// Every golden's name: the cells plus the special shapes.
     static var allNames: Set<String> { Set(enumerate().map(\.name)).union(specialNames) }
@@ -220,6 +227,14 @@ struct GoldenWorld {
          "AWS_PROFILE": "owner", "NPM_CONFIG_USERCONFIG": userHome.appending(path: ".npmrc").path]
     }
 
+    /// Plan X1 Task 4: the owner's environment with a Claude login and the gateway's names set in the shell. The key value is
+    /// assembled at runtime (Ruling 8); none of these may reach a turn.
+    var ambientAuthEnvironment: [String: String] {
+        baseEnvironment.merging(["ANTHROPIC_API_KEY": ["sk", "ant", "real"].joined(separator: "-"),
+                                 "CLAUDE_CODE_OAUTH_TOKEN": "owner-oauth", "ANTHROPIC_BASE_URL": "https://x",
+                                 "ANTHROPIC_DEFAULT_OPUS_MODEL": "owner-model", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"]) { $1 }
+    }
+
     /// The cell's request as `Orchestrator.performTurn`'s `turnRequest` builds it.
     func request(_ cell: ParityCell) throws -> TurnRequest {
         let company = company(cell.network)
@@ -335,8 +350,9 @@ private func json(_ text: String) throws -> Any { try JSONSerialization.jsonObje
 /// inline `--settings`), its child environment and the MCP config its argv names; the shape is `TurnShape.of(_:auth:)`'s key.
 /// Task 1 recorded the goldens on today's direct path (`TurnProfileCompiler.profile(for:)` → `validate` → `arguments`,
 /// `settingsJSON`, `ChildEnvironment.make(purpose: .claude)`); they match unchanged.
-private func capture(_ r: TurnRequest, world: GoldenWorld, controlSession: Bool = false) throws -> Capture {
-    let runtime = ClaudeRuntime(baseEnvironment: world.baseEnvironment)
+private func capture(_ r: TurnRequest, world: GoldenWorld, controlSession: Bool = false,
+                     baseEnvironment: [String: String]? = nil) throws -> Capture {
+    let runtime = ClaudeRuntime(baseEnvironment: baseEnvironment ?? world.baseEnvironment)
     let caps = RuntimeProbe(runtime: RuntimeCatalog.claude)
     let spec = controlSession ? try runtime.compileControl(r, caps) : try runtime.compile(r, caps)
     func value(after flag: String) throws -> String {
@@ -361,6 +377,9 @@ private func capture(cell: ParityCell, world: GoldenWorld) throws -> Capture {
 
 private func capture(name: String, world: GoldenWorld) throws -> Capture {
     if name == ParityShapes.conciergeName { return try capture(try world.conciergeRequest(), world: world) }
+    if name == ParityShapes.workSandboxedAmbientAuth {
+        return try capture(try world.request(ParityShapes.ambientAuthCell), world: world, baseEnvironment: world.ambientAuthEnvironment)
+    }
     if let canary = ModeCanary.shapes().first(where: { ParityShapes.modeCanaryName($0.0) == name }) {
         return try capture(world.modeCanaryRequest(canary.1), world: world, controlSession: true)
     }
@@ -371,6 +390,7 @@ private func capture(name: String, world: GoldenWorld) throws -> Capture {
 /// The request behind the golden `name`, as `capture(name:)` builds it (shared with Task 2's `RuntimeTypesTests`).
 func goldenRequest(name: String, world: GoldenWorld) throws -> TurnRequest {
     if name == ParityShapes.conciergeName { return try world.conciergeRequest() }
+    if name == ParityShapes.workSandboxedAmbientAuth { return try world.request(ParityShapes.ambientAuthCell) }
     if let canary = ModeCanary.shapes().first(where: { ParityShapes.modeCanaryName($0.0) == name }) {
         return world.modeCanaryRequest(canary.1)
     }
@@ -455,6 +475,20 @@ enum Goldens {
                 #expect(name.hasPrefix("mode-canary-"), "\(name) has no company server")
             }
         }
+    }
+
+    /// Plan X1 Task 4: with Claude auth and the gateway's names in the owner's environment, the turn compiles exactly as without
+    /// them — no auth or gateway variable in its environment.
+    @Test func ambientAuthShapeHasNoAuthVariable() throws {
+        let world = try GoldenWorld()
+        let ambient = try capture(name: ParityShapes.workSandboxedAmbientAuth, world: world)
+        for name in ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] {
+            #expect(ambient.env[name] == nil, "\(name) reached the turn")
+        }
+        #expect(!ambient.env.keys.contains { $0.hasPrefix("ANTHROPIC_") })
+        let plain = try capture(cell: ParityShapes.ambientAuthCell, world: world)
+        #expect(try ambient.text(world) == (try plain.text(world)))
     }
 
     /// The pair (e) asks about: an item and an itemless sandboxed work turn hash to the same shape (no array goes empty), the two

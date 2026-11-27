@@ -2,14 +2,31 @@ import Foundation
 
 /// The environment a child process (an agent turn or a check) gets: an allowlist, never the owner's full environment.
 public enum ChildEnvironment {
-    /// `check` is the engine-run verification command: the `general` allowlist and no auth variables (secrets never reach it).
+    /// `check` is the engine-run verification command: the `general` allowlist (secrets never reach it). No purpose inherits Claude
+    /// auth (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_*`) from the engine's environment (Plan X1 Task 4, spec §8.2.2).
     public enum Purpose: Sendable { case claude, general, check }
 
     static let allowed: Set<String> = ["PATH", "HOME", "LANG", "TERM", "USER", "LOGNAME", "SHELL", "DEVELOPER_DIR", "TMPDIR",
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
         "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "CLAUDE_CONFIG_DIR",
     ]
-    static let claudeAuth: Set<String> = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
+    /// What a gateway turn's environment carries (Plan X1 spec §8.2.2): the gateway's base URL, the turn token as the API key, the
+    /// model-class aliases and the switch that stops `claude`'s non-essential traffic. Admitted only from `make(gateway:)`, which
+    /// only the Claude gateway compile fills; never from the owner's environment, `extra` or `engineClaudeVars`.
+    public static let gatewayVariables: Set<String> = [
+        "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    ]
+    /// What a gateway turn sets over the owner's values (Ruling 32): the deny proxy and the agent's isolated `CLAUDE_CONFIG_DIR`.
+    public static let gatewayOverrides: Set<String> = [
+        "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "NO_PROXY", "no_proxy", "CLAUDE_CONFIG_DIR",
+    ]
+    /// The gateway names that only make sense with a well-formed turn token: without one, a base URL would carry the owner's
+    /// login to it (X1-0 (h2)), so `make` drops them all.
+    static let gatewayTokenBound: Set<String> = [
+        "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ]
 
     /// The `CLAUDE_CODE_*` controls the engine sets per turn (design §4.1), admitted only from what the compiler put on the turn,
     /// never inherited from the owner's environment. One list for 3a (W1/W8) and 5-lite (F1). Never passed, inherited or not:
@@ -29,10 +46,10 @@ public enum ChildEnvironment {
         return u.contains("TOKEN") || u.contains("SECRET") || u.contains("KEY") || u.hasPrefix("AWS_") || u == "SSH_AUTH_SOCK"
     }
 
-    /// Names a secret may never take: the engine's own variables, the basics every child needs, the Claude auth
-    /// variables and the loader/interpreter hooks that run code in a child.
+    /// Names a secret may never take: the engine's own variables, the basics every child needs, the Claude auth and gateway
+    /// variables (every `CLAUDE_*` and `ANTHROPIC_*`) and the loader/interpreter hooks that run code in a child.
     static func isReserved(_ name: String) -> Bool {
-        allowed.contains(name) || claudeAuth.contains(name) || name.hasPrefix("LC_") || name.hasPrefix("BRAHMA_")
+        allowed.contains(name) || name.hasPrefix("LC_") || name.hasPrefix("BRAHMA_")
             || name.hasPrefix("CLAUDE_") || name.hasPrefix("ANTHROPIC_") || name.hasPrefix("DYLD_") || name.hasPrefix("LD_")
             || ["NODE_OPTIONS", "BASH_ENV", "ENV", "SHELLOPTS", "PS4", "IFS", "PYTHONSTARTUP", "PYTHONPATH", "RUBYOPT", "PERL5OPT"].contains(name)
     }
@@ -47,13 +64,11 @@ public enum ChildEnvironment {
 
     public static func make(base: [String: String], extra: [String: String] = [:],
                             engineClaudeVars: [String: String] = [:], purpose: Purpose = .general,
-                            secrets: [String: String] = [:], allowBuiltinAgentsSwitch: Bool = false) -> [String: String] {
+                            secrets: [String: String] = [:], allowBuiltinAgentsSwitch: Bool = false,
+                            gateway: [String: String] = [:]) -> [String: String] {
         var env: [String: String] = [:]
         for (name, value) in base where (allowed.contains(name) || name.hasPrefix("LC_")) && !isSecretName(name) {
             env[name] = value
-        }
-        if purpose == .claude {
-            for name in claudeAuth { if let v = base[name] { env[name] = v } }
         }
         // Never the MCP server's per-turn token: it lives only in that server's env block (fix round 1, I2(d)).
         for (name, value) in extra where name.hasPrefix("BRAHMA_") && name != "BRAHMA_DEV" && name != MCPConfig.tokenVariable {
@@ -65,9 +80,21 @@ public enum ChildEnvironment {
             for name in CanaryProbes.variables { if let value = extra[name] { env[name] = value } }
             for (name, value) in engineClaudeVars where Self.engineClaudeVars.contains(name) { env[name] = value }
             if allowBuiltinAgentsSwitch, engineClaudeVars[builtinAgentsSwitch] == "1" { env[builtinAgentsSwitch] = "1" }
+            env.merge(admittedGateway(gateway)) { $1 }
         }
         for (name, value) in secrets where SecretName.isInjectable(name) { env[name] = value }
         return env
+    }
+
+    /// The part of `gateway` a turn takes (Ruling 32): `gatewayVariables` and `gatewayOverrides`, nothing else. A missing or
+    /// malformed turn token (`TurnTokenFormat`) drops the token, the base URL and the model aliases; the deny proxy, the config
+    /// dir and the traffic switch still apply, so the child can reach neither the gateway with the owner's login nor the network.
+    static func admittedGateway(_ gateway: [String: String]) -> [String: String] {
+        let admitted = gateway.filter { gatewayVariables.contains($0.key) || gatewayOverrides.contains($0.key) }
+        guard let token = admitted["ANTHROPIC_API_KEY"], TurnTokenFormat.isWellFormed(token) else {
+            return admitted.filter { !gatewayTokenBound.contains($0.key) }
+        }
+        return admitted
     }
 
     /// The names `make` would drop from `secrets` (sorted), for the caller to log.
