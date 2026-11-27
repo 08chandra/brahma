@@ -14,10 +14,46 @@ import Testing
         let forced = MetricValue(id: .usagePerLanded, label: "x", numerator: 3, denominator: 0, unit: .usd, basis: "", detail: [],
                                  status: .ok, target: nil)
         #expect(forced.display == "insufficient data (n=0)")
-        for unit in [MetricUnit.ratio, .usd, .perUSD, .perHour] {
+        for unit in [MetricUnit.ratio, .usd] {
             let z = MetricValue.rate(.revertRate, numerator: 5, denominator: 0, unit: unit, basis: "")
             #expect(z.status == .insufficient(n: 0), "\(unit)")
             #expect(!z.display.contains("inf") && !z.display.contains("nan"), "\(unit): \(z.display)")
+        }
+        // The inverted units count their numerator as events, and still never divide by a zero denominator.
+        for unit in [MetricUnit.perUSD, .perHour] {
+            let z = MetricValue.rate(.itemsPerDollar, numerator: 25, denominator: 0, unit: unit, basis: "")
+            #expect(z.status == .ok, "\(unit)")
+            #expect(z.display == "insufficient data (n=0)", "\(unit): \(z.display)")
+        }
+    }
+
+    @Test func insufficientUsesEventCountForInvertedRates() throws {
+        // 25 landed items over $12.50: 25 events, not 12.
+        let perUSD = MetricValue.rate(.itemsPerDollar, numerator: 25, denominator: 12.5, unit: .perUSD, basis: "")
+        #expect(perUSD.status == .ok)
+        #expect(perUSD.display == "2.00 per $LE (25/12.50)")
+        let fewItems = MetricValue.rate(.itemsPerDollar, numerator: 19, denominator: 400, unit: .perUSD, basis: "")
+        #expect(fewItems.status == .insufficient(n: 19))
+        let perHour = MetricValue.rate(.itemsPerPlanHour, numerator: 20, denominator: 3.5, unit: .perHour, basis: "")
+        #expect(perHour.status == .ok && perHour.display == "5.71 per plan-hour (20/3.50)")
+        #expect(MetricValue.rate(.itemsPerPlanHour, numerator: 7, denominator: 1000, unit: .perHour, basis: "").status == .insufficient(n: 7))
+        // ratio and usd still count the denominator.
+        #expect(MetricValue.rate(.usagePerLanded, numerator: 400, denominator: 19, unit: .usd, basis: "").status == .insufficient(n: 19))
+        #expect(MetricValue.rate(.firstPass, numerator: 7, denominator: 1000, unit: .ratio, basis: "").status == .ok)
+        // An explicit event count wins.
+        #expect(MetricValue.rate(.firstPass, numerator: 7, denominator: 1000, unit: .ratio, basis: "", events: 3).status == .insufficient(n: 3))
+    }
+
+    @Test func nonFiniteNumbersNeverTrap() throws {
+        for bad in [Double.nan, .infinity, -.infinity] {
+            #expect(MetricValue.rate(.greenMain, numerator: bad, denominator: 40, unit: .ratio, basis: "").display == "insufficient data (n=0)")
+            #expect(MetricValue.rate(.greenMain, numerator: 30, denominator: bad, unit: .ratio, basis: "").display == "insufficient data (n=0)")
+            #expect(MetricValue.rate(.itemsPerDollar, numerator: bad, denominator: 40, unit: .perUSD, basis: "").display == "insufficient data (n=0)")
+            #expect(MetricValue.count(.safety, label: "x", bad, basis: "").display == "0")
+            #expect(MetricValue.count(.safety, label: "x", 2, basis: "", target: bad).display == "2 (target 0)")
+            #expect(MetricValue.seconds(.queueHealth, label: "x", bad, basis: "").display == "0 s")
+            let forced = MetricValue(id: .greenMain, label: "x", numerator: bad, denominator: bad, unit: .ratio, basis: "", status: .ok)
+            #expect(forced.display == "insufficient data (n=0)")
         }
     }
 

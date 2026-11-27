@@ -23,6 +23,10 @@ import Testing
         #expect(try shared.companies().count == 2)
         let both = try Measure.report(store: shared, git: GitWorkspace(root: URL(fileURLWithPath: acme2.workspacePath)),
                                       companyId: acme2.id, window: window, now: now)
+        // The fixture's landed items look landed: done, with their landing time and merged commit, nothing actionable.
+        let landed = try shared.workItems(companyId: acme2.id)
+        #expect(landed.count == 24)
+        #expect(landed.allSatisfy { $0.status == .done && $0.doneAt != nil && $0.mergedCommit != nil && $0.mergeState == .none && $0.leaseHeadCommit == nil })
 
         #expect(both.metrics == single.metrics)
         #expect(both.metrics.map(\.id) == MetricId.all)
@@ -91,6 +95,9 @@ import Testing
         // Refused: not a date, a date after now.
         #expect(throws: MeasureError.self) { try MeasureWindow.parse("2025-13-45", now: now, companyCreated: created, tz: utc) }
         #expect(throws: MeasureError.self) { try MeasureWindow.parse("yesterday", now: now, companyCreated: created, tz: utc) }
+        // Given but empty is refused, never the default.
+        #expect(throws: MeasureError.badSince("")) { try MeasureWindow.parse("", now: now, companyCreated: created, tz: utc) }
+        #expect(throws: MeasureError.badSince("  ")) { try MeasureWindow.parse("  ", now: now, companyCreated: created, tz: utc) }
         #expect(throws: MeasureError.self) { try MeasureWindow.parse("2999-01-01", now: now, companyCreated: created, tz: utc) }
     }
 }

@@ -115,11 +115,15 @@ public struct MetricValue: Codable, Equatable, Sendable {
 
     // MARK: Constructors (the only way a metric function should build a value)
 
-    /// A rate: `ok` from `minEvents` events in the denominator, else `insufficient(n:)`.
+    /// A rate: `ok` from `minEvents` events, else `insufficient(n:)`. The events are the denominator for `ratio` and `usd` (landings,
+    /// landed items) and the NUMERATOR for the inverted units `perUSD` and `perHour` (landed items over dollars or hours; controller
+    /// ruling, fix round 1); `events` overrides that when a metric counts something else. A non-finite number is never an event.
     public static func rate(_ id: MetricId, label: String? = nil, numerator: Double, denominator: Double, unit: MetricUnit,
-                            basis: String, detail: [MetricValue] = []) -> MetricValue {
+                            basis: String, detail: [MetricValue] = [], events: Int? = nil) -> MetricValue {
         precondition(unit.isRate, "rate(…) takes a rate unit; use count(…) or seconds(…)")
-        let n = max(0, Int(denominator.rounded(.down)))
+        let counted = events.map(Double.init) ?? (unit == .perUSD || unit == .perHour ? numerator : denominator)
+        let finite = counted.isFinite && numerator.isFinite && denominator.isFinite
+        let n = finite ? max(0, Int(counted.rounded(.down))) : 0
         let status: MetricStatus = n >= minEvents ? .ok : .insufficient(n: n)
         return MetricValue(id: id, label: label ?? id.label, numerator: numerator, denominator: denominator, unit: unit, basis: basis,
                            detail: detail, status: status)
@@ -171,7 +175,7 @@ public struct MetricValue: Codable, Equatable, Sendable {
         case .seconds:
             return "\(Self.plain(numerator)) s"
         case .ratio, .usd, .perUSD, .perHour:
-            guard denominator > 0 else { return "insufficient data (n=0)" }
+            guard denominator > 0, numerator.isFinite, denominator.isFinite else { return "insufficient data (n=0)" }
             let q = numerator / denominator
             switch unit {
             case .ratio: return "\(Self.fixed(q * 100, 1))% (\(Self.pair(numerator, denominator)))"
@@ -185,11 +189,12 @@ public struct MetricValue: Codable, Equatable, Sendable {
 
     /// `38/39` when both are whole, else both with two decimals.
     static func pair(_ n: Double, _ d: Double) -> String {
-        n == n.rounded() && d == d.rounded() ? "\(Int(n))/\(Int(d))" : "\(fixed(n, 2))/\(fixed(d, 2))"
+        n.isFinite && d.isFinite && n == n.rounded() && d == d.rounded() ? "\(Int(n))/\(Int(d))" : "\(fixed(n, 2))/\(fixed(d, 2))"
     }
 
-    /// A whole number as an integer, else with up to two decimals (`20.5`, `0.75`).
+    /// A whole number as an integer, else with up to two decimals (`20.5`, `0.75`). A non-finite number prints `0`: `Int(Double)` traps.
     static func plain(_ x: Double) -> String {
+        guard x.isFinite else { return "0" }
         if x == x.rounded() { return "\(Int(x))" }
         var s = fixed(x, 2)
         while s.hasSuffix("0") { s.removeLast() }
@@ -197,6 +202,6 @@ public struct MetricValue: Codable, Equatable, Sendable {
         return s
     }
 
-    /// Fixed decimals, always with a `.` (never the process locale).
-    static func fixed(_ x: Double, _ decimals: Int) -> String { String(format: "%.\(decimals)f", locale: nil, x) }
+    /// Fixed decimals, always with a `.` (never the process locale); a non-finite number prints `0`.
+    static func fixed(_ x: Double, _ decimals: Int) -> String { x.isFinite ? String(format: "%.\(decimals)f", locale: nil, x) : "0" }
 }

@@ -30,7 +30,10 @@ enum MeasureFixtures {
 
     /// A landing as the journal records it: one `mergeBatch` at `done` whose `landedIds` are the ids of one merged `mergeRequest`
     /// per item (request ids, never item ids — inventory §2.1), each request `merged` with its own `mergedCommit`, enqueued at
-    /// `enqueuedAt` and finished at `landedAt`.
+    /// `enqueuedAt` and finished at `landedAt`. The items are left as `finishMerge(.merged)` leaves them (`Store+Merge.swift`,
+    /// `engineSetStatus(… .done)`): `status = done`, `doneAt = updatedAt = landedAt`, `mergeState = none`, `mergedCommit`,
+    /// `leaseHeadCommit = nil`. Before a landing an item is `inReview` with `mergeState = pending`; the fixture's items start `ready`
+    /// (never claimed), which the measure metrics do not read.
     @discardableResult
     static func land(_ store: Store, company: Company, items: [WorkItem], number: Int, enqueuedAt: Date, landedAt: Date)
         throws -> (batch: MergeBatch, requests: [MergeRequest]) {
@@ -60,7 +63,17 @@ enum MeasureFixtures {
         batch.finishedAt = landedAt
         let rows = requests, b = batch
         try store.writer.write { db in
-            for r in rows { try r.insert(db) }
+            for r in rows {
+                try r.insert(db)
+                guard var item = try WorkItem.fetchOne(db, key: r.itemId) else { throw FakeError(description: "no item \(r.itemId)") }
+                item.status = .done
+                item.doneAt = landedAt
+                item.updatedAt = landedAt
+                item.mergeState = .none
+                item.mergedCommit = r.mergedCommit
+                item.leaseHeadCommit = nil
+                try item.update(db)
+            }
             try b.insert(db)
         }
         return (batch, requests)

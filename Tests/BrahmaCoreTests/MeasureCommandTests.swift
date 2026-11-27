@@ -87,10 +87,10 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let md = try brahma(["measure", "Acme", "--since", "2025-11-01"], home: rig.home)
         #expect(md.stdout.hasPrefix("# measure Acme — 2025-11-01 00:00…"), "\(md.stdout)")
         // Refused: not a date, a date in the future. Nothing is printed on stdout.
-        for bad in ["2025-13-45", "yesterday", "2999-01-01"] {
+        for bad in ["2025-13-45", "yesterday", "2999-01-01", ""] {
             let r = try brahma(["measure", "Acme", "--since", bad], home: rig.home)
             #expect(r.status == 1, "\(bad)")
-            #expect(r.stderr.contains("--since") && r.stderr.contains(bad), "\(bad): \(r.stderr)")
+            #expect(r.stderr.contains("--since") && r.stderr.contains("'\(bad)'"), "\(bad): \(r.stderr)")
             #expect(r.stdout.isEmpty)
         }
     }

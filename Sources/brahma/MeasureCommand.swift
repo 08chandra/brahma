@@ -36,8 +36,7 @@ struct MeasureCommand: ParsableCommand {
             print(safeLines(report.markdown()), terminator: "")
         case .json:
             // JSON escapes every control character itself.
-            FileHandle.standardOutput.write(try report.json())
-            print()
+            print(String(decoding: try report.json(), as: UTF8.self))
         }
     }
 }

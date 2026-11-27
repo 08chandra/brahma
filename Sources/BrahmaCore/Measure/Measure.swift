@@ -11,7 +11,7 @@ public enum MeasureError: Error, Equatable, CustomStringConvertible {
     public var description: String {
         switch self {
         case .badSince(let s): return "--since must be a date (YYYY-MM-DD) or 'all', not '\(s)'"
-        case .sinceAfterNow(let s): return "--since \(s) is after today; nothing can have happened yet"
+        case .sinceAfterNow(let s): return "--since '\(s)' is after today; nothing can have happened yet"
         case .unknownCompany(let id): return "no company with id \(id)"
         }
     }
@@ -31,9 +31,10 @@ public struct MeasureWindow: Codable, Equatable, Sendable {
     /// time zone (`ownerSettings.timeZone`). `until` is always `now`.
     public static func parse(_ since: String?, now: Date, companyCreated: Date, tz: TimeZone) throws -> MeasureWindow {
         let until = now.wholeSeconds
-        guard let raw = since?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else {
-            return MeasureWindow(since: until.addingTimeInterval(-Double(defaultDays) * 86_400), until: until)
-        }
+        guard let since else { return MeasureWindow(since: until.addingTimeInterval(-Double(defaultDays) * 86_400), until: until) }
+        // Given but empty is a mistake, not the default.
+        let raw = since.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { throw MeasureError.badSince(since) }
         if raw == "all" { return MeasureWindow(since: min(companyCreated, until), until: until) }
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
