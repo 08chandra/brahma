@@ -12,6 +12,7 @@ struct Brahma: AsyncParsableCommand {
             PrefsGroup.self, PushGroup.self, Notices.self, SecretGroup.self, Network.self, BackupGroup.self, RestoreCommand.self, ExportCommand.self, TranscriptCommand.self, DigestCommand.self, AccessGroup.self, GrantsGroup.self, Presets.self, ExtGroup.self, LabGroup.self,
             StopCommand.self, ResumeCommand.self, ModeGroup.self, CanaryGroup.self, PreviewGroup.self, HostingCommand.self, ReleaseGroup.self, HumanTaskGroup.self, MilestonesCommand.self,
             MemoryCommand.self, KBCommand.self, ResourceCommand.self, ReplayCommand.self, MergeGroup.self, ArtifactsGroup.self, VouchGroup.self,
+            MeasureCommand.self,
         ]
     )
 }
