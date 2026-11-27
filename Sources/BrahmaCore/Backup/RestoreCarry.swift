@@ -63,6 +63,11 @@ struct RestoreCarry {
     /// could become its first recorder.
     var commitAuthors: [CommitAuthor] = []
 
+    /// Final wave B1 item 26 (final review m-1, Ruling 50): the live database's per-company ref counters (`refCounter`). A
+    /// number handed out after the snapshot is cited in git, notes, transcripts and exported copies whatever became of its
+    /// row; the restored counter is the greater of the two, so no number is ever handed out twice.
+    var refCounters: [(companyId: String, kind: String, last: Int)] = []
+
     /// A row of C4b's `turnCommit`.
     struct CommitAuthor { var companyId: String, sha: String, itemId: String?, agentId: String, turnId: String?, createdAt: Date }
 
@@ -135,6 +140,9 @@ struct RestoreCarry {
         }
         if try has("restoreEpoch") {
             c.restoreEpochs = try BrahmaCore.RestoreEpoch.fetchAll(db, sql: "SELECT * FROM restoreEpoch")
+        }
+        if try has("refCounter") {
+            c.refCounters = try Row.fetchAll(db, sql: "SELECT companyId, kind, last FROM refCounter").map { ($0["companyId"], $0["kind"], $0["last"]) }
         }
         if try has("turnCommit") {
             c.commitAuthors = try Row.fetchAll(db, sql: "SELECT companyId, sha, itemId, agentId, turnId, createdAt FROM turnCommit").map {
@@ -379,6 +387,19 @@ struct RestoreCarry {
         try carryRestoreEpochs(c.restoreEpochs, into: db)
         try carryItemCommitTaints(c.itemCommitTaints, into: db)
         try carryCommitAuthors(c.commitAuthors, into: db)
+        try carryRefCounters(c.refCounters, into: db)
+    }
+
+    /// Final wave B1 item 26: each live counter comes back as the greater of the live and the restored value (a counter only
+    /// moves forward; a restore never lowers one), for a company the snapshot has.
+    static func carryRefCounters(_ rows: [(companyId: String, kind: String, last: Int)], into db: Database) throws {
+        guard !rows.isEmpty, try db.tableExists("refCounter") else { return }
+        for r in rows {
+            try db.execute(sql: """
+                INSERT INTO refCounter (companyId, kind, last) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM company WHERE id = ?)
+                ON CONFLICT(companyId, kind) DO UPDATE SET last = MAX(last, excluded.last)
+                """, arguments: [r.companyId, r.kind, r.last, r.companyId])
+        }
     }
 
     /// C4b fix round 1 (I-1): the live database's commit-author rows come back (when their company is in the snapshot). The
