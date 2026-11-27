@@ -18,7 +18,7 @@ private func route(_ scope: RouteScope, _ subject: String, _ c: ModelClass, _ ta
     return ModelRoute(companyId: company, scope: scope, subject: subject, modelClass: c.rawValue, provider: parts[0], model: parts[1])
 }
 
-@Suite struct RouteResolverTests {
+@Suite(.scratch) struct RouteResolverTests {
     @Test func agentBeatsRoleBeatsCompany() {
         let company = route(.company, "", .deep, "anthropic/claude-opus-5-5")
         let role = route(.role, "engineer", .deep, "openai/role-model")

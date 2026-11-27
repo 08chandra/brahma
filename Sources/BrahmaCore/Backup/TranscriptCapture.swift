@@ -85,6 +85,20 @@ public struct TranscriptCapture: Sendable {
             return .held
         }
         heldLogged.reset()
+        // A gateway turn's config dir is the engine's (Ruling 63): a link on the way to its sessions means something tampered
+        // with the run area. Nothing is read, and the owner is alerted (Ruling 64 minor).
+        if refusesLinkedComponents, let linked = linkedComponent() {
+            let text = "The transcript of a turn of agent \(turn.agentId) was not captured: \(linked) in its gateway config dir is a "
+                + "link, which the engine never makes. Something changed the engine's run area; check it."
+            do {
+                try EngineAlerts.raise(store: store, text: text, now: now, reason: EngineAlerts.gatewayConfigReason,
+                                       companyId: turn.companyId)
+            } catch {
+                note("the alert about a linked gateway config dir could not be raised: \(error)")
+            }
+            note("transcript not captured: \(linked) is a link")
+            return .failed("\(linked) is a link")
+        }
         do {
             guard Self.isSessionId(sessionId), let file = newestFile(sessionId: sessionId) else {
                 note("no transcript found for session \(sessionId.prefix(80)); nothing captured for this turn")
@@ -237,6 +251,25 @@ public struct TranscriptCapture: Sendable {
             if best == nil || mtime > best!.mtime { best = (url, Int(st.st_size), mtime) }
         }
         return best.map { ($0.url, $0.size) }
+    }
+
+    /// The first link on the way to a gateway turn's sessions: a component of the config dir's path (from `/`), `projects/`,
+    /// or a project folder in it; nil when there is none (a missing `projects/` is not a link).
+    func linkedComponent() -> String? {
+        var current = URL(fileURLWithPath: "/", isDirectory: true)
+        for part in source.configDir.path.split(separator: "/") {
+            current = current.appending(path: String(part), directoryHint: .isDirectory)
+            if Self.isLink(current) { return current.path }
+        }
+        if Self.isLink(source.projectsDir) { return source.projectsDir.path }
+        guard Self.isRealDirectory(source.projectsDir),
+              let names = try? FileManager.default.contentsOfDirectory(atPath: source.projectsDir.path) else { return nil }
+        return names.sorted().map { source.projectsDir.appending(path: $0) }.first(where: Self.isLink)?.path
+    }
+
+    static func isLink(_ url: URL) -> Bool {
+        var st = stat()
+        return lstat(url.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK
     }
 
     /// Every component of `url`'s absolute path, from `/`, is a real directory (`lstat`: never a link). The path is taken as

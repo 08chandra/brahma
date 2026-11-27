@@ -63,7 +63,15 @@ public struct ClaudeRuntime: AgentRuntime {
         if let g = r.gateway {
             gatewayEnvironment = try ClaudeGatewayCompile.environment(g, owner: baseEnvironment, reachable: Self.reachablePlaces(r))
             ClaudeGatewayCompile.settings(&profile.settings, g)
-            profile.environment.merge(ClaudeGatewayCompile.extra(g)) { $1 }
+            profile.environment.merge(ClaudeGatewayCompile.extra(g, base: baseEnvironment)) { $1 }
+            // Ruling 64(1): on Workspace and Full, agent Bash runs through the engine's minimal gateway prefix (the sandboxed
+            // turn has its own); without one the turn does not start.
+            if r.profile != .sandboxed {
+                guard let prefix = r.shellPrefix, ClaudeGatewayCompile.isGatewayShellPrefix(prefix) else {
+                    throw .invalid("a gateway turn on the \(r.profile.rawValue) profile needs the engine's gateway shell prefix")
+                }
+                profile.environment["CLAUDE_CODE_SHELL_PREFIX"] = prefix
+            }
         }
         var files: [LaunchFile] = []
         if let path = profile.settingsFilePath {

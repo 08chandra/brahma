@@ -35,12 +35,17 @@ public enum GatewayConfigDir {
     public struct Prepared: Equatable, Sendable {
         /// The dir to hand to the turn (`GatewayLaunch.configDir`): empty when it was just made.
         public var url: URL
-        /// Where the previous dir went, when it was quarantined: the agent's next turn must start a fresh session.
+        /// Where the previous dir went, when it was quarantined.
         public var quarantined: URL?
         /// What was found there, for the alert.
         public var reason: String?
+        /// The dir was just made (first gateway turn, after a quarantine, or after one whose fresh dir could not be made):
+        /// no session of the agent's lives in it, so the turn must start a fresh session (`Store.forceFreshSession`).
+        public var needsFreshSession: Bool
 
-        public var needsFreshSession: Bool { quarantined != nil }
+        public init(url: URL, quarantined: URL? = nil, reason: String? = nil, needsFreshSession: Bool) {
+            self.url = url; self.quarantined = quarantined; self.reason = reason; self.needsFreshSession = needsFreshSession
+        }
     }
 
     /// Why `prepare` refused (the turn must not start): a link in the path, a component that is not a directory or not the
@@ -71,7 +76,11 @@ public enum GatewayConfigDir {
 
     /// The agent's dir, checked (or made, empty, 0700): see the file comment. `alert` gets the text of a quarantine (the
     /// production one is `prepare(paths:agent:store:now:)`'s engine alert); a failed alert does not undo the quarantine.
-    /// Throws `Refusal` when the turn must not start.
+    /// Throws `Refusal` when the turn must not start. A fresh dir that cannot be made after the quarantine throws too; the
+    /// next `prepare` makes it and reports `needsFreshSession`.
+    ///
+    /// Retention (Task 14): quarantined dirs stay in `run/gateway-config-quarantine` for the owner to inspect; nothing here
+    /// deletes them. The launcher (or a later sweep) should prune ones older than the alert's handling window.
     public static func prepare(paths: BrahmaPaths, agentId: String, agentName: String? = nil, now: Date = Date(),
                                alert: (String) throws -> Void) throws(Refusal) -> Prepared {
         let home = try resolvedHome(paths)
@@ -85,17 +94,23 @@ public enum GatewayConfigDir {
         if lstat(dir.path, &st) != 0 {
             guard errno == ENOENT else { throw Refusal(reason: "cannot examine \(dir.path) (errno \(errno))") }
             try makePrivateDirectory(dir)
-            return Prepared(url: dir, quarantined: nil, reason: nil)
+            return Prepared(url: dir, needsFreshSession: true)
         }
         try requireOwnDirectory(st, dir)
+        try restrict(dir, st)
         let found = try unexpectedEntries(in: dir)
-        guard !found.isEmpty else { return Prepared(url: dir, quarantined: nil, reason: nil) }
+        guard !found.isEmpty else { return Prepared(url: dir, needsFreshSession: false) }
         let stamp = Int(now.timeIntervalSince1970)
         let moved = quarantine.appending(path: "\(agentId)-\(stamp)-\(UUID().uuidString.prefix(8).lowercased())", directoryHint: .isDirectory)
         guard rename(dir.path, moved.path) == 0 else {
             throw Refusal(reason: "cannot move \(dir.path) to quarantine (errno \(errno))")
         }
-        try makePrivateDirectory(dir)
+        do {
+            try makePrivateDirectory(dir)
+        } catch {
+            throw Refusal(reason: "\(dir.path) was quarantined to \(moved.path) but a fresh one could not be made (\(error.reason)); "
+                          + "the next gateway turn makes it and starts a fresh session")
+        }
         let reason = found.prefix(8).joined(separator: ", ") + (found.count > 8 ? ", …" : "")
         let who = agentName.map { "@\($0)" } ?? "agent \(agentId)"
         do {
@@ -103,9 +118,9 @@ public enum GatewayConfigDir {
                       + "\(moved.path) and \(who) starts a fresh session. Something wrote into the engine's run area; check it.")
         } catch {
             // The quarantine stands whatever the alert did; its failure rides in `reason` for the caller to log.
-            return Prepared(url: dir, quarantined: moved, reason: reason + " (alert not written: \(error))")
+            return Prepared(url: dir, quarantined: moved, reason: reason + " (alert not written: \(error))", needsFreshSession: true)
         }
-        return Prepared(url: dir, quarantined: moved, reason: reason)
+        return Prepared(url: dir, quarantined: moved, reason: reason, needsFreshSession: true)
     }
 
     /// `prepare` with the engine alert for the agent's company (`EngineAlerts.raise`, reason `alertReason`).
@@ -159,16 +174,24 @@ public enum GatewayConfigDir {
         guard st.st_uid == geteuid() else { throw Refusal(reason: "\(url.path) is not owned by the engine's user") }
     }
 
-    /// `url` as a 0700 directory, made when missing; a link or a non-directory there is refused (never followed).
+    /// `url` as a 0700 directory, made when missing (an existing one is tightened to 0700); a link or a non-directory there
+    /// is refused (never followed).
     static func ensurePrivateDirectory(_ url: URL, under home: URL) throws(Refusal) {
         var st = stat()
         if lstat(url.path, &st) == 0 {
             try requireOwnDirectory(st, url)
+            try restrict(url, st)
             return
         }
         guard errno == ENOENT else { throw Refusal(reason: "cannot examine \(url.path) (errno \(errno))") }
         try requireRealDirectories(from: home, to: url.deletingLastPathComponent())
         try makePrivateDirectory(url)
+    }
+
+    /// An own directory (`requireOwnDirectory` passed) to 0700, when it is not already.
+    static func restrict(_ url: URL, _ st: stat) throws(Refusal) {
+        guard st.st_mode & 0o7777 != 0o700 else { return }
+        guard chmod(url.path, 0o700) == 0 else { throw Refusal(reason: "cannot restrict \(url.path) (errno \(errno))") }
     }
 
     /// `mkdir(url, 0700)`: fails on anything already there, a link included.

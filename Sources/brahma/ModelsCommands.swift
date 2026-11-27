@@ -33,11 +33,10 @@ private func requireRoutable(_ store: Store, _ target: (provider: String, model:
     }
 }
 
-/// Sets `route` and queues its probe (Task 13), printing one line.
+/// Sets `route` and queues its probe (Task 13) in one transaction, printing one line.
 private func setAndQueue(_ store: Store, _ route: ModelRoute, label: String) throws {
     do {
-        try store.setRoute(route)
-        _ = try store.queueProbe(provider: route.provider, model: route.model, requestedBy: "owner", companyId: route.companyId)
+        try store.setRouteQueuingProbe(route, requestedBy: "owner")
     } catch {
         throw fail("\(error)")
     }

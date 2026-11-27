@@ -318,6 +318,9 @@ public struct SandboxLayout: Equatable, Sendable {
     public var notesRelative: String { "\(notesDirRelative)/\(handle).md" }
     public var binDirRelative: String { trialRoot.map { "\($0)/bin" } ?? ".brahma/bin" }
     public var shellPrefixRelative: String { "\(binDirRelative)/shell-\(handle).sh" }
+    /// `.brahma/bin/gateway-shell-<h>.sh`: a Workspace or Full gateway turn's Bash prefix (`ShellPrefix.writeGateway`).
+    public var gatewayShellPrefixRelative: String { "\(binDirRelative)/\(ShellPrefix.gatewayPrefixName)\(handle).sh" }
+    public var gatewayShellPrefix: URL { workspace.appending(path: gatewayShellPrefixRelative) }
     public var trashRelative: String { trialRoot.map { "\($0)/trash" } ?? ".brahma/trash/\(handle)" }
 
     public init(paths: BrahmaPaths, company: Company, agentHandle: String, trialRoot: String? = nil) {

@@ -339,18 +339,36 @@ extension Store {
     /// or model, an unknown company or provider.
     public func setRoute(_ r: ModelRoute) throws {
         try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+        try Self.checkRoute(r)
+        try writer.write { db in try Self.setRoute(db, r) }
+    }
+
+    /// Sets `r` and queues its capability probe (Task 13) in one transaction (Plan X1 Task 12 fix round 1): both or neither.
+    /// Returns the probe request's id. Refused as `setRoute` and `queueProbe` are.
+    @discardableResult
+    public func setRouteQueuingProbe(_ r: ModelRoute, requestedBy: String, now: Date = Store.now()) throws -> String {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+        try Self.checkRoute(r)
+        return try writer.write { db in
+            try Self.setRoute(db, r)
+            return try Self.queueProbe(db, provider: r.provider, model: r.model, requestedBy: requestedBy, companyId: r.companyId, now: now)
+        }
+    }
+
+    static func checkRoute(_ r: ModelRoute) throws {
         guard (r.scope == .company) == r.subject.isEmpty else {
             throw WorkError.invalid(r.scope == .company ? "a company route has no subject" : "a \(r.scope.rawValue) route names its \(r.scope.rawValue)")
         }
         guard !r.modelClass.isEmpty, !r.model.isEmpty else { throw WorkError.invalid("a route names a class and a model") }
-        try writer.write { db in
-            try Self.requireCompany(db, r.companyId)
-            try Self.requireProvider(db, r.provider)
-            try db.execute(sql: """
-                INSERT INTO modelRoute (companyId, scope, subject, "class", provider, model) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(companyId, scope, subject, "class") DO UPDATE SET provider = excluded.provider, model = excluded.model
-                """, arguments: [r.companyId, r.scope.rawValue, r.subject, r.modelClass, r.provider, r.model])
-        }
+    }
+
+    static func setRoute(_ db: Database, _ r: ModelRoute) throws {
+        try requireCompany(db, r.companyId)
+        try requireProvider(db, r.provider)
+        try db.execute(sql: """
+            INSERT INTO modelRoute (companyId, scope, subject, "class", provider, model) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(companyId, scope, subject, "class") DO UPDATE SET provider = excluded.provider, model = excluded.model
+            """, arguments: [r.companyId, r.scope.rawValue, r.subject, r.modelClass, r.provider, r.model])
     }
 
     /// Removes every class's route of one scope and subject.
@@ -407,20 +425,25 @@ extension Store {
     /// is returned instead of a second one. Refused: an unknown provider or company.
     public func queueProbe(provider: String, model: String, requestedBy: String, companyId: String?,
                            now: Date = Store.now()) throws -> String {
-        guard !model.isEmpty else { throw WorkError.invalid("a probe names a model") }
-        return try writer.write { db in
-            try Self.requireProvider(db, provider)
-            if let companyId { try Self.requireCompany(db, companyId) }
-            if let queued = try String.fetchOne(db, sql: """
-                SELECT id FROM modelProbeRequest WHERE provider = ? AND model = ? AND companyId IS ? AND status = ?
-                ORDER BY createdAt, rowid LIMIT 1
-                """, arguments: [provider, model, companyId, ModelProbeRequest.Status.queued.rawValue]) { return queued }
-            let id = UUID().uuidString.lowercased()
-            try db.execute(sql: """
-                INSERT INTO modelProbeRequest (id, provider, model, requestedBy, companyId, status, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, arguments: [id, provider, model, requestedBy, companyId, ModelProbeRequest.Status.queued.rawValue, now])
-            return id
+        try writer.write { db in
+            try Self.queueProbe(db, provider: provider, model: model, requestedBy: requestedBy, companyId: companyId, now: now)
         }
+    }
+
+    static func queueProbe(_ db: Database, provider: String, model: String, requestedBy: String, companyId: String?,
+                           now: Date) throws -> String {
+        guard !model.isEmpty else { throw WorkError.invalid("a probe names a model") }
+        try Self.requireProvider(db, provider)
+        if let companyId { try Self.requireCompany(db, companyId) }
+        if let queued = try String.fetchOne(db, sql: """
+            SELECT id FROM modelProbeRequest WHERE provider = ? AND model = ? AND companyId IS ? AND status = ?
+            ORDER BY createdAt, rowid LIMIT 1
+            """, arguments: [provider, model, companyId, ModelProbeRequest.Status.queued.rawValue]) { return queued }
+        let id = UUID().uuidString.lowercased()
+        try db.execute(sql: """
+            INSERT INTO modelProbeRequest (id, provider, model, requestedBy, companyId, status, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, arguments: [id, provider, model, requestedBy, companyId, ModelProbeRequest.Status.queued.rawValue, now])
+        return id
     }
 
     /// The oldest queued request.

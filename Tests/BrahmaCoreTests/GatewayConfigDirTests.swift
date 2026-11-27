@@ -25,7 +25,7 @@ private func contents(_ url: URL) throws -> [String] { try FileManager.default.c
         let alerts = Alerts()
         let first = try GatewayConfigDir.prepare(paths: w.paths, agentId: w.eng.id, alert: alerts.record)
         #expect(first.url.path == w.paths.runDir.appending(path: "gateway-config/\(w.eng.id)").path)
-        #expect(first.quarantined == nil && !first.needsFreshSession)
+        #expect(first.quarantined == nil && first.needsFreshSession, "a dir just made holds no session")
         #expect(try contents(first.url).isEmpty)
         #expect((try FileManager.default.attributesOfItem(atPath: first.url.path)[.posixPermissions] as? Int) == 0o700)
         // What claude writes there itself.
@@ -37,7 +37,14 @@ private func contents(_ url: URL) throws -> [String] { try FileManager.default.c
             try Data("{}".utf8).write(to: first.url.appending(path: f))
         }
         let again = try GatewayConfigDir.prepare(paths: w.paths, agentId: w.eng.id, alert: alerts.record)
-        #expect(again == GatewayConfigDir.Prepared(url: first.url, quarantined: nil, reason: nil))
+        #expect(again == GatewayConfigDir.Prepared(url: first.url, needsFreshSession: false))
+        // An existing dir (and run/, run/gateway-config/) left wider than 0700 is tightened.
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: first.url.path)  // exec-bit fixture: a directory's mode under test
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: first.url.deletingLastPathComponent().path)  // exec-bit fixture: a directory's mode under test
+        _ = try GatewayConfigDir.prepare(paths: w.paths, agentId: w.eng.id, alert: alerts.record)
+        for dir in [first.url, first.url.deletingLastPathComponent()] {
+            #expect((try fm.attributesOfItem(atPath: dir.path)[.posixPermissions] as? Int) == 0o700, "\(dir.path)")
+        }
         #expect(try contents(again.url) == [".claude.json", ".claude.json.backup.1700000000", "history.jsonl", "projects", "shell-snapshots",
                                             "statsig", "todos"])
         #expect(alerts.all.isEmpty)
@@ -135,6 +142,17 @@ private func contents(_ url: URL) throws -> [String] { try FileManager.default.c
         let viaParent = TranscriptCapture(paths: w.paths, source: TranscriptSource(configDir: w.userHome))
             .reading(configDir: linkedDir.path + "/projects/..")
         #expect(viaParent.newestFile(sessionId: session) == nil)
+        // `capture` raises an engine alert for a linked component (a tampering sign) and reads nothing.
+        try fm.createDirectory(at: elsewhere.appending(path: "q"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: real.appending(path: "projects"), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(atPath: real.appending(path: "projects/-ws").path, withDestinationPath: elsewhere.appending(path: "q").path)
+        let turn = try w.store.startTurn(agentId: w.eng.id)
+        let outcome = capture.capture(turn: turn, sessionId: session, store: w.store)
+        guard case .failed(let why) = outcome else { Issue.record("\(outcome)"); return }
+        #expect(why.contains("projects/-ws is a link"), "\(why)")
+        let asks = try ModelGatewayTests.engineAlerts(w.store)
+        #expect(asks.map(\.subjectId) == [EngineAlerts.askSubject(reason: EngineAlerts.gatewayConfigReason)], "\(asks.map(\.title))")
+
         // A subscription capture is unchanged: it follows the owner's own layout as before.
         #expect(!TranscriptCapture(paths: w.paths, source: TranscriptSource(configDir: linkedDir)).refusesLinkedComponents)
     }

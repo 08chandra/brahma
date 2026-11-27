@@ -243,7 +243,7 @@ struct GoldenWorld {
     /// (never in a golden: `ANTHROPIC_API_KEY` is secret-named, so only its name is recorded).
     func gatewayLaunch(routed: Set<ModelClass> = [.deep, .standard]) -> GatewayLaunch {
         GatewayLaunch(baseURL: "http://127.0.0.1:4100/t/", token: GatewayToken(value: String(repeating: "0123456789abcdef", count: 4)),
-                      aliases: GatewayLaunch.aliases(for: routed), denyProxy: "http://127.0.0.1:4101",
+                      aliases: GatewayLaunch.aliases(for: routed), claudeProxy: "http://127.0.0.1:4101",
                       configDir: paths.runDir.appending(path: "gateway-config/\(eng.id)").path)
     }
 
