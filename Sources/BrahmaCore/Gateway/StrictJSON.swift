@@ -8,7 +8,10 @@ import Foundation
 /// `type`), and the gateway never forwards the bytes it received: the provider gets `serialized()` of the tree the policy
 /// checked. That serialization keeps each object's keys in the order received, writes every number with exactly the digits
 /// received (no `Double` round trip: `9223372036854775809` and long decimals survive), re-escapes strings, and adds no
-/// whitespace. Parsing and serializing are linear in the body; nesting deeper than `maxDepth` is refused.
+/// whitespace. Parsing and serializing are linear in the body (Ruling X1-36: the path of the current value is a stack of
+/// components, rendered to text only when a refusal needs it, at most `maxPathLength` characters); nesting deeper than
+/// `maxDepth` containers is refused. The server refuses a body over `GatewayLimits.maxBodyBytes` (32 MiB) on its
+/// `Content-Length`, before reading it, so no larger body ever reaches the parser.
 public indirect enum StrictJSON: Equatable, Sendable {
     case null
     case bool(Bool)
@@ -25,7 +28,18 @@ public indirect enum StrictJSON: Equatable, Sendable {
         public init(_ key: String, _ value: StrictJSON) { self.key = key; self.value = value }
     }
 
-    public static let maxDepth = 128
+    /// The most containers (objects and arrays) one value may be nested in, the outermost included.
+    public static let maxDepth = 64
+    /// The longest path a refusal shows; a longer one keeps its end, after an ellipsis.
+    public static let maxPathLength = 256
+
+    /// How much work a parse did (Ruling 47's deterministic seam: a test proves growth is linear by counting, not timing).
+    struct Work: Equatable {
+        /// Values and keys parsed.
+        var steps = 0
+        /// Paths rendered to text (only for a refusal).
+        var pathRenders = 0
+    }
 
     /// Why a body was refused: malformed JSON, or a repeated key (with its path, e.g. `messages[0].content[1].type`).
     public enum Failure: Error, Equatable, Sendable {
@@ -61,19 +75,49 @@ public indirect enum StrictJSON: Equatable, Sendable {
     // MARK: Parsing
 
     public static func parse(_ data: Data) throws(Failure) -> StrictJSON {
+        var work = Work()
+        return try parse(data, work: &work)
+    }
+
+    /// `parse(_:)`, counting its work into `work`.
+    static func parse(_ data: Data, work: inout Work) throws(Failure) -> StrictJSON {
         var parser = Parser(bytes: [UInt8](data))
+        defer { work = parser.work }
         parser.skipSpace()
-        let value = try parser.value(depth: 0, path: "")
+        let value = try parser.value(depth: 0)
         parser.skipSpace()
         guard parser.i == parser.bytes.count else { throw .malformed }
         return value
     }
 
+    /// One step of the path to the value being parsed.
+    private enum PathComponent {
+        case key(String)
+        case index(Int)
+    }
+
     private struct Parser {
         let bytes: [UInt8]
         var i = 0
+        /// The path to the value being parsed, as components; rendered only for a refusal.
+        var path: [PathComponent] = []
+        var work = Work()
 
         init(bytes: [UInt8]) { self.bytes = bytes }
+
+        /// The current path as text (`messages[0].content[1].type`), at most `maxPathLength` characters, keeping the end.
+        mutating func renderedPath() -> String {
+            work.pathRenders += 1
+            var text = ""
+            for component in path {
+                switch component {
+                case .key(let key): text += (text.isEmpty ? "" : ".") + StrictJSON.shown(key)
+                case .index(let n): text += "[\(n)]"
+                }
+            }
+            guard text.count > StrictJSON.maxPathLength else { return text }
+            return "…" + text.suffix(StrictJSON.maxPathLength - 1)
+        }
 
         mutating func skipSpace() {
             while i < bytes.count, bytes[i] == 0x20 || bytes[i] == 0x09 || bytes[i] == 0x0a || bytes[i] == 0x0d { i += 1 }
@@ -85,12 +129,17 @@ public indirect enum StrictJSON: Equatable, Sendable {
             i += l.count
         }
 
-        mutating func value(depth: Int, path: String) throws(Failure) -> StrictJSON {
-            guard depth <= StrictJSON.maxDepth else { throw .tooDeep }
+        /// The value at `i`; `depth` is the number of containers it is inside.
+        mutating func value(depth: Int) throws(Failure) -> StrictJSON {
+            work.steps += 1
             guard i < bytes.count else { throw .malformed }
             switch bytes[i] {
-            case UInt8(ascii: "{"): return try object(depth: depth, path: path)
-            case UInt8(ascii: "["): return try array(depth: depth, path: path)
+            case UInt8(ascii: "{"):
+                guard depth < StrictJSON.maxDepth else { throw .tooDeep }
+                return try object(depth: depth + 1)
+            case UInt8(ascii: "["):
+                guard depth < StrictJSON.maxDepth else { throw .tooDeep }
+                return try array(depth: depth + 1)
             case UInt8(ascii: "\""): return .string(try string())
             case UInt8(ascii: "t"): try expect("true"); return .bool(true)
             case UInt8(ascii: "f"): try expect("false"); return .bool(false)
@@ -99,7 +148,7 @@ public indirect enum StrictJSON: Equatable, Sendable {
             }
         }
 
-        mutating func object(depth: Int, path: String) throws(Failure) -> StrictJSON {
+        mutating func object(depth: Int) throws(Failure) -> StrictJSON {
             i += 1
             skipSpace()
             var members: [Member] = []
@@ -107,14 +156,16 @@ public indirect enum StrictJSON: Equatable, Sendable {
             if i < bytes.count, bytes[i] == UInt8(ascii: "}") { i += 1; return .object([]) }
             while true {
                 guard i < bytes.count, bytes[i] == UInt8(ascii: "\"") else { throw .malformed }
+                work.steps += 1
                 let key = try string()
-                let keyPath = path.isEmpty ? StrictJSON.shown(key) : path + "." + StrictJSON.shown(key)
-                guard seen.insert(key).inserted else { throw .duplicateKey(path: keyPath) }
+                path.append(.key(key))
+                guard seen.insert(key).inserted else { throw .duplicateKey(path: renderedPath()) }
                 skipSpace()
                 guard i < bytes.count, bytes[i] == UInt8(ascii: ":") else { throw .malformed }
                 i += 1
                 skipSpace()
-                members.append(Member(key, try value(depth: depth + 1, path: keyPath)))
+                members.append(Member(key, try value(depth: depth)))
+                path.removeLast()
                 skipSpace()
                 guard i < bytes.count else { throw .malformed }
                 if bytes[i] == UInt8(ascii: "}") { i += 1; return .object(members) }
@@ -124,13 +175,15 @@ public indirect enum StrictJSON: Equatable, Sendable {
             }
         }
 
-        mutating func array(depth: Int, path: String) throws(Failure) -> StrictJSON {
+        mutating func array(depth: Int) throws(Failure) -> StrictJSON {
             i += 1
             skipSpace()
             var items: [StrictJSON] = []
             if i < bytes.count, bytes[i] == UInt8(ascii: "]") { i += 1; return .array([]) }
             while true {
-                items.append(try value(depth: depth + 1, path: "\(path)[\(items.count)]"))
+                path.append(.index(items.count))
+                items.append(try value(depth: depth))
+                path.removeLast()
                 skipSpace()
                 guard i < bytes.count else { throw .malformed }
                 if bytes[i] == UInt8(ascii: "]") { i += 1; return .array(items) }

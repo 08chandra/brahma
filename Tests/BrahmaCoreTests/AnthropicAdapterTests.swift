@@ -186,6 +186,57 @@ import Foundation
         #expect(foundation?["s"] as? String == "😀 \u{07} \t é")
     }
 
+    /// Ruling X1-36 / 47: parsing is linear — counted, not timed. Doubling a 10k-element array nested 60 deep, or a 50k-key
+    /// object, doubles the parser's steps, and no path is rendered for a body that parses.
+    @Test func strictJSONWorkIsLinearAndRendersNoPathOnSuccess() throws {
+        func work(_ body: String) throws -> StrictJSON.Work {
+            var w = StrictJSON.Work()
+            _ = try StrictJSON.parse(Data(body.utf8), work: &w)
+            return w
+        }
+        func deepWide(_ n: Int) -> String {
+            String(repeating: "[", count: 60) + Array(repeating: "0", count: n).joined(separator: ",") + String(repeating: "]", count: 60)
+        }
+        func wide(_ n: Int) -> String { "{" + (0..<n).map { "\"k\($0)\":[\($0)]" }.joined(separator: ",") + "}" }
+        for (small, large) in [(try work(deepWide(10_000)), try work(deepWide(20_000))), (try work(wide(50_000)), try work(wide(100_000)))] {
+            #expect(small.pathRenders == 0 && large.pathRenders == 0, "no path is rendered on success")
+            let ratio = Double(large.steps) / Double(small.steps)
+            #expect((1.9...2.1).contains(ratio), "steps \(small.steps) -> \(large.steps)")
+        }
+    }
+
+    /// A duplicate deep inside still names its path, truncated to the last 256 characters behind an ellipsis; one render.
+    @Test func strictJSONDeepDuplicatePathIsTruncated() {
+        let keys = (0..<40).map { "level\($0)_long" }
+        let body = keys.map { "{\"\($0)\":" }.joined() + #"{"type":1,"type":2}"# + String(repeating: "}", count: keys.count)
+        var work = StrictJSON.Work()
+        do {
+            _ = try StrictJSON.parse(Data(body.utf8), work: &work)
+            Issue.record("the duplicate must be refused")
+        } catch {
+            guard case .duplicateKey(let path) = error else { Issue.record("\(error)"); return }
+            let full = (keys + ["type"]).joined(separator: ".")
+            #expect(path.count == StrictJSON.maxPathLength && path.hasPrefix("…") && full.hasSuffix(path.dropFirst()), "\(path)")
+            #expect(work.pathRenders == 1)
+        }
+    }
+
+    /// At most 64 nested containers; the 65th is refused with a reason.
+    @Test func strictJSONDepthIsCappedAt64() throws {
+        func nested(_ n: Int) -> Data { Data((String(repeating: "[", count: n) + String(repeating: "]", count: n)).utf8) }
+        #expect(StrictJSON.maxDepth == 64)
+        #expect(throws: Never.self) { try StrictJSON.parse(nested(64)) }
+        #expect(throws: StrictJSON.Failure.tooDeep) { try StrictJSON.parse(nested(65)) }
+        let body = #"{"model":"claude-opus-5-5","max_tokens":1,"messages":[],"metadata":{"x":"# + String(repeating: "[", count: 63)
+            + String(repeating: "]", count: 63) + "}}"
+        do {
+            _ = try CanonicalRequest.tree(Data(body.utf8))
+            Issue.record("depth 65 must be refused")
+        } catch {
+            #expect(error.status == 400 && error.message == "Brahma: the request body nests more than 64 levels deep", "\(error)")
+        }
+    }
+
     // MARK: Responses
 
     /// The stream reaches the client unchanged (events split across upstream chunks are re-joined into whole events) while the

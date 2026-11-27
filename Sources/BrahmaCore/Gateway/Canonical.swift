@@ -39,7 +39,7 @@ public struct CanonicalRequest: Codable, Sendable, Equatable {
         } catch {
             switch error {
             case .duplicateKey(let path): throw .policy("duplicate key \(path)")
-            case .tooDeep: throw .policy("the request body nests too deeply")
+            case .tooDeep: throw .policy("the request body nests more than \(StrictJSON.maxDepth) levels deep")
             case .malformed: throw .policy("the request body is not valid JSON")
             }
         }
