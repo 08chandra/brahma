@@ -34,7 +34,8 @@ extension Store {
         for lease in try leases(companyId: companyId) {
             guard let item = try workItem(id: lease.itemId), item.companyId == companyId,
                   let holder = try agent(id: lease.agentId), holder.companyId == companyId else { continue }
-            if case .agent(let id) = reader, id != lease.agentId, id != item.reviewerId { continue }
+            // The live worktree rule (`RefAccess.liveDiffSubject`), as for every live view.
+            guard (try? checkChangesAccess(companyId: companyId, key: item.key, compare: .main, reader: reader)) != nil else { continue }
             guard (try? fs.worktreeDirectory(key: item.key)) != nil else { continue }
             let raw: RawChanges
             do { raw = try changesRaw(companyId: companyId, key: item.key, compare: .main) } catch { continue }

@@ -440,6 +440,7 @@ import GRDB
     /// I-2: what an agent shares is never listed as a new resource "from the owner" (the share message delivers it).
     @Test func agentShareNotListedAsOwnerResource() throws {
         let w = try W()
+        try w.cf.hold(); try w.cf.review()
         _ = try w.share(w.fx.eng1, [".brahma/labs/eng-1/mine.txt"], to: "@qa-2")
         // A worktree file with a secret pattern is shared as a redacted company copy.
         let wt = try w.fx.git.ws.addWorktree(key: "ENG-1")
@@ -487,6 +488,7 @@ import GRDB
     /// A pin that fails after it wrote its share ref leaves no share ref behind.
     @Test func failedPinLeavesNoShareRef() throws {
         let w = try W()
+        try w.cf.hold(); try w.cf.review()
         let wt = try w.fx.git.ws.addWorktree(key: "ENG-1")
         try w.fx.git.write("src/a.ts", "work in progress\n", in: wt)
         w.store.refHooks.setFailAfterShareRef(true)

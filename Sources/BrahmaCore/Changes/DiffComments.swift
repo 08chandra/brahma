@@ -3,7 +3,7 @@ import GRDB
 
 /// Plan C Task C5b: the inline review limits (global constraints, "Inline review").
 public enum DiffReviewLimits {
-    /// Hunk lines quoted into the item comment.
+    /// Hunk lines quoted into the holder's DM.
     public static let quoteLines = 20
     /// Characters kept of each quoted line.
     public static let quoteLineChars = 200
@@ -15,7 +15,7 @@ public enum DiffReviewLimits {
     static let maxHunkHeader = 200
 }
 
-/// A row of migration `vC-changes`: one inline owner comment (or revert request) on an item's diff.
+/// A row of migration `vC-changes` (+ `vC-changes-quote`): one inline owner comment (or revert request) on an item's diff.
 public struct DiffComment: Codable, Equatable, Sendable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "diffComment"
     public static let comment = "comment"
@@ -26,34 +26,44 @@ public struct DiffComment: Codable, Equatable, Sendable, FetchableRecord, Persis
     public var itemId: String
     /// `comment` or `revertRequest`.
     public var kind: String
+    /// The file as the snapshot shows it (its display form).
     public var path: String
     /// `old` or `new`.
     public var side: String
     public var line: Int
     /// `StableHash.fnv1a64` of the anchored line's text (re-anchoring).
     public var lineHash: String
+    /// `@@ -a,b +c,d @@` (numbers only: never a line of the file).
     public var hunkHeader: String
     /// The compare's canonical ref (`ENG-1:diff@worktree`, `…?vs=head`, `ENG-1:diff@r1..worktree`).
     public var compare: String
     public var baseSha: String?
     /// The owner's text (a revert request's note, possibly empty).
     public var text: String
-    /// The `commented` item event that carries the body.
+    /// The `commented` item event that carries the owner's text (no diff text).
     public var eventId: String?
     public var createdAt: Date
     public var resolvedAt: Date?
+    /// Fix round 1: the quoted hunk (redacted, sanitized), read only under the live worktree rule.
+    public var quote: String? = nil
+    /// The quoted live text was tainted when the comment was made.
+    public var tainted: Bool = false
+    /// The owner's DM to the holder that carries the quote.
+    public var messageId: String? = nil
 
     public init(id: String = UUID().uuidString, companyId: String, itemId: String, kind: String, path: String, side: String, line: Int,
                 lineHash: String, hunkHeader: String, compare: String, baseSha: String?, text: String, eventId: String?, createdAt: Date,
-                resolvedAt: Date? = nil) {
+                resolvedAt: Date? = nil, quote: String? = nil, tainted: Bool = false, messageId: String? = nil) {
         self.id = id; self.companyId = companyId; self.itemId = itemId; self.kind = kind; self.path = path; self.side = side; self.line = line
         self.lineHash = lineHash; self.hunkHeader = hunkHeader; self.compare = compare; self.baseSha = baseSha; self.text = text
-        self.eventId = eventId; self.createdAt = createdAt; self.resolvedAt = resolvedAt
+        self.eventId = eventId; self.createdAt = createdAt; self.resolvedAt = resolvedAt; self.quote = quote; self.tainted = tainted
+        self.messageId = messageId
     }
 }
 
 /// Where a comment sits in a diff, as the app's diff model names it.
 public struct DiffAnchor: Hashable, Sendable, Codable {
+    /// The file's path as the snapshot shows it.
     public var path: String
     /// `old` or `new`.
     public var side: String
@@ -68,96 +78,134 @@ public struct DiffAnchor: Hashable, Sendable, Codable {
 }
 
 extension Store {
-    /// The owner's inline comment on `anchor` of the item's diff (the app's path, never a tool). Writes a `diffComment` row,
-    /// then an owner item comment through 3a's event path with the body
+    /// The owner's inline comment on `anchor` of the item's diff (the app's path, never a tool). Writes a `diffComment` row, an
+    /// owner item comment through 3a's event path, a waking `reviewComment` item event for the lease holder (else the
+    /// assignee), and an owner DM to that agent with the quoted hunk:
     ///
-    ///     Owner review comment on <path>:<line> (<compare canonical> @<base sha7>):
-    ///         | <the hunk header>
+    ///     Owner review comment on "<path>":<line> (<compare canonical> @<base sha7>):
+    ///         | @@ -a,b +c,d @@
     ///         | <up to 20 hunk lines around the line, redacted, invisible characters as ⟦U+XXXX⟧, each cut to 200 chars>
     ///     <owner text>
     ///
-    /// and a waking `reviewComment` item event for the lease holder (else the assignee). The quote comes from the redacted
-    /// snapshot (`changesSnapshot`); the whole body is gated as the final text before it is written: a stored value in it
-    /// (the owner's own text included: the body reaches agents) refuses the comment.
+    /// Fix round 1 (C5b-1): the item event every item reader sees carries the owner's text and the compare only — no path,
+    /// hunk or line of the live diff; those go to the live reader set alone (the DM, and `diffComments` under the live rule).
+    /// (I-1) The path must be one of the diff's files and prints as a JSON literal; the hunk header is regenerated from its
+    /// numbers. (I-2) The quote's taint (`snapshot.tainted`) is carried onto the row, the DM and the events. Every text is
+    /// redacted, then gated as the final string (a stored value in the owner's own text or in the quote refuses the comment).
     @discardableResult
     public func addDiffComment(companyId: String, key: String, compare: CompareMode, anchor: DiffAnchor, text: String,
                                knownValues: [(name: String, value: String)], now: Date) throws -> DiffComment {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { throw WorkError.invalid("the comment is empty") }
         return try writeDiffComment(companyId: companyId, key: key, compare: compare, anchor: anchor, kind: DiffComment.comment, text: body,
-                                    knownValues: knownValues, now: now) { snapshot, _ in
-            "Owner review comment on \(anchor.path):\(anchor.line) (\(compare.ref(key: key).canonical) @\(snapshot.base.prefix(7))):"
-        }
+                                    knownValues: knownValues, now: now)
     }
 
-    /// The same path with `kind = revertRequest` and the first line `Owner asks you to revert this hunk in <path> (<hunk
-    /// header>):`. The engine never writes to the worktree, its index or the item branch for it: no `checkout`, `apply`,
-    /// `restore`, `reset` or file write is ever issued (the holder does the revert in its turn).
+    /// The same path with `kind = revertRequest`; the DM's first line is `Owner asks you to revert this hunk in "<path>"
+    /// (<hunk header>):`. The engine never writes to the worktree, its index or the item branch for it: no `checkout`,
+    /// `apply`, `restore`, `reset` or file write is ever issued (the holder does the revert in its turn).
     @discardableResult
     public func requestHunkRevert(companyId: String, key: String, compare: CompareMode, anchor: DiffAnchor, note: String?,
                                   knownValues: [(name: String, value: String)], now: Date) throws -> DiffComment {
         let text = note?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return try writeDiffComment(companyId: companyId, key: key, compare: compare, anchor: anchor, kind: DiffComment.revertRequest, text: text,
-                                    knownValues: knownValues, now: now) { _, _ in
-            "Owner asks you to revert this hunk in \(anchor.path) (\(anchor.hunkHeader)):"
-        }
+                                    knownValues: knownValues, now: now)
     }
 
     private func writeDiffComment(companyId: String, key: String, compare: CompareMode, anchor: DiffAnchor, kind: String, text: String,
-                                  knownValues: [(name: String, value: String)], now: Date,
-                                  header: (ChangesSnapshot, DiffAnchor) -> String) throws -> DiffComment {
+                                  knownValues: [(name: String, value: String)], now: Date) throws -> DiffComment {
         guard text.count <= DiffReviewLimits.maxText else { throw WorkError.invalid("the comment is longer than \(DiffReviewLimits.maxText) characters") }
-        guard !anchor.path.isEmpty, anchor.path.count <= DiffReviewLimits.maxPath, !anchor.path.contains("\n"),
-              anchor.side == "old" || anchor.side == "new", anchor.line >= 1,
-              anchor.hunkHeader.hasPrefix("@@"), anchor.hunkHeader.count <= DiffReviewLimits.maxHunkHeader, !anchor.hunkHeader.contains("\n")
+        guard !anchor.path.isEmpty, anchor.path.count <= DiffReviewLimits.maxPath, anchor.side == "old" || anchor.side == "new", anchor.line >= 1,
+              anchor.hunkHeader.count <= DiffReviewLimits.maxHunkHeader, let header = DiffAnchoring.headerRange(anchor.hunkHeader)
         else { throw WorkError.invalid("the anchor is not a diff position") }
         guard let item = try writer.read({ db in try RefAccess.item(db, companyId, key) }) else { throw WorkError.notFound(Self.refUnavailable) }
-        // The snapshot as the owner sees it (redacted): the quote is cut from it.
-        let snapshot = try changesSnapshot(companyId: companyId, key: key, compare: compare, reader: .owner, knownValues: knownValues, now: now)
+        // The snapshot as the owner sees it (redacted): the quote is cut from it. The anchor names the shown path; the hunk is
+        // found under the path as the patch spells it.
+        try checkChangesAccess(companyId: companyId, key: key, compare: compare, reader: .owner)
+        let raw = try changesRaw(companyId: companyId, key: key, compare: compare)
+        let snapshot = Self.finishChanges(raw, knownValues: knownValues, now: now)
+        guard let index = snapshot.files.firstIndex(where: { $0.path == anchor.path }), index < raw.files.count else {
+            throw WorkError.invalid("the anchor's file is not in the diff")
+        }
+        let rawPath = raw.files[index].path
+        guard let hunk = DiffAnchoring.hunk(in: snapshot.patch, path: rawPath, header: header) else {
+            throw WorkError.invalid("the anchor's hunk is not in the diff")
+        }
+        guard let literal = PasteableRef.literal(anchor.path) else { throw WorkError.invalid("the anchor is not a diff position") }
         let gate = GlobalSearch.TextGate(knownValues: knownValues)
         guard !gate.holdsSecret(text) else { throw WorkError.invalid("the comment holds a stored secret's value; remove it before posting") }
-        let quote = DiffQuote.lines(snapshot.patch, anchor: anchor)
-        var lines = [header(snapshot, anchor), "    | " + DiffQuote.sanitize(anchor.hunkHeader)]
-        lines += quote.map { "    | " + $0 }
-        if !text.isEmpty { lines.append(text) }
-        let body = lines.joined(separator: "\n")
-        // Gated as the final text (Rulings 53–56): nothing changes it after this check.
-        guard !gate.holdsSecret(body) else { throw WorkError.invalid("the comment would quote a stored secret's value; it was not posted") }
-        let compareCanonical = compare.ref(key: key).canonical
-        let summary = kind == DiffComment.comment ? "owner review comment on \(anchor.path):\(anchor.line)"
-            : "owner asks to revert a hunk in \(anchor.path)"
+        let compareRef = compare.ref(key: key)
+        let compareCanonical = compareRef.canonical
+        let at = "\(compareCanonical) @\(snapshot.base.prefix(7))"
+        let quote = DiffQuote.lines(hunk, anchor: anchor)
+        // The holder's DM (the live reader set): the brief's form.
+        var dm = [kind == DiffComment.comment ? "Owner review comment on \(literal):\(anchor.line) (\(at)):"
+                  : "Owner asks you to revert this hunk in \(literal) (\(header)):", "    | " + header]
+        dm += quote.map { "    | " + $0 }
+        if !text.isEmpty { dm.append(text) }
+        // The item event (every item reader): the owner's text and the compare, nothing of the diff.
+        var event = [kind == DiffComment.comment ? "Owner review comment on \(item.key) changes (\(at)):" : "Owner asks you to revert a hunk in \(item.key) changes (\(at)):"]
+        if !text.isEmpty { event.append(text) }
+        // Redacted, then gated as the final strings (Ruling 55): nothing changes them after this check.
+        let dmBody = try redact(dm.joined(separator: "\n")), eventBody = try redact(event.joined(separator: "\n"))
+        let quoteText = try redact(quote.joined(separator: "\n"))
+        guard !gate.holdsSecret(dmBody), !gate.holdsSecret(eventBody), !gate.holdsSecret(quoteText) else {
+            throw WorkError.invalid("the comment would quote a stored secret's value; it was not posted")
+        }
+        let summary = kind == DiffComment.comment ? "owner review comment on the live changes" : "owner asks to revert a hunk in the live changes"
+        let taint: Bool? = snapshot.tainted ? true : nil
+        let router = MessageRouter(store: self)
         return try writer.write { db in
-            let event = try recordItemEvent(db: db, item: item, actor: "owner", kind: .commented, text: body, now: now)
-            // Whoever holds the work is woken: the lease holder, else the assignee.
+            let commented = try recordItemEvent(db: db, item: item, actor: "owner", kind: .commented, text: eventBody, taintedOverride: taint, now: now)
+            // Whoever holds the work is woken: the lease holder, else the assignee. The quote goes to that agent alone.
             let target = try Self.leaseHolderId(db: db, itemId: item.id) ?? item.ownerId
             try recordItemEvent(db: db, item: item, actor: "owner", kind: .reviewComment, text: summary,
-                                alsoNotify: target.map { [$0] } ?? [], alsoNotifyRole: .holder, onlyAlsoNotify: true, now: now)
+                                alsoNotify: target.map { [$0] } ?? [], alsoNotifyRole: .holder, onlyAlsoNotify: true, taintedOverride: taint, now: now)
+            var messageId: String?
+            if let target, let handle = try RefAccess.handle(db, companyId, target) {
+                let message = try router.sendDM(db: db, companyId: companyId, from: .owner, to: handle, text: dmBody, now: now)
+                messageId = message.id
+                if snapshot.tainted {
+                    try db.execute(sql: "UPDATE message SET taintedOrigin = 1, fromTaintedSession = 1, taintSource = ? WHERE id = ? AND companyId = ?",
+                                   arguments: ["ref:\(compareCanonical)", message.id, companyId])
+                }
+            }
             let row = DiffComment(companyId: companyId, itemId: item.id, kind: kind, path: anchor.path, side: anchor.side, line: anchor.line,
-                                  lineHash: StableHash.fnv1a64(anchor.lineText), hunkHeader: anchor.hunkHeader, compare: compareCanonical,
-                                  baseSha: snapshot.base, text: text, eventId: event.id.map(String.init), createdAt: now)
+                                  lineHash: StableHash.fnv1a64(anchor.lineText), hunkHeader: header, compare: compareCanonical,
+                                  baseSha: snapshot.base, text: text, eventId: commented.id.map(String.init), createdAt: now,
+                                  quote: quoteText, tainted: snapshot.tainted, messageId: messageId)
             try row.insert(db)
             return row
         }
     }
 
-    /// The item's diff comments, for readers who can read the item; each agent-visible field gated as the final string.
+    /// The item's diff comments for `reader`: those whose compare the reader may read in full (the live worktree rule, through
+    /// `RefAccess`; the owner reads all), each agent-visible field gated as the final string. A reader who can't read the item
+    /// is refused.
     public func diffComments(companyId: String, key: String, reader: Reader, knownValues: [(name: String, value: String)]) throws -> [DiffComment] {
-        let decision = try writer.read { db in
-            try RefAccess.canRead(reader, WorkRef(kind: .item, id: key), companyId: companyId, db: db, catalog: catalog)
-        }
-        guard case .allowed = decision else { throw WorkError.notFound(Self.refUnavailable) }
+        guard let company = try company(id: companyId) else { throw WorkError.notFound(Self.refUnavailable) }
+        let context = RefContext(companyId: companyId, keyPrefixes: [Self.keyPrefix(slug: company.slug)])
         let gate = GlobalSearch.TextGate(knownValues: knownValues)
-        let rows = try writer.read { db in
-            try DiffComment.fetchAll(db, sql: """
+        let rows: [DiffComment] = try writer.read { db in
+            guard case .allowed = try RefAccess.canRead(reader, WorkRef(kind: .item, id: key), companyId: companyId, db: db, catalog: catalog) else {
+                throw WorkError.notFound(Self.refUnavailable)
+            }
+            let all = try DiffComment.fetchAll(db, sql: """
                 SELECT diffComment.* FROM diffComment JOIN workItem ON workItem.id = diffComment.itemId
                 WHERE diffComment.companyId = ? AND workItem.companyId = ? AND workItem.key = ? ORDER BY diffComment.createdAt, diffComment.rowid
                 """, arguments: [companyId, companyId, key])
+            return try all.filter { row in
+                guard let ref = WorkRef.parse(row.compare, context: context) else { return false }
+                guard case .allowed = try RefAccess.canRead(reader, ref, companyId: companyId, db: db, catalog: catalog) else { return false }
+                return true
+            }
         }
         return rows.map { row in
             var r = row
             r.path = gate.final(row.path, max: DiffReviewLimits.maxPath) ?? Self.withheldPath
-            r.hunkHeader = gate.final(row.hunkHeader, max: DiffReviewLimits.maxHunkHeader) ?? "@@"
+            r.hunkHeader = DiffAnchoring.headerRange(row.hunkHeader) ?? "@@"
             r.text = gate.final(row.text, max: DiffReviewLimits.maxText) ?? ShowLimits.withheldNote
+            if let q = row.quote { r.quote = gate.holdsSecret(q) ? nil : q }
             return r
         }
     }
@@ -175,10 +223,8 @@ extension Store {
 /// The quoted hunk lines of an inline comment: redacted text from the snapshot, invisible characters shown as `⟦U+XXXX⟧`,
 /// each line cut to `DiffReviewLimits.quoteLineChars`.
 enum DiffQuote {
-    /// Up to `quoteLines` lines of the anchor's hunk around the anchored line (the hunk's first lines when the line isn't
-    /// found); nothing when the file or hunk isn't in the patch.
-    static func lines(_ patch: String, anchor: DiffAnchor) -> [String] {
-        guard let hunk = DiffAnchoring.hunk(in: patch, path: anchor.path, header: anchor.hunkHeader) else { return [] }
+    /// Up to `quoteLines` lines of the hunk around the anchored line (the hunk's first lines when the line isn't in it).
+    static func lines(_ hunk: DiffAnchoring.Hunk, anchor: DiffAnchor) -> [String] {
         let body = hunk.lines
         guard !body.isEmpty else { return [] }
         let at = hunk.numbered.firstIndex { $0.side(anchor.side) == anchor.line } ?? 0
@@ -189,13 +235,15 @@ enum DiffQuote {
         return body[start..<end].map(sanitize)
     }
 
-    /// Invisible characters as `⟦U+XXXX⟧`; the line cut to `quoteLineChars` with `…`.
+    /// Invisible characters (controls, DEL, bidi, zero-width, format, soft hyphen, line and paragraph separators) as `⟦U+XXXX⟧`;
+    /// the line cut to `quoteLineChars` with `…`. A tab stays.
     static func sanitize(_ line: String) -> String {
         var out = ""
         for scalar in line.unicodeScalars {
             let v = scalar.value
             if v == 0x09 { out.unicodeScalars.append(scalar); continue }
-            if RefText.isHidden(v) || scalar.properties.generalCategory == .format || v == 0x00AD || v == 0x180E {
+            let category = scalar.properties.generalCategory
+            if RefText.isHidden(v) || category == .format || category == .lineSeparator || category == .paragraphSeparator || v == 0x00AD || v == 0x180E {
                 out += "⟦U+" + String(v, radix: 16, uppercase: true).leftPadded(to: 4) + "⟧"
             } else {
                 out.unicodeScalars.append(scalar)
@@ -250,10 +298,10 @@ public enum DiffAnchoring {
         return out
     }
 
-    /// The hunk with `header` (else the one that spans the anchor's line, else nil).
+    /// The hunk whose range (`@@ -a,b +c,d @@`) is `header`'s, or nil: a stale anchor quotes nothing (never another hunk).
     static func hunk(in patch: String, path: String, header: String) -> Hunk? {
-        let all = hunks(in: patch, path: path)
-        return all.first { $0.header == header } ?? all.first { !$0.lines.isEmpty }
+        guard let wanted = headerRange(header) else { return nil }
+        return hunks(in: patch, path: path).first { headerRange($0.header) == wanted }
     }
 
     /// `@@ -a,b +c,d @@` → (a, c); 0 when unreadable.
@@ -262,6 +310,21 @@ public enum DiffAnchoring {
         func start(_ s: Substring) -> Int { Int(s.dropFirst().split(separator: ",").first ?? "") ?? 0 }
         guard parts.count >= 3 else { return (0, 0) }
         return (start(parts[1]), start(parts[2]))
+    }
+
+    /// The header's range alone, `@@ -a[,b] +c[,d] @@`, regenerated from its numbers (never the function context git appends,
+    /// which is a line of the file); nil when the text is not a hunk header.
+    public static func headerRange(_ header: String) -> String? {
+        let parts = header.split(separator: " ", omittingEmptySubsequences: false)
+        guard parts.count >= 4, parts[0] == "@@", parts[3] == "@@" else { return nil }
+        func range(_ s: Substring, _ sign: Character) -> String? {
+            guard s.first == sign else { return nil }
+            let nums = s.dropFirst().split(separator: ",", omittingEmptySubsequences: false)
+            guard (1...2).contains(nums.count), nums.allSatisfy({ !$0.isEmpty && $0.count <= 9 && $0.allSatisfy { $0.isASCII && $0.isNumber } }) else { return nil }
+            return String(sign) + nums.joined(separator: ",")
+        }
+        guard let old = range(parts[1], "-"), let new = range(parts[2], "+") else { return nil }
+        return "@@ \(old) \(new) @@"
     }
 
     /// The line the comment shows at in `patch` now, or nil when it is outdated.

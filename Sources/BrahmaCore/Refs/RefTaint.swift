@@ -421,13 +421,43 @@ extension Store {
         if ref.isWorktree {
             if let source = try holderSource(item: item) { return source }
             if item.taintedOrigin { return "outside content" }
-            guard ref.kind == .file else { return nil }
-            var committed = ref
-            committed.branch = "item/\(item.key)"
-            committed.rev = nil
+            if ref.kind == .file {
+                var committed = ref
+                committed.branch = "item/\(item.key)"
+                committed.rev = nil
+                return try commitSource(committed, item: item)
+            }
+            // Fix round 1 (N-1): a live diff shows the branch's commits from its base on (vs main: the merge base; `?vs=check`,
+            // `@r<n>..worktree`: a run's commit), so their taint rides on it; vs head it shows uncommitted work only.
+            return try compareRangeSource(ref, item: item)
+        }
+        // Fix round 1 (N-1b): `@r<n>..r<m>` is judged over exactly the pair it shows, both ways.
+        if ref.params["from"] != nil, ref.params["to"] != nil { return try compareRangeSource(ref, item: item) }
+        return try commitSource(ref, item: item)
+    }
+
+    /// The taint of the commits a compare shows: `commitSource` (the branch from its merge base, restore epochs included) when
+    /// the base is the merge base with main, else the symmetric range between the compare's base and its target (or the branch
+    /// head for the live worktree). A base that can't be resolved reads as tainted.
+    private func compareRangeSource(_ ref: WorkRef, item: WorkItem) throws -> String? {
+        guard let compare = CompareMode(ref: ref) else { return nil }
+        if compare == .head { return nil }
+        var committed = WorkRef(kind: .diff, id: item.key)
+        if compare == .main || compare == .revisions(from: "base", to: "head") || compare == .revisions(from: "base", to: "worktree") {
             return try commitSource(committed, item: item)
         }
-        return try commitSource(ref, item: item)
+        guard let company = try company(id: item.companyId) else { return "outside content" }
+        let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
+        let bases: (base: String, target: String?)
+        do { bases = try changesBases(companyId: item.companyId, item: item, compare: compare, git: git) } catch { return "outside content" }
+        let target = try bases.target ?? git.head("item/\(item.key)")
+        committed.rev = target
+        let rows = try unclearedCommits(companyId: item.companyId)
+        if let source = try Self.symmetricRangeSource(git, bases.base, target, rows: rows) { return source }
+        // Restore epochs and orphaned items (Rulings 22–25) judge the branch as a whole.
+        guard try openRestoreEpochs(companyId: item.companyId).isEmpty, try orphanedItems(companyId: item.companyId, rows: rows)[item.id] == nil
+        else { return try commitSource(committed, item: item) }
+        return nil
     }
 
     /// C5b: the source of the first uncleared tainted commit in `from..to` (full or abbreviated shas, verified by git), or the
@@ -437,14 +467,26 @@ extension Store {
         guard !rows.isEmpty else { return nil }
         guard let company = try company(id: companyId) else { return "outside content" }
         let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
-        let shas: [String]
         do {
             let refs = try reachabilityRefs(companyId: companyId)
-            shas = try git.revList(try git.verifyRev(from, reachableFrom: refs), try git.verifyRev(to, reachableFrom: refs))
+            return try Self.symmetricRangeSource(git, try git.verifyRev(from, reachableFrom: refs), try git.verifyRev(to, reachableFrom: refs), rows: rows)
         } catch {
             return "outside content"
         }
-        return rows.first { row in shas.contains { $0.hasPrefix(row.sha) } }?.source
+    }
+
+    /// Fix round 1 (C5b-3): a diff between two commits shows both sides, so the taint of `a...b` (both directions) counts; a
+    /// pair with no merge base, or a range that can't be listed, reads as tainted (fail closed). `a` and `b` are full shas.
+    static func symmetricRangeSource(_ git: SafeGit, _ a: String, _ b: String, rows: [TaintedCommit]) throws -> String? {
+        guard !rows.isEmpty else { return nil }
+        guard a != b else { return nil }
+        do {
+            _ = try git.mergeBase(a, b)
+            let shas = try git.revList(a, b) + git.revList(b, a)
+            return rows.first { row in shas.contains { $0.hasPrefix(row.sha) } }?.source
+        } catch {
+            return "outside content"
+        }
     }
 
     /// The company's uncleared tainted commits, sha → source.

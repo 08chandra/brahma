@@ -88,9 +88,12 @@ extension Store {
                 let fileName = ref.id.split(separator: "/").last.map(String.init) ?? ref.id
                 let redacted = try SecretGate.redactedCopy(data, ext: ext, canonical: ref.canonical, archives: archives ?? UnavailableArchiveReader(),
                                                            knownValues: knownValues, store: self)
+                // C5b: a live worktree file is read under the live worktree rule, but its pinned copy (like every pin) keeps the
+                // company class.
+                let live = ref.isWorktree && ref.itemKey != nil
                 let number = try vaultShareCopy(companyId: companyId, data: redacted,
-                                                fileName: fileName, sourceDetail: Self.unpinned(ref).canonical, scope: subject.access,
-                                                readerSet: subject.readerSet, futureHolders: subject.futureHolders, provenance: provenance,
+                                                fileName: fileName, sourceDetail: Self.unpinned(ref).canonical, scope: live ? .company : subject.access,
+                                                readerSet: live ? nil : subject.readerSet, futureHolders: live ? false : subject.futureHolders, provenance: provenance,
                                                 taint: source, secretScan: .redacted, paths: paths, now: Store.now())
                 var copy = WorkRef(kind: .resource, id: String(number))
                 copy.params["source"] = Self.unpinned(ref).canonical

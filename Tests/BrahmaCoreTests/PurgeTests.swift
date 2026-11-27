@@ -52,6 +52,7 @@ import GRDB
 
     @Test func purgeRemovesObjectAndFlagsBackups() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let cId = cf.c.id
         // A worktree file pinned as a blob under its share ref, carried by a message.
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
@@ -107,6 +108,7 @@ import GRDB
 
     @Test func purgedRefResolvesAsTombstone() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         try cf.fx.git.write("src/a.ts", "one\nTWO\nthree\nfour\n", in: wt)
         let file = try cf.store.pinRef(try cf.fx.ref("ENG-1:src/a.ts@worktree"), for: .agent(cf.fx.eng1.id), companyId: cf.c.id,
@@ -179,6 +181,7 @@ import GRDB
         #expect(!CompanyToolNames.all.contains { $0.contains("purge") })
         #expect(!TaintPolicy.taintSafeTools.contains { $0.contains("purge") })
         let cf = try CollabFixture()
+        try cf.hold()
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         try cf.fx.git.write("src/a.ts", "pinned\n", in: wt)
         let pinned = try cf.store.pinRef(try cf.fx.ref("ENG-1:src/a.ts@worktree"), for: .agent(cf.fx.eng1.id), companyId: cf.c.id,
@@ -225,6 +228,7 @@ import GRDB
     /// company's purge fence no turn starts, and a turn that started after the first check refuses the purge.
     @Test func purgeFencedAgainstTurnStart() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         cf.store.refHooks.setFenceHome(cf.paths.home)
         let cId = cf.c.id, eng1 = cf.fx.eng1.id
         // A turn start while the fence is held: refused (the agent stays ready), and it starts once the fence is gone.
@@ -255,6 +259,7 @@ import GRDB
     /// the check ends, a waiting purge gets in.
     @Test func purgeWaitsAheadOfNewHolders() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let home = cf.paths.home, cId = cf.c.id
         let check = try #require(try PurgeFence.holdShared(home: home, companyId: cId, wait: .zero, kind: .check))
         final class Outcome: @unchecked Sendable { var error: (any Error)?; var ran = false }
@@ -309,6 +314,7 @@ import GRDB
 
     @Test func purgeIncompleteAlertsOwner() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         try cf.fx.git.write("src/staged.ts", "staged bytes\n", in: wt)
         let pinned = try cf.store.pinRef(try cf.fx.ref("ENG-1:src/staged.ts@worktree"), for: .agent(cf.fx.eng1.id), companyId: cf.c.id,
@@ -330,6 +336,7 @@ import GRDB
     /// R2-6: the purge log keeps the ref's name with every stored value redacted (it is a log), like every message does.
     @Test func purgeLogNeverHoldsAValue() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let cId = cf.c.id
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         let file = "src/\(SecretGateTests.value).ts"

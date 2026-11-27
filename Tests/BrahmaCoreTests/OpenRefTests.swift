@@ -121,6 +121,23 @@ struct CollabFixture {
     }
 
     func reads(_ canonical: String) throws -> [RefRead] { try store.refReads(companyId: c.id, canonical: canonical, limit: 50) }
+
+    /// Plan C Task C5b's live worktree rule: `agent` (eng-1 by default) holds ENG-1's lease, so it may read and pin the item's
+    /// live worktree content. Replaces any lease on the item.
+    /// `agent` (qa-2 by default) reviews ENG-1, so it may read the item's live worktree content (C5b's live worktree rule).
+    func review(_ agent: Agent? = nil) throws {
+        let (itemId, reviewerId) = (fx.item.id, (agent ?? fx.qa2).id)
+        try store.writer.write { db in try db.execute(sql: "UPDATE workItem SET reviewerId = ? WHERE id = ?", arguments: [reviewerId, itemId]) }
+    }
+
+    func hold(_ agent: Agent? = nil) throws {
+        let holder = agent ?? fx.eng1
+        let (itemId, cId, now) = (fx.item.id, c.id, now)
+        try store.writer.write { db in
+            try db.execute(sql: "DELETE FROM workLease WHERE itemId = ?", arguments: [itemId])
+            try WorkLease(itemId: itemId, companyId: cId, agentId: holder.id, acquiredAt: now, expiresActive: 1e12).insert(db)
+        }
+    }
 }
 
 /// Plan C Task C2a: `Store.openRef` — access, taint before any byte, bounded and framed rendering, materialized copies.

@@ -120,7 +120,7 @@ import GRDB
         _ = try #require(await ib.next())
         #expect(await h.stats().recomputes == 1)
         await h.clock.waitForSleepers()
-        for _ in 0..<20 { await h.live.nudge(key: "ENG-1") }
+        for _ in 0..<20 { await h.live.nudge(companyId: h.f.c.id, key: "ENG-1") }
         try? await Task.sleep(for: .milliseconds(100))
         #expect(await h.stats().recomputes == 1, "a nudge never recomputes before the interval")
         await h.clock.waitForSleepers()
@@ -135,7 +135,7 @@ import GRDB
         h.clock.advance(by: .seconds(1))
         await h.waitForRecomputes(3)
         await h.clock.waitForSleepers()
-        for _ in 0..<5 { await h.live.nudge(key: "ENG-1") }
+        for _ in 0..<5 { await h.live.nudge(companyId: h.f.c.id, key: "ENG-1") }
         try? await Task.sleep(for: .milliseconds(100))
         #expect(await h.stats().recomputes == 3)
     }
@@ -155,7 +155,7 @@ import GRDB
         #expect(await h.stats().recomputes == 2)
         // A nudge while idle still waits for the refresh interval since the last compute.
         await h.clock.waitForSleepers()
-        await h.live.nudge(key: "ENG-1")
+        await h.live.nudge(companyId: h.f.c.id, key: "ENG-1")
         try? await Task.sleep(for: .milliseconds(100))
         #expect(await h.stats().recomputes == 2)
         await h.clock.waitForSleepers()
@@ -182,7 +182,7 @@ import GRDB
         #expect(seen == 1)
         for _ in 0..<50 where await h.live.isWatching(companyId: h.f.c.id, key: "ENG-1", compare: .main) { try? await Task.sleep(for: .milliseconds(5)) }
         let calls = runner.calls.count
-        await h.live.nudge(key: "ENG-1")
+        await h.live.nudge(companyId: h.f.c.id, key: "ENG-1")
         h.clock.advance(by: .seconds(30))
         try? await Task.sleep(for: .milliseconds(150))
         #expect(runner.calls.count == calls, "no git call after the last observer left")

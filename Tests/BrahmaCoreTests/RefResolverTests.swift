@@ -144,15 +144,16 @@ import GRDB
         let fx = try RefFixture()
         let wt = try fx.git.ws.addWorktree(key: "ENG-1")
         try fx.git.write("src/a.ts", "one\nTWO\nthree\nfour\n", in: wt)
-        let file = try fx.resolve(.eng1, try fx.ref("ENG-1:src/a.ts@worktree"))
-        #expect(file.visibility == .full)
-        #expect(file.subtitle == "4 lines · TypeScript · UNCOMMITTED")
-        // C5b: the live worktree rule — eng-1 reads ENG-1's live diff as its lease holder; the default compare is vs main
-        // (the merge base), so the branch's commits count too.
+        // C5b: the live worktree rule — eng-1 reads ENG-1's live file and diff as its lease holder (qa-2 is refused); the
+        // default compare is vs main (the merge base), so the branch's commits count too.
         let (itemId, cId, eng1Id, now) = (fx.item.id, fx.c.id, fx.eng1.id, fx.now)
         try fx.store.writer.write { db in
             try WorkLease(itemId: itemId, companyId: cId, agentId: eng1Id, acquiredAt: now, expiresActive: 1e12).insert(db)
         }
+        let file = try fx.resolve(.eng1, try fx.ref("ENG-1:src/a.ts@worktree"))
+        #expect(file.visibility == .full)
+        #expect(file.subtitle == "4 lines · TypeScript · UNCOMMITTED")
+        #expect(try fx.resolve(.qa2, try fx.ref("ENG-1:src/a.ts@worktree")).visibility == .refused)
         let diff = try fx.resolve(.eng1, try fx.ref("ENG-1:diff@worktree"))
         #expect(diff.title == "ENG-1 diff (uncommitted)")
         #expect(diff.subtitle == "+4 \u{2212}1 in 2 files")

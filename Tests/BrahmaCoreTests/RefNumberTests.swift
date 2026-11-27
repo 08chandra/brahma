@@ -220,6 +220,7 @@ import GRDB
     /// (no copy, snapshot, share ref, lease or message), and the share is refused.
     @Test func leaseFailureLeavesNothing() throws {
         let w = try W()
+        try w.cf.hold(); try w.cf.review()
         let store = w.store, cId = w.c.id
         _ = try store.createChannel(companyId: cId, name: "team", members: [w.fx.cto.id, w.fx.eng1.id, w.fx.qa2.id])
         func share(_ refs: [String], to: String = "@qa-2") -> String? {

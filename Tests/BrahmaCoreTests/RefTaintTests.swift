@@ -266,14 +266,16 @@ import GRDB
         try cf.fx.git.write("src/a.ts", "one\nTWO\nthree\nfour\n", in: wt)
         let file = try cf.fx.ref("ENG-1:src/a.ts@worktree"), diff = try cf.fx.ref("ENG-1:diff@worktree")
         #expect(try cf.store.refTaint(file, companyId: cId) == (false, nil))
-        #expect(!(try cf.fx.resolve(.qa2, diff)).tainted)
+        #expect(!(try cf.fx.resolve(.owner, diff)).tainted)
         try cf.store.markTainted(agentId: engId, source: "docs.swift.org")
         #expect(try cf.store.refTaint(file, companyId: cId) == (true, Self.reason))
         #expect(try cf.store.refTaint(diff, companyId: cId) == (true, Self.reason))
-        let resolved = try cf.fx.resolve(.qa2, file)
+        // C5b: live worktree content is read by the holder, the assignee, the reviewer, the owner and the concierge only.
+        let resolved = try cf.fx.resolve(.owner, file)
         #expect(resolved.tainted && resolved.taintReason == Self.reason)
+        #expect(try cf.fx.resolve(.qa2, file).visibility == .refused)
         // A pin made now keeps the taint after the holder's session is clean again.
-        let pinned = try cf.store.pinRef(file, for: .agent(cf.fx.qa2.id), companyId: cId, messageRefId: "mr-t", knownValues: [], paths: cf.paths)
+        let pinned = try cf.store.pinRef(file, for: .agent(cf.fx.eng1.id), companyId: cId, messageRefId: "mr-t", knownValues: [], paths: cf.paths)
         try cf.store.endThrowawaySessionTaint(agentId: engId)
         // The holder's session is clean again, but 5-lite's mark on the item it held while tainted is sticky: its worktree
         // still holds what that session wrote (fail closed).
@@ -361,6 +363,7 @@ import GRDB
     /// keeps it.
     @Test func worktreeCarriesCommittedTaint() throws {
         let cf = try CollabFixture()
+        try cf.hold(cf.fx.qa2)
         try Self.taintItemCommit(cf)
         _ = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         let file = try cf.fx.ref("ENG-1:src/a.ts@worktree")

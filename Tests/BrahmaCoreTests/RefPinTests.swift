@@ -13,6 +13,7 @@ import Glibc
 @Suite(.scratch) struct RefPinTests {
     @Test func worktreePinSurvivesWorktreeRemoval() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         try cf.fx.git.write("src/a.ts", "pinned bytes\n", in: wt)
         let ref = try cf.fx.ref("ENG-1:src/a.ts@worktree")
@@ -26,7 +27,8 @@ import Glibc
         // The worktree and the branch go (the item merged): the pin still opens the shared bytes.
         try cf.fx.git.git(["worktree", "remove", "--force", wt.path])
         try cf.fx.git.git(["branch", "-D", "item/ENG-1"])
-        #expect(try cf.fx.resolve(.qa2, ref).visibility == .missing)
+        #expect(try cf.fx.resolve(.eng1, ref).visibility == .missing)
+        #expect(try cf.fx.resolve(.qa2, ref).visibility == .refused, "C5b: a non-reader of the live worktree is refused")
         let resolved = try cf.store.resolveRef(pinned, for: .agent(cf.fx.qa2.id), companyId: cf.c.id)
         #expect(resolved.visibility == .full && resolved.subtitle.hasPrefix("1 line · TypeScript"))
         let out = try cf.open(.qa2, pinned: pinned)
@@ -43,6 +45,7 @@ import Glibc
 
     @Test func worktreeDiffPinIsVaultSnapshot() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         try cf.fx.git.write("src/a.ts", "one\nTWO\nthree\nfour\n", in: wt)
         let ref = try cf.fx.ref("ENG-1:diff@worktree")
@@ -174,6 +177,7 @@ import Glibc
 
     @Test func pinsAreSecretScanned() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         try cf.fx.git.write("src/a.ts", "const k = 'sk_test_51abcdefgh'\n", in: wt)
         func pin(_ s: String, _ id: String) throws -> WorkRef {

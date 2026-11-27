@@ -664,11 +664,12 @@ extension Store {
     func recordItemEvent(db: Database, item: WorkItem, actor: String, kind: WorkEventKind, text: String,
                          alsoNotify: [String] = [], alsoNotifyRole: NoticeRecipientRole = .other,
                          assigneeRole: NoticeRecipientRole = .owner, onlyAlsoNotify: Bool = false, sourceMessageId: String? = nil,
-                         now: Date) throws -> WorkItemEvent {
+                         taintedOverride: Bool? = nil, now: Date) throws -> WorkItemEvent {
         let text = try redact(text)
         let active = try Self.activeNow(db: db, companyId: item.companyId)
+        // Plan C Task C5b (I-2): an event that relays tainted content (an owner comment on a tainted live diff) carries that taint.
         var event = WorkItemEvent(id: nil, companyId: item.companyId, itemId: item.id, actorId: actor, kind: kind, text: text,
-                                  createdAt: now, createdActive: active, taintedOrigin: try writesTainted(db: db, actorId: actor),
+                                  createdAt: now, createdActive: active, taintedOrigin: try taintedOverride ?? writesTainted(db: db, actorId: actor),
                                   sourceMessageId: sourceMessageId)
         try event.insert(db)
         guard let eventId = event.id else { throw StoreError.notFound }

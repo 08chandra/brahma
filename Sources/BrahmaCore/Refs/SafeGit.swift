@@ -118,9 +118,9 @@ public struct SafeGit: Sendable {
     /// A `.gitignore` larger than this is not handed to git (`worktreeDiff`): fewer rules, more listed.
     static let maxIgnoreFileBytes = 1 << 20
     static let extraEnvironment = ["GIT_LITERAL_PATHSPECS": "1"]
-    static let extraConfig = ["-c", "core.untrackedCache=false", "-c", "core.excludesFile=/dev/null"]
+    static let extraConfig = ["-c", "core.untrackedCache=false", "-c", "core.excludesFile=/dev/null", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "core.quotePath=false"]
     static let sharesPrefix = "refs/brahma/shares/"
-    static let noDiffPrograms = ["--no-textconv", "--no-ext-diff", "--no-color", "--no-renames"]
+    static let noDiffPrograms = ["--no-textconv", "--no-ext-diff", "--no-color", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/"]
 
     public struct TreeEntry: Equatable, Sendable {
         public var path: String

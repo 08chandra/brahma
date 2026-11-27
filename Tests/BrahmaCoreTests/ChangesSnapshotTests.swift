@@ -261,4 +261,71 @@ final class PassthroughRecordingRunner: GitProcessRunning, @unchecked Sendable {
         // A committed diff is company-readable as before.
         #expect(try f.store.resolveRef(try f.fx.ref("ENG-1:diff"), for: .agent(f.eng7.id), companyId: f.c.id).visibility == .full)
     }
+
+    // MARK: Fix round 1
+
+    /// C5b-2: a live `@worktree` file follows the live worktree rule like the diff does.
+    @Test func liveWorktreeFileRefScoped() throws {
+        let f = try ChangesFixture()
+        let file = try f.fx.ref("ENG-1:src/a.ts@worktree")
+        #expect(try f.fx.resolve(.eng1, file).visibility == .full)
+        #expect(try f.fx.resolve(.qa2, file).visibility == .full)
+        #expect(try f.fx.resolve(.owner, file).visibility == .full)
+        #expect(try f.fx.resolve(.concierge, file).visibility == .full)
+        #expect(try f.store.resolveRef(file, for: .agent(f.eng7.id), companyId: f.c.id).visibility == .refused)
+        #expect(f.cf.failure {
+            try f.store.openRef(companyId: f.c.id, reader: .agent(f.eng7.id), ref: "ENG-1:src/a.ts@worktree", lines: nil, copy: false, turnId: nil,
+                                context: f.fx.ctx, knownValues: [], paths: f.cf.paths, now: f.cf.now)
+        } == Store.refUnavailable)
+        // A pinned blob keeps the company class, and so does the committed file.
+        let pinned = try f.store.pinRef(file, for: .agent(f.fx.eng1.id), companyId: f.c.id, messageRefId: "mr-lf", knownValues: [], paths: f.cf.paths)
+        #expect(try f.store.resolveRef(pinned, for: .agent(f.eng7.id), companyId: f.c.id).visibility == .full)
+        #expect(try f.store.resolveRef(try f.fx.ref("ENG-1:src/a.ts"), for: .agent(f.eng7.id), companyId: f.c.id).visibility == .full)
+    }
+
+    static func taintR2(_ f: ChangesFixture) throws {
+        try f.store.recordTaintedCommits(companyId: f.c.id, itemId: f.item.id, agentId: f.fx.eng1.id, turnId: nil, headBefore: f.r1, headAfter: f.r2,
+                                         source: "docs.swift.org", git: SafeGit(workspace: f.cf.workspace), now: f.cf.now)
+    }
+    static let taintReason = "from a session that read docs.swift.org"
+
+    /// C5b-3: a diff between two revs shows both sides, so a tainted commit on either side taints it.
+    @Test func diffRangeTaintSymmetric() throws {
+        let f = try ChangesFixture()
+        try Self.taintR2(f)
+        let main = try f.fx.head("main")
+        for s in ["diff:\(f.r2)..\(main)", "diff:\(main)..\(f.r2)", "diff:\(f.r2)..\(f.r1)", "diff:\(f.r1)..\(f.r2)", "ENG-1:diff@r2..r1", "ENG-1:diff@r1..r2",
+                  "ENG-1:diff@base..head", "ENG-1:diff"] {
+            #expect(try f.store.refTaint(try f.fx.ref(s), companyId: f.c.id) == (true, Self.taintReason), "\(s)")
+        }
+        for s in ["diff:\(f.r1)..\(main)", "diff:\(main)..\(f.r1)", "diff:\(f.base)..\(f.r1)", "ENG-1:diff@base..r1"] {
+            #expect(try f.store.refTaint(try f.fx.ref(s), companyId: f.c.id) == (false, nil), "\(s)")
+        }
+        // A rev pair whose merge base can't be found reads as tainted (fail closed).
+        let orphan = try f.fx.git.git(["commit-tree", try f.fx.git.git(["rev-parse", "main^{tree}"]), "-m", "orphan"])
+        try f.fx.git.git(["update-ref", "refs/heads/item/ENG-1", orphan])
+        defer { _ = try? f.fx.git.git(["update-ref", "refs/heads/item/ENG-1", f.r2]) }
+        #expect(try f.store.refTaint(try f.fx.ref("diff:\(orphan)..\(main)"), companyId: f.c.id).tainted)
+    }
+
+    /// N-1: the live compare vs main shows the branch's commits, so their taint rides on it (not only the holder's session).
+    @Test func liveDiffVsMainTaintedByCommittedTaint() throws {
+        let f = try ChangesFixture()
+        #expect(!(try f.snapshot(.main)).tainted)
+        try Self.taintR2(f)
+        let live = try f.snapshot(.main)
+        #expect(live.tainted && live.taintReason == Self.taintReason)
+        #expect(try f.snapshot(.revisions(from: "r1", to: "worktree")).tainted)
+        #expect(try f.snapshot(.revisions(from: "r1", to: "r2")).tainted)
+        // Ranges that don't include r2 are clean, and so is the holder's session.
+        #expect(!(try f.snapshot(.head)).tainted)
+        #expect(!(try f.snapshot(.lastCheck)).tainted)
+        #expect(!(try f.snapshot(.revisions(from: "base", to: "r1"))).tainted)
+        // The resolver, the open path and the board agree with the snapshot.
+        let resolved = try f.fx.resolve(.owner, try f.fx.ref("ENG-1:changes"))
+        #expect(resolved.tainted && resolved.taintReason == Self.taintReason)
+        #expect(!(try f.fx.resolve(.owner, try f.fx.ref("ENG-1:diff@worktree?vs=head"))).tainted)
+        #expect(try f.cf.open(.qa2, "ENG-1:changes").tainted)
+        #expect(try f.store.changesBoard(companyId: f.c.id, reader: .owner, knownValues: [], now: f.cf.now).first { $0.key == "ENG-1" }?.tainted == true)
+    }
 }

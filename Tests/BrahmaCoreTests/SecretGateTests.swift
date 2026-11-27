@@ -100,6 +100,7 @@ struct StubArchiveReader: ArchiveReader {
 
     @Test func secretInZipMemberRefused() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         // The stored bytes hold a placeholder; the member as inflated holds the value. Each case gets bytes of its own (the
         // gate caches a verdict by the bytes' hash, and a real reader inflates the same bytes the same way).
         let inflated: [(name: String, data: Data)] = [
@@ -459,6 +460,7 @@ struct StubArchiveReader: ArchiveReader {
 
     @Test func redactedShareWritesNoRawBlob() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         try cf.fx.git.write("src/conf.ts", "const region = 'eu'\nconst key = '\(Self.aws)'\n", in: wt)
         let pinned = try cf.store.pinRef(try cf.fx.ref("ENG-1:src/conf.ts@worktree"), for: .agent(cf.fx.eng1.id), companyId: cf.c.id,
@@ -492,6 +494,7 @@ struct StubArchiveReader: ArchiveReader {
 
     @Test func viewOriginalLogsRead() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         let original = "const key = '\(Self.aws)'\n"
         try cf.fx.git.write("src/conf.ts", original, in: wt)
@@ -618,6 +621,7 @@ struct StubArchiveReader: ArchiveReader {
     /// redacted copy is checked again through the whole gate.
     @Test func decodedSecretNeverRedacted() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let content = Data("BT /F1 12 Tf 72 700 Td (key \(Self.aws)) Tj ET".utf8)
         let hex = Data(content.map { String(format: "%02X", $0) }.joined().utf8) + Data(">".utf8)
         let pdf = PDFBuild.build(PDFBuild.page(PDFBuild.stream("<< /Length \(hex.count) /Filter /ASCIIHexDecode >>", hex)))
@@ -857,6 +861,7 @@ struct StubArchiveReader: ArchiveReader {
     /// R3-8 (m-D): a redacted copy whose re-check could not run (no reader, over the budget) says so.
     @Test func redactedCopyRecheckSaysWhy() throws {
         let cf = try CollabFixture()
+        try cf.hold()
         let wt = try cf.fx.git.ws.addWorktree(key: "ENG-1")
         try cf.fx.git.write("src/conf.ts", "const key = '\(Self.aws)'\n", in: wt)
         let pdf = PDFBuild.flate("hello")

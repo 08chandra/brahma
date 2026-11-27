@@ -43,7 +43,7 @@ public actor LiveChanges {
     private var watches: [Key: Watch] = [:]
 
     public init(store: Store, interval: Duration = ChangesLimits.refreshInterval, idle: Duration = ChangesLimits.idleInterval,
-                clock: any Clock<Duration> = ContinuousClock()) {
+                clock: any Clock<Duration> = SuspendingClock()) {
         self.store = store; self.interval = interval; self.idle = idle
         self.clock = LiveClock(clock)
     }
@@ -58,6 +58,11 @@ public actor LiveChanges {
             made = Observer(reader: reader, knownValues: knownValues, continuation: continuation)
         }
         guard let observer = made else { return stream }
+        // Access first: no git work starts for a reader the live rule refuses.
+        guard (try? store.checkChangesAccess(companyId: companyId, key: key, compare: compare, reader: reader)) != nil else {
+            observer.continuation.finish()
+            return stream
+        }
         let observerId = observer.id
         observer.continuation.onTermination = { [weak self] _ in
             Task { [weak self] in await self?.remove(id, observerId) }
@@ -79,9 +84,9 @@ public actor LiveChanges {
         return stream
     }
 
-    /// Asks for an early recompute of every watch of `key` (any company, any compare), within the rate limit.
-    public func nudge(key: String) {
-        for (id, watch) in watches where id.key == key {
+    /// Asks for an early recompute of every watch of the company's `key` (any compare), within the rate limit.
+    public func nudge(companyId: String, key: String) {
+        for (id, watch) in watches where id.companyId == companyId && id.key == key {
             watch.nudged = true
             watch.sleeper?.cancel()
         }

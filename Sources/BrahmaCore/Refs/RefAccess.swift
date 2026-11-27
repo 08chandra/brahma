@@ -96,7 +96,11 @@ public enum RefAccess {
     static func subject(_ ref: WorkRef, companyId: String, db: Database) throws -> Subject? {
         switch ref.kind {
         case .file:
-            if let key = ref.itemKey { guard try item(db, companyId, key) != nil else { return nil } }
+            if let key = ref.itemKey {
+                guard let item = try item(db, companyId, key) else { return nil }
+                // C5b-2: a live worktree file (no pinned blob) follows the live worktree rule like the live diff.
+                if ref.isWorktree, ref.rev == nil, ref.params["share"] == nil { return try liveDiffSubject(db, companyId, item, record: .file(place: nil)) }
+            }
             if isForbiddenPlace(ref.id) { return Subject(forbiddenPlace: true, record: .file(place: nil)) }
             guard let place = privatePlace(ref) else { return Subject(record: .file(place: nil)) }
             guard ref.branch == nil, ref.rev == nil,
@@ -255,12 +259,12 @@ public enum RefAccess {
     /// Plan C Task C5b, the live worktree rule: an unpinned live diff (`@worktree`, `:changes`, `wt:`, `@r<n>..worktree`) is
     /// readable by the owner, the concierge, the lease holder (else the assignee) and the item's reviewer; any other agent
     /// is refused (never offered an approver). Pinned snapshots keep the company class.
-    static func liveDiffSubject(_ db: Database, _ companyId: String, _ item: WorkItem) throws -> Subject {
+    static func liveDiffSubject(_ db: Database, _ companyId: String, _ item: WorkItem, record: Record? = nil) throws -> Subject {
         var readers: Set<String> = []
         if let holder = try Store.leaseHolderId(db: db, itemId: item.id) { readers.insert(holder) }
         if let assignee = item.ownerId { readers.insert(assignee) }
         if let reviewer = item.reviewerId { readers.insert(reviewer) }
-        return Subject(readerSet: readers, refusedWhenUnreadable: true, record: .diff(item))
+        return Subject(readerSet: readers, refusedWhenUnreadable: true, record: record ?? .diff(item))
     }
 
     /// The item whose lease the agent `handle` of this company holds now (the most recent lease), for `wt:@handle`.

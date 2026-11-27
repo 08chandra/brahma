@@ -320,6 +320,7 @@ extension Store {
             }
             if dropped > 0 { files[i].summary = "\(ChangesFormat.count(dropped)) more lines not shown" }
         }
+        if out.count > ChangesLimits.maxPatchLines { out = Array(out.prefix(ChangesLimits.maxPatchLines)); truncated = true }
         var patch = out.joined(separator: "\n")
         if !patch.isEmpty { patch += "\n" }
         return (patch, files, truncated)
@@ -387,8 +388,8 @@ enum ChangesPatch {
                     else if line.hasPrefix("deleted file mode") { s.status = "D" }
                     else if line.hasPrefix("rename from") || line.hasPrefix("rename to") { s.status = "R" }
                     else if line.hasPrefix("Binary files ") || line == "GIT binary patch" { s.binary = true }
-                    else if line.hasPrefix("+++ b/") { s.path = String(line.dropFirst(6)) }
-                    else if line.hasPrefix("--- a/"), s.status == "D" { s.path = String(line.dropFirst(6)) }
+                    else if line.hasPrefix("+++ "), let p = Self.prefixedPath(String(line.dropFirst(4)), "b/") { s.path = p }
+                    else if line.hasPrefix("--- "), s.status == "D", let p = Self.prefixedPath(String(line.dropFirst(4)), "a/") { s.path = p }
                     s.header.append(line)
                 }
             } else {
@@ -403,18 +404,68 @@ enum ChangesPatch {
         return sections
     }
 
-    /// `diff --git a/<p> b/<p>` → `<p>` (the two halves agree without renames; a path holding ` b/` is settled by `+++`).
+    /// `diff --git a/<p> b/<p>` → `<p>` (the two halves agree without renames; a path holding ` b/` is settled by `+++`). A
+    /// path git quotes (`"a/…"`, C escapes) is unquoted.
     static func pathFromGitLine(_ line: String) -> String {
-        let rest = line.dropFirst("diff --git ".count)
-        guard rest.hasPrefix("a/") else { return String(rest) }
-        let body = rest.dropFirst(2)
+        let rest = String(line.dropFirst("diff --git ".count))
+        if rest.hasPrefix("\"") {
+            // `"a/<p>" "b/<p>"`: the first quoted string.
+            var end = rest.index(after: rest.startIndex)
+            while end < rest.endIndex, rest[end] != "\"" { end = rest[end] == "\\" ? rest.index(end, offsetBy: 2, limitedBy: rest.endIndex) ?? rest.endIndex : rest.index(after: end) }
+            guard end < rest.endIndex, let p = prefixedPath(String(rest[...end]), "a/") else { return rest }
+            return p
+        }
+        guard rest.hasPrefix("a/") else { return rest }
         // The path appears twice: `<p> b/<p>`; take the longest prefix that repeats.
-        let text = String(body)
+        let text = String(rest.dropFirst(2))
         if let range = text.range(of: " b/") {
             let first = String(text[..<range.lowerBound]), second = String(text[range.upperBound...])
             if first == second { return first }
         }
         return text
+    }
+
+    /// `<prefix><path>` or `"<prefix><path>"` (git's C-style quoting: `\\`, `\"`, `\n`, `\t`, `\ooo`…) → the path; nil for anything else.
+    static func prefixedPath(_ s: String, _ prefix: String) -> String? {
+        var text = s
+        // git ends a `---`/`+++` name that holds a space with a tab (for `patch`).
+        if text.hasSuffix("\t") { text.removeLast() }
+        if text.hasPrefix("\""), text.hasSuffix("\""), text.count >= 2 {
+            guard let unquoted = unquote(String(text.dropFirst().dropLast())) else { return nil }
+            text = unquoted
+        }
+        guard text.hasPrefix(prefix) else { return nil }
+        return String(text.dropFirst(prefix.count))
+    }
+
+    /// The bytes of a C-quoted git path, decoded as UTF-8; nil for a malformed escape.
+    static func unquote(_ s: String) -> String? {
+        var bytes: [UInt8] = []
+        var it = Array(s.utf8)[...]
+        while let b = it.first {
+            it = it.dropFirst()
+            guard b == UInt8(ascii: "\\") else { bytes.append(b); continue }
+            guard let e = it.first else { return nil }
+            it = it.dropFirst()
+            switch e {
+            case UInt8(ascii: "n"): bytes.append(0x0A)
+            case UInt8(ascii: "t"): bytes.append(0x09)
+            case UInt8(ascii: "r"): bytes.append(0x0D)
+            case UInt8(ascii: "a"): bytes.append(0x07)
+            case UInt8(ascii: "b"): bytes.append(0x08)
+            case UInt8(ascii: "f"): bytes.append(0x0C)
+            case UInt8(ascii: "v"): bytes.append(0x0B)
+            case UInt8(ascii: "\\"), UInt8(ascii: "\""): bytes.append(e)
+            case 0x30...0x37:
+                var value = Int(e - 0x30)
+                var digits = 1
+                while digits < 3, let d = it.first, (0x30...0x37).contains(d) { value = value * 8 + Int(d - 0x30); it = it.dropFirst(); digits += 1 }
+                guard value <= 255 else { return nil }
+                bytes.append(UInt8(value))
+            default: return nil
+            }
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 

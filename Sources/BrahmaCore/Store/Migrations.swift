@@ -2018,6 +2018,15 @@ enum Migrations {
             }
             try db.create(index: "diffComment_item", on: "diffComment", columns: ["companyId", "itemId"])
         }
+        m.registerMigration("vC-changes-quote") { db in
+            // C5b fix round 1 (C5b-1, I-2): the quoted hunk lives only here (read under the live worktree rule) and in the owner's
+            // DM to the holder, never in an item event; the quote's taint; the DM it was sent in.
+            try db.alter(table: "diffComment") { t in
+                t.add(column: "quote", .text)
+                t.add(column: "tainted", .boolean).notNull().defaults(to: false)
+                t.add(column: "messageId", .text)
+            }
+        }
     }
 }
 
