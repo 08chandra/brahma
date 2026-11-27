@@ -183,13 +183,23 @@ extension AppModel {
     }
 
     /// C6b: the CHANGES model of the selected company over the live engine; the stored values come from the injected vault on
-    /// every subscription and refresh (a vault that can't be read shows nothing).
+    /// every subscription and refresh (a vault that can't be read shows nothing); without the owner principal it reads nothing (M-1).
     func wireChanges(companyId: String) {
         changes?.stop()
         let store = self.store, vault = self.secretVault
-        changes = ChangesTabModel(store: store, live: liveChanges, companyId: companyId,
+        changes = ChangesTabModel(store: store, live: liveChanges, companyId: companyId, owner: owner,
                                   knownValues: { try store.knownSecretValues(companyId: companyId, vault: vault) }, defaults: navDefaults, clock: clock)
         updateChangesVisibility()
+    }
+
+    /// I-4: the OPENED tab's body for a live item diff, its header carrying the changes model's chips (UNCOMMITTED, LIVE/STALE,
+    /// TAINTED with the gated reason, TRUNCATED, HIDDEN CHARACTERS), rebuilt on every yield; the static render keeps only the
+    /// chips the model does not own (LEASED BY, AS SHARED).
+    func liveOpenedBody(_ body: RefBody) -> RefBody {
+        guard case .changes(let key, let compare) = body.content, let changes, changes.selectedKey == key, changes.compare == compare else { return body }
+        var live = body
+        live.header.chips = body.header.chips + changes.chips
+        return live
     }
 
     /// M12: the stored navigation keeps canonicals only; the title is resolved and gated again here.

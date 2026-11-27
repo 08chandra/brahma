@@ -10,15 +10,28 @@ import BrahmaCore
 /// Every string shown — paths, hunk headers, lines, summaries, titles, comment text — is the engine's gated final string
 /// (`Store.finishChanges`, `changesBoard`, `diffComments`; Rulings 53–56); nothing is transformed after the gate. The stored values
 /// come from the injected loader on every subscription and refresh; a loader that throws refuses (nothing is shown).
+///
+/// Fix round 1: files and comments are matched on the engine's identity (`ChangedFile.patchIndex`, the section's index in the
+/// patch), never on the path text (I-1); a stream that ends is shown STALE and resubscribed with backoff, the generic refusal after
+/// `maxRetries` (I-2); the board reloads on its own cadence (`ChangesLimits.idleInterval`), never on the app tick (I-3); the
+/// header chips (TAINTED with a gated reason, LIVE/STALE, UNCOMMITTED, TRUNCATED, HIDDEN CHARACTERS) follow every yield (I-4,
+/// M-3); nothing is read without the minted owner principal (M-1).
 @MainActor @Observable public final class ChangesTabModel {
     /// Where the view mode is kept, per company: `brahma.changes.mode.<companyId>` (JSON, every access `try?`).
     public static let modeKeyPrefix = "brahma.changes.mode."
     /// `"The stored secrets can't be read, so no changes are shown."`
     public static let refusedText = "The stored secrets can't be read, so no changes are shown."
+    /// Stream ends in a row (no yield between them) before the model gives up with the generic refusal.
+    public static let maxRetries = 3
+    /// The board's reload cadence while the model runs: the engine's idle cadence (one diff per worktree per 10 s, within the
+    /// "≤ 1 recompute per 2 s per (item, compare)" cap).
+    public static let boardInterval: Duration = ChangesLimits.idleInterval
 
     @ObservationIgnored let store: Store
     @ObservationIgnored let live: LiveChanges
     public let companyId: String
+    /// Ruling C6-2(b) / M-1: nil in a process with no owner surface — the model then refuses every read.
+    @ObservationIgnored let owner: OwnerPrincipal?
     @ObservationIgnored let knownValues: @Sendable () throws -> [(name: String, value: String)]
     @ObservationIgnored let defaults: UserDefaults
     @ObservationIgnored let clock: @Sendable () -> Date
@@ -26,12 +39,16 @@ import BrahmaCore
     /// Every leased worktree's live changes vs `main` (the engine's rows), and the same as the view draws them.
     public private(set) var board: [BoardRow] = []
     public private(set) var rows: [BoardRowView] = []
+    /// Board reloads so far (tests: the cadence holds).
+    public private(set) var boardLoads = 0
     public private(set) var selectedKey: String?
     public private(set) var compare: CompareMode = .main
     /// `base`, `r<n>`…, `head`, `worktree` of the selected item (the compare picker).
     public private(set) var revisions: [ItemRevision] = []
     public private(set) var snapshot: ChangesSnapshot?
     public private(set) var diff: DiffModel?
+    /// The snapshot's files as the file list draws them (engine paths and summaries; `fileIndex` into `diff`).
+    public private(set) var files: [ChangedFileRow] = []
     public private(set) var changeStops: [DiffStop] = []
     public private(set) var stopIndex: Int?
     /// The selected item's review comments (resolved ones included), and the unresolved ones of this compare placed on the
@@ -41,19 +58,31 @@ import BrahmaCore
     public private(set) var outdated: [String: Int] = [:]
     /// The diff was opened from a show answer (`params["at"]`) and has changed since the agent showed it.
     public var changedSinceShown = false
-    /// Between `start()` and `stop()`: the stream runs for the selected item.
+    /// Between `start()` and `stop()` (or the model giving up): the stream runs (or is being retried) for the selected item.
     public private(set) var isRunning = false
+    /// The stream is open and what is shown is its latest yield; false once it ended (the view shows STALE) or before the first yield.
+    public private(set) var isLive = false
+    /// Stream ends since the last yield (the retry backoff grows with it).
+    public private(set) var retryAttempt = 0
+    /// The header chips of the shown diff, gated as final strings and rebuilt on every yield.
+    public private(set) var chips: [RefChip] = []
     /// The engine's words when the board or the stream can't be read (never a value), or nil.
     public private(set) var error: String?
 
     private var modeStorage: DiffViewMode
     @ObservationIgnored private var watchTask: Task<Void, Never>?
+    @ObservationIgnored private var retryTask: Task<Void, Never>?
+    @ObservationIgnored private var boardTask: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var shownAt: String?
+    /// The values the running subscription was gated with (the chips are gated with the same).
+    @ObservationIgnored private var known: [(name: String, value: String)] = []
 
-    public init(store: Store, live: LiveChanges, companyId: String, knownValues: @escaping @Sendable () throws -> [(name: String, value: String)],
+    public init(store: Store, live: LiveChanges, companyId: String, owner: OwnerPrincipal?,
+                knownValues: @escaping @Sendable () throws -> [(name: String, value: String)],
                 defaults: UserDefaults = .standard, clock: @escaping @Sendable () -> Date = { Store.now() }) {
-        self.store = store; self.live = live; self.companyId = companyId; self.knownValues = knownValues; self.defaults = defaults; self.clock = clock
+        self.store = store; self.live = live; self.companyId = companyId; self.owner = owner; self.knownValues = knownValues
+        self.defaults = defaults; self.clock = clock
         modeStorage = Self.loadMode(companyId: companyId, defaults: defaults)
     }
 
@@ -86,7 +115,7 @@ import BrahmaCore
         compare = .main
         shownAt = nil
         resubscribe()
-        if isRunning, key != nil { Task { await refresh() } }
+        if isRunning, key != nil { Task { await refreshItem() } }
     }
 
     /// A live diff ref opened in the OPENED tab: that item in that compare; `shownAt` is the patch hash it was shown at (a show
@@ -101,32 +130,34 @@ import BrahmaCore
         selectedKey = key
         self.compare = compare
         resubscribe()
-        if isRunning { Task { await refresh() } }
+        if isRunning { Task { await refreshItem() } }
     }
 
     public func setCompare(_ m: CompareMode) {
         guard m != compare else { return }
         compare = m
-        snapshot = nil
-        diff = nil
-        changeStops = []
-        stopIndex = nil
-        markers = [:]
-        outdated = [:]
-        changedSinceShown = false
+        clearShown()
         resubscribe()
     }
 
-    private func reset() {
+    private func clearShown() {
         snapshot = nil
         diff = nil
+        files = []
         changeStops = []
         stopIndex = nil
-        revisions = []
-        comments = []
         markers = [:]
         outdated = [:]
+        chips = []
         changedSinceShown = false
+        isLive = false
+        retryAttempt = 0
+    }
+
+    private func reset() {
+        clearShown()
+        revisions = []
+        comments = []
         error = nil
     }
 
@@ -141,30 +172,66 @@ import BrahmaCore
     public func nextChange() { stopIndex = DiffStops.next(stopIndex, count: changeStops.count) }
     public func previousChange() { stopIndex = DiffStops.previous(stopIndex, count: changeStops.count) }
 
-    // MARK: The stream
+    // MARK: Anchors
 
-    /// Subscribes to the selected item's live changes (`LiveChanges.watch`) and loads the board. Called when the CHANGES tab or a
-    /// live ref body becomes visible.
-    public func start() {
-        guard !isRunning else { return }
-        isRunning = true
-        resubscribe()
-        Task { await refresh() }
+    /// The anchor of the line at `index` of hunk `hunk` of `diff.files[fileIndex]` on `side` (`old`/`new`), with the ENGINE's
+    /// display path (the snapshot's), the header as numbers only and the shown text: what a review draft and the engine's
+    /// `addDiffComment` take. Nil when that line has no number on that side or the file is not the snapshot's.
+    public func anchor(fileIndex: Int, hunk: Int, index: Int, side: String) -> DiffAnchor? {
+        guard side == "old" || side == "new", let diff, let snapshot, diff.files.indices.contains(fileIndex), diff.files[fileIndex].hunks.indices.contains(hunk),
+              diff.files[fileIndex].hunks[hunk].lines.indices.contains(index),
+              let file = snapshot.files.first(where: { $0.patchIndex == fileIndex }) else { return nil }
+        let h = diff.files[fileIndex].hunks[hunk]
+        let line = h.lines[index]
+        guard let number = side == "old" ? line.oldNo : line.newNo else { return nil }
+        return DiffAnchor(path: file.path, side: side, line: number, hunkHeader: DiffAnchoring.headerRange(h.header) ?? h.header, lineText: line.text)
     }
 
-    /// Cancels the stream (the engine's loop stops once no observer is left). What was shown stays until the next start.
+    // MARK: The stream
+
+    /// Subscribes to the selected item's live changes (`LiveChanges.watch`) and starts the board's reload loop. Called when the
+    /// CHANGES tab or a live ref body becomes visible. Without an owner principal nothing is read (M-1).
+    public func start() {
+        guard !isRunning else { return }
+        guard owner != nil else {
+            error = OwnerPrincipal.refusal
+            return
+        }
+        isRunning = true
+        retryAttempt = 0
+        resubscribe()
+        boardTask?.cancel()
+        boardTask = Task { [weak self] in
+            while let self, self.isRunning, !Task.isCancelled {
+                await self.refreshBoard()
+                try? await Task.sleep(for: Self.boardInterval)
+            }
+        }
+        if selectedKey != nil { Task { await refreshItem() } }
+    }
+
+    /// Cancels the stream, the retry and the board loop (the engine's loop stops once no observer is left). What was shown stays
+    /// until the next start, marked not live.
     public func stop() {
         isRunning = false
+        isLive = false
         generation += 1
         watchTask?.cancel()
         watchTask = nil
+        retryTask?.cancel()
+        retryTask = nil
+        boardTask?.cancel()
+        boardTask = nil
+        if snapshot != nil { rebuildChips() }
     }
 
     private func resubscribe() {
         generation += 1
         watchTask?.cancel()
         watchTask = nil
-        guard isRunning, let key = selectedKey else { return }
+        retryTask?.cancel()
+        retryTask = nil
+        guard isRunning, let key = selectedKey, owner != nil else { return }
         let gen = generation
         let (live, companyId, compare, loader) = (self.live, self.companyId, self.compare, self.knownValues)
         watchTask = Task { [weak self] in
@@ -176,6 +243,7 @@ import BrahmaCore
                 self?.refuse(gen)
                 return
             }
+            self?.known = known
             let stream = await live.watch(companyId: companyId, key: key, compare: compare, reader: .owner, knownValues: known)
             for await snapshot in stream {
                 if Task.isCancelled { break }
@@ -183,6 +251,8 @@ import BrahmaCore
                 guard let self, !Task.isCancelled else { break }
                 self.apply(snapshot, parsed, gen: gen)
             }
+            guard let self, !Task.isCancelled else { return }
+            self.streamEnded(gen)
         }
     }
 
@@ -191,14 +261,46 @@ import BrahmaCore
         error = Self.refusedText
     }
 
+    /// I-2: the stream ended (access refused, the item or worktree gone, a git failure): what is shown is no longer live. Up to
+    /// `maxRetries` resubscriptions with backoff; past that the generic refusal, and the model stops (a new `start()` tries again).
+    private func streamEnded(_ gen: Int) {
+        guard gen == generation else { return }
+        isLive = false
+        retryAttempt += 1
+        if snapshot != nil { rebuildChips() }
+        guard retryAttempt <= Self.maxRetries else {
+            error = Store.refUnavailable
+            isRunning = false
+            watchTask = nil
+            boardTask?.cancel()
+            boardTask = nil
+            return
+        }
+        let wait = Self.backoff(retryAttempt)
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(for: wait)
+            guard let self, !Task.isCancelled, gen == self.generation, self.isRunning else { return }
+            self.resubscribe()
+        }
+    }
+
+    /// 500 ms, 1 s, 2 s, … (doubling; never over 30 s).
+    public static func backoff(_ attempt: Int) -> Duration {
+        let n = max(1, min(attempt, 7))
+        return min(.milliseconds(500 << (n - 1)), .seconds(30))
+    }
+
     /// A yield: the snapshot and its parse, the scroll stop kept on the same file when it still exists, the "changed since shown"
-    /// flag and the markers.
+    /// flag, the chips and the markers.
     private func apply(_ snapshot: ChangesSnapshot, _ parsed: DiffModel, gen: Int) {
         guard gen == generation else { return }
         let previous: (DiffStop, DiffModel)? = currentStop.flatMap { stop in diff.map { (stop, $0) } }
         self.snapshot = snapshot
         diff = parsed
+        files = ChangesFiles.rows(snapshot, diff: parsed)
         changeStops = parsed.changeStops
+        isLive = true
+        retryAttempt = 0
         error = nil
         if let (stop, old) = previous {
             stopIndex = DiffStops.relocate(stop, from: old, in: parsed).flatMap { moved in changeStops.firstIndex(of: moved) }
@@ -206,39 +308,88 @@ import BrahmaCore
             stopIndex = nil
         }
         changedSinceShown = shownAt.map { $0 != snapshot.patchHash } ?? false
+        rebuildChips()
         placeMarkers()
+    }
+
+    // MARK: Chips
+
+    private func rebuildChips() {
+        guard let snapshot else { chips = []; return }
+        chips = Self.chips(for: snapshot, diff: diff, live: isLive, gate: GlobalSearch.TextGate(knownValues: known))
+    }
+
+    /// The header chips of a shown diff (color tokens: UNCOMMITTED, TAINTED, TRUNCATED and HIDDEN CHARACTERS `warning`; LIVE
+    /// `running`; STALE `text2`). The taint reason is gated as a final string (nil → the bare chip).
+    public static func chips(for snapshot: ChangesSnapshot, diff: DiffModel?, live: Bool, gate: GlobalSearch.TextGate) -> [RefChip] {
+        var out: [RefChip] = []
+        if snapshot.target == "worktree" { out.append(RefChip(text: "UNCOMMITTED", tone: .warn)) }
+        out.append(live ? RefChip(text: "LIVE", tone: .busy) : RefChip(text: "STALE", tone: .idle))
+        if snapshot.tainted {
+            out.append(RefChip(text: gate.final("TAINTED · \(snapshot.taintReason ?? "outside content")", max: SafeTitle.max) ?? "TAINTED", tone: .warn))
+        }
+        if snapshot.truncated { out.append(RefChip(text: "TRUNCATED", tone: .warn)) }
+        if diff?.hasHidden == true { out.append(RefChip(text: "HIDDEN CHARACTERS", tone: .warn)) }
+        return out
     }
 
     // MARK: Board, revisions and comments
 
-    /// Reloads the board, and the selected item's revisions and comments, off the main actor (the stored values loaded now).
+    /// Reloads the board and the selected item's revisions and comments now (an owner action: the tab opened, a review posted).
     public func refresh() async {
-        let (store, companyId, key, loader, now) = (self.store, self.companyId, selectedKey, self.knownValues, clock())
+        await refreshBoard()
+        await refreshItem()
+    }
+
+    /// Reloads the board (`Store.changesBoard`: one diff per leased worktree) off the main actor. On its own cadence while the
+    /// model runs (`boardInterval`), never on the app tick (I-3).
+    public func refreshBoard() async {
+        guard owner != nil else { error = OwnerPrincipal.refusal; return }
+        let (store, companyId, loader, now) = (self.store, self.companyId, self.knownValues, clock())
+        let gen = generation
         do {
-            let (board, revisions, comments) = try await Task.detached { () -> ([BoardRow], [ItemRevision], [DiffComment]) in
+            let board = try await Task.detached { () -> [BoardRow] in
                 let known = try loader()
-                let board = try store.changesBoard(companyId: companyId, reader: .owner, knownValues: known, now: now)
-                guard let key else { return (board, [], []) }
-                let revisions = try store.itemRevisions(companyId: companyId, key: key)
-                let comments = try store.diffComments(companyId: companyId, key: key, reader: .owner, knownValues: known)
-                return (board, revisions, comments)
+                return try store.changesBoard(companyId: companyId, reader: .owner, knownValues: known, now: now)
             }.value
-            guard key == selectedKey else { return }
+            boardLoads += 1
             self.board = board
             rows = BoardRows.make(board, now: now)
+            if error == Self.refusedText { error = nil }
+        } catch {
+            // M-7: a failure of a stale load never overwrites the state of what is selected now.
+            guard gen == generation else { return }
+            self.error = (error as? WorkError)?.message ?? Self.refusedText
+        }
+    }
+
+    /// Reloads the selected item's revisions and comments off the main actor (no git diff: engine records and `diffComments`).
+    public func refreshItem() async {
+        guard owner != nil else { error = OwnerPrincipal.refusal; return }
+        guard let key = selectedKey else { return }
+        let (store, companyId, loader) = (self.store, self.companyId, self.knownValues)
+        let gen = generation
+        do {
+            let (revisions, comments) = try await Task.detached { () -> ([ItemRevision], [DiffComment]) in
+                let known = try loader()
+                let revisions = try store.itemRevisions(companyId: companyId, key: key)
+                let comments = try store.diffComments(companyId: companyId, key: key, reader: .owner, knownValues: known)
+                return (revisions, comments)
+            }.value
+            guard key == selectedKey else { return }
             self.revisions = revisions
             self.comments = comments
             placeMarkers()
-            if error == Self.refusedText { error = nil }
-        } catch let e as WorkError {
-            error = e.message
         } catch {
-            self.error = Self.refusedText
+            // M-7: the key may have changed meanwhile; only the current selection's error is shown.
+            guard gen == generation, key == selectedKey else { return }
+            self.error = (error as? WorkError)?.message ?? Self.refusedText
         }
     }
 
     /// The unresolved comments of this compare on the diff: each at the line `DiffAnchoring.relocate` finds for its text within
-    /// the re-anchor window, keyed by the anchor the view draws (the header as numbers only); the rest count as outdated per path.
+    /// the re-anchor window, in the section the engine's file identity names (`patchIndex`, never the path text: I-1), keyed by the
+    /// anchor the view draws (the engine's display path, the header as numbers only); the rest count as outdated per path.
     private func placeMarkers() {
         guard let snapshot, let diff else {
             markers = [:]
@@ -249,7 +400,9 @@ import BrahmaCore
         var placed: [DiffAnchor: [DiffComment]] = [:]
         var stale: [String: Int] = [:]
         for c in comments where c.resolvedAt == nil && c.compare == canonical {
-            guard let line = DiffAnchoring.relocate(c, in: snapshot.patch), let anchor = Self.anchor(in: diff, path: c.path, side: c.side, line: line) else {
+            guard let file = snapshot.files.first(where: { $0.path == c.path }), let section = file.patchIndex, diff.files.indices.contains(section),
+                  let line = DiffAnchoring.relocate(c, in: snapshot.patch, sectionIndex: section),
+                  let anchor = Self.anchor(in: diff.files[section], path: file.path, side: c.side, line: line) else {
                 stale[c.path, default: 0] += 1
                 continue
             }
@@ -259,9 +412,8 @@ import BrahmaCore
         outdated = stale
     }
 
-    /// The anchor of `line` on `side` of `path` in the parsed diff, or nil when that line is not shown.
-    static func anchor(in diff: DiffModel, path: String, side: String, line: Int) -> DiffAnchor? {
-        guard let file = diff.files.first(where: { $0.path == path }) else { return nil }
+    /// The anchor of `line` on `side` of the parsed `file`, carrying the engine's display `path`; nil when that line is not shown.
+    static func anchor(in file: DiffFile, path: String, side: String, line: Int) -> DiffAnchor? {
         for hunk in file.hunks {
             if let l = hunk.lines.first(where: { (side == "old" ? $0.oldNo : $0.newNo) == line }) {
                 return DiffAnchor(path: path, side: side, line: line, hunkHeader: DiffAnchoring.headerRange(hunk.header) ?? hunk.header, lineText: l.text)

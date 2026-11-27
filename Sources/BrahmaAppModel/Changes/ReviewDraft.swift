@@ -60,7 +60,8 @@ extension AppModel {
             return true
         }
         guard posted == true else { return false }
-        if let changes, changes.selectedKey == key { await changes.refresh() }
+        // The item's comments (engine records, no git): the markers follow.
+        if let changes, changes.selectedKey == key { await changes.refreshItem() }
         return true
     }
 }

@@ -41,26 +41,31 @@ struct ChangesWorld {
         }
     }
 
-    /// A tab model over a fast live engine (both cadences `interval`), with a private defaults suite.
-    func model(interval: Duration = .milliseconds(100), defaults: UserDefaults? = nil) -> (ChangesTabModel, LiveChanges) {
+    /// A tab model over a fast live engine (both cadences `interval`), with a private defaults suite and this process's owner
+    /// principal; `known` are the stored values the model gates with.
+    func model(interval: Duration = .milliseconds(100), defaults: UserDefaults? = nil, known: [(name: String, value: String)] = [],
+               noOwner: Bool = false) throws -> (ChangesTabModel, LiveChanges) {
         let live = LiveChanges(store: w.store, interval: interval, idle: interval)
         let suite = defaults ?? UserDefaults(suiteName: "brahma.tests.changes.\(UUID().uuidString)")!
         let now = w.now
-        let m = ChangesTabModel(store: w.store, live: live, companyId: w.company.id, knownValues: { [] }, defaults: suite, clock: { now })
+        let principal: OwnerPrincipal? = noOwner ? nil : try w.owner()
+        let m = ChangesTabModel(store: w.store, live: live, companyId: w.company.id, owner: principal, knownValues: { known }, defaults: suite, clock: { now })
         return (m, live)
     }
 
-    /// The anchor of `lineText` on the new side of `path`, from the diff the model shows.
-    func anchor(_ m: ChangesTabModel, path: String, lineText: String) throws -> DiffAnchor {
-        let diff = try #require(m.diff)
-        let file = try #require(diff.files.first { $0.path == path })
-        for hunk in file.hunks {
-            if let line = hunk.lines.first(where: { $0.text == lineText && $0.newNo != nil }) {
-                return DiffAnchor(path: path, side: "new", line: line.newNo!, hunkHeader: hunk.header, lineText: lineText)
+    /// The anchor of `lineText` on `side` of the snapshot file `path` (the engine's display path), through the model's builder.
+    func anchor(_ m: ChangesTabModel, path: String, lineText: String, side: String = "new") throws -> DiffAnchor {
+        let diff = try #require(m.diff), snapshot = try #require(m.snapshot)
+        let section = try #require(snapshot.files.first { $0.path == path }?.patchIndex)
+        for (h, hunk) in diff.files[section].hunks.enumerated() {
+            if let i = hunk.lines.firstIndex(where: { $0.text == lineText && (side == "old" ? $0.oldNo : $0.newNo) != nil }) {
+                return try #require(m.anchor(fileIndex: section, hunk: h, index: i, side: side))
             }
         }
         throw TestFailure("no line \(lineText) in \(path)")
     }
+
+    func write(_ path: String, _ text: String) throws { try RefWorld.write(path, text, in: wt) }
 }
 
 
@@ -153,7 +158,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
     @Test func selectingRowOpensLiveDiff() async throws {
         let cw = try ChangesWorld()
         let suite = UserDefaults(suiteName: "brahma.tests.changes.\(UUID().uuidString)")!
-        let (m, live) = cw.model(defaults: suite)
+        let (m, live) = try cw.model(defaults: suite)
         #expect(m.selectedKey == nil && m.snapshot == nil && m.diff == nil && m.compare == .main && m.mode == .unified)
         m.start()
         await m.refresh()
@@ -170,9 +175,13 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         #expect(await live.isWatching(companyId: cw.w.company.id, key: cw.key, compare: .main))
         // The mode is per company and survives a new model over the same defaults.
         m.mode = .split
-        let again = ChangesTabModel(store: cw.w.store, live: live, companyId: cw.w.company.id, knownValues: { [] }, defaults: suite, clock: { cw.w.now })
+        let owner = try cw.w.owner()
+        let again = ChangesTabModel(store: cw.w.store, live: live, companyId: cw.w.company.id, owner: owner, knownValues: { [] }, defaults: suite, clock: { cw.w.now })
         #expect(again.mode == .split)
-        #expect(ChangesTabModel(store: cw.w.store, live: live, companyId: "other", knownValues: { [] }, defaults: suite, clock: { cw.w.now }).mode == .unified)
+        #expect(ChangesTabModel(store: cw.w.store, live: live, companyId: "other", owner: owner, knownValues: { [] }, defaults: suite, clock: { cw.w.now }).mode == .unified)
+        // The file rows point at their hunks through the engine's identity.
+        #expect(m.files.map(\.path) == ["Sources/App.swift", "src/a.ts"] && m.files.map(\.fileIndex) == [0, 1])
+        #expect(m.isLive && m.chips.map(\.text) == ["UNCOMMITTED", "LIVE"])
         // Deselecting clears the diff and ends the watch.
         m.select(nil)
         #expect(m.snapshot == nil && m.diff == nil && m.selectedKey == nil)
@@ -182,7 +191,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
 
     @Test func compareModePickerListsRevisions() async throws {
         let cw = try ChangesWorld()
-        let (m, live) = cw.model()
+        let (m, live) = try cw.model()
         m.start()
         m.select(cw.key)
         await m.refresh()
@@ -209,7 +218,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
 
     @Test func liveYieldKeepsScrollStop() async throws {
         let cw = try ChangesWorld()
-        let (m, _) = cw.model()
+        let (m, _) = try cw.model()
         m.start()
         m.select(cw.key)
         try await eventually { m.diff != nil }
@@ -244,7 +253,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
 
     @Test func subscribesOnlyWhileVisible() async throws {
         let cw = try ChangesWorld()
-        let (m, live) = cw.model()
+        let (m, live) = try cw.model()
         m.select(cw.key)
         try await Task.sleep(for: .milliseconds(150))
         #expect(await !live.isWatching(companyId: cw.w.company.id, key: cw.key, compare: .main), "nothing streams before start()")
@@ -273,8 +282,8 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         app.apply(.changes(key: nil))
         #expect(changes.isRunning && changes.selectedKey == cw.key, "the board keeps the selection")
         // A stored value that can't be read refuses the stream (fail closed): nothing is shown.
-        let (refused, refusedLive) = cw.model()
-        let blind = ChangesTabModel(store: cw.w.store, live: refusedLive, companyId: cw.w.company.id,
+        let (refused, refusedLive) = try cw.model()
+        let blind = ChangesTabModel(store: cw.w.store, live: refusedLive, companyId: cw.w.company.id, owner: try cw.w.owner(),
                                     knownValues: { throw WorkError.invalid("vault locked") }, defaults: UserDefaults(suiteName: "brahma.tests.changes.x")!,
                                     clock: { cw.w.now })
         _ = refused
@@ -288,7 +297,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
 
     @Test func commentMarkersPlaced() async throws {
         let cw = try ChangesWorld()
-        let (m, _) = cw.model()
+        let (m, _) = try cw.model()
         m.start()
         m.select(cw.key)
         try await eventually { m.diff != nil }
@@ -303,9 +312,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         _ = try cw.w.store.addDiffComment(companyId: cw.w.company.id, key: cw.key, compare: .main, anchor: stale, text: "Stale", knownValues: [],
                                            now: cw.w.now, owner: owner)
         // A revert request on App.swift's deletion anchors on the old side.
-        let app = try #require(m.diff?.files.first { $0.path == "Sources/App.swift" })
-        let gone = try #require(app.hunks.first?.lines.first { $0.kind == .del })
-        let oldAnchor = DiffAnchor(path: "Sources/App.swift", side: "old", line: gone.oldNo!, hunkHeader: app.hunks[0].header, lineText: gone.text)
+        let oldAnchor = try cw.anchor(m, path: "Sources/App.swift", lineText: "let b = 2", side: "old")
         let revert = try cw.w.store.requestHunkRevert(companyId: cw.w.company.id, key: cw.key, compare: .main, anchor: oldAnchor, note: nil,
                                                        knownValues: [], now: cw.w.now, owner: owner)
         await m.refresh()
@@ -313,7 +320,8 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         #expect(m.markers.count == 2, "\(m.markers.keys)")
         let placed = try #require(m.markers.first { $0.key.path == "src/a.ts" })
         #expect(placed.key.side == "new" && placed.key.line == 3 && placed.key.lineText == "three")
-        #expect(placed.key.hunkHeader == DiffAnchoring.headerRange(anchor.hunkHeader), "the header is the numbers only, never a line of the file")
+        #expect(placed.key.hunkHeader == anchor.hunkHeader && anchor.hunkHeader.hasPrefix("@@ -") && anchor.hunkHeader.hasSuffix(" @@"),
+                "the header is the numbers only, never a line of the file")
         #expect(placed.value.map(\.id) == [c.id] && placed.value.first?.text == "Why three?")
         let revertMarker = try #require(m.markers.first { $0.key.path == "Sources/App.swift" })
         #expect(revertMarker.key.side == "old" && revertMarker.value.first?.id == revert.id && revertMarker.value.first?.kind == DiffComment.revertRequest)
@@ -359,7 +367,8 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         #expect(await app.submitReview(ReviewDraft(anchor: live, text: "Why three?", isRevert: false), key: cw.key, compare: .main))
         #expect(try cw.w.count("diffComment") == 1)
         #expect(app.errorMessage == nil)
-        #expect(changes.comments.count == 1 && changes.comments.first?.kind == DiffComment.comment && changes.markers.count == 1)
+        try await eventually { changes.comments.count == 1 }
+        #expect(changes.comments.first?.kind == DiffComment.comment && changes.markers.count == 1)
         #expect(await app.submitReview(ReviewDraft(anchor: live, text: "", isRevert: true), key: cw.key, compare: .main))
         #expect(try cw.w.count("diffComment") == 2)
         #expect(changes.comments.last?.kind == DiffComment.revertRequest)
@@ -377,10 +386,13 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         await app.openRef(ref, origin: .showAnswer(requestId: "r1", by: "@eng-1"))
         try await eventually { app.openedBody != nil }
         #expect(app.openedBody?.content == .changes(key: cw.key, compare: .main))
-        #expect(app.openedBody?.header.chips.contains { $0.text == "LIVE" } == true)
-        #expect(app.openedBody?.header.chips.contains { $0.text == "UNCOMMITTED" } == true)
         #expect(changes.isRunning && changes.selectedKey == cw.key && changes.compare == .main)
         try await eventually { changes.snapshot != nil }
+        // I-4: the pane's header carries the model's chips, rebuilt per yield (the static render has none of them).
+        guard case .ref(let shown) = app.previewBody(forTab: PreviewTabID.ref) else { Issue.record("no ref body"); return }
+        #expect(shown.header.chips.contains { $0.text == "LIVE" } && shown.header.chips.contains { $0.text == "UNCOMMITTED" })
+        #expect(shown.header.chips.contains { $0.text.hasPrefix("LEASED BY @eng-1") })
+        #expect(shown.header.chips.filter { $0.text == "UNCOMMITTED" }.count == 1, "no duplicate chips: \(shown.header.chips)")
         #expect(changes.changedSinceShown, "shown at a patch hash that is not the current one")
         let current = try #require(changes.snapshot?.patchHash)
         // Opened at the current hash of the same compare: unchanged.
@@ -405,5 +417,160 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         app.apply(.changes(key: cw.key))
         #expect(changes.isRunning && changes.compare == .main && app.selectedPreviewTab == PreviewTabID.changes)
         app.selectPreviewTab(nil)
+    }
+
+    // MARK: Fix round 1
+
+    /// I-1 / M-8: files are matched on the engine's identity (`patchIndex`), so a path with a space, two spaces, a quote (git
+    /// C-quotes it) or a non-ASCII letter keeps its hunks, its anchors are the engine's display path, and its comments place. A
+    /// ZWSP or bidi name is refused by the engine's walk (`SafeFS.checkComponent`): the whole live diff reads as unavailable, never
+    /// as a live diff with a mislabelled file.
+    @Test func hostilePathsKeepHunksAndComments() async throws {
+        let cw = try ChangesWorld()
+        let hostile = ["src/we ird.ts", "src/caf\u{E9}.ts", "src/two  spaces.ts", "src/qu\"ote.ts"]
+        for (i, p) in hostile.enumerated() { try cw.write(p, "line \(i)\n") }
+        let (m, _) = try cw.model()
+        m.start()
+        m.select(cw.key)
+        try await eventually { m.diff?.files.count == 2 + hostile.count }
+        let snapshot = try #require(m.snapshot), diff = try #require(m.diff)
+        #expect(snapshot.files.count == 2 + hostile.count)
+        #expect(m.files.allSatisfy { $0.fileIndex != nil }, "every file keeps its hunks: \(m.files)")
+        #expect(Set(m.files.compactMap(\.fileIndex)).count == m.files.count)
+        // The parser's own paths: no trailing tab, no fake rename for a space.
+        let spaced = try #require(snapshot.files.first { $0.path == "src/we ird.ts" })
+        let parsed = diff.files[try #require(spaced.patchIndex)]
+        #expect(parsed.path == "src/we ird.ts" && parsed.oldPath == nil && parsed.hunks.count == 1 && parsed.hunks[0].lines.first?.text == "line 0")
+        let quoted = diff.files[try #require(snapshot.files.first { $0.patchIndex == diff.files.firstIndex { $0.path.contains("ote.ts") } }?.patchIndex)]
+        #expect(quoted.path == "src/qu\"ote.ts" && quoted.hunks[0].lines.first?.text == "line 3", "git's C-quoting is decoded as the engine does")
+        // A comment on every hostile file, anchored through the model (the engine accepts each path), places as a marker.
+        let owner = try cw.w.owner()
+        for p in snapshot.files where p.path != "Sources/App.swift" && p.path != "src/a.ts" {
+            let i = try #require(p.patchIndex)
+            let a = try #require(m.anchor(fileIndex: i, hunk: 0, index: 0, side: "new"))
+            #expect(a.path == p.path && a.line == 1)
+            _ = try cw.w.store.addDiffComment(companyId: cw.w.company.id, key: cw.key, compare: .main, anchor: a, text: "on \(i)", knownValues: [],
+                                               now: cw.w.now, owner: owner)
+        }
+        await m.refreshItem()
+        #expect(m.comments.count == hostile.count && m.markers.count == hostile.count && m.outdated.isEmpty, "\(m.outdated)")
+        #expect(m.anchor(fileIndex: 99, hunk: 0, index: 0, side: "new") == nil && m.anchor(fileIndex: 0, hunk: 0, index: 0, side: "sideways") == nil)
+        // A hidden-character name: the engine refuses the walk, the stream ends, and after the retries the model shows the refusal.
+        try cw.write("src/zw\u{200B}sp.ts", "x\n")
+        try await eventually { !m.isRunning }
+        #expect(m.error == Store.refUnavailable && !m.isLive && m.chips.contains { $0.text == "STALE" })
+        #expect(m.diff?.files.count == 2 + hostile.count, "what was shown stays, marked stale")
+    }
+
+    /// I-2: a stream that ends is shown STALE and resubscribed with backoff; after `maxRetries` ends in a row the model shows the
+    /// generic refusal and stops, and a new `start()` tries again. A key the owner can't watch refuses the same way.
+    @Test func endedStreamIsNotLive() async throws {
+        #expect(ChangesTabModel.backoff(1) == .milliseconds(500) && ChangesTabModel.backoff(2) == .seconds(1) && ChangesTabModel.backoff(3) == .seconds(2))
+        #expect(ChangesTabModel.backoff(0) == .milliseconds(500) && ChangesTabModel.backoff(40) <= .seconds(30))
+        #expect(ChangesTabModel.maxRetries == 3)
+        let cw = try ChangesWorld()
+        let (m, live) = try cw.model()
+        m.start()
+        m.select(cw.key)
+        try await eventually { m.isLive }
+        #expect(m.chips.contains { $0.text == "LIVE" } && m.retryAttempt == 0 && m.error == nil)
+        // The worktree goes away: the engine ends the stream.
+        try RefWorld.git(["worktree", "remove", "--force", cw.wt.path], in: cw.w.workspace)
+        try await eventually { !m.isLive }
+        #expect(m.snapshot != nil && m.diff != nil, "what was shown stays, marked stale")
+        #expect(m.chips.contains { $0.text == "STALE" } && !m.chips.contains { $0.text == "LIVE" })
+        try await eventually { m.error != nil }
+        #expect(m.error == Store.refUnavailable && !m.isRunning && m.retryAttempt == ChangesTabModel.maxRetries + 1, "the first end plus the retries")
+        try await eventuallyAsync { await !live.isWatching(companyId: cw.w.company.id, key: cw.key, compare: .main) }
+        // A new start tries again (and gives up the same way while the worktree is gone).
+        m.start()
+        #expect(m.isRunning && m.retryAttempt == 0)
+        try await eventually { !m.isRunning }
+        #expect(m.error == Store.refUnavailable)
+        // `changes:<KEY>` for a key with nothing to watch: the refusal, never a blank live pane.
+        let (other, _) = try cw.model()
+        other.start()
+        other.select("ENG-9")
+        try await eventually { !other.isRunning }
+        #expect(other.error == Store.refUnavailable && other.snapshot == nil)
+        // M-1: without an owner principal nothing is read.
+        let (blind, blindLive) = try cw.model(noOwner: true)
+        _ = blindLive
+        blind.select(cw.key)
+        blind.start()
+        #expect(!blind.isRunning && blind.error == OwnerPrincipal.refusal)
+        await blind.refresh()
+        #expect(blind.board.isEmpty && blind.revisions.isEmpty && blind.error == OwnerPrincipal.refusal)
+    }
+
+    /// I-3: the board reloads on the model's own cadence (the engine's idle interval), never on the app tick.
+    @Test func boardReloadsOffTheTick() async throws {
+        #expect(ChangesTabModel.boardInterval == ChangesLimits.idleInterval)
+        let cw = try ChangesWorld()
+        let app = await cw.w.app()
+        let changes = try #require(app.changes)
+        #expect(changes.boardLoads == 0)
+        app.apply(.changes(key: cw.key))
+        try await eventually { changes.boardLoads == 1 && !changes.rows.isEmpty }
+        for _ in 0..<10 { await app.tick() }
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(changes.boardLoads == 1, "ten ticks reload nothing")
+        #expect(changes.rows.first?.key == cw.key)
+        // An explicit refresh (an owner action) reloads once; stopping ends the loop.
+        await changes.refresh()
+        #expect(changes.boardLoads == 2)
+        app.selectPreviewTab(nil)
+        await app.tick()
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(changes.boardLoads == 2 && !changes.isRunning)
+    }
+
+    /// I-4 / M-3 / M-4 / M-8: a tainted live diff shows a TAINTED chip whose reason is gated as a final string (a stored value or a
+    /// secret-shaped token in it withholds the reason), a stored value in the diff is never shown, CR characters keep their marker
+    /// (the one trailing CR of a CRLF line is the parser's line ending; a doubled or mid-line CR is shown) and raise the HIDDEN
+    /// CHARACTERS chip, and the chips follow the stream.
+    @Test func taintedLiveDiffShowsGatedChips() async throws {
+        let cw = try ChangesWorld()
+        let secret = "sk_" + "live_" + String(repeating: "q", count: 24)
+        try cw.write("src/a.ts", "one\nTWO\nthree\nkey = \(secret)\n")
+        try cw.write("win.txt", "a\r\r\nb\rc\r\n")
+        let git = SafeGit(workspace: cw.w.workspace)
+        try cw.w.store.recordTaintedCommits(companyId: cw.w.company.id, itemId: cw.w.item.id, agentId: cw.w.eng1.id, turnId: nil, headBefore: cw.r1,
+                                            headAfter: cw.r2, source: "docs.example.com token \(secret)", git: git, now: cw.w.now)
+        let (m, _) = try cw.model(known: [(name: "STRIPE", value: secret)])
+        m.start()
+        m.select(cw.key)
+        try await eventually { m.isLive }
+        let snapshot = try #require(m.snapshot), diff = try #require(m.diff)
+        #expect(snapshot.tainted && !snapshot.patch.contains(secret))
+        #expect(!diff.files.flatMap(\.hunks).flatMap(\.lines).contains { $0.text.contains(secret) }, "a stored value never reaches a shown line")
+        let texts = m.chips.map(\.text)
+        #expect(texts == ["UNCOMMITTED", "LIVE", "TAINTED", "HIDDEN CHARACTERS"], "\(texts)")
+        #expect(m.chips.first { $0.text == "TAINTED" }?.tone == .warn)
+        // A line's trailing CR (after the line ending's) survives as a marker in the highlighted rows (M-4); a mid-line CR too.
+        let win = try #require(snapshot.files.first { $0.path == "win.txt" }?.patchIndex)
+        let lines = diff.files[win].hunks[0].lines
+        #expect(lines.map(\.text) == ["a\r", "b\rc"], "\(lines)")
+        let rows = diff.highlighted(file: win)
+        #expect(rows.count == 2 && rows[0].last?.text == "⟦U+000D⟧" && rows[0].last?.hidden == true, "\(rows)")
+        #expect(rows[1].contains { $0.text == "⟦U+000D⟧" && $0.hidden } && rows[1].first?.text == "b" && rows[1].last?.text == "c")
+        // A reason with no secret in it shows, gated as one string; a secret-shaped token withholds it (the gate's patterns, with or
+        // without known values).
+        let gate = GlobalSearch.TextGate(knownValues: [])
+        var taintedSnapshot = snapshot
+        taintedSnapshot.taintReason = "from a session that read docs.example.com"
+        #expect(ChangesTabModel.chips(for: taintedSnapshot, diff: nil, live: true, gate: gate).map(\.text)
+                == ["UNCOMMITTED", "LIVE", "TAINTED · from a session that read docs.example.com"])
+        #expect(ChangesTabModel.chips(for: snapshot, diff: nil, live: true, gate: gate).map(\.text) == ["UNCOMMITTED", "LIVE", "TAINTED"])
+        // The pure builder: no taint, no hidden, not live.
+        let plain = ChangesSnapshot(key: "ENG-1", compare: .head, base: "b", target: "worktree", files: [], added: 0, removed: 0, patch: "", truncated: true,
+                                    tainted: false, taintReason: nil, lastEdit: nil, patchHash: "h", computedAt: cw.w.now)
+        #expect(ChangesTabModel.chips(for: plain, diff: nil, live: false, gate: GlobalSearch.TextGate(knownValues: [])).map(\.text)
+                == ["UNCOMMITTED", "STALE", "TRUNCATED"])
+        var committed = plain
+        committed.target = "abc"
+        committed.truncated = false
+        #expect(ChangesTabModel.chips(for: committed, diff: nil, live: true, gate: GlobalSearch.TextGate(knownValues: [])).map(\.text) == ["LIVE"])
+        m.stop()
     }
 }

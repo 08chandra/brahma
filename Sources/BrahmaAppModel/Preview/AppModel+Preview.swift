@@ -16,7 +16,10 @@ extension AppModel {
         if tabId == PreviewTabID.changes { return .changes }
         // Plan C: the OPENED tab shows the opened ref's body (or a placeholder while it renders).
         if tabId == PreviewTabID.ref, let opened = previewNav.opened {
-            return .ref(openedBody ?? RefBody(header: RefHeader(title: opened.title, subtitle: "", chips: [], actions: []), content: .unavailable("LOADING")))
+            guard let openedBody else {
+                return .ref(RefBody(header: RefHeader(title: opened.title, subtitle: "", chips: [], actions: []), content: .unavailable("LOADING")))
+            }
+            return .ref(liveOpenedBody(openedBody))
         }
         let p = previewForBodies
         let tails = p.logTails

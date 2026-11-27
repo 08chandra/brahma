@@ -1,4 +1,5 @@
 import Foundation
+import BrahmaCore
 
 /// One line of a unified diff hunk, with its old and new line numbers.
 public struct DiffLine: Equatable, Sendable {
@@ -82,26 +83,27 @@ public struct DiffModel: Equatable, Sendable {
         for line in CodeHighlighter.splitLines(patch) {
             if line.hasPrefix("diff --git ") {
                 closeFile()
-                let (a, b) = Self.gitPaths(line)
-                file = DiffFile(path: b ?? a ?? "", oldPath: a != nil && a != b ? a : nil)
+                // C6b I-1: the path exactly as the engine's `ChangesPatch` reads it (C-quoting decoded, a space never a rename).
+                file = DiffFile(path: ChangesPatch.pathFromGitLine(line))
                 noteHidden(line)
                 continue
             }
             guard file != nil else { continue }
             if line.hasPrefix("rename from ") {
-                file?.oldPath = Self.unquote(String(line.dropFirst("rename from ".count)))
+                file?.oldPath = Self.gitName(String(line.dropFirst("rename from ".count)))
                 noteHidden(line)
                 continue
             }
             if line.hasPrefix("rename to ") {
-                file?.path = Self.unquote(String(line.dropFirst("rename to ".count)))
+                file?.path = Self.gitName(String(line.dropFirst("rename to ".count)))
                 noteHidden(line)
                 continue
             }
             if line.hasPrefix("--- ") || line.hasPrefix("+++ ") {
                 if hunk == nil {
-                    // `+++ b/<path>` names the new path (a `/dev/null` keeps the header's).
-                    if line.hasPrefix("+++ b/") { file?.path = Self.unquote(String(line.dropFirst("+++ b/".count))) }
+                    // `+++ b/<path>` names the new path (a `/dev/null` keeps the header's); git's trailing tab after a path with a
+                    // space and its C-quoting are the engine's to read (`prefixedPath`).
+                    if line.hasPrefix("+++ "), let p = ChangesPatch.prefixedPath(String(line.dropFirst(4)), "b/") { file?.path = p }
                     noteHidden(line)
                     continue
                 }
@@ -145,36 +147,10 @@ public struct DiffModel: Equatable, Sendable {
         return model
     }
 
-    /// The `a/<old>` and `b/<new>` of a `diff --git` line.
-    static func gitPaths(_ line: String) -> (String?, String?) {
-        let rest = String(line.dropFirst("diff --git ".count))
-        // Quoted paths (`"a/x y" "b/x y"`) or plain (`a/x b/x`).
-        if rest.hasPrefix("\"") {
-            var parts: [String] = []
-            var current = ""
-            var inQuote = false
-            var escaped = false
-            for ch in rest {
-                if escaped { current.append(ch); escaped = false; continue }
-                if ch == "\\" { escaped = true; continue }
-                if ch == "\"" { inQuote.toggle(); if !inQuote { parts.append(current); current = "" }; continue }
-                if inQuote { current.append(ch) }
-            }
-            return (parts.first.map(Self.stripSide), parts.dropFirst().first.map(Self.stripSide))
-        }
-        let parts = rest.split(separator: " ", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return (parts.first.map(Self.stripSide), nil) }
-        return (Self.stripSide(parts[0]), Self.stripSide(parts[1]))
-    }
-
-    static func stripSide(_ s: String) -> String {
-        if s.hasPrefix("a/") || s.hasPrefix("b/") { return String(s.dropFirst(2)) }
-        return s
-    }
-
-    static func unquote(_ s: String) -> String {
-        guard s.hasPrefix("\""), s.hasSuffix("\""), s.count >= 2 else { return s }
-        return String(s.dropFirst().dropLast())
+    /// A `rename from` / `rename to` name as git writes it (possibly C-quoted), read by the engine's rule; a malformed quote keeps
+    /// the text as written.
+    static func gitName(_ s: String) -> String {
+        ChangesPatch.prefixedPath(s, "") ?? s
     }
 
     /// The old and new start lines of an `@@ -a,b +c,d @@` header (1 when it can't be read).
@@ -250,6 +226,8 @@ extension DiffModel {
     /// The unified rows of every file with the unchanged runs longer than 2 × `context` folded to `context` lines on each side
     /// and one `fold` item for the rest; a fold named in `expanded` shows its lines in place.
     public func collapsed(context: Int = 3, expanded: Set<DiffRowItem> = []) -> [DiffRowItem] {
+        // M-5: a caller's context is clamped (negative → 0; huge → never folds) so `2 * context` and the ranges stay sound.
+        let context = min(max(context, 0), Self.maxContext)
         var out: [DiffRowItem] = []
         for (f, file) in files.enumerated() {
             for (h, hunk) in file.hunks.enumerated() {
@@ -284,6 +262,9 @@ extension DiffModel {
         return out
     }
 
+    /// The largest `context` `collapsed` honours (more than any hunk the engine emits).
+    public static let maxContext = 1_000
+
     /// The first line of every run of changes, in file and hunk order.
     public var changeStops: [DiffStop] {
         var out: [DiffStop] = []
@@ -311,9 +292,13 @@ extension DiffModel {
             let room = Self.defaultMaxLines - out.count
             guard room > 0 else { break }
             let lines = Array(hunk.lines.prefix(room))
-            let spans = CodeHighlighter.highlight(lines.map(\.text).joined(separator: "\n"), language: language)
+            var spans = Array(CodeHighlighter.highlight(lines.map(\.text).joined(separator: "\n"), language: language).prefix(lines.count))
+            // M-4: the highlighter's line split drops one trailing CR per line; its marker is put back so a CRLF file shows it.
+            for (i, line) in lines.enumerated() where i < spans.count && line.text.unicodeScalars.last == "\r" {
+                spans[i].append(CodeSpan(text: InvisibleMarkers.marker("\r"), kind: .plain, hidden: true))
+            }
             // `highlight` yields one row per line of its input (a trailing newline would add an empty one; none is given).
-            out.append(contentsOf: spans.prefix(lines.count))
+            out.append(contentsOf: spans)
         }
         return out
     }

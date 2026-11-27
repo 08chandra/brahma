@@ -103,7 +103,8 @@ public enum BoardRows {
 }
 
 /// One file of a changes snapshot as the file list draws it: the engine's gated path, status and summary, and the index of its
-/// hunks in the parsed `DiffModel` (nil for a binary, large or otherwise summarized file with no hunks to open).
+/// hunks in the parsed `DiffModel` (nil for a binary, large or otherwise summarized file with no hunks to open). The index is the
+/// engine's `patchIndex` (I-1): the display path never has to equal the raw one.
 public struct ChangedFileRow: Equatable, Identifiable, Sendable {
     public var path: String
     public var oldPath: String?
@@ -119,13 +120,12 @@ public struct ChangedFileRow: Equatable, Identifiable, Sendable {
 }
 
 public enum ChangesFiles {
-    /// The snapshot's files in the engine's order, each pointing at its hunks in `diff` when it has any.
+    /// The snapshot's files in the engine's order, each pointing at its section in `diff` when the parser kept it with hunks.
     public static func rows(_ snapshot: ChangesSnapshot, diff: DiffModel) -> [ChangedFileRow] {
-        var indexByPath: [String: Int] = [:]
-        for (i, f) in diff.files.enumerated() where !f.hunks.isEmpty && indexByPath[f.path] == nil { indexByPath[f.path] = i }
-        return snapshot.files.map { f in
-            ChangedFileRow(path: f.path, oldPath: f.oldPath, status: f.status, stats: "+\(f.added) \u{2212}\(f.removed)", summary: f.summary,
-                           fileIndex: indexByPath[f.path])
+        snapshot.files.map { f in
+            let index = f.patchIndex.flatMap { diff.files.indices.contains($0) && !diff.files[$0].hunks.isEmpty ? $0 : nil }
+            return ChangedFileRow(path: f.path, oldPath: f.oldPath, status: f.status, stats: "+\(f.added) \u{2212}\(f.removed)", summary: f.summary,
+                                  fileIndex: index)
         }
     }
 }

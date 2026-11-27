@@ -280,6 +280,17 @@ public enum DiffAnchoring {
     /// The hunks of `path` in the patch, with old/new line numbers per body line.
     static func hunks(in patch: String, path: String) -> [Hunk] {
         guard let section = ChangesPatch.parse(patch).first(where: { $0.path == path }) else { return [] }
+        return hunks(of: section)
+    }
+
+    /// The hunks of the `index`-th section of the patch (`ChangedFile.patchIndex`: the engine's file identity, C6b I-1).
+    static func hunks(in patch: String, sectionIndex index: Int) -> [Hunk] {
+        let sections = ChangesPatch.parse(patch)
+        guard sections.indices.contains(index) else { return [] }
+        return hunks(of: sections[index])
+    }
+
+    static func hunks(of section: ChangesPatch.Section) -> [Hunk] {
         var out: [Hunk] = []
         var current: Hunk?
         var old = 0, new = 0
@@ -333,10 +344,12 @@ public enum DiffAnchoring {
         return "@@ \(old) \(new) @@"
     }
 
-    /// The line the comment shows at in `patch` now, or nil when it is outdated.
-    public static func relocate(_ comment: DiffComment, in patch: String) -> Int? {
+    /// The line the comment shows at in `patch` now, or nil when it is outdated. With `sectionIndex` (the snapshot file's
+    /// `patchIndex`) the section is the engine's identity, so a display path that differs from the raw one still relocates.
+    public static func relocate(_ comment: DiffComment, in patch: String, sectionIndex: Int? = nil) -> Int? {
         var best: Int?
-        for hunk in hunks(in: patch, path: comment.path) {
+        let found = sectionIndex.map { Self.hunks(in: patch, sectionIndex: $0) } ?? Self.hunks(in: patch, path: comment.path)
+        for hunk in found {
             for n in hunk.numbered {
                 guard let line = n.side(comment.side), abs(line - comment.line) <= DiffReviewLimits.reanchorWindow,
                       StableHash.fnv1a64(n.text) == comment.lineHash else { continue }

@@ -61,6 +61,10 @@ import Foundation
         // Two files, two hunks: items name their file and hunk.
         let two = DiffModel.parse(patch: Self.file("a.ts", ["+x"]) + Self.file("b.ts", ["-y"])).collapsed()
         #expect(two == [.line(file: 0, hunk: 0, index: 0), .line(file: 1, hunk: 0, index: 0)])
+        // M-5: a caller's context is clamped — never a trap or an overflow.
+        #expect(m.collapsed(context: -3) == m.collapsed(context: 0))
+        #expect(m.collapsed(context: Int.max).count == 22 && m.collapsed(context: Int.max / 2 + 1).count == 22)
+        #expect(DiffModel.parse(patch: "").collapsed(context: Int.min).isEmpty)
     }
 
     @Test func nextPrevChange() {
@@ -80,6 +84,22 @@ import Foundation
         #expect(DiffStops.relocate(stops[1], from: m, in: shifted) == DiffStop(file: 1, hunk: 0, line: 4))
         #expect(DiffStops.relocate(stops[2], from: m, in: DiffModel.parse(patch: Self.file("a.ts", ["+q"]))) == nil, "a file that is gone has no stop")
         #expect(DiffModel.parse(patch: Self.file("a.ts", [" only", " context"])).changeStops.isEmpty)
+    }
+
+    /// I-1: the parser reads paths as the engine does — git's trailing tab after a path with a space, C-quoted paths decoded, no
+    /// fake rename from the `diff --git` line.
+    @Test func parserPathsMatchTheEngine() {
+        let spaced = "diff --git a/src/we ird.ts b/src/we ird.ts\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/src/we ird.ts\t\n@@ -0,0 +1 @@\n+x\n"
+        let m = DiffModel.parse(patch: spaced)
+        #expect(m.files.count == 1 && m.files[0].path == "src/we ird.ts" && m.files[0].oldPath == nil && m.files[0].hunks[0].lines.count == 1)
+        let quoted = "diff --git \"a/src/caf\\303\\251 \\\"q\\\".ts\" \"b/src/caf\\303\\251 \\\"q\\\".ts\"\nindex 1..2 100644\n--- \"a/src/caf\\303\\251 \\\"q\\\".ts\"\n+++ \"b/src/caf\\303\\251 \\\"q\\\".ts\"\n@@ -1 +1 @@\n-a\n+b\n"
+        let q = DiffModel.parse(patch: quoted)
+        #expect(q.files.count == 1 && q.files[0].path == "src/caf\u{E9} \"q\".ts" && q.files[0].oldPath == nil && q.files[0].hunks.count == 1)
+        #expect(ChangesPatch.pathFromGitLine("diff --git a/x y b/x y") == "x y")
+        #expect(ChangesPatch.prefixedPath("b/a b.txt\t", "b/") == "a b.txt")
+        // A rename still names both paths.
+        let renamed = DiffModelTests.patch(adds: [1], dels: [0], rename: true)
+        #expect(DiffModel.parse(patch: renamed).files[0].oldPath == "src/old0.swift")
     }
 
     @Test func highlightPerFile() {
@@ -104,12 +124,15 @@ import Foundation
     }
 
     @Test func summariesShownForBinaryAndLarge() {
-        let patch = Self.file("src/a.ts", ["+one", "-two"])
+        // The patch holds the two sections the engine emitted (a.ts, new.ts); binary and large files have none. The rows map by the
+        // engine's `patchIndex`, never by path text (I-1): the shown path of new.ts differs from its raw one.
+        let patch = Self.file("src/a.ts", ["+one", "-two"]) + Self.file("src/n\u{200B}ew.ts", ["+a", "+b", "+c"])
         let diff = DiffModel.parse(patch: patch)
-        let files = [ChangedFile(path: "src/a.ts", status: "M", added: 1, removed: 1),
+        let files = [ChangedFile(path: "src/a.ts", status: "M", added: 1, removed: 1, patchIndex: 0),
                      ChangedFile(path: "img/logo.png", status: "M", added: 0, removed: 0, summary: "binary · 1.2 KB → 1.3 KB"),
                      ChangedFile(path: "data/big.bin", status: "A", added: 0, removed: 0, summary: "large file · 4.1 MB, diff not shown"),
-                     ChangedFile(path: "src/new.ts", oldPath: "src/old.ts", status: "R", added: 3, removed: 0, summary: "1,500 more lines not shown")]
+                     ChangedFile(path: "src/new.ts", oldPath: "src/old.ts", status: "R", added: 3, removed: 0, summary: "1,500 more lines not shown",
+                                 patchIndex: 1)]
         let snapshot = ChangesSnapshot(key: "ENG-1", compare: .main, base: "abc", target: "worktree", files: files, added: 4, removed: 1, patch: patch,
                                        truncated: false, tainted: false, taintReason: nil, lastEdit: nil, patchHash: "h", computedAt: .now)
         let rows = ChangesFiles.rows(snapshot, diff: diff)
@@ -117,7 +140,13 @@ import Foundation
         #expect(rows[0].summary == nil && rows[0].fileIndex == 0 && rows[0].stats == "+1 −1")
         #expect(rows[1].summary == "binary · 1.2 KB → 1.3 KB" && rows[1].fileIndex == nil, "a summarized file has no hunks to open")
         #expect(rows[2].summary == "large file · 4.1 MB, diff not shown" && rows[2].fileIndex == nil && rows[2].status == "A")
-        #expect(rows[3].summary == "1,500 more lines not shown" && rows[3].oldPath == "src/old.ts" && rows[3].stats == "+3 −0")
+        #expect(rows[3].summary == "1,500 more lines not shown" && rows[3].oldPath == "src/old.ts" && rows[3].stats == "+3 −0" && rows[3].fileIndex == 1)
+        // A section the parser did not keep (the 5000-line cut) has no hunks to open.
+        var cut = files
+        cut[3].patchIndex = 7
+        #expect(ChangesFiles.rows(ChangesSnapshot(key: "ENG-1", compare: .main, base: "abc", target: "worktree", files: cut, added: 4, removed: 1, patch: patch,
+                                                  truncated: true, tainted: false, taintReason: nil, lastEdit: nil, patchHash: "h", computedAt: .now),
+                                  diff: diff)[3].fileIndex == nil)
         // The summary is the engine's gated string, shown as is (never rebuilt here).
         #expect(rows[1].stats == "+0 −0")
     }

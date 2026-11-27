@@ -80,9 +80,13 @@ public struct ChangedFile: Equatable, Sendable, Codable {
     public var removed: Int
     /// `"binary · 1.2 MB → 1.3 MB"`, `"large file · 4.1 MB, diff not shown"` or `"1,500 more lines not shown"`.
     public var summary: String?
+    /// C6b fix round 1 (I-1): the index of this file's section in `patch` (its `diff --git` block, in order), nil when the patch holds
+    /// none (binary, large). The file's identity for a diff parser: `path` is the gated display form and need not equal the raw path.
+    public var patchIndex: Int? = nil
 
-    public init(path: String, oldPath: String? = nil, status: String, added: Int, removed: Int, summary: String? = nil) {
+    public init(path: String, oldPath: String? = nil, status: String, added: Int, removed: Int, summary: String? = nil, patchIndex: Int? = nil) {
         self.path = path; self.oldPath = oldPath; self.status = status; self.added = added; self.removed = removed; self.summary = summary
+        self.patchIndex = patchIndex
     }
 }
 
@@ -292,10 +296,12 @@ extension Store {
         var files = files
         var truncated = truncated
         let lastSection = sections.last?.path
+        var emitted = 0
         for i in files.indices {
             let path = files[i].path
             let section = byPath.removeValue(forKey: path)
             let size = bytes[path] ?? 0
+            files[i].patchIndex = nil
             if files[i].summary == "binary" {
                 let old = oldSize(path) ?? 0
                 files[i].summary = "binary · \(ChangesFormat.bytes(old)) → \(ChangesFormat.bytes(size))"
@@ -310,6 +316,8 @@ extension Store {
                 continue
             }
             guard let section else { continue }
+            files[i].patchIndex = emitted
+            emitted += 1
             out.append(contentsOf: section.header)
             // Hunk lines (not `@@` headers) count towards the per-file cap; the rest is summarized.
             var content = 0, dropped = 0
@@ -353,8 +361,9 @@ extension Store {
     static let withheldPath = "[path withheld]"
 }
 
-/// Plain parsing of a unified patch into per-file sections (no regex over agent text).
-enum ChangesPatch {
+/// Plain parsing of a unified patch into per-file sections (no regex over agent text). The path helpers are public so the app's
+/// `DiffModel` reads paths exactly as the engine does (C6b I-1).
+public enum ChangesPatch {
     struct Section {
         var path: String
         /// `A`, `M`, `D` or `R`.
@@ -406,7 +415,7 @@ enum ChangesPatch {
 
     /// `diff --git a/<p> b/<p>` → `<p>` (the two halves agree without renames; a path holding ` b/` is settled by `+++`). A
     /// path git quotes (`"a/…"`, C escapes) is unquoted.
-    static func pathFromGitLine(_ line: String) -> String {
+    public static func pathFromGitLine(_ line: String) -> String {
         let rest = String(line.dropFirst("diff --git ".count))
         if rest.hasPrefix("\"") {
             // `"a/<p>" "b/<p>"`: the first quoted string.
@@ -426,7 +435,7 @@ enum ChangesPatch {
     }
 
     /// `<prefix><path>` or `"<prefix><path>"` (git's C-style quoting: `\\`, `\"`, `\n`, `\t`, `\ooo`…) → the path; nil for anything else.
-    static func prefixedPath(_ s: String, _ prefix: String) -> String? {
+    public static func prefixedPath(_ s: String, _ prefix: String) -> String? {
         var text = s
         // git ends a `---`/`+++` name that holds a space with a tab (for `patch`).
         if text.hasSuffix("\t") { text.removeLast() }
@@ -439,7 +448,7 @@ enum ChangesPatch {
     }
 
     /// The bytes of a C-quoted git path, decoded as UTF-8; nil for a malformed escape.
-    static func unquote(_ s: String) -> String? {
+    public static func unquote(_ s: String) -> String? {
         var bytes: [UInt8] = []
         var it = Array(s.utf8)[...]
         while let b = it.first {

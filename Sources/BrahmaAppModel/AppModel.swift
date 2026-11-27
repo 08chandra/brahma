@@ -142,7 +142,6 @@ public final class AppModel {
     /// Plan C C6b: the CHANGES tab's model for the selected company (nil with none selected). It streams only while the tab or a
     /// live diff in the OPENED tab is visible (`updateChangesVisibility`).
     public internal(set) var changes: ChangesTabModel?
-    @ObservationIgnored var ticksSinceChanges = 0
 
     /// The embedded engine, when this app hosts one. Set by the app delegate.
     public var engine: EngineHost?
@@ -163,8 +162,6 @@ public final class AppModel {
     private static let activityCap = 500
     /// Owner notices are planned on every 4th tick (about every 2 s at the default poll).
     static let deliveryEvery = 4
-    /// The changes board and comments reload on every 4th tick while the CHANGES model runs (the diff itself streams).
-    static let changesRefreshEvery = 4
 
     public init(store: Store, paths: BrahmaPaths, secretVault: any SecretVault, clock: @escaping @Sendable () -> Date = { .now }) {
         self.store = store
@@ -366,13 +363,6 @@ public final class AppModel {
             }
             if turnStreamAgentId != nil { await refreshTurnStream() }
             await refreshCollab()
-            if let changes, changes.isRunning {
-                ticksSinceChanges += 1
-                if ticksSinceChanges >= Self.changesRefreshEvery {
-                    ticksSinceChanges = 0
-                    await changes.refresh()
-                }
-            }
             lastDBError = nil
             ticksSinceDelivery += 1
             if ticksSinceDelivery >= Self.deliveryEvery {
