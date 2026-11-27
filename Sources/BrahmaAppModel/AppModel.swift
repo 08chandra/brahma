@@ -300,6 +300,7 @@ public final class AppModel {
             access.companyId = firstId
             settings.companyId = firstId
             digest.companyId = firstId
+            cleanRenderScratch(all: true)
             if let firstId { loadPreviewNav(companyId: firstId) }
             try await reloadSelected()
             loaded = true

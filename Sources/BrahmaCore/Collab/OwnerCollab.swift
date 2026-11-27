@@ -43,8 +43,17 @@ extension Store {
             throw WorkError.notFound(Self.refUnavailable)
         }
         let canonical = ref.canonical
-        let gated = try gateRef(content.data, ext: content.ext, canonical: canonical, companyId: companyId, ref: ref, reader: .owner,
-                                purpose: .render, archives: archives, knownValues: knownValues, paths: paths)
+        // C6 fix round 1 (I1): strictly `gatedBytes` (a stored value refuses; a vouched PDF is its flattened copy), and the
+        // verdict honoured here, so the app never sees a pattern: redactable text is served redacted (`redactedCopy`, checked
+        // again through the gate), anything else holding a pattern is refused.
+        let g = try gatedBytes(content.data, ext: content.ext, canonical: canonical, companyId: companyId, archives: archives,
+                               knownValues: knownValues, paths: paths)
+        var data = g.data
+        if case .pattern(let label, _) = g.verdict {
+            guard SecretGate.isRedactable(data, ext: g.ext) else { throw Self.unredactable(canonical, label: label, knownValues: knownValues) }
+            data = try SecretGate.redactedCopy(data, ext: g.ext, canonical: canonical, archives: archives, knownValues: knownValues, store: self)
+        }
+        let gated = (data: data, ext: g.ext, verdict: g.verdict)
         var text: String?
         if case .text = content.body { text = String(decoding: gated.data, as: UTF8.self) }
         if let via {

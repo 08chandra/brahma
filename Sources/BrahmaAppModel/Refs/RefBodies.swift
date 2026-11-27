@@ -33,7 +33,6 @@ public enum RefContent: Equatable, Sendable {
     case item(itemId: String)
     case ask(askId: String)
     case kb(markdown: String, revision: String, backlinks: [Backlink])
-    case artifact(Artifact)
     case preview(surfaceId: String, path: String, viewport: PreviewViewport, builtBy: String)
     case run(lines: [[AnsiSpan]], footer: String)
     case release(Release)
@@ -42,7 +41,9 @@ public enum RefContent: Equatable, Sendable {
     /// `fact:<query>` and `sprint:<n>`: printed through `FactsResolver.block`.
     case fact(FactAnswer)
     /// A `show` answer: the agent's note (gated), its claims with their citations, the refs, the citation verdict and who answered.
-    case answer(note: String, claims: [Claim], refs: [WorkRef], verified: Bool, by: String)
+    /// `refNotes` are the agent's per-ref notes, gated as final strings (impersonation flagged, a value withholds the note); the refs
+    /// themselves carry no `note` parameter.
+    case answer(note: String, claims: [Claim], refs: [WorkRef], refNotes: [String?], verified: Bool, by: String)
     case unavailable(String)
 }
 
@@ -83,6 +84,8 @@ public enum RefBodies {
     public static let maxLineBytes = 4096
     /// What a code or thread body may weigh (text over it is cut).
     public static let maxTextBytes = 2_097_152
+    /// Lines a rendered file shows at most (the pinned `RefLimits` row: 20 000); the rest is one marker line (M2).
+    public static let maxLines = 20_000
 
     /// The body of `resolved` for the owner, off the main actor. `via` names the read (`Store.tabReadVia`, `inspectorReadVia`); nil
     /// renders without recording a read (a card).
@@ -101,7 +104,8 @@ public enum RefBodies {
         }
         let ref = resolved.ref
         func header(chips extra: [RefChip] = [], hasHidden: Bool = false, live: Bool = false, actions: [RefAction]? = nil) -> RefHeader {
-            self.header(for: resolved, store: store, companyId: companyId, gate: gate, extra: extra, hasHidden: hasHidden, live: live, actions: actions)
+            self.header(for: resolved, store: store, companyId: companyId, gate: gate, knownValues: ctx.knownValues, extra: extra, hasHidden: hasHidden,
+                        live: live, actions: actions)
         }
         func unavailable(_ text: String = unavailableText) -> RefBody { RefBody(header: header(), content: .unavailable(text)) }
         func read() throws {
@@ -120,9 +124,10 @@ public enum RefBodies {
                 let r = try render()
                 return try fileBody(r, resolved: resolved, header: header, ctx: ctx, gate: gate)
             case .artifact:
-                guard let n = Int(ref.id), let a = try store.artifact(companyId: companyId, number: n) else { return unavailable() }
-                try read()
-                return RefBody(header: header(), content: .artifact(a))
+                // M10: the entry file's bytes through the gate (`renderRef` → `gatedBytes`), copied for 4a's `FileBody`; never the
+                // workspace folder itself.
+                let r = try render()
+                return try fileBody(r, resolved: resolved, header: header, ctx: ctx, gate: gate)
             case .diff:
                 let r = try render()
                 let live = ref.isWorktree && ref.params["snapshot"] == nil
@@ -134,8 +139,10 @@ public enum RefBodies {
                 let text = redacted(r.text ?? "", knownValues: ctx.knownValues)
                 let model = DiffModel.parse(patch: text)
                 var h = header(hasHidden: model.hasHidden)
-                if let subject = text.split(separator: "\n", maxSplits: 1).first, let shown = gate.final(String(subject), max: SafeTitle.max) {
-                    h.subtitle = [shown, h.subtitle].filter { !$0.isEmpty }.joined(separator: " · ")
+                if let subject = text.split(separator: "\n", maxSplits: 1).first {
+                    // The assembled string is what is gated (Ruling 55), never its parts.
+                    h.subtitle = gate.final([String(subject), resolved.subtitle].filter { !$0.isEmpty }.joined(separator: " · "), max: SafeTitle.max)
+                        ?? h.subtitle
                 }
                 return RefBody(header: h, content: .diff(model, live: false, updated: nil))
             case .item:
@@ -152,7 +159,9 @@ public enum RefBodies {
                 }
                 let backlinks = try store.backlinks(companyId: companyId, ref: ref, reader: .owner)
                 try read()
-                let markdown = cut(redacted(view.text, knownValues: ctx.knownValues))
+                var markdown = cut(view.text)
+                // I4: the renderer's plain-text projection is what the owner reads; a value it joins withholds the page whole.
+                if gate.holdsSecret(markdown) || gate.holdsSecret(String(SafeMarkdown.render(markdown).characters)) { markdown = withheldText }
                 return RefBody(header: header(hasHidden: InvisibleMarkers.holdsHidden(markdown)),
                                content: .kb(markdown: markdown, revision: String(view.revision), backlinks: backlinks))
             case .preview:
@@ -164,8 +173,12 @@ public enum RefBodies {
                 return RefBody(header: header(), content: .preview(surfaceId: surface.id, path: params["path"] ?? "/", viewport: viewport, builtBy: builtBy))
             case .run:
                 let r = try render()
-                let text = redacted(r.text ?? "", knownValues: ctx.knownValues)
-                let lines = AnsiText.parse(cut(text))
+                let text = cut(r.text ?? "")
+                // I4: ANSI is parsed first; each line's visible text is then gated as the final string (a value an escape split is
+                // whole again here) and withheld when it holds one.
+                let lines = AnsiText.parse(text).map { spans -> [AnsiSpan] in
+                    gate.holdsSecret(spans.map(\.text).joined()) ? [AnsiSpan(text: "(withheld)")] : spans
+                }
                 return RefBody(header: header(hasHidden: InvisibleMarkers.holdsHidden(text)),
                                content: .run(lines: lines, footer: gate.final(resolved.subtitle, max: SafeTitle.max) ?? ""))
             case .release:
@@ -178,7 +191,9 @@ public enum RefBodies {
                 try read()
                 func clean(_ m: Message) -> Message {
                     var m = m
-                    m.text = cut(redacted(m.text, knownValues: ctx.knownValues))
+                    let text = cut(m.text)
+                    // I4: the text as the view shows it (verbatim, or its markdown projection) withheld whole when it holds a value.
+                    m.text = gate.holdsSecret(text) || gate.holdsSecret(String(SafeMarkdown.render(text).characters)) ? withheldText : text
                     return m
                 }
                 let root = clean(t.root), replies = t.replies.map(clean)
@@ -188,7 +203,7 @@ public enum RefBodies {
                 let model = try agentNow(resolved, store: store, companyId: companyId, ctx: ctx, gate: gate)
                 try read()
                 var chips: [RefChip] = []
-                if let tainted = model.taintedBy { chips.append(RefChip(text: tainted.uppercased(), tone: .warn)) }
+                if let tainted = model.taintedBy, let shown = gate.final(tainted.uppercased(), max: SafeTitle.max) { chips.append(RefChip(text: shown, tone: .warn)) }
                 return RefBody(header: header(chips: chips, hasHidden: model.liveDiff?.hasHidden ?? false, live: model.liveDiff != nil),
                                content: .agentNow(model))
             case .sprint, .fact:
@@ -213,12 +228,18 @@ public enum RefBodies {
         let binary = r.data.prefix(OpenRefLimits.binarySniffBytes).contains(0)
         let isCode = !binary && (kind == nil || kind == .code || kind == .text)
         if isCode {
-            let text = redacted(String(decoding: r.data.prefix(maxTextBytes), as: UTF8.self), knownValues: ctx.knownValues)
-            var lines = CodeHighlighter.highlight(cutLines(text), language: CodeLanguage.detect(path: resolved.ref.kind == .file ? resolved.ref.id : "x.\(ext)"))
-            // A file ending in a newline shows its lines, not a last empty one.
-            if lines.count > 1, lines.last?.isEmpty == true { lines.removeLast() }
+            // The bytes are the gate's (a pattern already redacted by `renderRef`).
+            let text = String(decoding: r.data.prefix(maxTextBytes), as: UTF8.self)
+            var raw = CodeHighlighter.splitLines(cutLines(text))
+            if raw.count > 1, raw.last?.isEmpty == true { raw.removeLast() }
+            // M2: the pinned line cap, with one marker line for the rest.
+            let truncated = raw.count > maxLines
+            let more = raw.count - maxLines
+            if truncated { raw = Array(raw.prefix(maxLines)) }
+            var lines = CodeHighlighter.highlight(raw.joined(separator: "\n"), language: CodeLanguage.detect(path: resolved.ref.kind == .file ? resolved.ref.id : "x.\(ext)"))
+            if truncated { lines.append([CodeSpan(text: "\u{2026} \(more) more lines", kind: .comment)]) }
             let hidden = CodeHighlighter.hasHidden(lines)
-            return RefBody(header: header([], hidden, false, nil),
+            return RefBody(header: header(truncated ? [RefChip(text: "TRUNCATED", tone: .warn)] : [], hidden, false, nil),
                            content: .code(lines: lines, firstLine: 1, highlight: resolved.ref.range, hasHidden: hidden))
         }
         // Anything else: a per-open confined copy for 4a's `FileBody` (agent and outside files open out of process: `effectiveMode`).
@@ -228,10 +249,10 @@ public enum RefBodies {
         let url = dir.appending(path: name)
         try r.data.write(to: url, options: [.withoutOverwriting])
         try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: url.path)
-        let body = FileBody.make(url: url, kind: kind ?? (binary ? .text : .text), root: dir)
+        let body = FileBody.make(url: url, kind: kind ?? .text, root: dir)
         var actions: [RefAction]? = nil
         if resolved.ref.kind == .resource, resolved.state == .redacted { actions = defaultActions(for: resolved) + [.viewOriginal] }
-        return RefBody(header: header([], false, false, actions), content: .file(body, provenance: resolved.provenance))
+        return RefBody(header: header([], false, false, actions), content: .file(body, provenance: renderProvenance(resolved)))
     }
 
     /// An engine-made file name for the copy: the path's last component for a file (its own characters are never trusted: only
@@ -248,10 +269,11 @@ public enum RefBodies {
 
     // MARK: Header
 
-    static func header(for resolved: ResolvedRef, store: Store, companyId: String, gate: GlobalSearch.TextGate, extra: [RefChip],
-                       hasHidden: Bool, live: Bool, actions: [RefAction]?) -> RefHeader {
+    static func header(for resolved: ResolvedRef, store: Store, companyId: String, gate: GlobalSearch.TextGate,
+                       knownValues: [(name: String, value: String)], extra: [RefChip], hasHidden: Bool, live: Bool, actions: [RefAction]?) -> RefHeader {
         let ref = resolved.ref
-        let title = gate.final(resolved.title, max: SafeTitle.max).flatMap { $0.isEmpty ? nil : $0 }
+        let title = askTitle(for: ref, store: store, companyId: companyId, knownValues: knownValues)
+            ?? gate.final(resolved.title, max: SafeTitle.max).flatMap { $0.isEmpty ? nil : $0 }
             ?? gate.final(ref.canonical, max: SafeTitle.max) ?? ref.kind.rawValue
         let subtitle = gate.final(resolved.subtitle, max: SafeTitle.max) ?? ""
         var chips: [RefChip] = []
@@ -292,8 +314,17 @@ public enum RefBodies {
     public static func answerBody(message: Message, refs: [WorkRef], by: String, knownValues: [(name: String, value: String)],
                                   title: String? = nil) -> RefBody {
         let gate = GlobalSearch.TextGate(knownValues: knownValues)
-        var note = redacted(message.text, knownValues: knownValues)
-        if gate.holdsSecret(note) { note = ShowLimits.withheldNote }
+        // M7: a note holding a value (as written, or in any spelling the gate checks) is withheld whole, as the engine does.
+        let note = gate.holdsSecret(message.text) ? ShowLimits.withheldNote : message.text
+        // I2: the per-ref notes (agent-written) gated as final strings, impersonation flagged; the refs lose the note parameter.
+        let sender = Sender.agent(message.senderId)
+        let refNotes: [String?] = refs.map { ref in
+            guard let raw = ref.params["note"], !raw.isEmpty else { return nil }
+            guard let shown = gate.final(raw, max: ShowLimits.refNoteMax, inert: true) else { return ShowLimits.withheldNote }
+            let flagged = OwnerImpersonation.flags(text: shown, sender: sender) ? OwnerImpersonation.digestPrefix + shown : shown
+            return gate.holdsSecret(flagged) ? ShowLimits.withheldNote : flagged
+        }
+        let refs = refs.map(OpenedRef.stripped)
         let citation = CitationCheck.verify(note: note, refCount: refs.count)
         let verified = message.answerVerified ?? citation.verified
         let claims = citation.claims + citation.uncited.map { Claim(text: $0, cites: []) }
@@ -310,7 +341,7 @@ public enum RefBodies {
         let shownTitle = title.flatMap { gate.final($0, max: SafeTitle.max) } ?? "answered"
         let header = RefHeader(title: shownTitle, subtitle: gate.final("from \(who)", max: SafeTitle.max) ?? "answer", chips: chips,
                                actions: [.copyRef, .shareTo, .askToExplain, .openInChat])
-        return RefBody(header: header, content: .answer(note: note, claims: claims, refs: refs, verified: verified, by: who))
+        return RefBody(header: header, content: .answer(note: note, claims: claims, refs: refs, refNotes: refNotes, verified: verified, by: who))
     }
 
     // MARK: Agent now
@@ -345,6 +376,30 @@ public enum RefBodies {
                              item: key, liveDiff: liveDiff, stream: stream, activity: activity,
                              usageShare: AgentNowModel.usageText(share: share), openRequests: requests,
                              taintedBy: AgentNowModel.taintText(source: taint).flatMap { gate.final($0, max: SafeTitle.max) })
+    }
+
+    // MARK: Trust and titles
+
+    /// What a block the owner reads says when it held a stored value.
+    public static let withheldText = "(withheld: it held a stored secret)"
+
+    /// C6-1 / C1: what `FileBody.effectiveMode` decides on. Owner provenance is only a resource row's (an owner drop the engine
+    /// recorded; the resolver already turns share copies into workspace content); anything else — agent, outside, engine, unknown —
+    /// decodes out of process (fail closed).
+    static func renderProvenance(_ resolved: ResolvedRef) -> Provenance {
+        switch resolved.provenance {
+        case .owner where resolved.ref.kind == .resource: return .owner
+        case .agent, .external: return resolved.provenance
+        default: return .agent("workspace")
+        }
+    }
+
+    /// I3: an ask's title as the owner's lines show it (`Store.ownerShownTitle`: gated, impersonation flagged, `titleHeldText` when
+    /// the values are unknown, `FileRequestCard.withheld` when it holds one), prefixed by its ref; nil for any other kind.
+    static func askTitle(for ref: WorkRef, store: Store, companyId: String, knownValues: [(name: String, value: String)]?) -> String? {
+        guard ref.kind == .ask, let n = Int(ref.id),
+              let ask = try? store.asks(companyId: companyId).first(where: { $0.number == n }) else { return nil }
+        return "\(ask.ref) " + Store.ownerShownTitle(ask, knownValues: knownValues)
     }
 
     // MARK: Text

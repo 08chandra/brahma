@@ -9,21 +9,21 @@ import Foundation
         let locked = ResolvedRef(ref: WorkRef(kind: .file, id: "x"), reader: .agent(w.eng1.id), visibility: .locked(approverRole: "cto"),
                                  title: "", subtitle: "", bytes: nil, provenance: .engine, tainted: false, taintReason: nil,
                                  accessClass: .ownerOnly, newer: nil, state: .ok, opaqueId: "o")
-        let card = try AttachmentCards.make(locked, store: w.store, context: w.renderContext())
+        let card = try AttachmentCards.make(locked, store: w.store, context: try w.renderContext())
         #expect(card.locked && card.kindChip == "FILE" && card.title == "" && card.meta == "locked · ask the owner")
         #expect(card.preview == .none && card.chips.isEmpty)
         // Refused and missing refs are cards of nothing too (the same text: no oracle).
         for v in [Visibility.refused, .missing] {
             var r = locked
             r.visibility = v
-            let c = try AttachmentCards.make(r, store: w.store, context: w.renderContext())
+            let c = try AttachmentCards.make(r, store: w.store, context: try w.renderContext())
             #expect(c.locked && c.title == "" && c.meta == "locked · ask the owner")
         }
     }
 
     @Test func fileCardShowsSixHighlightedLines() throws {
         let w = try RefWorld()
-        let ctx = w.renderContext()
+        let ctx = try w.renderContext()
         let card = try AttachmentCards.make(try w.resolve("src/checkout.tsx"), store: w.store, context: ctx)
         #expect(!card.locked && card.kindChip == "FILE")
         #expect(card.title == "src/checkout.tsx")

@@ -23,6 +23,36 @@ public struct OpenedRef: Equatable, Sendable, Codable {
         self.ref = ref; self.title = title; self.kindChip = kindChip; self.origin = origin; self.steps = steps; self.stepIndex = stepIndex
     }
 
+    // C6 fix round 1 (M12): what UserDefaults keeps is canonicals only (no agent-written notes, no titles); the app re-resolves and
+    // re-gates the title on restore (`AppModel.refreshOpenedTitle`).
+    enum CodingKeys: String, CodingKey { case ref, origin, steps, stepIndex }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let ref = Self.stripped(try c.decode(WorkRef.self, forKey: .ref))
+        self.ref = ref
+        title = ""
+        kindChip = Self.kindChip(for: ref)
+        origin = try c.decode(OpenOrigin.self, forKey: .origin)
+        steps = try c.decodeIfPresent([WorkRef].self, forKey: .steps)?.map(Self.stripped)
+        stepIndex = try c.decodeIfPresent(Int.self, forKey: .stepIndex)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(Self.stripped(ref), forKey: .ref)
+        try c.encode(origin, forKey: .origin)
+        try c.encodeIfPresent(steps?.map(Self.stripped), forKey: .steps)
+        try c.encodeIfPresent(stepIndex, forKey: .stepIndex)
+    }
+
+    /// The ref without agent-written parameters (`note`).
+    public static func stripped(_ ref: WorkRef) -> WorkRef {
+        var r = ref
+        r.params["note"] = nil
+        return r
+    }
+
     /// The step chips (`"1 PREVIEW"`, `"2 ARTIFACT"`, …), nil without steps.
     public var stepChips: [String]? {
         steps.map { $0.enumerated().map { "\($0.offset + 1) \(Self.kindChip(for: $0.element))" } }

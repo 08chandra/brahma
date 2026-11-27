@@ -44,7 +44,8 @@ public enum AttachmentCards {
             return AttachmentCard(kindChip: kindChip, title: "", meta: meta, preview: .none, chips: [], locked: true)
         }
         let gate = GlobalSearch.TextGate(knownValues: ctx.knownValues)
-        let title = gate.final(r.title, max: SafeTitle.max).flatMap { $0.isEmpty ? nil : $0 } ?? gate.final(r.ref.canonical, max: SafeTitle.max) ?? kindChip
+        let title = RefBodies.askTitle(for: r.ref, store: store, companyId: ctx.companyId, knownValues: ctx.knownValues)
+            ?? gate.final(r.title, max: SafeTitle.max).flatMap { $0.isEmpty ? nil : $0 } ?? gate.final(r.ref.canonical, max: SafeTitle.max) ?? kindChip
         let meta = gate.final(r.subtitle, max: SafeTitle.max) ?? ""
         var chips: [RefChip] = []
         func chip(_ text: String, _ tone: PreviewTone) {

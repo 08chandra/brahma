@@ -23,7 +23,7 @@ import BrahmaCore
             Self.event(.export, "ownerExport src/a.ts", at: Self.t0 + 3),
             Self.event(.show, "show request 3 to @eng-3 (reviewer of ENG-1)", agent: "a3", at: Self.t0 + 4),
         ]
-        let rows = SharingRows.make(events: events, reads: nil, handles: ["a1": "eng-1", "a3": "eng-3"], timeZone: Self.utc)
+        let rows = SharingRows.make(events: events, reads: nil, handles: ["a1": "eng-1", "a3": "eng-3"], timeZone: Self.utc, knownValues: [])
         #expect(rows.count == 4)
         let share = try! #require(rows.first { $0.result == "shared" })
         #expect(share.from == "@eng-1" && share.to == "#general" && share.ref == "src/a.ts @abc1234" && share.session == "")
@@ -48,9 +48,9 @@ import BrahmaCore
             RefRead(companyId: "c", readerKind: "concierge", readerId: nil, canonical: "F-1", rev: nil, bytes: 9, tainted: false, via: "open_ref",
                     turnId: nil, createdAt: Self.t0 + 30),
         ]
-        let without = SharingRows.make(events: events, reads: nil, handles: ["a1": "eng-1", "a3": "eng-3"], timeZone: Self.utc)
+        let without = SharingRows.make(events: events, reads: nil, handles: ["a1": "eng-1", "a3": "eng-3"], timeZone: Self.utc, knownValues: [])
         #expect(without.count == 1)
-        let with = SharingRows.make(events: events, reads: reads, handles: ["a1": "eng-1", "a3": "eng-3"], timeZone: Self.utc)
+        let with = SharingRows.make(events: events, reads: reads, handles: ["a1": "eng-1", "a3": "eng-3"], timeZone: Self.utc, knownValues: [])
         #expect(with.count == 4)
         let agentRead = try! #require(with.first { $0.ref == "ENG-1" && $0.result.hasPrefix("read") })
         #expect(agentRead.from == "@eng-3" && agentRead.result == "read · open_ref" && agentRead.session == "clean" && agentRead.to == "")

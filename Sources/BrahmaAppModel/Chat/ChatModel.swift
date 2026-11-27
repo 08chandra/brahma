@@ -15,6 +15,9 @@ public struct ChatMessage: Equatable, Identifiable, Sendable {
     public var id: String
     /// Plan C (C4c, Ruling 60): the concierge's answer, labelled as the concierge's and never as engine text.
     public var isConcierge = false
+    /// Plan C: the message came from a session that read outside content (the untrusted chip; `taintSource` names it).
+    public var isTainted: Bool { message.taintedOrigin || message.fromTaintedSession }
+    public var taintSource: String? { isTainted ? message.taintSource ?? "outside content" : nil }
 }
 
 @MainActor @Observable

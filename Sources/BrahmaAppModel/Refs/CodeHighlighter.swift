@@ -85,13 +85,6 @@ public enum CodeHighlighter {
 
         init(language: CodeLanguage) { self.language = language }
 
-        var lineCommentStarts: [[Unicode.Scalar]] {
-            switch language {
-            case .swift, .typescript, .jsonYaml: [["/", "/"]]
-            case .python: [["#"]]
-            case .plain: []
-            }
-        }
         var hasBlockComments: Bool { language == .swift || language == .typescript || language == .jsonYaml }
         var nestedBlockComments: Bool { language == .swift }
         var hashComments: Bool { language == .python || language == .jsonYaml }

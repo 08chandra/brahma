@@ -84,11 +84,10 @@ enum CodeFixtures {
     }
 
     @Test func highlighterFuzz() {
-        let clock = ContinuousClock()
         func timed(_ what: String, _ body: () -> [[CodeSpan]]) -> [[CodeSpan]] {
-            let start = clock.now
+            let start = AwakeTime.now
             let out = body()
-            let took = clock.now - start
+            let took = start.duration(to: AwakeTime.now)
             #expect(took < .seconds(1), "\(what) took \(took)")
             return out
         }

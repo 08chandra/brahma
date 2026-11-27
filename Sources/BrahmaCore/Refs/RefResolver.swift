@@ -326,7 +326,7 @@ extension Store {
             pinned.params["from"] = base
             pinned.params["to"] = head
             pinned.rev = head
-            return Details(title: "diff \(base.prefix(7))..\(head.prefix(7))", subtitle: Self.diffStat(diff),
+            return Details(title: "diff \(base.prefix(7))..\(head.prefix(7))", subtitle: Self.diffStat(diff), provenance: .agent("workspace"),
                            state: diff.truncated ? .tooLarge : .ok, pinned: pinned)
         case .commit:
             let git = try refGit(workspace)
@@ -334,7 +334,7 @@ extension Store {
             let shown = try git.show(commit: sha)
             var pinned = ref
             pinned.rev = sha
-            return Details(title: "commit \(sha.prefix(7))", subtitle: Self.diffStat(shown.diff), pinned: pinned)
+            return Details(title: "commit \(sha.prefix(7))", subtitle: Self.diffStat(shown.diff), provenance: .agent("workspace"), pinned: pinned)
         case .item(let item, let owner):
             var pinned = ref
             pinned.params["was"] = item.status.rawValue
@@ -359,7 +359,7 @@ extension Store {
             let state: RefState = r.purgedAt != nil ? .purged : r.secretScan == .redacted ? .redacted : .ok
             return Details(title: r.tainted ? "\(r.ref) (untrusted)" : Self.safe(r.displayName),
                            subtitle: "\(r.ref) · \(r.fileKind ?? r.kind.rawValue)", bytes: r.purgedAt != nil ? nil : Int(r.bytes),
-                           provenance: Provenance(raw: r.provenance) ?? .external(r.provenance), tainted: r.tainted,
+                           provenance: Self.resourceProvenance(r), tainted: r.tainted,
                            taintReason: r.taintReason, state: state, pinned: ref)
         case .artifact(let a):
             // 4a's title is agent-controlled: sanitized here; a tainted one is never shown (4a's digest rule; the source-derived
@@ -401,16 +401,43 @@ extension Store {
 
     // MARK: Files and diffs
 
+    /// C6 fix round 1 (C1 refinement): owner provenance comes only from an owner-drop record (ML's `addResources` through a drop
+    /// context); a share copy (`addedVia = share`, a redacted copy or a snapshot an agent's share made) is never the owner's,
+    /// whatever its row says, and a value that doesn't parse is outside content. Both decode out of process.
+    static func resourceProvenance(_ r: Resource) -> Provenance {
+        guard let p = Provenance(raw: r.provenance) else { return .external(r.provenance) }
+        if p == .owner, r.addedVia == "share" { return .agent("workspace") }
+        return p
+    }
+
+    /// Controller Ruling C6-1: workspace content is agent-made, whoever committed it (an agent's turn, or the owner through an
+    /// agent's branch), so the app decodes it only out of process. A live worktree file or diff is its lease holder's
+    /// (`.agent(<holder id>)`), a private `.brahma` place its owner's, and every committed blob, diff or commit
+    /// `.agent("workspace")`. Owner provenance is reserved for a resource the owner dropped (`Resource.provenance`), recorded
+    /// by the engine. Anything unknown falls back to the workspace (fail closed).
+    func workspaceProvenance(itemKey: String?, isWorktree: Bool, companyId: String, ownHandle: String? = nil) -> Provenance {
+        if let ownHandle, let id = try? writer.read({ db in
+            try String.fetchOne(db, sql: "SELECT id FROM agent WHERE companyId = ? AND name = ?", arguments: [companyId, ownHandle])
+        }) { return .agent(id) }
+        if isWorktree, let key = itemKey, let lease = try? lease(companyId: companyId, key: key), let agent = try? agent(id: lease.agentId),
+           agent.companyId == companyId {
+            return .agent(agent.id)
+        }
+        return .agent("workspace")
+    }
+
     private func fileDetails(_ ref: WorkRef, workspace: URL, companyId: String, ownHandle: String?) throws -> Details {
         let title = Self.safe(ref.id + (ref.range.map { $0.start == $0.end ? ":\($0.start)" : ":\($0.start)-\($0.end)" } ?? ""))
         let language = Self.language(of: ref.id)
+        let place = RefAccess.privatePlace(ref)
+        let provenance = workspaceProvenance(itemKey: ref.itemKey, isWorktree: ref.isWorktree, companyId: companyId, ownHandle: place)
         // A pinned worktree or `.brahma` file (C2a): the blob its share ref holds, whatever happened to the file since.
         if let share = ref.params["share"], let blob = ref.rev {
             let git = try refGit(workspace)
             guard try git.shareTarget(share) == blob else { throw Outcome.missing }
             let data = try git.catBlob(blob, binary: true)
             let subtitle = "\(Self.lines(Self.lineCount(data))) · \(language)" + (ref.isWorktree ? " · as shared" : "")
-            return Details(title: title, subtitle: subtitle, bytes: data.count, pinned: ref)
+            return Details(title: title, subtitle: subtitle, bytes: data.count, provenance: provenance, pinned: ref)
         }
         // `.brahma` places (labs, notes, the allowlisted children) and live worktree files: the bytes SafeFS checked.
         if ref.isWorktree || (ref.branch == nil && ref.rev == nil && ref.id.hasPrefix(".brahma/")) {
@@ -426,7 +453,7 @@ extension Store {
                 throw Outcome.refused
             }
             let subtitle = "\(Self.lines(Self.lineCount(try file.readAll()))) · \(language)" + (ref.isWorktree ? " · UNCOMMITTED" : "")
-            return Details(title: title, subtitle: subtitle, bytes: file.size, pinned: ref)
+            return Details(title: title, subtitle: subtitle, bytes: file.size, provenance: provenance, pinned: ref)
         }
         let git = try refGit(workspace)
         let branch = ref.itemKey.map { "item/\($0)" } ?? "main"
@@ -459,12 +486,13 @@ extension Store {
         }
         var pinned = ref
         pinned.rev = sha
-        return Details(title: title, subtitle: subtitle, bytes: size, newer: newer, state: state, pinned: pinned)
+        return Details(title: title, subtitle: subtitle, bytes: size, provenance: provenance, newer: newer, state: state, pinned: pinned)
     }
 
     private func diffDetails(_ ref: WorkRef, item: WorkItem, workspace: URL) throws -> Details {
         let file = ref.params["file"]
         let title = Self.safe("\(item.key) diff" + (file.map { " · \($0)" } ?? ""))
+        let provenance = workspaceProvenance(itemKey: item.key, isWorktree: ref.isWorktree && ref.params["snapshot"] == nil, companyId: item.companyId)
         // A pinned worktree diff (C2a): the vault snapshot taken when it was shared.
         if ref.isWorktree, let id = ref.params["snapshot"] {
             guard let snapshot = try writer.read({ db in
@@ -473,7 +501,7 @@ extension Store {
                     """, arguments: [item.companyId, id, RefSnapshot.worktreeDiff])
             }) else { throw Outcome.missing }
             return Details(title: Self.safe(title + " (uncommitted, as shared)"), subtitle: "\(snapshot.bytes) bytes", bytes: snapshot.bytes,
-                           tainted: snapshot.tainted, taintReason: snapshot.taintReason,
+                           provenance: provenance, tainted: snapshot.tainted, taintReason: snapshot.taintReason,
                            state: ref.params["redacted"] == "1" ? .redacted : .ok, pinned: ref)
         }
         let git = try refGit(workspace)
@@ -491,7 +519,8 @@ extension Store {
             let summary = Self.diffStat(files.map { (path: $0.path, added: $0.added, removed: $0.removed) })
             var pinned = ref
             pinned.params["base"] = base
-            return Details(title: Self.safe(title + " (uncommitted)"), subtitle: summary, state: diff.truncated ? .tooLarge : .ok, pinned: pinned)
+            return Details(title: Self.safe(title + " (uncommitted)"), subtitle: summary, provenance: provenance,
+                           state: diff.truncated ? .tooLarge : .ok, pinned: pinned)
         }
         if let from = ref.params["from"], let to = ref.params["to"] {
             // C5b: between two item revisions (engine records). A pin keeps the shas it was made with.
@@ -512,6 +541,7 @@ extension Store {
             pinned.rev = head
             pinned.params["base"] = base
             return Details(title: Self.safe("\(item.key) diff \(from)..\(to)" + (file.map { " · \($0)" } ?? "")), subtitle: Self.diffStat(diff),
+                           provenance: provenance,
                            state: diff.truncated ? .tooLarge : .ok, pinned: pinned)
         }
         let branch = "item/\(item.key)"
@@ -528,7 +558,8 @@ extension Store {
         }
         var pinned = ref
         pinned.rev = head
-        return Details(title: title, subtitle: Self.diffStat(diff), newer: newer, state: diff.truncated ? .tooLarge : .ok, pinned: pinned)
+        return Details(title: title, subtitle: Self.diffStat(diff), provenance: provenance, newer: newer, state: diff.truncated ? .tooLarge : .ok,
+                       pinned: pinned)
     }
 
     /// Whether `ref` is a pin whose bytes the owner purged (`Store.purge`): its share's `messageRef` row is `purged` or a

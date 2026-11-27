@@ -24,7 +24,12 @@ public enum SharingRows {
 
     /// The sharing rows of `events` (only `.share`, `.access`, `.export` and `.show` kinds; every text is the engine's) plus, when
     /// `reads` is given (the READS toggle), one row per `refRead`. Newest first. `handles` maps agent ids to handles.
-    public static func make(events: [ActivityEvent], reads: [RefRead]?, handles: [String: String] = [:], timeZone: TimeZone = .current) -> [SharingRow] {
+    /// `knownValues` are the stored values (from the injected vault; the caller refuses the view when they can't be read): every
+    /// string is gated as the final display string (`TextGate.final`, inert), `"(withheld)"` when it holds a value.
+    public static func make(events: [ActivityEvent], reads: [RefRead]?, handles: [String: String] = [:], timeZone: TimeZone = .current,
+                            knownValues: [(name: String, value: String)]) -> [SharingRow] {
+        let gate = GlobalSearch.TextGate(knownValues: knownValues)
+        func shown(_ s: String) -> String { s.isEmpty ? "" : (gate.final(s, max: 400, inert: true) ?? "(withheld)") }
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = timeZone
@@ -74,6 +79,10 @@ public enum SharingRows {
             rows.append(SharingRow(when: f.string(from: r.createdAt), from: from, to: "", ref: ref, result: "read · \(r.via)",
                                    session: r.tainted ? "tainted" : "clean", at: r.createdAt, id: "read:\(r.id)"))
         }
-        return rows.sorted { $0.at > $1.at }
+        return rows.map { row in
+            var r = row
+            r.from = shown(row.from); r.to = shown(row.to); r.ref = shown(row.ref); r.result = shown(row.result); r.session = shown(row.session)
+            return r
+        }.sorted { $0.at > $1.at }
     }
 }

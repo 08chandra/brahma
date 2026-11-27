@@ -67,11 +67,14 @@ struct RefWorld {
         return model
     }
 
-    func renderContext() -> RefRenderContext {
-        RefRenderContext(companyId: company.id, knownValues: [], paths: paths, archives: UnavailableArchiveReader(), timeZone: TimeZone(identifier: "UTC")!,
-                         tempRoot: (try? tempDir()) ?? FileManager.default.temporaryDirectory, handles: [cto.id: "cto", eng1.id: "eng-1", eng3.id: "eng-3"],
+    func renderContext() throws -> RefRenderContext {
+        try RefRenderContext(companyId: company.id, knownValues: [], paths: paths, archives: UnavailableArchiveReader(), timeZone: TimeZone(identifier: "UTC")!,
+                             tempRoot: tempDir(), handles: [cto.id: "cto", eng1.id: "eng-1", eng3.id: "eng-3"],
                          now: now)
     }
+
+    /// One write transaction (the synchronous overload, from an async test).
+    func write(_ body: @escaping (Database) throws -> Void) throws { try store.writer.write(body) }
 
     func count(_ table: String) throws -> Int {
         try store.writer.read { db in
@@ -143,7 +146,8 @@ struct TestFailure: Error, CustomStringConvertible {
 
 /// A minimal valid PNG (signature, IHDR, IEND; CRCs right), as the gate's strict chunk walk requires.
 enum TinyPNG {
-    static func make() -> Data {
+    /// With `text`, a `tEXt` chunk `Comment\0<text>` (what a secret pattern hides in).
+    static func make(text: String? = nil) -> Data {
         var d = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
         func chunk(_ type: String, _ body: [UInt8]) {
             var len = UInt32(body.count).bigEndian
@@ -154,6 +158,7 @@ enum TinyPNG {
             d.append(Data(bytes: &crc, count: 4))
         }
         chunk("IHDR", [0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0])
+        if let text { chunk("tEXt", Array("Comment".utf8) + [0] + Array(text.utf8)) }
         chunk("IEND", [])
         return d
     }

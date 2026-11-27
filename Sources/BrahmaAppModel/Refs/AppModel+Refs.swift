@@ -17,10 +17,31 @@ extension AppModel {
     func renderContext(companyId: String) async throws -> RefRenderContext {
         let store = self.store, paths = self.paths, vault = self.secretVault
         let known = try await Task.detached { try store.knownSecretValues(companyId: companyId, vault: vault) }.value
-        let tmp = try paths.ensureTmpDir().appending(path: "preview", directoryHint: .isDirectory)
-        try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         return RefRenderContext(companyId: companyId, knownValues: known, paths: paths, archives: refArchives(store, paths, companyId),
-                                timeZone: ownerTimeZone, tempRoot: tmp, handles: handles, now: clock())
+                                timeZone: ownerTimeZone, tempRoot: try ensureRenderScratch(), handles: handles, now: clock())
+    }
+
+    /// M4: where per-open and per-card copies of gated bytes live: `<data home>/tmp/preview`, 0700, never the shared TMPDIR. Opens
+    /// (`open-*`) are removed when the slot changes or closes; everything is removed at launch.
+    public var renderScratch: URL { paths.tmpDir.appending(path: "preview", directoryHint: .isDirectory) }
+
+    func ensureRenderScratch() throws -> URL {
+        _ = try paths.ensureTmpDir()
+        let dir = renderScratch
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+        return dir
+    }
+
+    /// Removes the copies of earlier opens (`open-*`), and with `all` the cards' too and anything else left there.
+    func cleanRenderScratch(all: Bool = false) {
+        let dir = renderScratch
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
+        for name in names where all || name.hasPrefix("open-") {
+            try? FileManager.default.removeItem(at: dir.appending(path: name))
+        }
     }
 
     /// Builds a chat message's cards off-main: its `messageRef` rows resolved for the owner, each an `AttachmentCard` (locked ones a
@@ -31,8 +52,11 @@ extension AppModel {
             let rows = try store.messageRefs(companyId: companyId, messageId: message.id)
             guard !rows.isEmpty else { return [] }
             let known = try store.knownSecretValues(companyId: companyId, vault: vault)
-            let tmp = try paths.ensureTmpDir().appending(path: "cards", directoryHint: .isDirectory)
-            try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            _ = try paths.ensureTmpDir()
+            let tmp = paths.tmpDir.appending(path: "preview", directoryHint: .isDirectory)
+            if !FileManager.default.fileExists(atPath: tmp.path) {
+                try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            }
             let ctx = RefRenderContext(companyId: companyId, knownValues: known, paths: paths, archives: archives(store, paths, companyId), timeZone: tz,
                                        tempRoot: tmp, handles: handles, now: Store.now())
             return try rows.compactMap(\.workRef).map { ref in
@@ -55,12 +79,10 @@ extension AppModel {
             errorMessage = "Couldn't open \(ref.kind.rawValue): the stored secrets can't be read, so nothing is shown."
             return
         }
-        let resolved = try? await Task.detached { try store.resolveRef(ref, for: .owner, companyId: companyId) }.value
+        let title = await Self.gatedTitle(for: ref, store: store, companyId: companyId, knownValues: known)
         guard companyId == selectedCompanyId else { return }
-        let gate = GlobalSearch.TextGate(knownValues: known)
-        let title = resolved.flatMap { gate.final($0.title, max: SafeTitle.max) }.flatMap { $0.isEmpty ? nil : $0 }
-            ?? gate.final(ref.canonical, max: SafeTitle.max) ?? ref.kind.rawValue
-        let opened = OpenedRef(ref: ref, title: title, kindChip: OpenedRef.kindChip(for: ref), origin: origin, steps: steps, stepIndex: stepIndex)
+        let opened = OpenedRef(ref: OpenedRef.stripped(ref), title: title, kindChip: OpenedRef.kindChip(for: ref), origin: origin,
+                               steps: steps?.map(OpenedRef.stripped), stepIndex: stepIndex)
         previewNav.open(opened, select: select)
         if select {
             selectPreviewTab(PreviewTabID.ref)
@@ -100,6 +122,7 @@ extension AppModel {
     public func closeOpened() {
         previewNav.close()
         openedBody = nil
+        cleanRenderScratch()
         if selectedPreviewTab == PreviewTabID.ref { selectPreviewTab(nil) }
         saveNav()
     }
@@ -124,7 +147,33 @@ extension AppModel {
         ownerRequestUsage = nil
         if previewNav.selection == PreviewTabID.ref, previewNav.opened != nil { selectedPreviewTab = PreviewTabID.ref }
         wireShowBar(companyId: companyId)
-        if previewNav.opened != nil { Task { await loadOpenedBody() } }
+        if previewNav.opened != nil {
+            Task {
+                await refreshOpenedTitle()
+                await loadOpenedBody()
+            }
+        }
+    }
+
+    /// M12: the stored navigation keeps canonicals only; the title is resolved and gated again here.
+    func refreshOpenedTitle() async {
+        guard let companyId = selectedCompanyId, let opened = previewNav.opened else { return }
+        let store = self.store, vault = self.secretVault
+        guard let known = try? await Task.detached { try store.knownSecretValues(companyId: companyId, vault: vault) }.value else { return }
+        let title = await Self.gatedTitle(for: opened.ref, store: store, companyId: companyId, knownValues: known)
+        guard previewNav.opened == opened else { return }
+        previewNav.opened?.title = title
+    }
+
+    /// The engine title of `ref` for the owner, gated as a final string; an ask's through `ownerShownTitle` (I3).
+    nonisolated static func gatedTitle(for ref: WorkRef, store: Store, companyId: String, knownValues: [(name: String, value: String)]) async -> String {
+        await Task.detached {
+            if let ask = RefBodies.askTitle(for: ref, store: store, companyId: companyId, knownValues: knownValues) { return ask }
+            let gate = GlobalSearch.TextGate(knownValues: knownValues)
+            let resolved = try? store.resolveRef(ref, for: .owner, companyId: companyId)
+            return resolved.flatMap { gate.final($0.title, max: SafeTitle.max) }.flatMap { $0.isEmpty ? nil : $0 }
+                ?? gate.final(ref.canonical, max: SafeTitle.max) ?? ref.kind.rawValue
+        }.value
     }
 
     /// Renders the opened ref off-main; a body for a ref the owner has since left is dropped.
@@ -135,6 +184,7 @@ extension AppModel {
         }
         openGeneration += 1
         let gen = openGeneration
+        cleanRenderScratch()
         let body = await renderBody(for: opened, companyId: companyId, via: Store.tabReadVia)
         guard gen == openGeneration, previewNav.opened == opened, companyId == selectedCompanyId else { return }
         openedBody = body
@@ -170,6 +220,11 @@ extension AppModel {
                 let who = answer?.senderId == ConciergeCaps.agentId ? "Brahma (concierge)" : by
                 if let chip = gate.final("ANSWERED BY \(who)", max: SafeTitle.max) { body.header.chips.append(RefChip(text: chip, tone: .idle)) }
                 if answer?.answerVerified == false { body.header.chips.append(RefChip(text: "UNVERIFIED", tone: .warn)) }
+                // I6: a tainted answer keeps its untrusted chip on every step it opened.
+                if let answer, answer.taintedOrigin || answer.fromTaintedSession {
+                    body.header.chips.append(RefChip(text: gate.final("TAINTED · \(answer.taintSource ?? "outside content")", max: SafeTitle.max) ?? "TAINTED",
+                                                     tone: .warn))
+                }
                 return body
             }
             let resolved = try await Task.detached { try store.resolveRef(opened.ref, for: .owner, companyId: companyId) }.value
@@ -192,11 +247,8 @@ extension AppModel {
             errorMessage = "Couldn't open \(ref.kind.rawValue): the stored secrets can't be read, so nothing is shown."
             return
         }
-        let resolved = try? await Task.detached { try store.resolveRef(ref, for: .owner, companyId: companyId) }.value
-        let gate = GlobalSearch.TextGate(knownValues: known)
-        let title = resolved.flatMap { gate.final($0.title, max: SafeTitle.max) }.flatMap { $0.isEmpty ? nil : $0 }
-            ?? gate.final(ref.canonical, max: SafeTitle.max) ?? ref.kind.rawValue
-        let opened = OpenedRef(ref: ref, title: title, kindChip: OpenedRef.kindChip(for: ref), origin: .card(messageId: messageId))
+        let title = await Self.gatedTitle(for: ref, store: store, companyId: companyId, knownValues: known)
+        let opened = OpenedRef(ref: OpenedRef.stripped(ref), title: title, kindChip: OpenedRef.kindChip(for: ref), origin: .card(messageId: messageId))
         chatInspector = opened
         inspectorBody = nil
         let body = await renderBody(for: opened, companyId: companyId, via: Store.inspectorReadVia)
@@ -299,17 +351,18 @@ extension AppModel {
                 let gate = GlobalSearch.TextGate(knownValues: known)
                 var chips: [WaitingChip] = []
                 for r in try store.openShowRequests(companyId: companyId) {
-                    let query = gate.final(r.query, max: 80) ?? "(withheld)"
+                    // I4: the assembled chip text is what is gated.
+                    func chip(_ text: String) -> WaitingChip { WaitingChip(text: gate.final(text, max: 200) ?? "(withheld)", requestId: r.id) }
                     switch r.showTarget {
                     case .concierge:
-                        chips.append(WaitingChip(text: "Brahma is answering: \(query)", requestId: r.id))
+                        chips.append(chip("Brahma is answering: \(r.query)"))
                     case .agent(let id):
                         guard let agent = try store.agent(id: id) else { continue }
                         let turn = try store.lastTurn(agentId: id)
                         let running = turn.flatMap { $0.outcome == .inProgress && $0.endedAt == nil ? $0 : nil }
                         let eta = ShowETA.text(agent: agent, running: running, recentDurations: try store.recentTurnDurations(agentId: id),
                                                gate: UsageGate.evaluate(usage, mode: mode, now: now), now: now, tz: tz)
-                        chips.append(WaitingChip(text: "@\(agent.name) · \(eta): \(query)", requestId: r.id))
+                        chips.append(chip("@\(agent.name) · \(eta): \(r.query)"))
                     }
                 }
                 return (chips, try store.ownerRequestUsage(companyId: companyId, now: now))
@@ -348,8 +401,8 @@ extension AppModel {
     /// 5-lite's batching (`notifyOwner`); `.cardOnly` changes nothing.
     public func applyAutoOpen(_ auto: AutoOpen, decision: AutoOpenDecision, title: String) async {
         guard let first = auto.refs.first, let companyId = selectedCompanyId else { return }
-        let steps = auto.refs.count > 1 ? auto.refs : nil
-        let opened = OpenedRef(ref: first, title: title, kindChip: OpenedRef.kindChip(for: first),
+        let steps = auto.refs.count > 1 ? auto.refs.map(OpenedRef.stripped) : nil
+        let opened = OpenedRef(ref: OpenedRef.stripped(first), title: title, kindChip: OpenedRef.kindChip(for: first),
                                origin: .showAnswer(requestId: auto.requestId, by: auto.by), steps: steps, stepIndex: steps == nil ? nil : 0)
         switch decision {
         case .cardOnly:
@@ -483,12 +536,17 @@ extension AppModel {
     @discardableResult
     public func purge(_ ref: WorkRef) async -> RefPurgeReport? {
         guard let companyId = selectedCompanyId else { return nil }
+        // M6: the confirmation token comes only from the view's explicit owner confirmation (`confirmPurge`), never from here.
         if ref.kind == .resource {
-            confirmPurge = "F-\(ref.id)"
             _ = await purge(resource: "F-\(ref.id)")
             if previewNav.opened?.ref == ref { closeOpened() }
             return nil
         }
+        guard confirmPurge == ref.canonical else {
+            errorMessage = "Confirm the purge of \(ref.canonical.prefix(80)) first."
+            return nil
+        }
+        confirmPurge = nil
         let paths = self.paths, vault = self.secretVault, now = clock()
         let report: RefPurgeReport? = await ownerWrite("purge \(ref.canonical.prefix(60))") { store in
             let known = try store.knownSecretValues(companyId: companyId, vault: vault)
@@ -521,9 +579,16 @@ extension AppModel {
         }
     }
 
-    /// The text Copy ref puts on the pasteboard: the canonical ref (an empty string when it holds a stored value).
-    public func copyRef(_ ref: WorkRef) -> String {
-        guard let companyId = selectedCompanyId, let known = try? store.knownSecretValues(companyId: companyId, vault: secretVault) else { return "" }
-        return GlobalSearch.TextGate(knownValues: known).final(ref.canonical, max: 1024) ?? ""
+    /// The text Copy ref puts on the pasteboard: Ruling 58's escaped JSON literal of the canonical ref (what `open_ref` and the app
+    /// take back as is), gated as a final string; an empty string when it holds a stored value. Off the main actor (M5).
+    public func copyRef(_ ref: WorkRef) async -> String {
+        guard let companyId = selectedCompanyId else { return "" }
+        let store = self.store, vault = self.secretVault
+        return await Task.detached {
+            guard let known = try? store.knownSecretValues(companyId: companyId, vault: vault),
+                  let literal = PasteableRef.literal(OpenedRef.stripped(ref).canonical) else { return "" }
+            let gate = GlobalSearch.TextGate(knownValues: known)
+            return gate.holdsSecret(literal) || gate.holdsSecret(ref.canonical) ? "" : literal
+        }.value
     }
 }
