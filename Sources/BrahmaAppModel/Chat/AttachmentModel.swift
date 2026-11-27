@@ -24,9 +24,13 @@ public struct AttachmentCard: Equatable, Sendable {
     public var preview: CardPreview
     public var chips: [RefChip]
     public var locked: Bool
+    /// C7a: the ref the card opens (in chat's inspector) and its context menu acts on, without agent-written parameters
+    /// (`OpenedRef.stripped`); nil for a locked card, which opens nothing.
+    public var ref: WorkRef?
 
-    public init(kindChip: String, title: String, meta: String, preview: CardPreview, chips: [RefChip], locked: Bool) {
+    public init(kindChip: String, title: String, meta: String, preview: CardPreview, chips: [RefChip], locked: Bool, ref: WorkRef? = nil) {
         self.kindChip = kindChip; self.title = title; self.meta = meta; self.preview = preview; self.chips = chips; self.locked = locked
+        self.ref = ref
     }
 }
 
@@ -78,7 +82,7 @@ public enum AttachmentCards {
         default:
             break
         }
-        return AttachmentCard(kindChip: kindChip, title: title, meta: meta, preview: preview, chips: chips, locked: false)
+        return AttachmentCard(kindChip: kindChip, title: title, meta: meta, preview: preview, chips: chips, locked: false, ref: OpenedRef.stripped(r.ref))
     }
 
     /// The first `previewLines` highlighted lines of a text file (from the ref's range when it has one); a thumbnail for an
