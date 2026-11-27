@@ -149,13 +149,13 @@ public enum RefBodies {
                 }
                 let r = try render()
                 let live = ref.isWorktree && ref.params["snapshot"] == nil
-                let model = DiffModel.parse(patch: redacted(r.text ?? "", knownValues: ctx.knownValues))
+                let model = DiffModel.parse(patch: redacted(r.text ?? "", knownValues: ctx.knownValues), gate: gate)
                 return RefBody(header: header(hasHidden: model.hasHidden, live: live),
                                content: .diff(model, live: live, updated: live ? "updated just now" : nil))
             case .commit:
                 let r = try render()
                 let text = redacted(r.text ?? "", knownValues: ctx.knownValues)
-                let model = DiffModel.parse(patch: text)
+                let model = DiffModel.parse(patch: text, gate: gate)
                 var h = header(hasHidden: model.hasHidden)
                 if let subject = text.split(separator: "\n", maxSplits: 1).first {
                     // The assembled string is what is gated (Ruling 55), never its parts.
@@ -372,7 +372,7 @@ public enum RefBodies {
         var liveDiff: DiffModel?
         if let key, let snapshot = try? store.changesSnapshot(companyId: companyId, key: key, compare: .main, reader: .owner,
                                                                knownValues: ctx.knownValues, now: ctx.now) {
-            liveDiff = DiffModel.parse(patch: redacted(snapshot.patch, knownValues: ctx.knownValues))
+            liveDiff = DiffModel.parse(patch: redacted(snapshot.patch, knownValues: ctx.knownValues), gate: GlobalSearch.TextGate(knownValues: ctx.knownValues))
         }
         let turn = try store.lastTurn(agentId: agent.id)
         var stream: (turnId: String?, running: Bool, lines: [TurnStreamLine]) = (nil, false, [])

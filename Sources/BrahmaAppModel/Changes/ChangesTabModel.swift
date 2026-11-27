@@ -205,10 +205,13 @@ import BrahmaCore
         resubscribe()
         boardTask?.cancel()
         boardTask = Task { [weak self] in
-            // N-5: the model is held only around its reload, never across the sleep (a dropped model ends the loop).
+            // N-5 / R2-2: the model is held only inside the `do` scope, around its reload; the strong reference ends before the
+            // sleep, and the weak one is re-checked after it (a dropped model ends the loop).
             while !Task.isCancelled {
-                guard let model = self, model.isRunning else { return }
-                await model.refreshBoard()
+                do {
+                    guard let model = self, model.isRunning else { return }
+                    await model.refreshBoard()
+                }
                 try? await Task.sleep(for: Self.boardInterval)
             }
         }
@@ -252,7 +255,10 @@ import BrahmaCore
             let stream = await live.watch(companyId: companyId, key: key, compare: compare, reader: .owner, knownValues: known)
             for await snapshot in stream {
                 if Task.isCancelled { break }
-                let parsed = await Task.detached(priority: .userInitiated) { DiffModel.parse(patch: snapshot.patch) }.value
+                // R2-3: decoded paths are gated as their final display strings with the same known values.
+                let parsed = await Task.detached(priority: .userInitiated) {
+                    DiffModel.parse(patch: snapshot.patch, gate: GlobalSearch.TextGate(knownValues: known))
+                }.value
                 guard let self, !Task.isCancelled else { break }
                 self.apply(snapshot, parsed, gen: gen)
             }
@@ -331,10 +337,22 @@ import BrahmaCore
         placeMarkers()
     }
 
-    /// Ruling C6b-2: nil when `diff`'s sections are the engine's (`sectionPaths`: the same count, the same path at every index),
-    /// else `unverifiedText`.
+    /// Ruling C6b-2: nil when `diff`'s sections are the engine's (`sectionPaths`: the same count, the same path at every index) and
+    /// (R2-1) every hunk of every section has the engine's line counts (`sectionHunks`), else `unverifiedText`: a parse that reads
+    /// any line differently from the engine never has its markers or numbers drawn.
     public static func verify(_ diff: DiffModel, against snapshot: ChangesSnapshot) -> String? {
-        diff.files.map(\.path) == snapshot.sectionPaths ? nil : unverifiedText
+        guard diff.files.map(\.path) == snapshot.sectionPaths, spans(diff) == snapshot.sectionHunks else { return unverifiedText }
+        return nil
+    }
+
+    /// R2-1: the app parse's line counts per file and hunk, in the engine's `HunkSpan` terms.
+    public static func spans(_ diff: DiffModel) -> [[HunkSpan]] {
+        diff.files.map { file in
+            file.hunks.map { h in
+                HunkSpan(old: h.lines.filter { $0.oldNo != nil }.count, new: h.lines.filter { $0.newNo != nil }.count,
+                         shown: h.lines.filter { $0.oldNo != nil || $0.newNo != nil }.count)
+            }
+        }
     }
 
     // MARK: Chips

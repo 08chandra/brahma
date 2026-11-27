@@ -157,4 +157,27 @@ import Foundation
         // The summary is the engine's gated string, shown as is (never rebuilt here).
         #expect(rows[1].stats == "+0 −0")
     }
+
+    /// R2-3 (Ruling 55): a path is decoded FIRST and its final display string is gated: a stored value that only appears once git's
+    /// C-quoting is decoded (here spelled in octal escapes, which the engine's redaction of the escaped patch never sees) is
+    /// withheld from `displayPath`; the identity `path` stays decoded for `verify`, and display strips hidden characters.
+    @Test func decodedPathsAreGatedForDisplay() {
+        let value = "caf\u{E9}-" + String(UInt64.random(in: 1_000_000...9_999_999))
+        let escaped = value.utf8.map { $0 < 0x80 ? String(UnicodeScalar($0)) : "\\" + String($0, radix: 8) }.joined()
+        let patch = "diff --git \"a/src/\(escaped).ts\" \"b/src/\(escaped).ts\"\nindex 1..2 100644\n--- \"a/src/\(escaped).ts\"\n+++ \"b/src/\(escaped).ts\"\n@@ -1 +1 @@\n-a\n+b\n"
+        #expect(!patch.contains(value), "the escaped patch never spells the value")
+        let open = DiffModel.parse(patch: patch, gate: GlobalSearch.TextGate(knownValues: []))
+        #expect(open.files[0].path == "src/\(value).ts" && open.files[0].displayPath == "src/\(value).ts")
+        let gated = DiffModel.parse(patch: patch, gate: GlobalSearch.TextGate(knownValues: [(name: "CAFE", value: value)]))
+        #expect(gated.files[0].path == "src/\(value).ts", "identity is the decoded path")
+        #expect(gated.files[0].displayPath == DiffFile.withheldPath && !gated.files[0].displayPath.contains(value))
+        // A rename's old path is gated the same way.
+        let renamed = "diff --git \"a/\(escaped)\" b/plain.txt\nsimilarity index 100%\nrename from \"\(escaped)\"\nrename to plain.txt\n"
+        let r = DiffModel.parse(patch: renamed, gate: GlobalSearch.TextGate(knownValues: [(name: "CAFE", value: value)]))
+        #expect(r.files[0].oldPath == value && r.files[0].displayOldPath == DiffFile.withheldPath && r.files[0].displayPath == "plain.txt")
+        // Display drops hidden characters (flagged in `hasHidden`); identity keeps them.
+        let bidi = "diff --git \"a/x\\342\\200\\256y.ts\" \"b/x\\342\\200\\256y.ts\"\nindex 1..2 100644\n@@ -1 +1 @@\n-a\n+b\n"
+        let b = DiffModel.parse(patch: bidi, gate: GlobalSearch.TextGate(knownValues: []))
+        #expect(b.hasHidden && b.files[0].path == "x\u{202E}y.ts" && !b.files[0].displayPath.unicodeScalars.contains("\u{202E}"))
+    }
 }

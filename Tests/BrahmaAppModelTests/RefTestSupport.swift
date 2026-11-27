@@ -180,3 +180,11 @@ enum TinyPNG {
         return crc ^ 0xFFFF_FFFF
     }
 }
+
+extension DiffModel {
+    /// Tests that read structure only (numbers, kinds, identity paths) parse with no stored values; production callers always pass
+    /// the reader's gate (R2-3).
+    static func parse(patch: String, maxLines: Int = defaultMaxLines) -> DiffModel {
+        parse(patch: patch, gate: GlobalSearch.TextGate(knownValues: []), maxLines: maxLines)
+    }
+}

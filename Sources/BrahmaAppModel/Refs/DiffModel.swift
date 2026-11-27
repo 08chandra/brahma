@@ -23,12 +23,20 @@ public struct DiffHunk: Equatable, Sendable {
 }
 
 public struct DiffFile: Equatable, Sendable {
+    /// What `displayPath` shows when the decoded path holds a stored value.
+    public static let withheldPath = "[path withheld]"
+
     /// The path as the patch spells it, C-quoting decoded (N-4: it may hold bidi or control characters, flagged in `hasHidden`). It
     /// is the file's identity against the engine's sections (`ChangesSnapshot.sectionPaths`) and is NEVER rendered raw: a view
-    /// shows the engine's gated display path (`ChangedFile.path`, `ChangedFileRow.path`).
+    /// shows `displayPath` (or, in the CHANGES tab, the engine's `ChangedFile.path` / `ChangedFileRow.path`).
     public var path: String
     /// Set for a rename (decoded like `path`; never rendered raw).
     public var oldPath: String?
+    /// R2-3 (Ruling 55): `path` decoded FIRST, then gated as its final display string (`TextGate.final`: display form, at most
+    /// 512 characters) — `withheldPath` when it holds a stored value. The only path a view may draw for a parsed diff.
+    public var displayPath: String = DiffFile.withheldPath
+    /// `oldPath` the same way (nil when not a rename).
+    public var displayOldPath: String?
     public var added: Int
     public var removed: Int
     public var hunks: [DiffHunk]
@@ -43,6 +51,8 @@ public struct DiffFile: Equatable, Sendable {
 /// patch comes from C1a's `SafeGit` (`worktreeDiff`, `diff`, `show`).
 public struct DiffModel: Equatable, Sendable {
     public static let defaultMaxLines = 5_000
+    /// The display cap of a path (the engine's, for `ChangedFile.path`).
+    public static let maxDisplayPath = 512
 
     public var files: [DiffFile]
     public var added: Int
@@ -61,7 +71,8 @@ public struct DiffModel: Equatable, Sendable {
 
     /// Parses `patch` (`git diff` / `git show` output): `diff --git`, `rename from/to`, `---`/`+++`, `@@` hunks, `+`/`-`/` ` lines;
     /// `\ No newline at end of file` and anything else is skipped. At most `maxLines` hunk lines are kept (`truncated`).
-    public static func parse(patch: String, maxLines: Int = defaultMaxLines) -> DiffModel {
+    /// R2-3: `gate` (the reader's known values) gates each decoded path as its final display string (`DiffFile.displayPath`).
+    public static func parse(patch: String, gate: GlobalSearch.TextGate, maxLines: Int = defaultMaxLines) -> DiffModel {
         var model = DiffModel()
         var file: DiffFile?
         var hunk: DiffHunk?
@@ -74,7 +85,10 @@ public struct DiffModel: Equatable, Sendable {
         }
         func closeFile() {
             closeHunk()
-            if let f = file {
+            if var f = file {
+                // R2-3: decoded first (above), then the final display strings gated — nothing changes them after this.
+                f.displayPath = gate.final(f.path, max: Self.maxDisplayPath) ?? DiffFile.withheldPath
+                f.displayOldPath = f.oldPath.map { gate.final($0, max: Self.maxDisplayPath) ?? DiffFile.withheldPath }
                 model.files.append(f)
                 model.added += f.added
                 model.removed += f.removed
@@ -121,7 +135,7 @@ public struct DiffModel: Equatable, Sendable {
                     continue
                 }
             }
-            if line.hasPrefix("@@") {
+            if ChangesPatch.marker(line) == .hunkHeader {
                 closeHunk()
                 let (o, n) = Self.hunkStarts(line)
                 oldNo = o
@@ -130,27 +144,29 @@ public struct DiffModel: Equatable, Sendable {
                 noteHidden(line)
                 continue
             }
-            guard hunk != nil, let first = line.unicodeScalars.first else { continue }
+            // R2-1: the engine's one classification rule (`ChangesPatch.marker`: the first unicode scalar).
+            let marker = ChangesPatch.marker(line)
+            guard hunk != nil, marker != .other else { continue }
             if kept >= maxLines {
                 model.truncated = true
                 break
             }
             let text = String(line.unicodeScalars.dropFirst())
-            switch first {
-            case "+":
+            switch marker {
+            case .add:
                 hunk?.lines.append(DiffLine(kind: .add, text: text, oldNo: nil, newNo: newNo))
                 newNo += 1
                 file?.added += 1
-            case "-":
+            case .del:
                 hunk?.lines.append(DiffLine(kind: .del, text: text, oldNo: oldNo, newNo: nil))
                 oldNo += 1
                 file?.removed += 1
-            case " ":
+            case .context:
                 hunk?.lines.append(DiffLine(kind: .ctx, text: text, oldNo: oldNo, newNo: newNo))
                 oldNo += 1
                 newNo += 1
-            default:
-                // `\ No newline at end of file` and anything unknown.
+            case .hunkHeader, .note, .other:
+                // `\ No newline at end of file` (a header was read above; an unknown line never gets here).
                 continue
             }
             kept += 1

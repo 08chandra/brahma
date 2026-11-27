@@ -61,7 +61,7 @@ public enum AttachmentCards {
         case .diff, .commit:
             if let render = try? store.renderRef(companyId: ctx.companyId, ref: r.ref, knownValues: ctx.knownValues, paths: ctx.paths,
                                                   archives: ctx.archives, via: nil, now: ctx.now, owner: ctx.owner), let text = render.text {
-                let m = DiffModel.parse(patch: RefBodies.redacted(text, knownValues: ctx.knownValues))
+                let m = DiffModel.parse(patch: RefBodies.redacted(text, knownValues: ctx.knownValues), gate: GlobalSearch.TextGate(knownValues: ctx.knownValues))
                 preview = .diffStat(added: m.added, removed: m.removed, files: m.files.count)
             }
         case .item:

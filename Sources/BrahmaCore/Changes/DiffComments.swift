@@ -290,12 +290,25 @@ public enum DiffAnchoring {
         return hunks(of: sections[index])
     }
 
+    /// C6b R2-1: the line counts of every hunk of every section of `patch` (`ChangesSnapshot.sectionHunks`).
+    static func spans(in patch: String) -> [[HunkSpan]] {
+        ChangesPatch.parse(patch).map(spans(of:))
+    }
+
+    /// The line counts of each hunk of `section`, from the same numbering relocation and quoting use.
+    static func spans(of section: ChangesPatch.Section) -> [HunkSpan] {
+        hunks(of: section).map { h in
+            HunkSpan(old: h.numbered.filter { $0.old != nil }.count, new: h.numbered.filter { $0.new != nil }.count,
+                     shown: h.numbered.filter { $0.old != nil || $0.new != nil }.count)
+        }
+    }
+
     static func hunks(of section: ChangesPatch.Section) -> [Hunk] {
         var out: [Hunk] = []
         var current: Hunk?
         var old = 0, new = 0
         for line in section.hunks {
-            if line.hasPrefix("@@") {
+            if ChangesPatch.marker(line) == .hunkHeader {
                 if let h = current { out.append(h) }
                 let (o, n) = starts(line)
                 old = o; new = n
@@ -307,10 +320,14 @@ public enum DiffAnchoring {
             // The line as the app shows it (C6b-2): its marker dropped, one trailing CR read as the line ending — the hash both sides agree on.
             var text = String(line.unicodeScalars.dropFirst())
             if text.unicodeScalars.last == "\r" { text.unicodeScalars.removeLast() }
-            if line.hasPrefix("+") { h.numbered.append(Numbered(old: nil, new: new, text: text)); new += 1 }
-            else if line.hasPrefix("-") { h.numbered.append(Numbered(old: old, new: nil, text: text)); old += 1 }
-            else if line.hasPrefix("\\") { h.numbered.append(Numbered(old: nil, new: nil, text: text)) }
-            else { h.numbered.append(Numbered(old: old, new: new, text: text)); old += 1; new += 1 }
+            // R2-1: classified by the first unicode scalar (`ChangesPatch.marker`), exactly as the app's `DiffModel` reads it; a line
+            // no reader numbers (a note, an empty or unknown line) takes no number on either side.
+            switch ChangesPatch.marker(line) {
+            case .add: h.numbered.append(Numbered(old: nil, new: new, text: text)); new += 1
+            case .del: h.numbered.append(Numbered(old: old, new: nil, text: text)); old += 1
+            case .context: h.numbered.append(Numbered(old: old, new: new, text: text)); old += 1; new += 1
+            case .hunkHeader, .note, .other: h.numbered.append(Numbered(old: nil, new: nil, text: text))
+            }
             current = h
         }
         if let h = current { out.append(h) }

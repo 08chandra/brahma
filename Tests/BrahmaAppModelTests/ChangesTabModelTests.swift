@@ -662,6 +662,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         let snapshot = try #require(m.snapshot), diff = try #require(m.diff)
         #expect(snapshot.sectionPaths == ["A.txt", "Sources/App.swift", "src/a.ts", "src/caf\u{E9}.ts", "win.txt"], "\(snapshot.sectionPaths)")
         #expect(snapshot.sectionPaths == diff.files.map(\.path))
+        #expect(snapshot.sectionHunks == ChangesTabModel.spans(diff) && snapshot.sectionHunks.count == 5 && snapshot.sectionHunks.allSatisfy { !$0.isEmpty })
         #expect(snapshot.files.compactMap(\.patchIndex).sorted() == [0, 1, 2, 3, 4] && m.files.allSatisfy { $0.fileIndex != nil })
         // Every file's section is its own: the engine's gated path is the gate of the parser's decoded one.
         let gate = GlobalSearch.TextGate(knownValues: [])
@@ -681,6 +682,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         var withheld = snapshot
         withheld.patch = "[patch withheld]\n"
         withheld.sectionPaths = []
+        withheld.sectionHunks = []
         #expect(ChangesTabModel.verify(DiffModel.parse(patch: withheld.patch), against: withheld) == nil)
         // Hand-made patches with a combining-character path and a ZWSP path: each section lands on its own file, through the
         // engine's section identity, or the diff is refused.
@@ -692,7 +694,7 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
                                  files: [ChangedFile(path: "src/caf\u{E9}.ts", status: "A", added: 1, removed: 0, patchIndex: 0),
                                          ChangedFile(path: "src/zwsp.ts", status: "A", added: 1, removed: 0, patchIndex: 1)],
                                  added: 2, removed: 0, patch: patch, truncated: false, tainted: false, taintReason: nil, lastEdit: nil, patchHash: "h",
-                                 computedAt: cw.w.now, sectionPaths: [combining, zwsp])
+                                 computedAt: cw.w.now, sectionPaths: [combining, zwsp], sectionHunks: DiffAnchoring.spans(in: patch))
         #expect(ChangesTabModel.verify(parsed, against: ok) == nil)
         let rows = ChangesFiles.rows(ok, diff: parsed)
         #expect(rows.map(\.fileIndex) == [0, 1] && parsed.files[1].hunks[0].lines.first?.text == "two")
@@ -704,5 +706,77 @@ func eventuallyAsync(timeout: Duration = .seconds(60), _ cond: () async throws -
         #expect(DiffModel.parse(patch: glued).files.map(\.path) == ChangesPatch.parse(glued).map(\.path))
         #expect(DiffModel.parse(patch: glued).files[0].hunks[0].lines.map(\.text) == ["a", "b"])
         m.stop()
+    }
+
+    // MARK: Fix round 3 (R2-1, R2-2)
+
+    /// R2-1: every diff line is classified by its FIRST UNICODE SCALAR on both sides (`ChangesPatch.marker`): a line that starts
+    /// with a combining mark, a ZWJ or a variation selector is still an add/del, so the engine's numbers, its relocation, the
+    /// holder's quote row and the app's markers all name the same line; the snapshot's per-hunk spans make any remaining
+    /// divergence refuse to render.
+    @Test func scalarClassificationAgrees() throws {
+        #expect(ChangesPatch.marker("+\u{301}x") == .add && ChangesPatch.marker("-\u{200D}y") == .del && ChangesPatch.marker(" \u{FE0F}z") == .context)
+        #expect(ChangesPatch.marker("\\\u{301} No newline at end of file") == .note && ChangesPatch.marker("@@ -1 +1 @@") == .hunkHeader)
+        #expect(ChangesPatch.marker("") == .other && ChangesPatch.marker("x") == .other && ChangesPatch.marker("@x") == .other)
+        let header = "@@ -10,7 +10,8 @@"
+        let body = [" a", "+\u{301}x", "-\u{200D}y", "+\u{FE0F}z", " \u{20E3}k", "-\u{308}w", "+\u{E0100}v", " b", "-old target", "+new target", " tail"]
+        let patch = DiffPresentationTests.file("src/m.ts", body, header: header)
+        let engine = DiffAnchoring.hunks(in: patch, sectionIndex: 0)
+        let app = DiffModel.parse(patch: patch)
+        try #require(engine.count == 1 && app.files.count == 1 && app.files[0].hunks.count == 1)
+        let shown = engine[0].numbered.filter { $0.old != nil || $0.new != nil }
+        let lines = app.files[0].hunks[0].lines
+        #expect(shown.map { [$0.old, $0.new] } == lines.map { [$0.oldNo, $0.newNo] }, "\(shown.map { ($0.old, $0.new) })")
+        #expect(shown.map(\.text) == lines.map(\.text))
+        #expect(lines.first { $0.text == "new target" }?.newNo == 16 && lines.first { $0.text == "old target" }?.oldNo == 15)
+        // The holder's quote is centred on the engine's row for the anchored number: the commented line itself.
+        let at = try #require(engine[0].numbered.firstIndex { $0.new == 16 })
+        #expect(engine[0].lines[at] == "+new target")
+        let atOld = try #require(engine[0].numbered.firstIndex { $0.old == 15 })
+        #expect(engine[0].lines[atOld] == "-old target")
+        // Markers: the engine relocates the comment to the number the app shows the same text at.
+        func comment(_ side: String, _ line: Int, _ text: String) -> DiffComment {
+            DiffComment(id: UUID().uuidString, companyId: "c", itemId: "i", kind: DiffComment.comment, path: "src/m.ts", side: side, line: line,
+                        lineHash: StableHash.fnv1a64(text), hunkHeader: header, compare: "ENG-1:diff@worktree", baseSha: nil, text: "look",
+                        eventId: nil, createdAt: .now, resolvedAt: nil)
+        }
+        for (side, line, text) in [("new", 16, "new target"), ("old", 15, "old target"), ("new", 11, "\u{301}x"), ("old", 11, "\u{200D}y")] {
+            let relocated = DiffAnchoring.relocate(comment(side, line, text), in: patch, sectionIndex: 0)
+            #expect(relocated == line, "\(side) \(text)")
+            #expect(ChangesTabModel.anchor(in: app.files[0], path: "src/m.ts", side: side, line: try #require(relocated))?.lineText == text)
+        }
+        // The engine's per-hunk spans agree with the app's parse; a forced divergence (count or classification) is refused.
+        let spans = DiffAnchoring.spans(in: patch)
+        #expect(spans == [[HunkSpan(old: 7, new: 8, shown: 11)]] && ChangesTabModel.spans(app) == spans)
+        let snapshot = ChangesSnapshot(key: "ENG-1", compare: .main, base: "b", target: "worktree",
+                                       files: [ChangedFile(path: "src/m.ts", status: "M", added: 4, removed: 3, patchIndex: 0)],
+                                       added: 4, removed: 3, patch: patch, truncated: false, tainted: false, taintReason: nil, lastEdit: nil,
+                                       patchHash: "h", computedAt: .now, sectionPaths: ["src/m.ts"], sectionHunks: spans)
+        #expect(ChangesTabModel.verify(app, against: snapshot) == nil)
+        var diverged = app
+        diverged.files[0].hunks[0].lines[1] = DiffLine(kind: .ctx, text: "\u{301}x", oldNo: 11, newNo: 11)   // the old Character reading
+        #expect(ChangesTabModel.verify(diverged, against: snapshot) == ChangesTabModel.unverifiedText)
+        for forged in [[[HunkSpan(old: 7, new: 8, shown: 12)]], [[HunkSpan(old: 8, new: 9, shown: 11)]], [spans[0] + spans[0]], []] {
+            var s = snapshot
+            s.sectionHunks = forged
+            #expect(ChangesTabModel.verify(app, against: s) == ChangesTabModel.unverifiedText, "\(forged)")
+        }
+        // {add, del} and {ctx, unnumbered} have the same old/new counts; the shown count tells them apart.
+        #expect(HunkSpan(old: 1, new: 1, shown: 2) != HunkSpan(old: 1, new: 1, shown: 1))
+    }
+
+    /// R2-2: the board loop holds the model only around its reload, never across its sleep: a running model dropped without
+    /// `stop()` is freed long before the next `boardInterval`.
+    @Test func droppedModelIsFreedDuringBoardSleep() async throws {
+        let cw = try ChangesWorld()
+        weak var dropped: ChangesTabModel?
+        do {
+            let (m, _) = try cw.model()
+            dropped = m
+            m.start()
+            try await eventually { m.boardLoads >= 1 }
+        }
+        #expect(ChangesTabModel.boardInterval >= .seconds(10))
+        try await eventually(timeout: .seconds(4)) { dropped == nil }
     }
 }

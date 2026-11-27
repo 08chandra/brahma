@@ -114,6 +114,22 @@ public struct ChangesSnapshot: Equatable, Sendable {
     /// Ruling C6b-2: the path of every `diff --git` section of `patch`, in order (`ChangesPatch.parse` over the shown patch). A diff
     /// parser's result must agree with it, section for section, before anything is drawn; `ChangedFile.patchIndex` indexes it.
     public var sectionPaths: [String] = []
+    /// C6b R2-1: per section, per hunk, the engine's line counts (`DiffAnchoring.spans`: its own classification of the shown patch).
+    /// A parser that reads any line differently disagrees with it, and the app refuses to render (`ChangesTabModel.verify`).
+    public var sectionHunks: [[HunkSpan]] = []
+}
+
+/// C6b R2-1: one hunk's lines as the engine numbers them: `old` lines (context and removed), `new` lines (context and added) and
+/// `shown` lines (every numbered line). The three fix the count of added, removed and context lines, so two readings that
+/// classify any line differently never agree on all three.
+public struct HunkSpan: Equatable, Hashable, Sendable, CustomStringConvertible {
+    public var old: Int
+    public var new: Int
+    public var shown: Int
+
+    public init(old: Int, new: Int, shown: Int) { self.old = old; self.new = new; self.shown = shown }
+
+    public var description: String { "(-\(old) +\(new) =\(shown))" }
 }
 
 /// A revision of an item: `base` (the merge base with `main`), `r<n>` (the commit of its n-th check run, oldest first),
@@ -325,9 +341,10 @@ extension Store {
             // Hunk lines (not `@@` headers) count towards the per-file cap; the rest is summarized.
             var content = 0, dropped = 0
             for line in section.hunks {
-                if content >= ChangesLimits.maxFileHunkLines { if !line.hasPrefix("@@") { dropped += 1 }; continue }
+                let header = ChangesPatch.marker(line) == .hunkHeader
+                if content >= ChangesLimits.maxFileHunkLines { if !header { dropped += 1 }; continue }
                 out.append(line)
-                if !line.hasPrefix("@@") { content += 1 }
+                if !header { content += 1 }
             }
             if dropped > 0 { files[i].summary = "\(ChangesFormat.count(dropped)) more lines not shown" }
         }
@@ -355,11 +372,14 @@ extension Store {
         let listing = files.map { "\($0.status) \($0.path) \($0.oldPath ?? "") +\($0.added) -\($0.removed) \($0.summary ?? "")" }.joined(separator: "\n")
         let hash = SHA256.hex(Data((patch + "\u{0}" + listing + "\u{0}" + raw.base + "\u{0}" + raw.target).utf8))
         // C6b-2: the sections as the shown (redacted) patch has them; a withheld patch has none.
-        let sectionPaths = patch == Self.withheldPatch ? [] : ChangesPatch.parse(patch).map(\.path)
+        let sections = patch == Self.withheldPatch ? [] : ChangesPatch.parse(patch)
+        let sectionPaths = sections.map(\.path)
+        // R2-1: and their hunks' line counts, by the engine's one classification rule.
+        let sectionHunks = sections.map(DiffAnchoring.spans(of:))
         return ChangesSnapshot(key: raw.key, compare: raw.compare, base: raw.base, target: raw.target, files: files,
                                added: files.reduce(0) { $0 + $1.added }, removed: files.reduce(0) { $0 + $1.removed }, patch: patch,
                                truncated: raw.truncated, tainted: raw.tainted, taintReason: raw.taintReason, lastEdit: raw.lastEdit,
-                               patchHash: hash, computedAt: now, sectionPaths: sectionPaths)
+                               patchHash: hash, computedAt: now, sectionPaths: sectionPaths, sectionHunks: sectionHunks)
     }
 
     static let withheldPatch = "[patch withheld: it still looks like it holds a stored secret after redaction]\n"
@@ -369,6 +389,35 @@ extension Store {
 /// Plain parsing of a unified patch into per-file sections (no regex over agent text). The path helpers are public so the app's
 /// `DiffModel` reads paths exactly as the engine does (C6b I-1).
 public enum ChangesPatch {
+    /// C6b R2-1: what a patch line is to a hunk reader.
+    public enum LineMarker: Equatable, Sendable {
+        /// `@@ … @@`.
+        case hunkHeader
+        /// `+`, `-`, ` `.
+        case add, del, context
+        /// `\ No newline at end of file`.
+        case note
+        /// Anything else (an empty line, a line no hunk reader numbers).
+        case other
+    }
+
+    /// C6b R2-1: the ONE classification rule for every unified-diff line, the engine's and the app's `DiffModel`: the FIRST UNICODE
+    /// SCALAR (then the second, for `@@`). Never a `Character`: `"+\u{301}x".hasPrefix("+")` is false because the combining mark
+    /// joins the `+` into one grapheme, so a Character reading turns an agent-written added line into context and shifts every
+    /// later number of its hunk.
+    public static func marker(_ line: String) -> LineMarker {
+        var scalars = line.unicodeScalars.makeIterator()
+        guard let first = scalars.next() else { return .other }
+        switch first {
+        case "@": return scalars.next() == "@" ? .hunkHeader : .other
+        case "+": return .add
+        case "-": return .del
+        case " ": return .context
+        case "\\": return .note
+        default: return .other
+        }
+    }
+
     struct Section {
         var path: String
         /// `A`, `M`, `D` or `R`.
@@ -393,7 +442,7 @@ public enum ChangesPatch {
             }
             guard var s = current else { continue }
             if !inHunks {
-                if line.hasPrefix("@@") {
+                if marker(line) == .hunkHeader {
                     inHunks = true
                     s.hunks.append(line)
                 } else {
