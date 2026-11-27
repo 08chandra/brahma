@@ -57,6 +57,10 @@ public enum CompanySecurity {
         ordered("allowLocalBinding", \.allowLocalBinding, "local listening", rank: { $0 ? 1 : 0 }, show: { $0 ? "allowed" : "off" }),
         // Merging.
         ordered("autoMergeSmall", \.autoMergeSmall, "auto-merge", rank: { $0 ? 1 : 0 }, show: { $0 ? "on" : "off" }),
+        // Landing (Plan X8): `local` keeps every commit on this machine; `pr` pushes to GitHub, and engine-merge lets the engine
+        // merge there itself. A restore never re-enables either.
+        ordered("landing", \.landing, "landing", rank: { $0 == .local ? 0 : 1 }, show: \.rawValue),
+        ordered("engineMerge", \.engineMerge, "engine-merge", rank: { $0 ? 1 : 0 }, show: { $0 ? "on" : "off" }),
         // The owner's pause: nothing of a paused company runs.
         ordered("status", \.status, "status", rank: { $0 == .paused ? 0 : 1 }, show: \.rawValue),
     ] }

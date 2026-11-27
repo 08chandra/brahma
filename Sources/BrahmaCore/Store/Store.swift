@@ -317,6 +317,9 @@ public final class Store: Sendable {
                 // Set once at creation (Task 14).
                 kept.importedFrom = stored.importedFrom
                 kept.importedCommit = stored.importedCommit
+                // The landing mode changes only through `setLanding` (Plan X8).
+                kept.landing = stored.landing
+                kept.engineMerge = stored.engineMerge
             }
             try kept.update(db)
         }

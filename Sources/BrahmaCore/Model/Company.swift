@@ -82,6 +82,13 @@ public struct Company: Codable, Equatable, Sendable, FetchableRecord, Persistabl
     /// Why the merge queue is held (an engine-written reason); nil: running.
     public var mergeHold: String? = nil
 
+    // PR mode (Plan X8, `"vX5-pr"`). Changed only through `Store.setLanding` (the owner's `brahma company landing`);
+    // `updateCompany` keeps the stored values.
+    /// How approved items reach `main`: the local fast-forward, or a pushed branch and a pull request.
+    public var landing: LandingMode = .local
+    /// In PR mode, whether the engine merges a mergeable PR itself (needs a `merge-pr` grant); off: the owner merges on GitHub.
+    public var engineMerge: Bool = false
+
     /// The profile a turn of an agent with this role runs under: the role's override, else the company's.
     public func profile(forRole role: String) -> PermissionProfile { roleProfiles[role] ?? permissionProfile }
 }

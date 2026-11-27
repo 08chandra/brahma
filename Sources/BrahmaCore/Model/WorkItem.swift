@@ -188,6 +188,13 @@ public struct WorkItem: Codable, Equatable, Sendable, FetchableRecord, Persistab
     /// A session that had read outside content created, edited or worked on the item (Task 10 fix round 2, S18): its readers
     /// are tainted, its review frames it as untrusted and it is never auto-approved. Sticky until the item is done.
     public var taintedOrigin: Bool = false
+    /// Where an imported item came from (Plan X8, `"vX5-pr"`; see `ItemOrigin`): the issue's URL, unique per company, its
+    /// author's login, whether that author was trusted when the snapshot was taken (false for an item created inside Brahma:
+    /// "has an origin" is `originURL != nil`), and the issue number or identifier. Read them through `origin`.
+    public var originURL: String? = nil
+    public var originAuthor: String? = nil
+    public var originTrusted: Bool = false
+    public var originId: String? = nil
 
     /// The id of whoever confirmed the spec, without the role.
     public var specConfirmerId: String? { specConfirmedBy?.split(separator: ":").first.map(String.init) }

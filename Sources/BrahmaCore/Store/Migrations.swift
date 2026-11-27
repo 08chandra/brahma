@@ -644,6 +644,7 @@ enum Migrations {
         registerPlanL(&m)
         registerPlan4b(&m)
         registerPlanML(&m)
+        registerPlanX8(&m)
         return m
     }
 
