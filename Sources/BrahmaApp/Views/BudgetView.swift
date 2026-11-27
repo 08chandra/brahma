@@ -28,6 +28,15 @@ struct BudgetView: View {
                         }
                     }
                     .fixedSize(horizontal: false, vertical: true)
+                    // Plan C C7a: what the owner's show requests cost (design §2.4), one line.
+                    Panel(title: "Owner requests") {
+                        Text(verbatim: model.ownerRequestsBudgetLine)
+                            .font(BrahmaTheme.mono)
+                            .foregroundStyle(BrahmaTheme.text0)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
                     StoragePanel(storage: budget.storage, timeZone: model.ownerTimeZone)
                 }
                 .padding(BrahmaTheme.spaceS)

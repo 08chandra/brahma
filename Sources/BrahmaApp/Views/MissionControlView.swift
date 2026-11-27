@@ -6,7 +6,7 @@ import BrahmaAppModel
 struct MissionControlView: View {
     let model: AppModel
     @State private var topHeight: CGFloat = 300
-    @State private var previewWidth: CGFloat = 340
+    @State private var previewWidth: CGFloat = 460
 
     var body: some View {
         GeometryReader { geo in
@@ -14,7 +14,8 @@ struct MissionControlView: View {
             let maxPreview = max(200, geo.size.width - 300)
             VStack(spacing: 0) {
                 HStack(spacing: 0) {
-                    PreviewPane(model: model)
+                    // Plan C C7a: the Show bar and the OPENED strip sit above the tab strip.
+                    PreviewPane(model: model) { ShowBar(model: model) }
                         .frame(width: min(previewWidth, maxPreview))
                     SplitDivider(width: $previewWidth, range: 200...maxPreview, axis: .vertical)
                     AgentMapPlaceholder(model: model)

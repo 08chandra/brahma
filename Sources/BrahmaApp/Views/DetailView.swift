@@ -57,7 +57,7 @@ struct DetailView: View {
                 case .channel, .dm:
                     if let chat = model.chat {
                         VSplitView {
-                            ChatView(chat: chat, highlightedId: Bindable(model).highlightedMessageId, timeZone: model.ownerTimeZone)
+                            ChatView(chat: chat, model: model, highlightedId: Bindable(model).highlightedMessageId, timeZone: model.ownerTimeZone)
                                 .id(chat.target)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                                 .frame(minHeight: 200)

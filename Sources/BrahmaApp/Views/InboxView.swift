@@ -54,6 +54,9 @@ struct InboxView: View {
             HumanTaskCardView(model: model, card: task).id(task.askId)
         } else if let fallback = LiveCardFallback.for(row: row, deployCard: deploy, humanTaskCard: task) {
             LiveCardFallbackView(model: model, row: row, fallback: fallback).id(row.id)
+        } else if pending, row.kind == .request, let ask = model.work.inbox.first(where: { $0.id == row.id }), FileRequests.isFileRequest(ask) {
+            // Plan C C7a: an agent's file request (`details.request == "file"`): the engine's gated card with a drop zone.
+            FileRequestCardView(model: model, row: row).id(row.id)
         } else if pending, row.kind == .request {
             SecretRequestCard(model: model, row: row)
         } else {

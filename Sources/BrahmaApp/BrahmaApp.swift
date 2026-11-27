@@ -11,6 +11,18 @@ struct BrahmaApp: App {
         .defaultSize(width: 1280, height: 800)
         // The ops-console chrome draws its own 40 pt top bar under the traffic lights.
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            // Plan C C7a: the search-and-ask palette and the OPENED slot's history.
+            CommandMenu("Go") {
+                Button("Search or Ask…") { delegate.model?.openShow(presentation: .overlay) }
+                    .keyboardShortcut("k", modifiers: .command)
+                Divider()
+                Button("Back") { Task { await delegate.model?.goBack() } }
+                    .keyboardShortcut("[", modifiers: .command)
+                Button("Forward") { Task { await delegate.model?.goForward() } }
+                    .keyboardShortcut("]", modifiers: .command)
+            }
+        }
 
         // Opened by the map's pop-out button and by `--map-demo`. Only the first scene opens at launch.
         Window("Agent Map", id: AgentMapPanel.windowId) {

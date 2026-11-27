@@ -4,8 +4,8 @@ import BrahmaCore
 import BrahmaAppModel
 
 /// Mission Control's PREVIEW panel (L-1): one `MonoChip` tab per surface (plus LIVE), the selected tab's body with its
-/// header buttons, and an accessory strip above the tabs for other surfaces (L passes none; Collab puts its "Show me" bar
-/// there). `inspector(body:model:)` renders one body without the tab strip, for chat's inspector split.
+/// header buttons, and an accessory strip above the tabs for other surfaces (L passes none; Collab puts its Show bar and
+/// OPENED strip there, C7a). `inspector(body:model:)` renders one body without the tab strip, for chat's inspector split.
 struct PreviewPane<Accessory: View>: View {
     let model: AppModel
     @ViewBuilder var accessory: Accessory
@@ -63,6 +63,16 @@ struct PreviewPane<Accessory: View>: View {
                     .help(Text(verbatim: "\(tab.title) · \(tab.statusTitle)"))
                     .accessibilityLabel(Text(verbatim: "\(tab.title), \(tab.statusTitle)"))
                     .accessibilityAddTraits(isSelected ? .isSelected : [])
+                    // Plan C C7a: only the OPENED tab closes (history keeps it for Back).
+                    if tab.closable {
+                        Button { model.closeOpened() } label: {
+                            Image(systemName: "xmark").font(.system(size: 7, weight: .bold)).foregroundStyle(BrahmaTheme.text2)
+                                .frame(width: 14, height: BrahmaTheme.chipHeight).contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Close")
+                        .accessibilityLabel(Text("Close the opened ref"))
+                    }
                 }
             }
             .padding(.horizontal, BrahmaTheme.spaceS)
@@ -276,8 +286,12 @@ private struct PreviewBodyView: View {
         case .window(let pid):
             WindowCaptureView(pid: pid)
         case .changes:
-            // Plan C C6b: the model is in place (`model.changes`); C7a draws the board, the split view and the review gutter.
+            // Plan C C6b: the model is in place (`model.changes`); C7c draws the board, the split view and the review gutter.
             MonoEmptyState("CHANGES", detail: "Live changes of every leased worktree appear here.")
+        case .ref(let refBody):
+            // Plan C C7a: the OPENED tab (or, from `inspector(body:model:)`, chat's inspector) draws the ref's body.
+            RefBodyView(model: model, refBody: refBody, opened: tabId == PreviewTabID.ref ? model.previewNav.opened : model.chatInspector,
+                        inspector: tabId != PreviewTabID.ref)
         default:
             // `.web`, and the cases Collab adds to the open enum (L-1).
             if case .web(let url, let origin, let builtBy) = body_ {
@@ -291,6 +305,8 @@ private struct PreviewBodyView: View {
     /// The ARTIFACTS body carries its own header (the picker and Reveal in Finder); the pane's row would be empty over it.
     private var showsHeader: Bool {
         if case .artifact = body_ { return false }
+        // Plan C C7a: a ref body carries its own header (title, chips, actions).
+        if case .ref = body_ { return false }
         return true
     }
 

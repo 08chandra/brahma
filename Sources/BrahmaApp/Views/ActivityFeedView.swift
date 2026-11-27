@@ -7,6 +7,8 @@ struct ActivityFeedView: View {
     let model: AppModel
     var compact: Bool
     @State private var flashId: Int64?
+    /// Plan C C7a: the SHARING filter's READS toggle (each recorded read of a shared ref is a row).
+    @State private var showReads = false
 
     var body: some View {
         let events = model.filteredActivity
@@ -14,10 +16,15 @@ struct ActivityFeedView: View {
         Panel(title: "Activity", padded: false, accessory: {
             HStack(spacing: BrahmaTheme.spaceS) {
                 filterPicker
+                if model.activityFilter == .sharing {
+                    Segmented(options: [(false, "Shares"), (true, "+ Reads")], selection: showReads, label: "Reads") { showReads = $0 }
+                }
                 MonoChip(text: "\(events.count)", color: BrahmaTheme.text1, fill: BrahmaTheme.bg4)
             }
         }, content: {
-            if events.isEmpty {
+            if model.activityFilter == .sharing {
+                SharingTable(model: model, reads: showReads)
+            } else if events.isEmpty {
                 MonoEmptyState("No activity yet.")
             } else {
                 ScrollViewReader { proxy in
@@ -64,7 +71,7 @@ struct ActivityFeedView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .controlSize(.small)
-            .frame(width: 380)
+            .frame(width: 440)
         }
     }
 
@@ -142,5 +149,74 @@ struct ActivityRow: View {
         case .export: BrahmaTheme.text1
         case .show: BrahmaTheme.accent
         }
+    }
+}
+
+/// Plan C C7a: the SHARING filter as a table (collab design §4.7): WHEN, FROM, TO, REF, RESULT and SESSION, newest first, from
+/// `AppModel.sharingRows` (every string gated by `SharingRows.make`); with READS, each recorded read of a shared ref too. Without
+/// the stored values the model refuses and nothing is listed.
+struct SharingTable: View {
+    let model: AppModel
+    let reads: Bool
+    @State private var rows: [SharingRow] = []
+    @State private var error: String?
+
+    private static let columns: [(String, CGFloat?)] = [("When", 110), ("From", 110), ("To", 110), ("Ref", nil), ("Result", 110), ("Session", 70)]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: BrahmaTheme.spaceS) {
+                ForEach(Array(Self.columns.enumerated()), id: \.offset) { _, c in
+                    ColumnHeader(c.0).frame(width: c.1, alignment: .leading).frame(maxWidth: c.1 == nil ? .infinity : nil, alignment: .leading)
+                }
+            }
+            .padding(.horizontal, BrahmaTheme.spaceS)
+            .frame(height: BrahmaTheme.denseRowHeight)
+            .background(BrahmaTheme.bg3)
+            Hairline()
+            if let error {
+                MonoEmptyState("Refused", detail: error)
+            } else if rows.isEmpty {
+                MonoEmptyState("No sharing yet", detail: "Shares, access decisions, exports and show requests appear here.")
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(rows.enumerated()), id: \.element.id) { i, row in
+                            HStack(spacing: BrahmaTheme.spaceS) {
+                                cell(row.when, 110, color: BrahmaTheme.text2)
+                                cell(row.from, 110)
+                                cell(row.to, 110)
+                                cell(row.ref, nil)
+                                cell(row.result, 110, color: BrahmaTheme.text1)
+                                cell(row.session, 70, color: row.session == "tainted" ? BrahmaTheme.warning : BrahmaTheme.text2)
+                            }
+                            .tableRow(index: i, height: BrahmaTheme.denseRowHeight)
+                        }
+                    }
+                }
+            }
+        }
+        .task(id: "\(reads)|\(model.activity.last?.id ?? 0)|\(model.selectedCompanyId ?? "")") {
+            do {
+                let loaded = try await model.sharingRows(reads: reads)
+                guard !Task.isCancelled else { return }
+                rows = loaded
+                error = nil
+            } catch {
+                guard !Task.isCancelled else { return }
+                rows = []
+                self.error = (error as? WorkError)?.message ?? "The stored secrets can't be read, so nothing is listed."
+            }
+        }
+    }
+
+    private func cell(_ text: String, _ width: CGFloat?, color: Color = BrahmaTheme.text0) -> some View {
+        Text(verbatim: text)
+            .font(BrahmaTheme.monoSmall)
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .frame(width: width, alignment: .leading)
+            .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
     }
 }

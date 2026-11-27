@@ -54,6 +54,9 @@ private struct Shell: View {
         }
         .background(BrahmaTheme.bg0)
         .ignoresSafeArea(.container, edges: .top)
+        // Plan C C7a: the ⌘K palette over any view, and the sheets the ref actions open (Share to…, Quote, Purge).
+        .showPaletteHost(model: model)
+        .refActionHost(model: model)
         .navigationTitle(Text(verbatim: model.selectedCompany?.company.name ?? "Brahma"))
         .sheet(item: $model.presentedSheet) { sheet in
             Group {
