@@ -33,13 +33,13 @@ struct ChangesBoardView: View {
     let open: (String) -> Void
 
     private static let columns: (key: CGFloat, agent: CGFloat, files: CGFloat, counts: CGFloat, edited: CGFloat, check: CGFloat) =
-        (70, 96, 44, 84, 74, 112)
-    private static let minTitle: CGFloat = 120
+        (62, 80, 34, 64, 56, 74)
+    private static let minTitle: CGFloat = 90
 
     var body: some View {
         Panel(title: "Changes", padded: false, accessory: {
             if !changes.rows.isEmpty {
-                MonoChip(text: "\(changes.rows.count) LIVE", color: BrahmaTheme.running, fill: BrahmaTheme.bg4)
+                MonoChip(text: "\(changes.rows.count) \(changes.rows.count == 1 ? "WORKTREE" : "WORKTREES")", color: BrahmaTheme.text1, fill: BrahmaTheme.bg4)
             }
         }, content: {
             if changes.rows.isEmpty {
@@ -69,13 +69,15 @@ struct ChangesBoardView: View {
                         }
                     }
                 }
+                // A two-axis scroll view centers smaller content: pin the table to the top leading corner.
                 .frame(width: width, alignment: .topLeading)
+                .frame(minHeight: geo.size.height, alignment: .top)
             }
         }
     }
 
     private static var minWidth: CGFloat {
-        columns.key + columns.agent + columns.files + columns.counts + columns.edited + columns.check + minTitle + 2 * BrahmaTheme.spaceS
+        columns.key + columns.agent + columns.files + columns.counts + columns.edited + columns.check + minTitle + 2 * BrahmaTheme.spaceS + 8
     }
 
     private var headerRow: some View {
@@ -85,7 +87,7 @@ struct ChangesBoardView: View {
             ColumnHeader("Agent").frame(width: Self.columns.agent, alignment: .leading)
             ColumnHeader("Files").frame(width: Self.columns.files, alignment: .trailing)
             ColumnHeader("+/\u{2212}").frame(width: Self.columns.counts, alignment: .trailing)
-            ColumnHeader("Edited").frame(width: Self.columns.edited, alignment: .trailing).padding(.trailing, 2)
+            ColumnHeader("Edited").frame(width: Self.columns.edited, alignment: .trailing).padding(.trailing, 2).padding(.leading, 6)
             ColumnHeader("Check").frame(width: Self.columns.check, alignment: .trailing)
         }
         .padding(.horizontal, BrahmaTheme.spaceS)
@@ -133,22 +135,31 @@ struct ChangesBoardView: View {
                     .lineLimit(1)
                     .frame(width: Self.columns.edited, alignment: .trailing)
                     .padding(.trailing, 2)
+                    .padding(.leading, 6)
                 HStack(spacing: 0) {
                     Spacer(minLength: 0)
-                    StatusChip(label: row.check, color: RefStyle.tone(row.checkTone), pulse: row.checkTone == .busy).fixedSize()
+                    StatusChip(label: Self.check(row.check), color: RefStyle.tone(row.checkTone), pulse: row.checkTone == .busy).fixedSize()
                 }
                 .frame(width: Self.columns.check)
             }
         }
         .buttonStyle(.plain)
         .tableRow(index: i, selected: changes.selectedKey == row.key)
-        .help(Text(verbatim: row.reviewer.map { "\(row.key) · reviewer \($0)" } ?? row.key))
+        .help(Text(verbatim: [row.key, row.edited, row.reviewer.map { "reviewer " + $0 }].compactMap { $0 }.joined(separator: " · ")))
         .accessibilityLabel(Text(verbatim: "\(row.key), \(row.title), \(row.agent), \(row.stats), \(row.edited), \(row.check)"))
     }
 
-    /// `12 s ago` (the model's `edited` without its verb; the column says EDITED), `no edits yet`.
+    /// `12 s ago` (the model's `edited` without its verb; the column says EDITED), `—` for no edits yet (the row's help and
+    /// accessibility label keep the model's words).
     static func edited(_ date: Date?, now: Date) -> String {
+        guard date != nil else { return "—" }
         let text = BoardRows.edited(date, now: now)
         return text.hasPrefix("edited ") ? String(text.dropFirst("edited ".count)) : text
+    }
+
+    /// The model's check chip without the word the column already says: `PASSED`, `FAILED`, `RUNNING`, `NONE`.
+    static func check(_ text: String) -> String {
+        if text == "NO CHECK" { return "NONE" }
+        return text.hasPrefix("CHECK ") ? String(text.dropFirst("CHECK ".count)) : text
     }
 }

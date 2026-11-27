@@ -21,7 +21,7 @@ struct ChangesDiffView: View {
     var onBoard: (() -> Void)?
 
     @State private var jump: String?
-    @State private var listWidth: CGFloat = 170
+    @State private var listWidth: CGFloat = 140
 
     var body: some View {
         VStack(spacing: 0) {
@@ -56,49 +56,65 @@ struct ChangesDiffView: View {
 
     // MARK: Header
 
+    /// At most three rows, so the diff keeps the pane: the title row (not in the OPENED tab, whose ref header has it), one toolbar
+    /// row that scrolls sideways when the pane is narrow, and the chips (wrapping) when there are any.
     private var header: some View {
         VStack(alignment: .leading, spacing: BrahmaTheme.spaceXS) {
-            HStack(spacing: BrahmaTheme.spaceS) {
-                if let onBoard {
-                    Button(action: onBoard) { Label("Board", systemImage: "chevron.left") }
-                        .buttonStyle(.brahma)
-                        .fixedSize()
-                        .help("Back to the changes board")
-                }
-                if !embedded, let key = model.selectedKey {
-                    Text(verbatim: key).font(BrahmaTheme.mono.weight(.semibold)).foregroundStyle(BrahmaTheme.text0).fixedSize()
-                    if let title = row?.title {
-                        Text(verbatim: "· " + title).font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text1).lineLimit(1).truncationMode(.tail)
+            if !embedded {
+                HStack(spacing: BrahmaTheme.spaceS) {
+                    if let onBoard {
+                        Button(action: onBoard) { Label("Board", systemImage: "chevron.left") }
+                            .buttonStyle(.brahma)
+                            .fixedSize()
+                            .help("Back to the changes board")
                     }
-                }
-                if showsLive && !embedded {
-                    StatusChip(label: "LIVE · UNCOMMITTED", color: BrahmaTheme.running, pulse: true).fixedSize()
-                }
-                Spacer(minLength: 0)
-                if let computed = model.snapshot?.computedAt {
-                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                        Text(verbatim: "updated \(max(0, Int(ctx.date.timeIntervalSince(computed)))) s ago")
-                            .font(BrahmaTheme.monoTiny).foregroundStyle(BrahmaTheme.text2).fixedSize()
+                    if let key = model.selectedKey {
+                        Text(verbatim: key).font(BrahmaTheme.mono.weight(.semibold)).foregroundStyle(BrahmaTheme.text0).fixedSize()
+                        if let title = row?.title {
+                            Text(verbatim: "· " + title).font(BrahmaTheme.body).foregroundStyle(BrahmaTheme.text1).lineLimit(1).truncationMode(.tail)
+                        }
                     }
+                    if showsLive {
+                        StatusChip(label: "LIVE · UNCOMMITTED", color: BrahmaTheme.running, pulse: true).fixedSize()
+                    }
+                    Spacer(minLength: 0)
+                    updated
                 }
             }
-            ComparePicker(compare: model.compare, revisions: model.revisions, choose: choose)
-            FlowLayout(spacing: BrahmaTheme.spaceXS) {
-                Segmented(options: [(DiffViewMode.unified, "Unified"), (.split, "Split")], selection: model.mode, label: "Diff layout (⌘⇧D)") {
-                    model.mode = $0
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: BrahmaTheme.spaceS) {
+                    ComparePicker(compare: model.compare, revisions: model.revisions, choose: choose)
+                    Segmented(options: [(DiffViewMode.unified, "Unified"), (.split, "Split")], selection: model.mode, label: "Diff layout (⌘⇧D)") {
+                        model.mode = $0
+                    }
+                    stepper
+                    if let snapshot = model.snapshot {
+                        Text(verbatim: BoardRows.stats(added: snapshot.added, removed: snapshot.removed, files: snapshot.files.count))
+                            .font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1).fixedSize()
+                    }
+                    if embedded { updated }
                 }
-                stepper
-                if let snapshot = model.snapshot {
-                    Text(verbatim: BoardRows.stats(added: snapshot.added, removed: snapshot.removed, files: snapshot.files.count))
-                        .font(BrahmaTheme.monoSmall).foregroundStyle(BrahmaTheme.text1).frame(height: 20)
+                .frame(height: 24)
+            }
+            if !chips.isEmpty {
+                FlowLayout(spacing: BrahmaTheme.spaceXS) {
+                    ForEach(Array(chips.enumerated()), id: \.offset) { _, chip in RefChipView(chip: chip) }
                 }
-                ForEach(Array(chips.enumerated()), id: \.offset) { _, chip in RefChipView(chip: chip).frame(height: 20) }
             }
         }
         .padding(.horizontal, BrahmaTheme.spaceS)
         .padding(.vertical, BrahmaTheme.spaceXS)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(BrahmaTheme.bg2)
+    }
+
+    @ViewBuilder private var updated: some View {
+        if let computed = model.snapshot?.computedAt {
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                Text(verbatim: "updated \(max(0, Int(ctx.date.timeIntervalSince(computed)))) s ago")
+                    .font(BrahmaTheme.monoTiny).foregroundStyle(BrahmaTheme.text2).fixedSize()
+            }
+        }
     }
 
     private var stepper: some View {
@@ -332,10 +348,12 @@ struct DiffPane: View {
         let stopId = stop.map { PaneRow.lineId($0.file, $0.hunk, $0.line) }
         GeometryReader { geo in
             ScrollViewReader { proxy in
-                ScrollView([.vertical, .horizontal]) {
+                // Unified scrolls sideways for long lines; split keeps each side half the pane and wraps its lines, so both sides
+                // stay in view and nothing is clipped.
+                ScrollView(mode == .split ? [.vertical] : [.vertical, .horizontal]) {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(rows) { row in
-                            rowView(row, spans: spans, stopId: stopId, half: halfWidth(geo.size.width)).id(row.id)
+                            rowView(row, spans: spans, stopId: stopId, half: max((geo.size.width - 1) / 2, 0)).id(row.id)
                         }
                     }
                     // A two-axis scroll view centers narrower content: pin the rows to the leading edge, at least the pane wide.
@@ -385,11 +403,13 @@ struct DiffPane: View {
             foldRow(item)
         case .split(let f, let h, let left, let right):
             let lines = diff.files[f].hunks[h].lines
-            HStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 0) {
                 splitHalf(f, h, left, lines, side: "old", spans: spans, width: half)
                 Hairline(axis: .vertical)
                 splitHalf(f, h, right, lines, side: "new", spans: spans, width: half)
             }
+            // Both sides take the taller side's height (a wrapped line), so the tints line up.
+            .fixedSize(horizontal: false, vertical: true)
             .overlay(alignment: .leading) {
                 if row.id == stopId { Rectangle().fill(BrahmaTheme.accent).frame(width: 2) }
             }
@@ -403,10 +423,15 @@ struct DiffPane: View {
             DiffLineView(line: line, spans: Self.lineSpans(spans, f, h, index, line),
                          comments: (markers[f]?[side]?[side == "old" ? line.oldNo ?? -1 : line.newNo ?? -1]) ?? [],
                          review: review.map { ctx in ReviewTarget(context: ctx, file: f, hunk: h, index: index, side: side) },
-                         numbers: side == "old" ? .old : .new, isStop: false)
+                         numbers: side == "old" ? .old : .new, wraps: true, isStop: false)
                 .frame(width: width, alignment: .leading)
+                .frame(maxHeight: .infinity, alignment: .top)
         } else {
-            BrahmaTheme.bg1.frame(width: width).frame(maxHeight: .infinity)
+            // An empty side: one blank line's height on `bg1` (never a greedy height inside the lazy stack).
+            Text(verbatim: " ").font(BrahmaTheme.mono).padding(.vertical, 1)
+                .frame(width: width, alignment: .leading)
+                .frame(maxHeight: .infinity)
+                .background(BrahmaTheme.bg1)
         }
     }
 
@@ -475,15 +500,6 @@ struct DiffPane: View {
             .help("Show the unchanged lines")
             .accessibilityLabel(Text(verbatim: "Expand " + DiffRowItem.foldText(count)))
         )
-    }
-
-    // MARK: Layout
-
-    /// Each split half is at least half the pane and wide enough for the longest line (nothing is clipped; the pane scrolls).
-    private func halfWidth(_ pane: CGFloat) -> CGFloat {
-        guard mode == .split else { return 0 }
-        let longest = diff.files.lazy.flatMap(\.hunks).flatMap(\.lines).map { $0.text.count }.max() ?? 0
-        return max((pane - 1) / 2, CGFloat(min(longest, 4096)) * 7.3 + 16 + 48 + 16 + BrahmaTheme.spaceL)
     }
 
     // MARK: Row building (the model's rows, in drawing order)
@@ -667,6 +683,8 @@ struct DiffLineView: View {
     var comments: [DiffComment] = []
     var review: ReviewTarget?
     var numbers: Numbers = .both
+    /// Split halves wrap a long line (each side is half the pane); unified keeps one line and scrolls sideways.
+    var wraps = false
     var isStop = false
     @State private var hovered = false
     @State private var reviewing = false
@@ -680,20 +698,32 @@ struct DiffLineView: View {
                 .font(BrahmaTheme.mono)
                 .foregroundStyle(signColor)
                 .frame(width: 16)
-            RefStyle.text(spans)
-                .font(BrahmaTheme.mono)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .textSelection(.enabled)
-            Spacer(minLength: BrahmaTheme.spaceL)
+            code
+            Spacer(minLength: wraps ? 0 : BrahmaTheme.spaceL)
         }
         .padding(.vertical, 1)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: wraps ? .infinity : nil, alignment: .topLeading)
         .background(tint)
         .overlay(alignment: .leading) {
             if isStop { Rectangle().fill(BrahmaTheme.accent).frame(width: 2) }
         }
         .onHover { hovered = $0 }
+    }
+
+    @ViewBuilder private var code: some View {
+        if wraps {
+            RefStyle.text(spans)
+                .font(BrahmaTheme.mono)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            RefStyle.text(spans)
+                .font(BrahmaTheme.mono)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .textSelection(.enabled)
+        }
     }
 
     private func number(_ n: Int?) -> some View {

@@ -23,7 +23,7 @@ struct ComparePicker: View {
     }
 
     var body: some View {
-        FlowLayout(spacing: BrahmaTheme.spaceXS) {
+        HStack(spacing: BrahmaTheme.spaceXS) {
             Segmented(options: [(Choice.main, "VS MAIN"), (.head, "VS LAST COMMIT"), (.check, "VS LAST CHECK"), (.revisions, "REVISIONS…")],
                       selection: current, label: "Compare", select: pick)
             if case .revisions(let from, let to) = compare {
