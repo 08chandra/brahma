@@ -318,13 +318,12 @@ extension Store {
         }
     }
 
-    /// Sets (or replaces) the owner's price for one model. Refused: an empty provider, model or author, a negative or
-    /// non-finite price.
+    /// Sets (or replaces) the owner's price for one model. Refused: an empty provider, model or author, and any price
+    /// `PriceBook.refusal(for:)` refuses (negative, non-finite or zero: the price book's one rule, Plan X1 Task 6).
     public func setPriceRow(_ p: PriceRow) throws {
         try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
         guard !p.provider.isEmpty, !p.model.isEmpty, !p.setBy.isEmpty else { throw WorkError.invalid("a price names its provider, model and author") }
-        let prices = [p.inPerMTok, p.outPerMTok] + [p.cacheReadPerMTok, p.cacheWritePerMTok].compactMap { $0 }
-        guard prices.allSatisfy({ $0.isFinite && $0 >= 0 }) else { throw WorkError.invalid("prices are zero or more dollars per million tokens") }
+        if let why = PriceBook.refusal(for: p) { throw WorkError.invalid(why) }
         try writer.write { db in
             try db.execute(sql: """
                 INSERT OR REPLACE INTO priceRow (provider, model, inPerMTok, outPerMTok, cacheReadPerMTok, cacheWritePerMTok, setBy)

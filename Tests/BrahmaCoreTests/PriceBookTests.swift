@@ -52,7 +52,8 @@ import Testing
 
     @Test func ownerRowOverridesPinned() {
         let book = PriceBook(owner: [owner("anthropic", "claude-opus-5-5", 7, 30), owner("openai", "gpt-x", 1, 2, cacheRead: 0.5)])
-        #expect(book.price(provider: "anthropic", model: "claude-opus-5-5") == Price(inPerMTok: 7, outPerMTok: 30, cacheReadPerMTok: nil, cacheWritePerMTok: nil))
+        // Ruling 38: an owner row without cache rates keeps the pinned row's cache rates.
+        #expect(book.price(provider: "anthropic", model: "claude-opus-5-5") == Price(inPerMTok: 7, outPerMTok: 30, cacheReadPerMTok: 0.20, cacheWritePerMTok: 8))
         #expect(book.price(provider: "openai", model: "gpt-x") == Price(inPerMTok: 1, outPerMTok: 2, cacheReadPerMTok: 0.5, cacheWritePerMTok: nil))
         // The other pinned rows stand.
         #expect(book.price(provider: "anthropic", model: "claude-sonnet-5-5") == PriceBook.pinned["anthropic/claude-sonnet-5-5"])
@@ -60,6 +61,36 @@ import Testing
         let routed = PriceBook(owner: [owner("openrouter", "acme/model-1", 3, 4)])
         #expect(routed.price(provider: "openrouter", model: "acme/model-1")?.inPerMTok == 3)
         #expect(routed.price(provider: "openrouter", model: "model-1") == nil)
+    }
+
+    /// Ruling 38: overriding a pinned row's input and output prices never silently lowers its cache rates; a rate the owner
+    /// sets wins, and a key with no pinned row defaults its cache rates to the input price.
+    @Test func ownerRowInheritsPinnedCacheRates() throws {
+        let book = PriceBook(owner: [owner("anthropic", "claude-sonnet-5-5", 3, 12, cacheRead: 0.5),
+                                     owner("anthropic", "claude-haiku-5-5", 0.6, 3, cacheWrite: 0.7),
+                                     owner("openai", "gpt-x", 1, 2)])
+        let sonnet = try #require(book.price(provider: "anthropic", model: "claude-sonnet-5-5"))
+        #expect(sonnet == Price(inPerMTok: 3, outPerMTok: 12, cacheReadPerMTok: 0.5, cacheWritePerMTok: 4))
+        let haiku = try #require(book.price(provider: "anthropic", model: "claude-haiku-5-5"))
+        #expect(haiku == Price(inPerMTok: 0.6, outPerMTok: 3, cacheReadPerMTok: 0.05, cacheWritePerMTok: 0.7))
+        let unpinned = try #require(book.price(provider: "openai", model: "gpt-x"))
+        #expect(unpinned.cacheReadPerMTok == nil && unpinned.cacheWritePerMTok == nil)
+        #expect(unpinned.cacheReadRate == 1 && unpinned.cacheWriteRate == 1)
+        #expect(PriceBook.price(for: owner("anthropic", "claude-opus-5-5", 7, 30)) == Price(inPerMTok: 7, outPerMTok: 30, cacheReadPerMTok: 0.20, cacheWritePerMTok: 8))
+    }
+
+    /// Important 1: an owner row the owner could not set (zero, negative, infinite, NaN: tampered into the database) is never
+    /// honoured, and its key is left unpriced, never priced by the pinned row it replaced; the other owner rows stand.
+    @Test func invalidOwnerRowsAreUnpriced() {
+        let bad: [PriceRow] = [
+            owner("anthropic", "claude-opus-5-5", 0, 20), owner("anthropic", "claude-sonnet-5-5", -2, 10),
+            owner("anthropic", "claude-haiku-5-5", 0.5, .infinity), owner("openai", "zero", 1, 2, cacheRead: 0),
+            owner("openai", "nan", .nan, 2), owner("openai", "negative-write", 1, 2, cacheWrite: -1),
+        ]
+        let book = PriceBook(owner: bad + [owner("groq", "fine", 1, 2)])
+        for row in bad { #expect(book.price(provider: row.provider, model: row.model) == nil, "\(row)") }
+        #expect(book.price(provider: "groq", model: "fine")?.inPerMTok == 1)
+        #expect(PriceBook.price(for: owner("openai", "zero", 0, 2)) == nil)
     }
 
     @Test func noPrefixMatching() {

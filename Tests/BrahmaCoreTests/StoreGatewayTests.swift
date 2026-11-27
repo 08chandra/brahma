@@ -356,6 +356,21 @@ import GRDB
         #expect(throws: WorkError.self) { try store.setPriceRow(bad) }
     }
 
+    /// Plan X1 Task 6 (Important 1): the store refuses what `PriceBook.refusal` refuses, zero included, with its reason.
+    @Test func setPriceRowRefusesZero() throws {
+        let (store, _, _) = try store()
+        for row in [PriceRow(provider: "groq", model: "m", inPerMTok: 0, outPerMTok: 1, setBy: "owner"),
+                    PriceRow(provider: "groq", model: "m", inPerMTok: 1, outPerMTok: 0, setBy: "owner"),
+                    PriceRow(provider: "groq", model: "m", inPerMTok: 1, outPerMTok: 1, cacheReadPerMTok: 0, setBy: "owner"),
+                    PriceRow(provider: "groq", model: "m", inPerMTok: 1, outPerMTok: 1, cacheWritePerMTok: 0, setBy: "owner")] {
+            #expect(throws: WorkError.invalid("zero prices are only for local providers")) { try store.setPriceRow(row) }
+        }
+        #expect(throws: WorkError.invalid("prices must be finite and zero or more dollars per million tokens")) {
+            try store.setPriceRow(PriceRow(provider: "groq", model: "m", inPerMTok: .infinity, outPerMTok: 1, setBy: "owner"))
+        }
+        #expect(try store.priceRows().isEmpty)
+    }
+
     // MARK: Company scoping
 
     /// A deleted company takes its caps, charges, routes and probe requests with it.

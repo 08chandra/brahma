@@ -10,8 +10,9 @@ extension SettingsGroup {
             abstract: "List the model prices the gateway meters with, or set the price of one provider's model.",
             discussion: """
                 Prices are USD per million tokens. Pinned prices cover the Anthropic models Brahma runs; the gateway refuses \
-                any other model until it is priced here. A price you set replaces a pinned one. Every price must be above \
-                zero, and an unset cache rate is the input rate.
+                any other model until it is priced here. A price you set replaces a pinned one; a cache rate you leave \
+                unset keeps the pinned rate, or is the input rate for a model with no pinned price. Every price must \
+                be above zero.
 
                 EXAMPLES:
                   brahma settings model-price
@@ -29,9 +30,9 @@ extension SettingsGroup {
         var cacheWrite: Double?
 
         func run() throws {
+            try refuseInsideAgentTurn()  // first, in both forms: inside a turn nothing else is checked (Ruling 21)
             guard let model else {
                 guard cacheRead == nil, cacheWrite == nil else { throw fail("--cache-read and --cache-write need a model and its prices") }
-                try refuseInsideAgentTurn()
                 let (store, _) = try openStore()
                 list(owner: try store.priceRows())
                 return
@@ -50,23 +51,28 @@ extension SettingsGroup {
             let (store, _) = try openStore()
             guard try store.provider(id: row.provider) != nil else { throw fail("no such provider: \(row.provider)") }
             do { try store.setPriceRow(row) } catch { throw fail("\(error)") }
-            print(Self.line(PriceBook.key(provider: row.provider, model: row.model), Price(row), "owner"))
+            print(Self.line(PriceBook.key(provider: row.provider, model: row.model), PriceBook.price(for: row), "owner"))
         }
 
         /// Every owner row and every pinned row, by key; a pinned row an owner row replaces says so.
         private func list(owner rows: [PriceRow]) {
             let ownerKeys = Set(rows.map { PriceBook.key(provider: $0.provider, model: $0.model) })
-            var entries = rows.map { (key: PriceBook.key(provider: $0.provider, model: $0.model), rank: 0, price: Price($0), source: "owner") }
+            var entries = rows.map { row in
+                (key: PriceBook.key(provider: row.provider, model: row.model), rank: 0, price: PriceBook.price(for: row),
+                 source: PriceBook.refusal(for: row).map { "unpriced (owner row refused: \($0))" } ?? "owner")
+            }
             for (key, price) in PriceBook.pinned {
                 let source = "pinned \(PriceBook.pinnedOn)" + (ownerKeys.contains(key) ? ", overridden by owner" : "")
-                entries.append((key: key, rank: 1, price: price, source: source))
+                entries.append((key: key, rank: 1, price: Optional(price), source: source))
             }
-            print("USD per million tokens; pinned prices as of \(PriceBook.pinnedOn); an unset cache rate is the input rate")
+            print("USD per million tokens; pinned prices as of \(PriceBook.pinnedOn); an unset cache rate is the pinned rate, else the input rate")
             for e in entries.sorted(by: { ($0.key, $0.rank) < ($1.key, $1.rank) }) { print(Self.line(e.key, e.price, e.source)) }
         }
 
-        static func line(_ key: String, _ p: Price, _ source: String) -> String {
+        /// One price line; a key with no price (an owner row the price rule refuses) says why instead.
+        static func line(_ key: String, _ price: Price?, _ source: String) -> String {
             func usd(_ v: Double) -> String { "$" + String(format: "%g", v) }
+            guard let p = price else { return "\(safe(key))  \(safe(source))" }
             return "\(safe(key))  in \(usd(p.inPerMTok))  out \(usd(p.outPerMTok))  cache read \(usd(p.cacheReadRate))  "
                 + "cache write \(usd(p.cacheWriteRate))  \(source)"
         }

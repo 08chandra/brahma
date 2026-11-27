@@ -134,10 +134,7 @@ func requireOwnerShell(quietly: Bool = false) throws -> OwnerPrincipal {
     func refuse(_ why: String) -> ExitCode { quietly ? ExitCode.failure : fail(why) }
     let paths = BrahmaPaths.fromEnvironment()
     let running = Store.recordedTurnLeaders(paths: paths)
-    if let why = OwnerShellGuard.refusal(environment: ProcessInfo.processInfo.environment,
-                                         ancestors: ProcessAncestry.chain(of: getpid()), runningTurnPids: running) {
-        throw refuse(why)
-    }
+    if let why = agentTurnRefusal(runningTurnPids: running) { throw refuse(why) }
     guard OwnerKey.verify(paths: paths, store: try ownerKeyStore(for: paths)) else {
         throw refuse("owner key missing or invalid; run 'brahma owner init' in Terminal or open the app")
     }
@@ -150,12 +147,16 @@ func requireOwnerShell(quietly: Bool = false) throws -> OwnerPrincipal {
     do { return try OwnerPrincipal.mint(runningTurnPids: running) } catch { throw refuse("\(error)") }
 }
 
+/// Why this process is inside an agent turn (its environment, or an ancestor that is one of `running`), or nil.
+func agentTurnRefusal(runningTurnPids running: Set<Int32>) -> String? {
+    OwnerShellGuard.refusal(environment: ProcessInfo.processInfo.environment, ancestors: ProcessAncestry.chain(of: getpid()),
+                            runningTurnPids: running)
+}
+
 /// Plan X1 Ruling 21: a read-only owner command refuses inside an agent turn (its environment or its ancestry), with no owner
 /// key needed; a state-changing one calls `requireOwnerShell()` instead.
 func refuseInsideAgentTurn() throws {
-    let running = Store.recordedTurnLeaders(paths: BrahmaPaths.fromEnvironment())
-    if let why = OwnerShellGuard.refusal(environment: ProcessInfo.processInfo.environment,
-                                         ancestors: ProcessAncestry.chain(of: getpid()), runningTurnPids: running) {
+    if let why = agentTurnRefusal(runningTurnPids: Store.recordedTurnLeaders(paths: BrahmaPaths.fromEnvironment())) {
         throw fail(why)
     }
 }

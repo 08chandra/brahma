@@ -54,11 +54,23 @@ public struct PriceBook: Sendable {
 
     private let table: [String: Price]
 
-    /// The pinned rows with every owner row laid over them.
+    /// The pinned rows with every owner row laid over them. An owner row `refusal(for:)` refuses (one tampered into the
+    /// database) leaves its key unpriced, never priced by the pinned row it replaced: the gateway refuses the model with a reason.
     public init(owner: [PriceRow]) {
         var table = Self.pinned
-        for row in owner { table[Self.key(provider: row.provider, model: row.model)] = Price(row) }
+        for row in owner { table[Self.key(provider: row.provider, model: row.model)] = Self.price(for: row) }
         self.table = table
+    }
+
+    /// The price an owner row meters at, or nil when the row is refused (`refusal(for:)`). A cache rate the row leaves unset is
+    /// the pinned row's for that key (Ruling 38: overriding the input and output prices never lowers a pinned cache rate), or
+    /// the input rate when no row is pinned.
+    public static func price(for row: PriceRow) -> Price? {
+        guard refusal(for: row) == nil else { return nil }
+        let pinned = Self.pinned[key(provider: row.provider, model: row.model)]
+        return Price(inPerMTok: row.inPerMTok, outPerMTok: row.outPerMTok,
+                     cacheReadPerMTok: row.cacheReadPerMTok ?? pinned?.cacheReadPerMTok,
+                     cacheWritePerMTok: row.cacheWritePerMTok ?? pinned?.cacheWritePerMTok)
     }
 
     public static func key(provider: String, model: String) -> String { "\(provider)/\(model)" }
@@ -69,7 +81,7 @@ public struct PriceBook: Sendable {
         return table[Self.key(provider: provider, model: model)]
     }
 
-    /// Why the owner may not set `row`, or nil. Every rate is finite and not negative; zero is only for a provider whose adapter
+    /// Why the owner may not set `row`, or nil: the one price rule, enforced by `Store.setPriceRow` and by `init(owner:)`. Every rate is finite and not negative; zero is only for a provider whose adapter
     /// is `local`, which X1 does not have (X1b), so a zero rate is refused for every provider (Ruling 36).
     public static func refusal(for row: PriceRow) -> String? {
         let rates = [row.inPerMTok, row.outPerMTok] + [row.cacheReadPerMTok, row.cacheWritePerMTok].compactMap { $0 }

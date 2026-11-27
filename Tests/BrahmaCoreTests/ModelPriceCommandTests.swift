@@ -22,6 +22,9 @@ import Testing
         let over = try runBrahma(["settings", "model-price", "anthropic/claude-opus-5-5", "7", "30", "--cache-read", "0.5",
                                   "--cache-write", "9"], home: home)
         #expect(over.status == 0, "\(over.stderr)")
+        // Ruling 38: no cache rates given, a pinned model keeps its pinned cache rates.
+        let inherit = try runBrahma(["settings", "model-price", "anthropic/claude-sonnet-5-5", "3", "12"], home: home)
+        #expect(inherit.stdout == "anthropic/claude-sonnet-5-5  in $3  out $12  cache read $0.2  cache write $4  owner\n", "\(inherit.stdout) \(inherit.stderr)")
         // A slash inside the model id belongs to the model (OpenRouter's `vendor/model`).
         #expect(try runBrahma(["settings", "model-price", "openrouter/acme/model-1", "3", "4"], home: home).status == 0)
 
@@ -35,13 +38,22 @@ import Testing
         #expect(try runBrahma(["settings", "model-price", "openai/gpt-x", "2", "8"], home: home).status == 0)
         let store = try Store(path: ownerPaths(home).database.path)
         let rows = try store.priceRows()
-        #expect(rows.map { "\($0.provider)/\($0.model)" } == ["anthropic/claude-opus-5-5", "openai/gpt-x", "openrouter/acme/model-1"])
+        #expect(rows.map { "\($0.provider)/\($0.model)" } == ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5", "openai/gpt-x",
+                                                             "openrouter/acme/model-1"])
         #expect(rows.first { $0.model == "gpt-x" } == PriceRow(provider: "openai", model: "gpt-x", inPerMTok: 2, outPerMTok: 8, setBy: "owner"))
         #expect(PriceBook(owner: rows).price(provider: "anthropic", model: "claude-opus-5-5")?.cacheWritePerMTok == 9)
+        // A row tampered into the database below the price rule is listed as unpriced, never as a price.
+        try store.writer.write { db in
+            try db.execute(sql: "INSERT INTO priceRow (provider, model, inPerMTok, outPerMTok, setBy) VALUES ('groq', 'tampered', 0, 1, 'owner')")
+        }
+        let tampered = try runBrahma(["settings", "model-price"], home: home).stdout
+        #expect(tampered.contains("groq/tampered  unpriced (owner row refused: zero prices are only for local providers)\n"), "\(tampered)")
 
         let help = try runBrahma(["settings", "model-price", "--help"], home: home)
         #expect(help.stdout.contains("EXAMPLES:"), "\(help.stdout)")
         #expect(help.stdout.contains("brahma settings model-price openai/"), "\(help.stdout)")
+        let flatHelp = help.stdout.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        #expect(flatHelp.contains("a cache rate you leave unset keeps the pinned rate"), "\(help.stdout)")
     }
 
     @Test func refusesNegativeAndNaN() throws {
@@ -75,7 +87,10 @@ import Testing
 
     @Test func refusedInsideAgentTurn() throws {
         let owner = try OwnerTestHome(); let home = owner.url
-        for args in [["settings", "model-price"], ["settings", "model-price", "openai/gpt-x", "1", "2"]] {
+        // The refusal comes before any argument check (minor 1): a bad value or key still says "agent turn".
+        for args in [["settings", "model-price"], ["settings", "model-price", "openai/gpt-x", "1", "2"],
+                     ["settings", "model-price", "openai/gpt-x", "0", "2"], ["settings", "model-price", "gpt-x", "1", "2"],
+                     ["settings", "model-price", "--cache-read", "1"], ["settings", "model-price", "openai/gpt-x", "1"]] {
             let r = try runBrahma(args, home: home, extra: ["BRAHMA_AGENT_ID": "a1"])
             #expect(r.status == 1, "\(args)")
             #expect(r.stdout.isEmpty, "\(args): \(r.stdout)")
