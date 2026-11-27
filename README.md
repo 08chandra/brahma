@@ -1037,7 +1037,8 @@ Context folds can't appear yet, because the engine's patches carry git's default
 
 - **The secret gate on every read.** Everything an agent reads through Brahma (`open_ref`, a share, search snippets,
   fact answers, the concierge's reads) and everything rendered for you, exported or copied passes the secret gate with
-  the company's stored secret values. A stored value refuses the read or share, naming the line, never the value; a
+  the company's stored secret values. A stored value of 8 or more characters refuses the read or share, naming the line,
+  never the value (shorter stored values are not matched yet; see below); a
   secret pattern is redacted in what is shown and copied; an archive, Office file or PDF is scanned by a sandboxed helper
   the engine runs, never inside a turn, and one that can't be scanned is refused. If the stored values can't be read,
   nothing is shown (fail closed).
@@ -1076,7 +1077,8 @@ the data home, and so the vault, is denied to agents. Denying agents reads of ot
 the Sandboxed profile is final-wave work.
 
 **Not built yet (final wave):** the SHARED / MENTIONED / READ BY footer on a ref, the Handbook revision picker in the
-preview, diff folds, the concierge citing PDFs, short-secret protection, and Word-style hybrid PDFs (still refused).
+preview, diff folds, the concierge citing PDFs, short-secret protection (a stored value shorter than 8 characters is not
+matched by the gate today; the per-secret opt-in is still owed), and Word-style hybrid PDFs (still refused).
 
 **The seed.** `scripts/seed-demo.sh` gives Initech one of each: @devops-1's share of `index.html:1-20` in #general,
 @mgr-1's share of `INITE-5:diff` with a three-message thread under it, your file ask to @devops-1, a company resource
