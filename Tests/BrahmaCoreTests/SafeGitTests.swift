@@ -304,6 +304,41 @@ import Foundation
         #expect(onlyUncommitted.files.first?.bytes == 16)
     }
 
+    /// Every loose object file under `<objects>` (`xx/<38 hex>`), as `xx/rest` names.
+    static func looseObjects(_ objects: URL) -> Set<String> {
+        var out: Set<String> = []
+        let fm = FileManager.default
+        for dir in (try? fm.contentsOfDirectory(atPath: objects.path)) ?? [] where dir.count == 2 {
+            for name in (try? fm.contentsOfDirectory(atPath: objects.appending(path: dir).path)) ?? [] { out.insert("\(dir)/\(name)") }
+        }
+        return out
+    }
+
+    /// Final review I-1 / C1a M5 (FW-B2 item 23): a live worktree diff hashes the holder's uncommitted bytes into a PRIVATE
+    /// object directory under the engine's temp dir (the company's objects only as an alternate), removed with the call. No
+    /// new loose object lands in `<ws>/.git/objects`, so no turn can `git cat-file` the bytes the gate has not seen.
+    @Test func worktreeDiffWritesNoObjectIntoTheCompanyStore() throws {
+        let r = try Repo()
+        let git = SafeGit(workspace: r.root)
+        let objects = r.root.appending(path: ".git/objects")
+        try r.f.write("src/a.txt", "one\nUNCOMMITTED-SECRET-\(UUID().uuidString)\n", in: r.wt)
+        try r.f.write("new/b.txt", "brand new \(UUID().uuidString)\n", in: r.wt)
+        let before = Self.looseObjects(objects)
+        let temp = try tempDir()
+        let diff = try git.worktreeDiff(key: "ENG-1", worktree: r.wt, tempDir: temp, fs: r.fs)
+        #expect(diff.files.map(\.path) == ["new/b.txt", "src/a.txt"])
+        #expect(diff.patch.contains("+UNCOMMITTED-SECRET-"), "the diff still compares the uncommitted bytes")
+        #expect(Self.looseObjects(objects) == before, "a live diff wrote loose objects into the company's store")
+        for (path, sha) in diff.blobShas {
+            #expect((try? r.f.git(["cat-file", "-e", sha])) == nil, "\(path)'s uncommitted blob is readable from the company's store")
+        }
+        // The private object directory went with the call.
+        #expect(((try? FileManager.default.contentsOfDirectory(atPath: temp.path)) ?? []).isEmpty)
+        // Committed content and share pins still use the company's store (company-class by design).
+        let pin = try git.hashObject(data: Data("pinned \(UUID().uuidString)".utf8))
+        #expect((try? r.f.git(["cat-file", "-e", pin])) != nil)
+    }
+
     @Test func worktreeDiffMatchesGitStatus() throws {
         let r = try Repo()
         let git = SafeGit(workspace: r.root)

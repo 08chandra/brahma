@@ -146,7 +146,8 @@ public struct SafeGit: Sendable {
         /// `status` is `A`, `M`, `D` or `T`; `added`/`removed` nil for a binary file; `bytes` the file's size now (0 when deleted).
         public var files: [(path: String, status: String, added: Int?, removed: Int?, bytes: Int)]
         public var patch: String
-        /// Path → blob id of the bytes `SafeFS` read (written to the repository), for every file present.
+        /// Path → blob id of the bytes `SafeFS` read, for every file present. The blobs were written only to the call's private
+        /// object directory (final review I-1), gone when the call returns: never in the company's store.
         public var blobShas: [String: String]
         public var truncated: Bool
         /// Plan C Task C5b: changed paths whose hunks were left out of `patch` for size (`patchSkipOver`), listed in `files`.
@@ -546,7 +547,9 @@ public struct SafeGit: Sendable {
     /// 3. Each changed file's checked bytes (a link: its target) are copied to an engine-owned file under the call directory,
     ///    one descriptor at a time, summed against `maxDiffBytes` before any hashing; ONE `hash-object -w --no-filters
     ///    --stdin-paths` hashes the copies, one `update-index --index-info` (and one `--force-remove`) fills the index, and
-    ///    `diff --cached` against the base compares objects only.
+    ///    `diff --cached` against the base compares objects only. Every process of the call writes objects only to the call
+    ///    directory's own `objects` (`GIT_OBJECT_DIRECTORY`; the company's `.git/objects` is an alternate, read only), so the
+    ///    holder's uncommitted bytes never land in the store every turn reads (final review I-1, C1a M5).
     /// Bounded: a constant number of git processes (at most 10); `WorktreeListing.maxEntries` entries walked, `maxDiffFiles`
     /// changed paths, `maxDiffBytes` changed bytes, `maxBinaryBytes` per file, git output at its cap — each refuses the whole
     /// diff with `.tooManyChanges`; one time budget (`timeout`) for the call. No agent-controlled or git-reported name reaches
@@ -570,10 +573,17 @@ public struct SafeGit: Sendable {
         let index = callDir.appending(path: "index")
         let shadow = callDir.appending(path: "shadow", directoryHint: .isDirectory)
         let blobDir = callDir.appending(path: "blobs", directoryHint: .isDirectory)
-        guard mkdir(shadow.path, 0o700) == 0, mkdir(blobDir.path, 0o700) == 0 else { throw SafeGitError.io("cannot create the diff's directories") }
+        // Final review I-1 / C1a M5: the call's own object directory. `hash-object -w` writes the holder's uncommitted bytes
+        // here, never into `<ws>/.git/objects` (which every sandboxed turn reads to use git); the company's objects are read
+        // through it as an alternate. Removed with the call directory.
+        let objects = callDir.appending(path: "objects", directoryHint: .isDirectory)
+        guard mkdir(shadow.path, 0o700) == 0, mkdir(blobDir.path, 0o700) == 0, mkdir(objects.path, 0o700) == 0,
+              mkdir(objects.appending(path: "info").path, 0o700) == 0, mkdir(objects.appending(path: "pack").path, 0o700) == 0
+        else { throw SafeGitError.io("cannot create the diff's directories") }
+        let privateObjects = try privateObjectEnvironment(objects)
         @discardableResult
         func engineGit(_ args: [String], stdin: Data? = nil) throws -> Data {
-            try output(args, workTree: shadow, anchor: anchor, index: index, stdin: stdin, budget: budget)
+            try output(args, workTree: shadow, anchor: anchor, index: index, stdin: stdin, budget: budget, objects: privateObjects)
         }
         var changed: [(status: String, path: String, kind: WorktreeListing.Kind?)] = []
         func listing(_ args: [String]) throws -> [Data] {
@@ -632,7 +642,7 @@ public struct SafeGit: Sendable {
             let r: (status: Int32, stdout: Data, stderr: Data)
             do {
                 r = try run(["check-ignore", "-z", "--stdin", "--no-index"], workTree: shadow, anchor: anchor, index: index, stdin: stdin, outputCap: listingByteCap,
-                            allowFailure: true, budget: budget, literalPathspecs: false)
+                            allowFailure: true, budget: budget, literalPathspecs: false, objects: privateObjects)
             } catch SafeGitError.outputTooLarge {
                 throw SafeGitError.tooManyChanges(files: candidates.count, bytes: stdin.count)
             }
@@ -725,7 +735,8 @@ public struct SafeGit: Sendable {
             for change in changed { if let size = baseEntries[change.path]?.size, size > cap { skipping.insert(change.path) } }
         }
         let text: DiffText
-        do { text = try diffText(cached, ["--end-of-options", base, "--"], workTree: shadow, anchor: anchor, index: index, budget: budget, skipping: skipping) }
+        do { text = try diffText(cached, ["--end-of-options", base, "--"], workTree: shadow, anchor: anchor, index: index, budget: budget, skipping: skipping,
+                                 objects: privateObjects) }
         catch SafeGitError.outputTooLarge { throw SafeGitError.tooManyChanges(files: changed.count, bytes: total) }
         let counts = Dictionary(text.stat.map { ($0.path, ($0.added, $0.removed)) }, uniquingKeysWith: { a, _ in a })
         let sizes = Dictionary(copies.map { ($0.path, $0.size) }, uniquingKeysWith: { a, _ in a })
@@ -832,6 +843,22 @@ public struct SafeGit: Sendable {
     }
 
     /// `dir` (under the call's shadow work tree) and its missing parents, 0700.
+    /// The environment that gives one worktree diff its own object directory (final review I-1, C1a M5): `GIT_OBJECT_DIRECTORY`
+    /// = `objects` (the call's, under the engine's temp dir), `GIT_ALTERNATE_OBJECT_DIRECTORIES` = the workspace's own
+    /// `.git/objects`, read only. A path holding `:` or a leading `"` is given as a C-quoted entry (git's alternates syntax); a
+    /// control character in either path refuses the diff.
+    func privateObjectEnvironment(_ objects: URL) throws -> [String: String] {
+        let company = workspace.appending(path: ".git/objects", directoryHint: .isDirectory).path
+        for path in [objects.path, company] where path.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) {
+            throw SafeGitError.io("the diff's object directory path holds a control character")
+        }
+        func entry(_ path: String) -> String {
+            guard path.contains(":") || path.hasPrefix("\"") else { return path }
+            return "\"" + path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        }
+        return ["GIT_OBJECT_DIRECTORY": objects.path, "GIT_ALTERNATE_OBJECT_DIRECTORIES": entry(company)]
+    }
+
     private static func makeShadowDirectory(_ dir: URL) throws {
         do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
         catch { throw SafeGitError.io("cannot create the diff's directories") }
@@ -874,8 +901,8 @@ public struct SafeGit: Sendable {
     /// literal pathspec (`GIT_LITERAL_PATHSPECS=1`); only when `tail` ends at `--` (no path given), every kept path passes
     /// `checkPath`, and the pathspecs fit `maxPathspecBytes` — else the whole patch is taken as usual and nothing is skipped.
     private func diffText(_ command: [String], _ tail: [String], workTree: URL? = nil, anchor: Anchor? = nil, index: URL? = nil, budget: Budget? = nil,
-                          skipping: Set<String> = []) throws -> DiffText {
-        let numstat = try output(command + ["--numstat", "-z"] + tail, workTree: workTree, anchor: anchor, index: index, budget: budget)
+                          skipping: Set<String> = [], objects: [String: String] = [:]) throws -> DiffText {
+        let numstat = try output(command + ["--numstat", "-z"] + tail, workTree: workTree, anchor: anchor, index: index, budget: budget, objects: objects)
         var stat: [(path: String, added: Int?, removed: Int?)] = []
         for record in numstat.split(separator: 0, omittingEmptySubsequences: true) {
             let fields = String(decoding: record, as: UTF8.self).split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
@@ -897,7 +924,7 @@ public struct SafeGit: Sendable {
                 }
             }
         }
-        let patch = Self.text(try output(command + ["-p"] + patchTail, workTree: workTree, anchor: anchor, index: index, budget: budget))
+        let patch = Self.text(try output(command + ["-p"] + patchTail, workTree: workTree, anchor: anchor, index: index, budget: budget, objects: objects))
         let lines = patch.split(separator: "\n", omittingEmptySubsequences: false)
         if lines.count > Self.maxDiffLines {
             return DiffText(stat: stat, patch: lines.prefix(Self.maxDiffLines).joined(separator: "\n") + "\n", truncated: true, skipped: skipped)
@@ -908,8 +935,9 @@ public struct SafeGit: Sendable {
     /// Stdout of a successful call; a non-zero status is `.git`.
     @discardableResult
     private func output(_ args: [String], workTree: URL? = nil, anchor: Anchor? = nil, index: URL? = nil, stdin: Data? = nil,
-                        outputCap: Int = SafeGit.outputCap, budget: Budget? = nil) throws -> Data {
-        let r = try run(args, workTree: workTree, anchor: anchor, index: index, stdin: stdin, outputCap: outputCap, allowFailure: false, budget: budget)
+                        outputCap: Int = SafeGit.outputCap, budget: Budget? = nil, objects: [String: String] = [:]) throws -> Data {
+        let r = try run(args, workTree: workTree, anchor: anchor, index: index, stdin: stdin, outputCap: outputCap, allowFailure: false, budget: budget,
+                        objects: objects)
         return r.stdout
     }
 
@@ -917,8 +945,10 @@ public struct SafeGit: Sendable {
     /// the pinned environment, plus `extraEnvironment`/`extraConfig`), then the runner runs it.
     /// `workTree`: the engine-owned work tree the process gets (a worktree diff's shadow directory); nil: the workspace. Never
     /// an agent's worktree. `anchor`: the held worktree whose path is checked right before and right after the process.
+    /// `objects`: a worktree diff's private object directory (`privateObjectEnvironment`), added to the environment.
     private func run(_ args: [String], workTree: URL? = nil, anchor: Anchor? = nil, index: URL? = nil, stdin: Data? = nil, outputCap: Int = SafeGit.outputCap,
-                     allowFailure: Bool, budget: Budget? = nil, literalPathspecs: Bool = true) throws -> (status: Int32, stdout: Data, stderr: Data) {
+                     allowFailure: Bool, budget: Budget? = nil, literalPathspecs: Bool = true,
+                     objects: [String: String] = [:]) throws -> (status: Int32, stdout: Data, stderr: Data) {
         // Within a budgeted call, each process gets what is left of the budget (never more than one call's timeout).
         var timeout = callTimeout
         if let budget {
@@ -930,7 +960,7 @@ public struct SafeGit: Sendable {
         // (the forced `core.hooksPath=/dev/null` still applies to every call, so no hook ever runs).
         git.engineHooksPath = GitWorkspace.engineHooksPath(root: workspace)
         git.indexFile = index
-        git.extraEnvironment = literalPathspecs ? Self.extraEnvironment : [:]
+        git.extraEnvironment = (literalPathspecs ? Self.extraEnvironment : [:]).merging(objects) { _, new in new }
         git.extraConfig = Self.extraConfig
         git.timeoutSeconds = Self.seconds(timeout)
         let line: (args: [String], environment: [String: String])
