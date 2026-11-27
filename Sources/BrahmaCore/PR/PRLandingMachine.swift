@@ -160,7 +160,7 @@ public actor PRLandingMachine: PRLandingBeginning {
         let cardGate = CardGate(inner: gate, action: .pushBranch, itemId: item.id, sha: landing.pushedSHA, repoURL: repo.pushURL, open: nil,
                                 approved: card.approval)
         switch await push.gated(by: cardGate).run(item: item, repo: repo, verifiedSHA: landing.pushedSHA, base: base, git: git,
-                                                    branch: landing.branch) {
+                                                    branch: landing.branch, lease: Self.lease(landing)) {
         case .pushed:
             consume(card)
         case .needsOwner(let reason, let payload):
@@ -172,6 +172,15 @@ public actor PRLandingMachine: PRLandingBeginning {
         case .failed:
             break   // the stage recorded it (still `pushing`, with `lastError`), unless the landing moved on meanwhile
         }
+    }
+
+    /// Ruling X8-31′: a resubmit to the engine's own PR branch replaces the commit Brahma last pushed and recorded there — only
+    /// when the branch is in the `brahma/` namespace and Brahma opened the PR on it (it has the PR's number and the digest of what
+    /// it sent, Ruling 28). Anything else is a plain push, never forced.
+    static func lease(_ landing: PRLanding) -> String? {
+        guard let lease = landing.leaseSHA, lease != landing.pushedSHA, landing.branch.hasPrefix(PRBranch.prefix),
+              landing.prNumber != nil, landing.openDigest != nil else { return nil }
+        return lease
     }
 
     // MARK: open-pr

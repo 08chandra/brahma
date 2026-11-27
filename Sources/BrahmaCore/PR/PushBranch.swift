@@ -63,12 +63,17 @@ public struct PushBranchStage: Sendable {
     /// Pushes `verifiedSHA` (already rebased onto `base`, the remote `main` it was verified on) for `item` to `repo`. `branch`:
     /// the landing's branch when it has one (a resubmit updates the same branch even if the item was renamed); it must be a
     /// valid `brahma/` branch, else the name is derived from the item (`PRBranch.name`).
+    ///
+    /// `lease` (Ruling X8-31′): the commit Brahma last pushed to `existing`, its own PR branch — the push replaces exactly that
+    /// commit (`--force-with-lease`), or GitHub refuses it. Taken only together with `existing`; a derived branch never is.
     public func run(item: WorkItem, repo: GitHubRepoRef, verifiedSHA: String, base: String, git: GitWorkspace,
-                    branch existing: String? = nil) async -> PushBranchOutcome {
+                    branch existing: String? = nil, lease requested: String? = nil) async -> PushBranchOutcome {
         let named: PRDecision<String>
+        var lease: String? = nil
         if let existing, existing.hasPrefix(PRBranch.prefix), existing.count > PRBranch.prefix.count, PRBranch.isValidBranchName(existing),
            PRBranch.ref(existing).utf8.count <= PRBranch.maxRefBytes {
             named = .allowed(existing)
+            lease = requested
         } else {
             named = PRBranch.name(key: item.key, title: item.title)
         }
@@ -84,7 +89,8 @@ public struct PushBranchStage: Sendable {
         } catch {
             return .refused("the pre-push scan could not run: \(Store.flat("\(error)", max: 200))")
         }
-        guard case .allowed(let payload) = scanned else { return .refused(scanned.refusal ?? "the pre-push scan refused") }
+        guard case .allowed(var payload) = scanned else { return .refused(scanned.refusal ?? "the pre-push scan refused") }
+        payload.lease = lease
         // 2. The request, with the visibility read now (never the connect-time value), through the one gate.
         let visibility: String
         do { visibility = try await github.repo(repo).visibility } catch {
@@ -119,7 +125,7 @@ public struct PushBranchStage: Sendable {
         }
         let outcome: GitPushOutcome
         let (push, pushRequest) = (self.push, GitPushRequest(gitCommonDir: git.root.appending(path: ".git", directoryHint: .isDirectory),
-                                                        sha: verifiedSHA, ref: target.ref, url: target.url))
+                                                        sha: verifiedSHA, ref: target.ref, url: target.url, lease: lease))
         do {
             outcome = try await blocking.tryRun { try push.run(pushRequest, token: handle) }
         } catch {
@@ -129,6 +135,11 @@ public struct PushBranchStage: Sendable {
         case .pushed:
             return pushed(item, branch, payload)
         case .refused(let why), .failed(let why):
+            // A lease GitHub found stale: someone else pushed to the branch since Brahma did. Held; never overwritten.
+            if let lease, why.contains("stale info") {
+                return fail(item, branch, verifiedSHA, "\(why): \(branch) on GitHub is no longer \(lease.prefix(7)), the commit Brahma last "
+                            + "pushed — someone else pushed to it; Brahma never overwrites their commits")
+            }
             return fail(item, branch, verifiedSHA, why)
         case .unknown(let why):
             // Never a blind retry: GitHub says what the branch holds.

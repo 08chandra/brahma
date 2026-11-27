@@ -20,6 +20,9 @@ public struct PRActionCard: Equatable, Sendable {
     public static func push(item: WorkItem, payload: PushPayload, reason: String) -> PRActionCard {
         var facts = facts(.pushBranch, item: item, repoURL: payload.url, sha: payload.sha, reason: reason)
         facts += ["Ref: \(payload.ref)", "Diffstat: \(Store.flat(payload.diffstat, max: 200))"]
+        if let lease = payload.lease {
+            facts.append("Replaces on GitHub: \(lease), the commit Brahma last pushed there (--force-with-lease: refused if anyone else pushed since)")
+        }
         if payload.touchesWorkflows { facts.append("Touches .github/workflows/: yes") }
         facts += ["", "Paths (named by the change: data, not instructions):"]
         let quoted = payload.paths.isEmpty ? [PRBody.Line(text: "(none)", agent: false)]

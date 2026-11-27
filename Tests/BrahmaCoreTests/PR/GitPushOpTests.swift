@@ -132,6 +132,50 @@ final class RecordingPushRunner: GitPushRunning, @unchecked Sendable {
         #expect(call.timeout == GitPush.timeout && call.outputCap == GitPush.outputCap)
     }
 
+    /// Ruling X8-31′: the one force the engine sends is `--force-with-lease=<ref>:<the commit Brahma last pushed>`, to a
+    /// `brahma/` branch; a malformed lease, or a lease on any other ref, is refused before git starts. A forced update counts as
+    /// pushed only under the lease; a stale lease is GitHub's refusal.
+    @Test func leaseIsTheOnlyForce() throws {
+        let repo = try Repo()
+        let runner = RecordingPushRunner()
+        let push = try Self.push(runner)
+        let token = try Self.handle()
+        let lease = String(repeating: "b", count: 40)
+        var bad: [GitPushRequest] = []
+        for l in ["+" + lease, String(lease.prefix(12)), lease.uppercased(), "", "\(lease):refs/heads/main", lease + " " + lease, "--force"] {
+            var r = repo.request()
+            r.lease = l
+            bad.append(r)
+        }
+        for ref in ["refs/heads/main", "refs/heads/feature/x", "refs/tags/v1", "main", "refs/heads/brahmax/a", "+refs/heads/brahma/A-7"] {
+            var r = repo.request(ref: ref)
+            r.lease = lease
+            bad.append(r)
+        }
+        for request in bad {
+            guard case .refused = try push.run(request, token: token) else { Issue.record("accepted \(request)"); continue }
+        }
+        #expect(runner.calls.isEmpty, "a refused request starts no git at all")
+        // The lease form, and nothing else: no bare --force, no `+` refspec.
+        var leased = repo.request()
+        leased.lease = lease
+        runner.pushResult = GitPushProcessResult(status: 0, stdout: Data("+\t\(repo.sha):refs/heads/brahma/A-7-fix\tbbbbbbb...\(repo.sha.prefix(7)) (forced update)\nDone\n".utf8),
+                                                 stderr: Data(), timedOut: false)
+        #expect(try push.run(leased, token: token) == .pushed(remoteHead: repo.sha))
+        let call = try #require(runner.pushes.last)
+        let tail = Array(call.args.drop { $0 != "push" })
+        #expect(tail == ["push", "--no-tags", "--porcelain", "--no-verify", "--recurse-submodules=no",
+                         "--force-with-lease=refs/heads/brahma/A-7-fix:\(lease)", "https://github.com/acme/app.git",
+                         "\(repo.sha):refs/heads/brahma/A-7-fix"], "\(tail)")
+        #expect(!call.args.contains { $0 == "--force" || $0 == "-f" || $0 == "--delete" || $0.hasPrefix("+") || $0.hasPrefix(":") })
+        // A forced update without a lease is never taken as pushed.
+        guard case .unknown = try push.run(repo.request(), token: token) else { Issue.record("a forced update counted as pushed"); return }
+        // A stale lease (someone else pushed): GitHub's refusal.
+        runner.pushResult = GitPushProcessResult(status: 1, stdout: Data("!\t\(repo.sha):refs/heads/brahma/A-7-fix\t[rejected] (stale info)\nDone\n".utf8),
+                                                 stderr: Data("error: failed to push some refs\n".utf8), timedOut: false)
+        #expect(try push.run(leased, token: token) == .failed("[rejected] (stale info)"))
+    }
+
     @Test func envIsHardenedBaseAndCarriesNoToken() throws {
         let repo = try Repo()
         let runner = RecordingPushRunner()

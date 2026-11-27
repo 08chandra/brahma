@@ -11,10 +11,18 @@ public struct GitPushRequest: Equatable, Sendable {
     public var ref: String
     /// Exactly `https://github.com/<owner>/<repo>.git`, from the channel record (never from the repository's config).
     public var url: String
+    /// Ruling X8-31′: a resubmit to the engine's own PR branch replaces the commit Brahma last pushed and recorded there, and
+    /// only that one: `--force-with-lease=<ref>:<lease>` (40 hex). GitHub refuses it (`[rejected] (stale info)`) when anyone
+    /// else pushed to the branch since — their commits are never overwritten. Nil (a first push, or any branch Brahma did not
+    /// open a PR on): a plain push, never forced. No other force exists: no bare `--force`, no `+` refspec.
+    public var lease: String?
 
-    public init(gitCommonDir: URL, sha: String, ref: String, url: String) {
-        self.gitCommonDir = gitCommonDir; self.sha = sha; self.ref = ref; self.url = url
+    public init(gitCommonDir: URL, sha: String, ref: String, url: String, lease: String? = nil) {
+        self.gitCommonDir = gitCommonDir; self.sha = sha; self.ref = ref; self.url = url; self.lease = lease
     }
+
+    /// `--force-with-lease=<ref>:<lease>`, the one force the engine ever sends.
+    var leaseArgument: String? { lease.map { "--force-with-lease=\(ref):\($0)" } }
 }
 
 /// What a push came to.
@@ -139,6 +147,9 @@ public struct GitPush: Sendable {
         guard let repo = GitHubRepoRef.parse(pushURL: r.url) else {
             return .refused("the push URL must be exactly https://github.com/<owner>/<repo>.git")
         }
+        if let lease = r.lease, lease.range(of: "^[0-9a-f]{40}$", options: .regularExpression) == nil {
+            return .refused("the lease must be the full 40-character sha Brahma last pushed to the branch")
+        }
         return .allowed(repo)
     }
 
@@ -175,12 +186,13 @@ public struct GitPush: Sendable {
         try Self.writeHelper(helper, loopback: loopbackRemote)
         var args = ["-c", Self.helperConfig(helper), "-c", "credential.useHttpPath=false"]
         if let loopbackRemote { args += ["-c", "protocol.http.allow=always", "-c", "url.\(loopbackRemote)/.insteadOf=https://github.com/"] }
-        args += ["push", "--no-tags", "--porcelain", "--no-verify", "--recurse-submodules=no", r.url, "\(r.sha):\(r.ref)"]
+        args += ["push", "--no-tags", "--porcelain", "--no-verify", "--recurse-submodules=no"] + (r.leaseArgument.map { [$0] } ?? [])
+            + [r.url, "\(r.sha):\(r.ref)"]
         let line: (args: [String], environment: [String: String])
         do { line = try git.commandLine(args) } catch let e as GitError { return .refused(Self.refusalText(e)) }
         let result = try runner.run(args: line.args, env: GitPushEnvironment.make(line.environment), credential: token,
                                     workingDirectory: callDir, timeout: Self.timeout, outputCap: Self.outputCap)
-        return Self.outcome(result, sha: r.sha, ref: r.ref, token: token)
+        return Self.outcome(result, sha: r.sha, ref: r.ref, token: token, leased: r.lease != nil)
     }
 
     // MARK: Pieces
@@ -228,16 +240,17 @@ public struct GitPush: Sendable {
     static let ambiguous = ["hung up unexpectedly", "rpc failed", "unexpected disconnect", "connection reset", "operation timed out",
                             "early eof", "broken pipe", "transfer closed", "http/2 stream", "ssl_read", "recv failure"]
 
-    static func outcome(_ result: GitPushProcessResult, sha: String, ref: String, token: TokenHandle) -> GitPushOutcome {
+    static func outcome(_ result: GitPushProcessResult, sha: String, ref: String, token: TokenHandle, leased: Bool = false) -> GitPushOutcome {
         let stderr = shown(result.stderr, token: token)
         if result.timedOut { return .unknown("git push timed out after \(Int(SafeGit.seconds(timeout))) s") }
         let lines = String(decoding: result.stdout.prefix(outputCap), as: UTF8.self).split(separator: "\n")
-        // `--porcelain`: `<flag>\t<from>:<to>\t<summary>`; ` ` fast-forward, `*` new, `=` up to date, `!` rejected.
+        // `--porcelain`: `<flag>\t<from>:<to>\t<summary>`; ` ` fast-forward, `*` new, `=` up to date, `!` rejected, `+` forced
+        // (taken only with the lease: the branch held exactly the commit Brahma last pushed).
         let mine = lines.first { line in
             let fields = line.split(separator: "\t")
             return fields.count >= 2 && fields[1].hasSuffix(":" + ref)
         }
-        if let flag = mine?.first, [" ", "*", "="].contains(flag) {
+        if let flag = mine?.first, [" ", "*", "="].contains(flag) || (leased && flag == "+") {
             // Git reported the ref taken but exited non-zero: what GitHub holds is read back, never assumed either way.
             return result.status == 0 ? .pushed(remoteHead: sha) : .unknown("git push reported \(ref) but exited \(result.status)")
         }

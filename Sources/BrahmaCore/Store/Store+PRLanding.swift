@@ -35,6 +35,11 @@ extension Store {
                 landing.prURL = nil
                 landing.mergedSHA = nil
                 landing.openDigest = nil
+                landing.leaseSHA = nil
+            } else if let existing, existing.state != .pushing {
+                // Ruling X8-31′: the branch holds the commit Brahma pushed and recorded; the resubmit may replace that one only.
+                // (Still `pushing`: the earlier commit never was confirmed on GitHub, so the lease stays what it was.)
+                landing.leaseSHA = existing.pushedSHA
             }
             landing.pushedSHA = sha
             landing.state = .pushing

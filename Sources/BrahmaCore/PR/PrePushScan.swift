@@ -15,6 +15,9 @@ public struct PushPayload: Codable, Equatable, Sendable {
     public var paths: [String]
     /// Some changed path, shown or not, is under `.github/workflows/`.
     public var touchesWorkflows: Bool
+    /// Ruling X8-31′: the commit Brahma last pushed to the branch, which this push replaces (`--force-with-lease`); nil for a
+    /// plain push. Shown on the owner's card and part of what an approval binds.
+    public var lease: String? = nil
 
     public init(sha: String, ref: String, url: String, itemKey: String, diffstat: String, paths: [String], touchesWorkflows: Bool) {
         self.sha = sha; self.ref = ref; self.url = url; self.itemKey = itemKey

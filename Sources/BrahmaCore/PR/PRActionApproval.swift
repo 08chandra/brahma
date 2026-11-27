@@ -90,6 +90,8 @@ public enum PRActionDigest {
         var number: Int?
         var head: String?
         var method: String?
+        /// A push that replaces the commit Brahma last pushed (`--force-with-lease`, Ruling X8-31′); absent otherwise.
+        var lease: String?
     }
 
     /// For `push-branch` the repository, commit, ref and change come from the request's payload; for `open-pr`, from `repoURL`,
@@ -107,7 +109,8 @@ public enum PRActionDigest {
                                   repoVisibility: r.repoVisibility, taintedSession: r.taintedSession, itemTainted: r.itemTainted,
                                   externalInput: r.externalInput, firstUse: r.firstUse,
                                   touchesWorkflows: r.payload.map { $0.touchesWorkflows ? "yes" : "no" } ?? "-", reason: reason,
-                                  number: merge?.number, head: merge?.head, method: merge?.method.rawValue)
+                                  number: merge?.number, head: merge?.head, method: merge?.method.rawValue,
+                                  lease: r.payload?.lease)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         do { return PRBody.hex(SHA256.hash(try encoder.encode(canonical))) } catch {

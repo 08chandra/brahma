@@ -39,9 +39,16 @@ import GRDB
             }
             let (mode, hook) = lock.withLock { refspecs.append(spec); argv.append(args); return (currentMode, self.hook) }
             hook?()
+            let branchName = String(spec[spec.index(after: colon)...].dropFirst("refs/heads/".count))
+            // `--force-with-lease=<ref>:<sha>`: GitHub refuses when the branch is not at the lease (someone else pushed).
+            if mode == .land, let lease = args.first(where: { $0.hasPrefix("--force-with-lease=") }).flatMap({ $0.split(separator: ":").last }),
+               github.snapshot(PRLandingMachineTests.repo)?.branches[branchName] != String(lease) {
+                return GitPushProcessResult(status: 1, stdout: Data("!\t\(spec)\t[rejected] (stale info)\nDone\n".utf8),
+                                            stderr: Data("error: failed to push some refs\n".utf8), timedOut: false)
+            }
             switch mode {
             case .land:
-                let sha = String(spec[..<colon]), branch = String(spec[spec.index(after: colon)...].dropFirst("refs/heads/".count))
+                let sha = String(spec[..<colon]), branch = branchName
                 // GitHub moves the branch, and every open PR on it follows.
                 github.update(PRLandingMachineTests.repo) { r in
                     r.branches[branch] = sha

@@ -356,9 +356,14 @@ import GRDB
         let landing = try w.landing(item)
         #expect(landing.state == .open && landing.pushedSHA == fixed && landing.branch == branch && landing.prNumber == 1, "\(landing)")
         #expect(w.runner.pushes == ["\(sha):refs/heads/\(branch)", "\(fixed):refs/heads/\(branch)"])
-        for args in w.runner.pushArguments {
-            #expect(!args.contains { $0 == "--force" || $0 == "-f" || $0.hasPrefix("--force-with-lease") || $0.hasPrefix("+") }, "\(args)")
+        // Ruling X8-31′: the first push of the branch is plain; the resubmit replaces exactly the commit Brahma pushed before.
+        let pushArgs = w.runner.pushArguments
+        #expect(pushArgs.count == 2 && !pushArgs[0].contains { $0.hasPrefix("--force-with-lease") }, "\(pushArgs)")
+        #expect(pushArgs.last?.filter { $0.hasPrefix("--force") } == ["--force-with-lease=refs/heads/\(branch):\(sha)"], "\(pushArgs)")
+        for args in pushArgs {
+            #expect(!args.contains { $0 == "--force" || $0 == "-f" || $0.hasPrefix("+") || $0 == "--delete" }, "\(args)")
         }
+        #expect(try w.store.prLanding(itemId: item.id)?.leaseSHA == sha)
         #expect(w.github.openRequests.count == 1, "the same pull request follows the branch")
         let pushAsk = try #require(w.gate.requests.dropFirst(asked).first)
         #expect(pushAsk.type == .pushBranch && pushAsk.payload?.sha == fixed, "the push of the new commit went through the gate")
@@ -368,19 +373,27 @@ import GRDB
         await step.tick(now: Self.t0.addingTimeInterval(PRStep.interval))
         #expect(try w.landing(item).state == .mergeable)
 
-        // Someone pushed to the branch on GitHub: the next resubmit's push is refused (never forced) and the owner is told.
+        // Someone pushed to the branch on GitHub: the lease is stale, the resubmit is refused (their commit stays), the landing
+        // holds and the owner is told once.
         let (other, otherSHA) = try await Self.openPR(w, "Moved upstream")
         w.github.update(Self.repo) { $0.checkRuns.append(.init(name: "ci", headSHA: otherSHA, conclusion: "failure")) }
         await step.tick(now: Self.t0.addingTimeInterval(2 * PRStep.interval))
         #expect(try w.landing(other).state == .checksFailed)
-        w.runner.mode = .reject
+        let otherBranch = try w.landing(other).branch
+        let theirs = "f00d" + String(otherSHA.dropFirst(4))
+        w.github.update(Self.repo) { $0.branches[otherBranch] = theirs }
         let again = try w.env.commit(["again.txt": "again\n"])
         try w.handOff(other, again)
         await w.machine.begin(item: other, verifiedSHA: again)
         let held = try w.landing(other)
-        #expect(held.state == .pushing && held.lastError?.contains("rejected") == true, "\(held)")
+        #expect(held.state == .pushing && held.lastError?.contains("[rejected] (stale info)") == true
+                && held.lastError?.contains("someone else pushed") == true, "\(held)")
+        #expect(w.github.snapshot(Self.repo)?.branches[otherBranch] == theirs, "never overwritten")
+        #expect(w.runner.pushArguments.last?.contains("--force-with-lease=refs/heads/\(otherBranch):\(otherSHA)") == true)
         let reasons = try w.store.stallReport(companyId: w.env.company.id).reasons
         #expect(reasons.contains { $0.hasPrefix("@eng-1 waits: PR #2 held — ") && $0.contains("rejected") }, "\(reasons)")
+        await step.tick(now: Self.t0.addingTimeInterval(3 * PRStep.maxBackoff))
+        #expect(try Self.alerts(w.store).filter { $0.summary.contains(other.key) && $0.summary.contains("someone else pushed") }.count == 1)
     }
 
     /// "Paused" on this tree: a paused company, a merge hold that does not lift itself, or the owner's stop. The step makes no

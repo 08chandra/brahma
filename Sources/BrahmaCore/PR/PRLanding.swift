@@ -33,10 +33,13 @@ public struct PRLanding: Codable, Equatable, Sendable, FetchableRecord, Persista
     /// `PRBody.contentDigest` of the title and body the engine sent with its `open-pr` (`"vX5-pr-3"`): a PR on the branch is the
     /// engine's only when its content matches (Ruling 28). Nil until the engine has sent one.
     public var openDigest: String? = nil
+    /// Ruling X8-31′ (`"vX5-pr-4"`): while a resubmit is `pushing` to the landing's own PR branch, the commit Brahma last pushed
+    /// there and recorded — the only one its `--force-with-lease` may replace. Nil for a first push.
+    public var leaseSHA: String? = nil
 
     public init(itemId: String, companyId: String, branch: String, pushedSHA: String, prNumber: Int? = nil, prURL: String? = nil,
                 state: PRLandingState, lastPolled: Date? = nil, lastError: String? = nil, mergedSHA: String? = nil, updatedAt: Date,
-                openDigest: String? = nil) {
+                openDigest: String? = nil, leaseSHA: String? = nil) {
         self.itemId = itemId
         self.companyId = companyId
         self.branch = branch
@@ -49,5 +52,6 @@ public struct PRLanding: Codable, Equatable, Sendable, FetchableRecord, Persista
         self.mergedSHA = mergedSHA
         self.updatedAt = updatedAt
         self.openDigest = openDigest
+        self.leaseSHA = leaseSHA
     }
 }

@@ -192,6 +192,43 @@ import GRDB
         #expect(control.contains("leaky env") && control.contains { $0.hasSuffix("stray.txt") }, "\(control)")
     }
 
+    /// Ruling X8-31′ on a real push: a resubmit that is not a fast-forward (the remote main moved, the commit was rebased) is
+    /// refused as a plain push and lands with the lease of the commit Brahma last pushed; once a third party pushed to the
+    /// branch, the lease is stale and their commit stays.
+    @Test(.tags(.process), .enabled(if: LoopbackGitServer.available))
+    func leaseReplacesOnlyBrahmasOwnCommit() async throws {
+        let token = ["lease", "push", "Hd6Js2Kf"].joined(separator: "-")
+        let server = try LoopbackGitServer(token: token)
+        defer { server.stop() }
+        let bare = try server.bare(Self.repo)
+        let env = try Env()
+        let gitDir = env.fx.root.appending(path: ".git")
+        let ref = "refs/heads/brahma/A-1-lease"
+        var push = GitPush(runner: LivePushRunner(), tempRoot: try tempDir())
+        push.loopbackRemote = server.base
+        let handle = try #require(TokenHandle(value: token))
+        func request(_ sha: String, lease: String? = nil) -> GitPushRequest {
+            GitPushRequest(gitCommonDir: gitDir, sha: sha, ref: ref, url: Self.repo.pushURL, lease: lease)
+        }
+        let first = try env.commit(["a.txt": "1\n"])
+        #expect(try push.run(request(first), token: handle) == .pushed(remoteHead: first))
+        // The resubmit, rebased: not a fast-forward of the branch. A plain push is refused, never forced.
+        let second = try env.commit(["a.txt": "2\n"])
+        guard case .failed(let plain) = try push.run(request(second), token: handle) else { Issue.record("a non-fast-forward pushed"); return }
+        #expect(plain.contains("[rejected]"), "\(plain)")
+        #expect(try GitFixture.plainGit(["rev-parse", ref], in: bare) == first)
+        // With the lease of the commit Brahma last pushed: it lands.
+        #expect(try push.run(request(second, lease: first), token: handle) == .pushed(remoteHead: second))
+        #expect(try GitFixture.plainGit(["rev-parse", ref], in: bare) == second)
+        // A third party pushes to the branch: Brahma's lease is stale; their commit stays.
+        let theirs = try env.commit(["a.txt": "theirs\n"])
+        _ = try GitFixture.plainGit(["push", "-q", "--force", bare.path, "\(theirs):\(ref)"], in: env.fx.root)
+        let third = try env.commit(["a.txt": "3\n"])
+        guard case .failed(let stale) = try push.run(request(third, lease: second), token: handle) else { Issue.record("a stale lease pushed"); return }
+        #expect(stale.contains("stale info"), "\(stale)")
+        #expect(try GitFixture.plainGit(["rev-parse", ref], in: bare) == theirs)
+    }
+
     /// The same real push, but the repository has a planted pre-push hook and the remote is the argument's: the hook never runs.
     @Test(.tags(.process), .enabled(if: LoopbackGitServer.available))
     func plantedHookNeverRunsOnARealPush() async throws {

@@ -82,5 +82,10 @@ extension Migrations {
             try db.alter(table: "prActionApproval") { t in t.add(column: "digest", .text).notNull().defaults(to: "") }
             try db.alter(table: "prLanding") { t in t.add(column: "openDigest", .text) }
         }
+        // Task 5 fix round 1 (Ruling X8-31′): the commit Brahma last pushed to the landing's own PR branch, which a resubmit's
+        // `--force-with-lease` replaces (and only it).
+        m.registerMigration("vX5-pr-4") { db in
+            try db.alter(table: "prLanding") { t in t.add(column: "leaseSHA", .text) }
+        }
     }
 }
