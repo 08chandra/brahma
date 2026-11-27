@@ -54,7 +54,8 @@ struct MCP: ParsableCommand {
         let store = try Store(path: db, catalog: catalog)
         // Plan C Task C4c: the concierge's server. Its process runs as `BRAHMA_AGENT_ID=concierge` (so no owner command runs from
         // it), its token must name the live run of exactly this request in this company, and it serves only the concierge's
-        // four tools, read as `.concierge`. Archives and PDFs are refused in its `open_ref` (no gate broker: fail closed).
+        // four tools, read as `.concierge`. Archives and PDFs in its `open_ref` go through the engine gate (final wave B1 item 11:
+        // the broker answers under the live `conciergeRun`; no helper runs in this process).
         if agent == ConciergeCaps.agentId {
             guard ProcessInfo.processInfo.environment["BRAHMA_AGENT_ID"] == ConciergeCaps.agentId, let request = launch.showRequest,
                   store.conciergeCredentialIsValid(token: token, companyId: company, requestId: request) else {
@@ -77,6 +78,7 @@ struct MCP: ParsableCommand {
             }
             try? check()
             MCPServer(tools: CompanyTools(store: store, companyId: company, agentId: ConciergeCaps.agentId, paths: secretPaths, vault: vault,
+                                          archives: EngineGateArchives(broker: QueuedRefGate(store: store, conciergeRequestId: request)),
                                           conciergeRequestId: request), beforeCall: check)
                 .serve(input: .standardInput, output: .standardOutput)
             return

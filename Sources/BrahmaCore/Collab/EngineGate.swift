@@ -9,7 +9,9 @@ import GRDB
 /// turn holds its live credential (`Store.turnCredentialIsLive`, what every call of the turn's MCP server needs), and only
 /// for a ref the agent may read in full: it resolves the ref itself, reads the bytes itself, runs the sandboxed deny-default
 /// helpers and writes back only the verdict and the gated bytes (or the rendered text). The tool then works with the engine's
-/// bytes, never its own. No answer within `QueuedRefGate.timeout` refuses (fail closed) and withdraws the request.
+/// bytes, never its own. No answer within `QueuedRefGate.timeout` refuses (fail closed) and withdraws the request. Final wave
+/// B1 item 11: the concierge's server queues requests the same way under its run (`QueuedRefGate(conciergeRequestId:)`); the
+/// engine answers them only while that `conciergeRun` is live, resolving the ref as `.concierge`.
 public enum GatePurpose: String, Codable, Sendable {
     /// The share's step 4 (`gatedBytes` strict, the shown read).
     case check
@@ -76,6 +78,12 @@ public struct QueuedRefGate: RefGateBroker {
 
     public init(store: Store, turnId: String, timeout: Duration = QueuedRefGate.defaultTimeout) {
         self.store = store; self.turnId = turnId; self.timeout = timeout
+    }
+
+    /// Final wave B1 item 11: the concierge's broker. Its requests are written under the concierge's run (`requestId` in the
+    /// `turnId` column, `ConciergeCaps.agentId` as the agent); the engine answers them only while that run is live.
+    public init(store: Store, conciergeRequestId: String, timeout: Duration = QueuedRefGate.defaultTimeout) {
+        self.store = store; self.turnId = conciergeRequestId; self.timeout = timeout
     }
 
     public func gate(companyId: String, agentId: String, ref: WorkRef, purpose: GatePurpose,
@@ -148,7 +156,13 @@ extension Store {
             return (data, ext, v)
         }
         guard let engine = archives as? EngineGateArchives else { return try local(archives) }
-        guard case .agent(let agentId) = reader else { throw WorkError.notFound(Self.refUnavailable) }
+        // A turn's agent, or (final wave B1 item 11) the concierge, whose requests the engine answers under its live run.
+        let agentId: String
+        switch reader {
+        case .agent(let id): agentId = id
+        case .concierge: agentId = ConciergeCaps.agentId
+        default: throw WorkError.notFound(Self.refUnavailable)
+        }
         let expected = (size: data.count, sha256: SHA256.hex(data))
         if Self.needsHelper(data, ext: ext) {
             let r = try engine.broker.gate(companyId: companyId, agentId: agentId, ref: ref, purpose: purpose, expected: expected)
@@ -207,7 +221,12 @@ extension Store {
             guard taken else { continue }
             let outcome: (status: String, message: String?, result: Data?, ext: String?, verdict: String?)
             do {
-                guard try turnCredentialIsLive(turnId: turnId, companyId: companyId, agentId: agentId) else {
+                // Final wave B1 item 11: a concierge request (its agent is `ConciergeCaps.agentId`, its `turnId` the request's id)
+                // is answered only while that request's `conciergeRun` is live in this company, like a turn's live credential.
+                let live = agentId == ConciergeCaps.agentId
+                    ? try conciergeRunIsLive(companyId: companyId, requestId: turnId)
+                    : try turnCredentialIsLive(turnId: turnId, companyId: companyId, agentId: agentId)
+                guard live else {
                     throw WorkError.invalid("this turn has ended; its tools no longer work")
                 }
                 guard let purpose = GatePurpose(rawValue: row["purpose"]),
@@ -242,7 +261,8 @@ extension Store {
     func engineGate(companyId: String, agentId: String, ref: WorkRef, purpose: GatePurpose, archives: any ArchiveReader,
                     knownValues: [(name: String, value: String)], paths: BrahmaPaths,
                     expected: (size: Int, sha256: String)) throws -> EngineGateResult {
-        let reader = Reader.agent(agentId)
+        // The concierge reads as `.concierge` (the owner's access minus secret values), every other requester as its agent.
+        let reader: Reader = agentId == ConciergeCaps.agentId ? .concierge : .agent(agentId)
         let r = try resolveDetailed(ref, reader: reader, companyId: companyId, messageRefId: nil)
         guard r.resolved.visibility == .full, let subject = r.subject, let company = r.company, r.resolved.state != .purged else {
             throw WorkError.notFound(Self.refUnavailable)

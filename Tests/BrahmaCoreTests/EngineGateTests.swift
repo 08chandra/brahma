@@ -58,9 +58,10 @@ import GRDB
             }
         }
 
+        /// Idempotent: a second stop returns at once.
         func stop() {
-            lock.withLock { running = false }
-            done.wait()
+            let wasRunning = lock.withLock { () -> Bool in let r = running; running = false; return r }
+            if wasRunning { done.wait() }
         }
     }
 
@@ -219,6 +220,56 @@ import GRDB
                           expected: (wrong.count, SHA256.hex(wrong)))
         }
         #expect(message?.contains("changed while it was being checked") == true, "\(message ?? "")")
+    }
+
+    /// Final wave B1 item 11: the engine's gate broker accepts the concierge's live `conciergeRun` credential like a live turn
+    /// credential, so the concierge can open (and cite) a PDF or an Office file; the engine resolves the ref as `.concierge`.
+    /// A request under an ended run, or naming the concierge without a live run of that request, is refused.
+    @Test func conciergeRunCredentialIsAcceptedByTheEngineGate() throws {
+        let w = try W()
+        let pdf = Data("%PDF-1.4 an anomalous pdf\n%%EOF\n".utf8)
+        try w.cf.addResource(62, name: "plan.pdf", ext: "pdf", bytes: pdf)
+        let documentXML = "<w:document><w:body><w:p><w:r><w:t>Hello docx</w:t></w:r></w:p></w:body></w:document>"
+        try w.cf.addResource(63, name: "spec.docx", ext: "docx", bytes: try w.zip(["word/document.xml": documentXML]))
+        let engineReader = Recording(members: ["word/document.xml": Data(documentXML.utf8)])
+        let engine = Engine(store: w.store, paths: w.cf.paths, archives: engineReader)
+        defer { engine.stop() }
+        // The PDF's structure was refused once (a turn's share), and the owner vouched for those bytes.
+        _ = w.refusal { try w.tools().call(name: "share", arguments: ["refs": .array([.string("F-62")]), "to": .string("@qa-2")]) }
+        _ = try w.store.vouchFile(companyId: w.cf.c.id, canonical: "F-62", sha256: SHA256.hex(pdf), now: w.cf.now)
+        let r = try w.store.createShowRequest(companyId: w.cf.c.id, kind: .show, query: "the plan", attachedRef: nil,
+                                              routed: ConciergeTests.routed, candidates: [], now: w.cf.now)
+        _ = try #require(try w.store.beginConciergeRun(r, now: w.cf.now))
+        let tools = CompanyTools(store: w.store, companyId: w.cf.c.id, agentId: ConciergeCaps.agentId, paths: w.cf.paths, vault: MemoryVault(),
+                                 archives: EngineGateArchives(broker: QueuedRefGate(store: w.store, conciergeRequestId: r.id, timeout: .seconds(30))),
+                                 conciergeRequestId: r.id)
+        let shown = ConciergeTests.call(tools, "open_ref", ["ref": .string("F-62")])
+        #expect(shown.contains("[resource F-62") && shown.contains("    | pdf · "), "\(shown)")
+        let text = ConciergeTests.call(tools, "open_ref", ["ref": .string("F-63")])
+        #expect(text.contains("    | Hello docx"), "\(text)")
+        #expect(engineReader.calls >= 1)
+        #expect(try w.requests() == 0)
+        // The run ends: the engine answers no request under it.
+        let gate = QueuedRefGate(store: w.store, conciergeRequestId: r.id, timeout: .seconds(30))
+        engine.stop()
+        w.store.endConciergeRun(requestId: r.id, now: Store.now())
+        let ended = try gate.enqueue(companyId: w.cf.c.id, agentId: ConciergeCaps.agentId, ref: try w.fx.ref("F-62"), purpose: .render,
+                                     expected: (pdf.count, SHA256.hex(pdf)))
+        // A turn's id under the concierge's name is not a concierge credential.
+        let forged = try QueuedRefGate(store: w.store, turnId: w.turnId).enqueue(companyId: w.cf.c.id, agentId: ConciergeCaps.agentId,
+                                                                                 ref: try w.fx.ref("F-62"), purpose: .render,
+                                                                                 expected: (pdf.count, SHA256.hex(pdf)))
+        let before = engineReader.calls
+        _ = try w.store.serveGateRequests(archives: { _ in engineReader }, knownValues: { _ in [] }, paths: w.cf.paths, now: Store.now())
+        for id in [ended, forged] {
+            let row = try #require(try w.store.writer.read { db in try Row.fetchOne(db, sql: "SELECT * FROM gateRequest WHERE id = ?", arguments: [id]) })
+            #expect(row["status"] == "refused" && (row["result"] as Data?) == nil, "\(id)")
+        }
+        #expect(engineReader.calls == before)
+        // `brahma mcp` wires the concierge's server to the engine gate.
+        let source = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appending(path: "Sources/brahma/MCPCommand.swift"), encoding: .utf8)
+        #expect(source.contains("QueuedRefGate(store: store, conciergeRequestId: request)"))
     }
 
     /// `brahma mcp` passes the engine gate, never a helper of its own.
