@@ -41,6 +41,10 @@ public enum ReviewMetrics {
                 .count(.reviewCatch, label: "unconfirmed change requests", Double(unconfirmed),
                        basis: "changesRequested events in the window with no later submitted followed by a passing check; not in the rate"),
             ]
+            // Ruling R27/R28: nothing landed, nothing caught, nothing escaped — no data, whatever unconfirmed requests exist.
+            if caught == 0, escaped.isEmpty, landed.isEmpty {
+                return .notMeasured(.reviewCatch, reason: "no landings or review events in the window", basis: basis, detail: detail)
+            }
             return .rate(.reviewCatch, numerator: Double(caught), denominator: Double(caught + escaped.count), unit: .ratio,
                          basis: basis, detail: detail)
         }
@@ -82,7 +86,7 @@ public enum ReviewMetrics {
     }
 
     /// Finish times of the passing checks of each item (any time up to now): verification runs, item merge runs, and the main
-    /// runs of the batch that merged it.
+    /// run at the land commit of the batch that merged it (R23: a bisected batch's runs at other candidates never judge it).
     static func passingChecks(_ db: Database, companyId: String, itemIds: [String]) throws -> [String: [Date]] {
         var passed: [String: [Date]] = [:]
         for chunk in LandingMetrics.chunks(itemIds) {
@@ -101,6 +105,7 @@ public enum ReviewMetrics {
                 SELECT r.itemId AS itemId, m.finishedAt AS finishedAt FROM mergeRun m
                 JOIN mergeRequest r ON r.batchId = m.batchId AND r.companyId = m.companyId
                 WHERE m.companyId = ? AND m.kind = 'main' AND m.status = 'passed' AND m.finishedAt IS NOT NULL
+                  AND m.candidateCommit = (SELECT b.landCommit FROM mergeBatch b WHERE b.id = m.batchId AND b.companyId = m.companyId)
                   AND r.status = 'merged' AND r.itemId IN (\(marks))
                 """,
             ] {
@@ -150,11 +155,13 @@ public enum ReviewMetrics {
         let keys = try itemKeys(db, companyId: companyId, ids: Array(Set(links.map { $0["itemId"] as String })))
         for link in links {
             let targetId: String = link["targetId"], itemId: String = link["itemId"]
-            guard let target = landed[targetId], let key = keys[itemId] else { continue }
-            sources[targetId, default: []].append("\(key) \(ItemLinkKind.regressionOf.rawValue) \(target.key)")
+            guard let target = landed[targetId] else { continue }
+            // The escape is the target's; a linking item with no key row (cannot happen while the foreign key holds) is named by id.
+            let name = keys[itemId] ?? itemId
+            sources[targetId, default: []].append("\(name) \(ItemLinkKind.regressionOf.rawValue) \(target.key)")
         }
         // `reviewAudit.verdict` stores `failed` (ruling R14).
-        for itemId in try String.fetchAll(db, sql: "SELECT itemId FROM reviewAudit WHERE companyId = ? AND verdict = 'failed' ORDER BY itemId",
+        for itemId in try String.fetchAll(db, sql: "SELECT DISTINCT itemId FROM reviewAudit WHERE companyId = ? AND verdict = 'failed' ORDER BY itemId",
                                           arguments: [companyId]) {
             guard let target = landed[itemId] else { continue }
             sources[itemId, default: []].append("\(target.key) failed audit")
@@ -187,12 +194,14 @@ public enum ReviewMetrics {
         let entries = landed.values.sorted { ($0.landedAt, $0.key) < ($1.landedAt, $1.key) }
 
         // No item has had even the shortest span: no row can be measured, and no git needs to run.
+        let windowStart = Store.measureDay(ctx.window.since, in: tz)
+        func tooYoung(_ days: Int) -> String { "no landings at least \(days) d old in the window (window starts \(windowStart))" }
         guard entries.contains(where: { age($0) >= shortest }) else {
             let rows = revertDays.map { days in
-                MetricValue.notMeasured(.revertRate, label: "\(days) d", reason: "no landings old enough",
+                MetricValue.notMeasured(.revertRate, label: "\(days) d", reason: tooYoung(days),
                                         basis: "no landed item in the window landed \(days) days or more before now")
             }
-            return .notMeasured(.revertRate, reason: "no landings old enough",
+            return .notMeasured(.revertRate, reason: tooYoung(headlineDays),
                                 basis: "no landed item in the window landed \(headlineDays) days or more before now (\(LandingMetrics.plural(entries.count, "landed item")) in the window)",
                                 detail: rows)
         }
@@ -236,7 +245,10 @@ public enum ReviewMetrics {
             var basis = "landed items in the window that have had \(days) days to be reverted (\(population.count))"
             if tooRecent > 0 { basis += "; \(tooRecent) landed in the last \(days) days excluded" }
             guard !population.isEmpty else {
-                return .notMeasured(id, label: label, reason: "no landings old enough", basis: basis)
+                // Ruling R28: say why — none that old in the window, or none of those readable.
+                let unreadableOld = entries.filter { excluded.contains($0.itemId) && age($0) >= span }.count
+                let reason = unreadableOld > 0 ? "no readable landings at least \(days) d old (\(unreadableOld) excluded)" : tooYoung(days)
+                return .notMeasured(id, label: label, reason: reason, basis: basis)
             }
             let hits = population.filter { entry in
                 guard let first = firstRevert(entry) else { return false }

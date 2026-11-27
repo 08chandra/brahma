@@ -67,4 +67,14 @@ import Testing
         #expect(fine.stoppedAt == nil && fine.basis == nil && fine.notScanned.isEmpty && fine.scanned.count == 5)
         #expect(RevertDetector.Limits.standard == RevertDetector.Limits(maxItems: 2000, gitCallSeconds: 10, lookback: 30 * day))
     }
+
+    /// A revision is a commit id, optionally with `^1`, and nothing after it: a trailing newline is not a revision.
+    @Test func revisionsAreStrict() {
+        #expect(RevertDetector.isRevision("abc1234"))
+        #expect(RevertDetector.isRevision("abc1234^1"))
+        #expect(!RevertDetector.isRevision("abc1234\n"))
+        #expect(!RevertDetector.isRevision("abc1234^1\n"))
+        #expect(!RevertDetector.isRevision("-abc1234"))
+        #expect(!RevertDetector.isRevision("HEAD"))
+    }
 }

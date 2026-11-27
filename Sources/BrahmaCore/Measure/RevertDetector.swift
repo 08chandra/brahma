@@ -106,13 +106,15 @@ public final class RevertDetector {
     }
 
     /// Scans `landed` (any order; scanned oldest first) and pairs each landed item with the earliest later landing that is its
-    /// exact inverse within `limits.lookback`. Throws only `SourceError.unavailable` (nothing could be read).
+    /// exact inverse within `limits.lookback`. Throws only `SourceError.unavailable`: nothing could be read at all (no repository,
+    /// a refused config, or every range tried failed).
     public func inversePairs(_ landed: [LandedRange]) throws -> Scan {
         let ordered = Self.ordered(landed)
         var forward: [String: String] = [:], inverse: [String: String] = [:]
         var scanned: [LandedRange] = []
         var unreadable: [String] = [], notScanned: [String] = []
         var stoppedAt: String? = nil
+        var firstFailure: String? = nil
         for (index, range) in ordered.enumerated() {
             if index >= limits.maxItems {
                 stoppedAt = "\(limits.maxItems) landed items"
@@ -132,7 +134,12 @@ public final class RevertDetector {
             } catch let error as SourceError {
                 if case .unavailable = error { throw error }
                 unreadable.append(range.itemId)
+                if firstFailure == nil { firstFailure = error.description }
             }
+        }
+        // Every range tried failed and none was read: git is not reading this repository, which is not "no old landings".
+        if scanned.isEmpty, !unreadable.isEmpty, let firstFailure {
+            throw SourceError.unavailable("git could not read any of the \(unreadable.count) landed items' commits (\(firstFailure))")
         }
         return Scan(pairs: Self.pair(scanned, forward: forward, inverse: inverse, lookback: limits.lookback),
                     scanned: Set(scanned.map(\.itemId)), unreadable: unreadable, notScanned: notScanned, stoppedAt: stoppedAt)
@@ -172,7 +179,7 @@ public final class RevertDetector {
 
     /// A commit id as the store records it, optionally with `^1` (R17's base): nothing git could read as an option or a path.
     static func isRevision(_ s: String) -> Bool {
-        s.range(of: "^[0-9a-f]{7,64}(\\^1)?$", options: .regularExpression) != nil
+        s.range(of: "^[0-9a-f]{7,64}(\\^1)?\\z", options: .regularExpression) != nil
     }
 
     /// `git diff --no-color --no-ext-diff --no-textconv <from> <to> --`, then that diff on the stdin of `git patch-id --stable`,

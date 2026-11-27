@@ -52,9 +52,12 @@ import Testing
     @Test func caughtNeedsResubmission() throws {
         let store = try Store.inMemory()
         let acme = try MeasureFixtures.company(store, name: "Acme")
-        let items = try MeasureFixtures.items(store, company: acme, count: 5, now: now.addingTimeInterval(-20 * day))
+        let items = try MeasureFixtures.items(store, company: acme, count: 7, now: now.addingTimeInterval(-70 * day))
         let t = now.addingTimeInterval(-10 * day)
-        // [0] change request, then a passing check, never resubmitted: not caught.
+        // [0] the real first round: submitted, a passing submit check, then the change request; never resubmitted, so the
+        // earlier pass and the later one confirm nothing: not caught.
+        try MeasureFixtures.event(store, item: items[0], kind: .submitted, at: t.addingTimeInterval(-3600))
+        try MeasureFixtures.verificationRun(store, company: acme, item: items[0], finishedAt: t.addingTimeInterval(-1800))
         try MeasureFixtures.event(store, item: items[0], kind: .changesRequested, at: t)
         try MeasureFixtures.verificationRun(store, company: acme, item: items[0], finishedAt: t.addingTimeInterval(3600))
         // [1] confirmed by a passing submit check.
@@ -79,6 +82,17 @@ import Testing
             try MeasureFixtures.event(store, item: items[4], kind: .submitted, at: r.addingTimeInterval(500))
         }
         try MeasureFixtures.verificationRun(store, company: acme, item: items[4], finishedAt: t.addingTimeInterval(5000))
+        // [5] confirmed, but the confirming check finished before the window: neither caught nor unconfirmed here.
+        let before = window.since
+        try MeasureFixtures.event(store, item: items[5], kind: .changesRequested, at: before.addingTimeInterval(-3 * day))
+        try MeasureFixtures.event(store, item: items[5], kind: .submitted, at: before.addingTimeInterval(-2 * day))
+        try MeasureFixtures.verificationRun(store, company: acme, item: items[5], finishedAt: before.addingTimeInterval(-day))
+        // [6] the only passing main run of its batch is at another candidate, not the land commit (R23): not a confirmation.
+        try MeasureFixtures.event(store, item: items[6], kind: .changesRequested, at: t)
+        try MeasureFixtures.event(store, item: items[6], kind: .submitted, at: t.addingTimeInterval(600))
+        let other = try MeasureFixtures.landEach(store, company: acme, items: [items[6]], at: [t.addingTimeInterval(7400)], firstNumber: 50)
+        try MeasureFixtures.mergeRun(store, company: acme, batch: other[0].batch, kind: .main, request: other[0].request,
+                                     candidateCommit: String(repeating: "e", count: 40), finishedAt: t.addingTimeInterval(7100))
 
         let m = try ReviewMetrics.reviewCatch(context(store, acme))
         #expect(m.id == .reviewCatch && m.unit == .ratio)
@@ -86,7 +100,7 @@ import Testing
         #expect(m.status == .insufficient(n: 4))
         #expect(row(m, "confirmed catches")?.numerator == 4)
         #expect(row(m, "escaped")?.numerator == 0)
-        #expect(row(m, "unconfirmed change requests")?.numerator == 1, "\(m.detail)")
+        #expect(row(m, "unconfirmed change requests")?.numerator == 2, "\(m.detail)")
         #expect(m.basis.contains("confirmed"), "\(m.basis)")
     }
 
@@ -95,8 +109,10 @@ import Testing
     @Test func unconfirmedCatchNotCounted() throws {
         let store = try Store.inMemory()
         let acme = try MeasureFixtures.company(store, name: "Acme")
-        let items = try MeasureFixtures.items(store, company: acme, count: 2, now: now.addingTimeInterval(-20 * day))
+        let items = try MeasureFixtures.items(store, company: acme, count: 3, now: now.addingTimeInterval(-20 * day))
         let t = now.addingTimeInterval(-10 * day)
+        // One landing with no escape: there is data, so the rate rule applies (R27).
+        try MeasureFixtures.landEach(store, company: acme, items: [items[2]], at: [t])
         try MeasureFixtures.verificationRun(store, company: acme, item: items[0], finishedAt: t.addingTimeInterval(-100))
         try MeasureFixtures.event(store, item: items[0], kind: .changesRequested, at: t)
         try MeasureFixtures.event(store, item: items[0], kind: .submitted, at: t.addingTimeInterval(600))
@@ -287,8 +303,11 @@ import Testing
         let items = try MeasureFixtures.items(store, company: acme, count: 3, now: now.addingTimeInterval(-10 * day))
         try MeasureFixtures.landEach(store, company: acme, items: items, at: (0..<3).map { now.addingTimeInterval(-3 * day + Double($0) * 60) })
         let recent = try ReviewMetrics.revertRate(context(store, acme), detector: detector(calls: calls))
-        #expect(recent.status == .notMeasured(reason: "no landings old enough"), "\(recent)")
-        for label in ["7 d", "14 d", "30 d"] { #expect(row(recent, label)?.status == .notMeasured(reason: "no landings old enough"), "\(label)") }
+        let start = Store.measureDay(window.since, in: store.ownerTimeZone())
+        #expect(recent.status == .notMeasured(reason: "no landings at least 14 d old in the window (window starts \(start))"), "\(recent)")
+        for days in [7, 14, 30] {
+            #expect(row(recent, "\(days) d")?.status == .notMeasured(reason: "no landings at least \(days) d old in the window (window starts \(start))"), "\(days)")
+        }
         #expect(calls.n == 0)
 
         // Old enough, but the company's workspace has no repository: the scan cannot run.
@@ -298,5 +317,117 @@ import Testing
         let noRepo = try ReviewMetrics.revertRate(ctx, detector: RevertDetector(git: ctx.git))
         guard case .notMeasured(let reason) = noRepo.status else { Issue.record("\(noRepo.status)"); return }
         #expect(reason.contains("no repository"), "\(reason)")
+    }
+
+    // MARK: Fix round 1
+
+    /// Ruling R27/R28: no landings, no confirmed catch and no escape in the window is `not measured`, even when unconfirmed
+    /// change requests exist; one landing (and nothing else) is data, so the rate rule gives `insufficient data (n=0)`.
+    @Test func reviewCatchNotMeasuredWithoutData() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme")
+        let empty = try ReviewMetrics.reviewCatch(context(store, acme))
+        #expect(empty.status == .notMeasured(reason: "no landings or review events in the window"), "\(empty)")
+        #expect(empty.display == "not measured: no landings or review events in the window")
+
+        let items = try MeasureFixtures.items(store, company: acme, count: 2, now: now.addingTimeInterval(-20 * day))
+        try MeasureFixtures.event(store, item: items[0], kind: .changesRequested, at: now.addingTimeInterval(-5 * day))
+        let unconfirmed = try ReviewMetrics.reviewCatch(context(store, acme))
+        #expect(unconfirmed.status == .notMeasured(reason: "no landings or review events in the window"), "\(unconfirmed)")
+        #expect(row(unconfirmed, "unconfirmed change requests")?.numerator == 1)
+
+        try MeasureFixtures.landEach(store, company: acme, items: [items[1]], at: [now.addingTimeInterval(-2 * day)])
+        let landed = try ReviewMetrics.reviewCatch(context(store, acme))
+        #expect(landed.status == .insufficient(n: 0), "\(landed)")
+    }
+
+    /// A detector whose every git call fails cannot claim the rows have no old landings: the metric says the scan could not run.
+    @Test func revertScanFailureIsNotMeasured() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme", createdAt: now.addingTimeInterval(-200 * day))
+        let items = try MeasureFixtures.items(store, company: acme, count: 3, now: now.addingTimeInterval(-50 * day))
+        try MeasureFixtures.landEach(store, company: acme, items: items, at: (0..<3).map { now.addingTimeInterval(-40 * day + Double($0) * 60) })
+        let failing = RevertDetector(limits: .standard, source: { _, _ in throw RevertDetector.SourceError.unreadable("git diff exited 128") })
+        let m = try ReviewMetrics.revertRate(context(store, acme), detector: failing)
+        guard case .notMeasured(let reason) = m.status else { Issue.record("\(m.status)"); return }
+        #expect(reason.hasPrefix("revert scan could not run: "), "\(reason)")
+        #expect(reason.contains("git diff exited 128"), "\(reason)")
+    }
+
+    /// Ruling R28: an empty row says why — no landing that old in the window (naming the window's start), or none readable.
+    @Test func emptyRevertRowSaysWhy() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme", createdAt: now.addingTimeInterval(-200 * day))
+        let items = try MeasureFixtures.items(store, company: acme, count: 3, now: now.addingTimeInterval(-50 * day))
+        let rows = try MeasureFixtures.landEach(store, company: acme, items: items, at: [
+            now.addingTimeInterval(-20 * day), now.addingTimeInterval(-20 * day + 60), now.addingTimeInterval(-8 * day),
+        ])
+        let start = Store.measureDay(window.since, in: store.ownerTimeZone())
+        let m = try ReviewMetrics.revertRate(context(store, acme), detector: detector())
+        #expect(row(m, "30 d")?.status == .notMeasured(reason: "no landings at least 30 d old in the window (window starts \(start))"), "\(m.detail)")
+        #expect(row(m, "7 d")?.denominator == 3)
+        // Only the 8-day-old landing is readable: the 14 d row has old landings, none readable.
+        let bad = try #require(rows[0].request.mergedCommit), bad2 = try #require(rows[1].request.mergedCommit)
+        let partial = RevertDetector(limits: .standard, source: { from, to in
+            if from.hasPrefix(bad) || to.hasPrefix(bad) || from.hasPrefix(bad2) || to.hasPrefix(bad2) {
+                throw RevertDetector.SourceError.unreadable("git diff exited 128")
+            }
+            return nil
+        })
+        let p = try ReviewMetrics.revertRate(context(store, acme), detector: partial)
+        #expect(p.status == .notMeasured(reason: "no readable landings at least 14 d old (2 excluded)"), "\(p)")
+        #expect(row(p, "7 d")?.denominator == 1)
+    }
+
+    /// Ruling R26: an item git cannot read, or one past a scan bound, is excluded from every row even when a `revertOf` link
+    /// names it, and the basis says so.
+    @Test func excludedItemsLeaveEveryRowEvenWhenLinked() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme", createdAt: now.addingTimeInterval(-200 * day))
+        let items = try MeasureFixtures.items(store, company: acme, count: 4, now: now.addingTimeInterval(-50 * day))
+        // A, B at −40 d; T at −35 d; R at −34 d reverts T (linked).
+        let rows = try MeasureFixtures.landEach(store, company: acme, items: items, at: [
+            now.addingTimeInterval(-40 * day), now.addingTimeInterval(-40 * day + 60), now.addingTimeInterval(-35 * day),
+            now.addingTimeInterval(-34 * day),
+        ])
+        try MeasureFixtures.link(store, item: rows[3].item, kind: .revertOf, target: rows[2].item, at: now.addingTimeInterval(-34 * day))
+        let tCommit = try #require(rows[2].request.mergedCommit)
+        let unreadableT = RevertDetector(limits: .standard, source: { from, to in
+            if from.hasPrefix(tCommit) || to.hasPrefix(tCommit) { throw RevertDetector.SourceError.unreadable("git diff exited 128") }
+            return nil
+        })
+        let m = try ReviewMetrics.revertRate(context(store, acme), detector: unreadableT)
+        for label in ["7 d", "14 d", "30 d"] {
+            #expect(row(m, label)?.numerator == 0 && row(m, label)?.denominator == 3, "\(label): \(m.detail)")
+        }
+        #expect(m.basis.contains("1 landed item whose commits git could not read excluded"), "\(m.basis)")
+        #expect(!m.detail.contains { $0.label.contains(" reverts ") })
+
+        // Past a bound: the two newest (T and R) are not scanned.
+        let capped = RevertDetector(limits: RevertDetector.Limits(maxItems: 2, gitCallSeconds: 10, lookback: 30 * day), source: { _, _ in nil })
+        let c = try ReviewMetrics.revertRate(context(store, acme), detector: capped)
+        for label in ["7 d", "14 d", "30 d"] {
+            #expect(row(c, label)?.numerator == 0 && row(c, label)?.denominator == 2, "\(label): \(c.detail)")
+        }
+        #expect(c.basis.contains("revert scan stopped at 2 landed items: 2 landed items not scanned excluded"), "\(c.basis)")
+    }
+
+    /// A detected-only revert landed 20 days after its target is in the 30-day row only; a `revertOf` link whose linking item
+    /// landed before its target is ignored.
+    @Test func detectedRevertAtDay20AndBackwardLink() throws {
+        let store = try Store.inMemory()
+        let acme = try MeasureFixtures.company(store, name: "Acme", createdAt: now.addingTimeInterval(-200 * day))
+        let items = try MeasureFixtures.items(store, company: acme, count: 4, now: now.addingTimeInterval(-50 * day))
+        // T at −45 d, R at −25 d (an exact inverse, day 20); E at −44 d links revertOf L at −40 d (E landed first).
+        let rows = try MeasureFixtures.landEach(store, company: acme, items: items, at: [
+            now.addingTimeInterval(-45 * day), now.addingTimeInterval(-25 * day), now.addingTimeInterval(-44 * day),
+            now.addingTimeInterval(-40 * day),
+        ])
+        try MeasureFixtures.link(store, item: rows[2].item, kind: .revertOf, target: rows[3].item, at: now.addingTimeInterval(-39 * day))
+        let m = try ReviewMetrics.revertRate(context(store, acme), detector: detector(inverses: [(rows[0].request, rows[1].request)]))
+        #expect(row(m, "7 d")?.numerator == 0 && row(m, "14 d")?.numerator == 0, "\(m.detail)")
+        #expect(row(m, "30 d")?.numerator == 1 && row(m, "30 d")?.denominator == 3, "\(m.detail)")
+        let reverts = m.detail.map(\.label).filter { $0.contains(" reverts ") }
+        #expect(reverts == ["\(rows[1].item.key) reverts \(rows[0].item.key) (exact inverse)"], "\(reverts)")
     }
 }
