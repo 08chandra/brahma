@@ -28,7 +28,7 @@ enum SafetyLint {
         var pattern: String {
             switch self {
             case .spawn: return #"\bProcess\(\)|\bposix_spawn\(|"/usr/bin/env"|\[\s*"git""#
-            case .sandboxPolicy: return #"\bSandboxPolicy\("#
+            case .sandboxPolicy: return #"\bSandboxPolicy\(|\blegacyExtract\("#
             case .descriptor: return #"\b(open|openat|fstatat|lstat|readlink|realpath)\(|\bO_NOFOLLOW\b"#
             case .fileAPI: return #"FileManager\.default|Data\(contentsOf:|String\(contentsOf|\.write\(to:|FileHandle\(for"#
             case .dirWalk: return #"enumerator\(at:|contentsOfDirectory\(|\bopendir\(|\bfdopendir\(|\breaddir\("#
@@ -71,7 +71,12 @@ enum SafetyLint {
             case .failOpen: return ["Sources/BrahmaSafety/", "Sources/BrahmaCore/Principal/"]
             case .alertScope, .idSubject: return SafetyLint.scanned.map { $0 + "/" }
             case .publicBool: return Self.policyAndPrincipal
-            case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .turnScope:
+            // S7: every Seatbelt policy comes from `SandboxPolicyFactory` (spec §6.3.4): a policy literal (or the one legacy
+            // entry) appears only in the kernel's `Policy/`, everywhere else none.
+            case .sandboxPolicy:
+                return ["Sources/BrahmaCore/", "Sources/brahma/", "Sources/BrahmaSafety/Path/", "Sources/BrahmaSafety/Process/",
+                        "Sources/BrahmaSafety/Prompt/", "Sources/BrahmaSafety/Sandbox/"]
+            case .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .turnScope:
                 return []
             }
         }
@@ -83,7 +88,10 @@ enum SafetyLint {
             case .spawn:
                 return ["Sources/BrahmaCore/Sandbox/ClaudeSettings.swift":
                             "script text, not a spawn: `ShellPrefix.tools` names the absolute tools (`/usr/bin/env -i`) the agent's shell prefix script runs; the engine spawns nothing here"]
-            case .sandboxPolicy, .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope, .publicBool, .idSubject:
+            case .sandboxPolicy:
+                return ["Sources/BrahmaCore/Refs/TextExtract.swift":
+                            "removed in S12: `SandboxedUnzipReader`'s policy is `SandboxPolicyFactory.legacyExtract`, the one policy not yet decided by purpose, until text extraction moves into the helper (`.helper(.extractText)`)"]
+            case .descriptor, .fileAPI, .dirWalk, .loopbackHTTP, .failOpen, .alertScope, .turnScope, .publicBool, .idSubject:
                 return [:]
             }
         }
@@ -392,8 +400,15 @@ enum SafetyLint {
         #expect(spawn("let p = Process()\np.executableURL = URL(fileURLWithPath: \"/usr/bin/env\")") == 2)
         #expect(spawn("posix_spawn(&pid, exe, &a, &b, &argv, &envp)\nlet argv = [ \"git\", \"status\"]") == 2)
         #expect(spawn("try Spawn.run(tools.git, [\"status\"], cwd: dir, env: env, timeout: .seconds(1), outputCap: 1)") == 0)
-        #expect((counts[.sandboxPolicy]?["Sources/BrahmaCore/Sandbox/SandboxedCheckRunner.swift"] ?? 0) > 0,
-                "sandboxPolicy: the check runner builds a policy")
+        // S7: the factory is the only place a policy is built; the check runner names its purpose.
+        #expect((counts[.sandboxPolicy]?["Sources/BrahmaSafety/Policy/SandboxPolicyFactory.swift"] ?? 0) > 0,
+                "sandboxPolicy: the factory builds the policies")
+        #expect(counts[.sandboxPolicy]?["Sources/BrahmaCore/Sandbox/SandboxedCheckRunner.swift"] == nil, "sandboxPolicy: the check runner builds none")
+        #expect(counts[.sandboxPolicy]?["Sources/BrahmaCore/Refs/TextExtract.swift"] == 1, "sandboxPolicy: the one legacyExtract caller")
+        func policyLiteral(_ code: String) -> Int { SafetyLint.regexHits(in: code, pattern: SafetyLint.Rule.sandboxPolicy.pattern).count }
+        #expect(policyLiteral("let p = SandboxPolicy(writable: [w], readable: [], network: .none, toolchain: false)") == 1)
+        #expect(policyLiteral("SandboxPolicyFactory.legacyExtract(unzipped: o, held: h, program: u, memoryLimit: 1, baseline: b)") == 1)
+        #expect(policyLiteral("SandboxPolicyFactory.decide(.check(.submit), principals: p, places: x, network: n, baseline: b)") == 0)
         #expect((counts[.descriptor]?["Sources/BrahmaSafety/Path/EngineFiles.swift"] ?? 0) > 0, "descriptor: the kernel is scanned")
         // S4: every `EngineAlerts.raise` names its scope (the compiler requires it too).
         #expect(counts[.alertScope]?.isEmpty ?? true, "alertScope: \(counts[.alertScope] ?? [:])")

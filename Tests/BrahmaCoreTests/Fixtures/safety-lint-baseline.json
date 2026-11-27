@@ -385,18 +385,8 @@
 
   },
   "sandboxPolicy" : {
-    "Sources/BrahmaCore/Engine/Doctor+Extensions.swift" : 1,
-    "Sources/BrahmaCore/Extensions/ExtensionImporter.swift" : 1,
-    "Sources/BrahmaCore/Extensions/ExtensionValidator.swift" : 1,
-    "Sources/BrahmaCore/Hosting/ProviderProbe.swift" : 2,
-    "Sources/BrahmaCore/Preview/PreviewKinds.swift" : 3,
-    "Sources/BrahmaCore/Preview/PreviewModel.swift" : 1,
-    "Sources/BrahmaCore/Refs/SandboxedPDFReader.swift" : 1,
     "Sources/BrahmaCore/Refs/TextExtract.swift" : 1,
-    "Sources/BrahmaCore/Release/ReleaseExecutor.swift" : 2,
-    "Sources/BrahmaCore/Safety/SandboxCanary.swift" : 2,
-    "Sources/BrahmaCore/Sandbox/SandboxedCheckRunner.swift" : 1,
-    "Sources/BrahmaCore/Store/Store+Release.swift" : 1
+    "Sources/BrahmaSafety/Policy/SandboxPolicyFactory.swift" : 15
   },
   "spawn" : {
     "Sources/BrahmaCore/Sandbox/ClaudeSettings.swift" : 2,

@@ -5,13 +5,24 @@ import Darwin
 import Glibc
 #endif
 
+/// Runs agent-written commands with no sandbox, for the company owner's Full opt-out only (spec §6.3.1): every entry takes
+/// the `FullOptOut` that `SandboxPolicyFactory.decide` returned for the action, so the unsandboxed route cannot be reached
+/// from a `Bool` (Plan S Task S7).
+public protocol UnsandboxedRunning: Sendable {
+    /// Runs `command` (`/bin/sh -c`) to completion or `timeout`; never throws (whatever goes wrong is the outcome).
+    func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+             optOut: FullOptOut) async -> CheckOutcome
+    /// Starts `command` as a long-running process (a preview); its output goes to `logURL`.
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, optOut: FullOptOut) throws -> any SandboxedProcess
+}
+
 /// The runner a Full company's previews use (PR-5: as its checks run unsandboxed): `/bin/sh -c` in its own process group
-/// through 3a's helpers (`GroupRun`, `ProcessGroupChild`, `OutputCapture`), the policy unenforced.
-public struct UnsandboxedPreviewRunner: SandboxedRunner {
+/// through 3a's helpers (`GroupRun`, `ProcessGroupChild`, `OutputCapture`), nothing enforced.
+public struct UnsandboxedPreviewRunner: UnsandboxedRunning {
     public init() {}
 
     public func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-                    policy: SandboxPolicy) async -> CheckOutcome {
+                    optOut: FullOptOut) async -> CheckOutcome {
         let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
         let cancel = GroupRun.CancelFlag()
         return await withTaskCancellationHandler {
@@ -27,7 +38,7 @@ public struct UnsandboxedPreviewRunner: SandboxedRunner {
         } onCancel: { cancel.set() }
     }
 
-    public func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
+    public func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, optOut: FullOptOut) throws -> any SandboxedProcess {
         try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let file = open(logURL.path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard file >= 0 else { throw SandboxError.invalidPath("cannot open the log \(logURL.path)") }

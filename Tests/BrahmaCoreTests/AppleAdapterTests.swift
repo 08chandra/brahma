@@ -482,8 +482,10 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
 
     // MARK: The profile is built from the checked paths (obligation d)
 
-    /// `SeatbeltRunner.prepare` validates the policy's paths and then renders the profile. A path swapped for a link between
-    /// the two must not widen the profile: the profile names exactly the paths the check saw.
+    /// `SeatbeltRunner.prepare` checks the validated policy's paths and then renders the profile. A path swapped for a link
+    /// between the two must not widen the profile: the profile names exactly the paths the check saw. Plan S Task S7 re-points
+    /// this 4a Task 7 test to `ValidatedPolicy`: the runner is handed the strings `SandboxPolicyCheck.validate` accepted (as
+    /// `SandboxPolicyFactory.decide` hands them), and its own check runs again at `prepare`.
     @Test func profileUsesCheckedPaths() throws {
         let dir = try Scratch.homeDir().resolvedForSandbox
         let outside = dir.appending(path: "outside")
@@ -493,7 +495,9 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
         let baseline = SandboxBaseline.current(paths: BrahmaPaths(home: dir.appending(path: "home"), workspaces: dir.appending(path: "wss")),
                                                otherWorkspaces: [], backupTargets: [])
         try #require(baseline.problem == nil)
-        let policy = SandboxPolicy(writable: [appData], readable: [run], network: .none, toolchain: false)
+        let policy = try SandboxPolicyCheck.validate(SandboxPolicy(writable: [appData], readable: [run], network: .none, toolchain: false),
+                                                     baseline: baseline)
+        #expect(policy.writable == [appData.path] && policy.readable == [run.path])
         // 1. A readable entry (the run) swapped for a link out between the check and the render: the profile still names the
         //    checked path, never the link's target.
         let swapped = Swapped()
@@ -510,7 +514,7 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
         #expect(!profile.contains(SeatbeltProfile.quote(outside.path)), "the link's target leaked into the profile:\n\(profile)")
         #expect(prepared.environment["TMPDIR"] == appData.appending(path: ".brahma-tmp").path)
         SeatbeltRunner.removeTemp(policy)
-        // The same policy presented with the link already in place is refused by the check itself.
+        // The same validated policy presented with the link already in place is refused by the runner's own check.
         #expect(throws: (any Error).self) { try readSwap.prepare(command: "true", environment: [:], policy: policy, proxyPort: nil, marker: nil) }
         try FileManager.default.removeItem(at: run)
         try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
@@ -522,8 +526,8 @@ final class FakeSimulator: SimulatorControlling, @unchecked Sendable {
         })
         #expect(throws: (any Error).self) { try writeSwap.prepare(command: "true", environment: [:], policy: policy, proxyPort: nil, marker: nil) }
         #expect(try FileManager.default.contentsOfDirectory(atPath: outside.path).isEmpty, "the engine wrote through the link")
-        // 3. The renderer itself: with the policy's paths taken as checked, no link is followed at render time.
-        let plain = SeatbeltProfile.render(policy: policy, baseline: baseline, proxyPort: nil, resolvePolicyPaths: false)
+        // 3. The renderer itself: it renders the validated strings and resolves nothing.
+        let plain = SeatbeltProfile.render(policy, baseline: baseline, proxyPort: nil)
         #expect(plain.contains("(subpath \(SeatbeltProfile.quote(appData.path)))") && !plain.contains(SeatbeltProfile.quote(outside.path)), "\(plain)")
     }
 

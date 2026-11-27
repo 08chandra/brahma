@@ -73,25 +73,37 @@ struct DevHostSandbox: SandboxedRunner {
     let hostDir: URL
 
     func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-             policy: SandboxPolicy) async -> CheckOutcome {
-        await base.run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL,
-                       policy: granted(command, policy))
+             policy: ValidatedPolicy) async -> CheckOutcome {
+        switch granted(command, policy) {
+        case .sandboxed(let p):
+            return await base.run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, policy: p)
+        case let other:
+            return await base.run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, decision: other)
+        }
     }
 
-    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
-        try base.spawn(command: command, cwd: cwd, environment: environment, logURL: logURL, policy: granted(command, policy))
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: ValidatedPolicy) throws -> any SandboxedProcess {
+        switch granted(command, policy) {
+        case .sandboxed(let p): return try base.spawn(command: command, cwd: cwd, environment: environment, logURL: logURL, policy: p)
+        case .refused(let why): throw SandboxError.invalidPath(why)
+        case .fullOptOut: throw SandboxError.invalidPath("the dev host's copy step runs only sandboxed")
+        }
     }
+
+    func policyBaseline() -> SandboxBaseline { base.policyBaseline() }
 
     /// The copy step's policy with the dev-host folder writable (kept off `writable[0]`, the TMPDIR, and the last entry, the
-    /// toolchain HOME); any other policy as it is.
-    func granted(_ command: String, _ policy: SandboxPolicy) -> SandboxPolicy {
+    /// toolchain HOME); any other policy as it is. Plan S Task S7: the widened policy is the factory's `.releaseTool`
+    /// decision over the step's own places plus the folder (a verified place), so it is validated like any other.
+    func granted(_ command: String, _ policy: ValidatedPolicy) -> PolicyDecision {
         let copy = ShellQuote.joinArgv([LocalCopyHostingAdapter.copy, "-R"], rawRefs: []) + " "
         let quoted = ShellQuote.quote(hostDir.path + "/")
         let target = " " + (quoted.hasPrefix("'") ? String(quoted.dropLast()) : quoted)
-        guard command.hasPrefix(copy), command.contains(target), !policy.writable.isEmpty else { return policy }
-        var p = policy
-        p.writable.insert(hostDir.resolvedForSandbox, at: 1)
-        return p
+        guard command.hasPrefix(copy), command.contains(target), !policy.writable.isEmpty else { return .sandboxed(policy) }
+        var writable = policy.writable.map { URL(fileURLWithPath: $0, isDirectory: false) }
+        writable.insert(hostDir.resolvedForSandbox, at: 1)
+        return ReleaseExecutor.toolDecision(writable: writable, readable: policy.readable.map { URL(fileURLWithPath: $0, isDirectory: false) },
+                                            network: policy.allowedDomains ?? [], baseline: base.policyBaseline())
     }
 }
 

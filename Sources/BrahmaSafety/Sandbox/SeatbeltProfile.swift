@@ -40,8 +40,9 @@ import Foundation
 ///   `defaults write` reached the owner's `~/Library/Preferences` (other apps' settings, a persistence and code-execution
 ///   route). Seatbelt's `user-preference-write` operation did not stop it under `sandbox-exec`.
 ///
-/// Every string is escaped (`quote`, `regexEscape`) and every path is resolved; paths holding characters no profile string
-/// may carry are refused before rendering (`SandboxPolicyCheck`).
+/// Every string is escaped (`quote`, `regexEscape`); the policy's paths are the validated strings (`ValidatedPolicy`) and
+/// every baseline path is resolved; paths holding characters no profile string may carry are refused before rendering
+/// (`SandboxPolicyCheck`).
 public enum SeatbeltProfile {
     /// The `.brahma` children every turn may read when they exist (5L-1). `hooks` and the shell prefix must be readable for
     /// git and Bash to start; `ext` holds mounted extension parts whose scripts run in Bash; `cache/shared` is the read-only
@@ -112,25 +113,22 @@ public enum SeatbeltProfile {
     /// a per-run unique mach global name the profile allows (and no service answers), so the engine can recognize the run's
     /// processes afterwards by their sandbox alone (B-I4).
     ///
-    /// `resolvePolicyPaths`: whether the policy's own paths are resolved here. `SeatbeltRunner.prepare` passes false: it has
-    /// just checked that every policy path is already resolved (`SandboxPolicyCheck`), and rendering from the checked spelling
-    /// means a link planted between the check and the render cannot put its target into the profile (Task 7, obligation d).
-    /// Baseline paths are always resolved (they are the engine's own).
-    public static func render(policy: SandboxPolicy, baseline: SandboxBaseline, proxyPort: UInt16?, marker: String? = nil,
-                              resolvePolicyPaths: Bool = true) -> String {
+    /// The policy's own paths are rendered exactly as `SandboxPolicyCheck` validated them (`ValidatedPolicy`): nothing of the
+    /// policy is resolved here, so a link planted between the check and the render cannot put its target into the profile
+    /// (Task 7, obligation d; Plan S Task S7 makes it structural, spec §6.3.3). Baseline paths are always resolved (they are
+    /// the engine's own).
+    public static func render(_ policy: ValidatedPolicy, baseline: SandboxBaseline, proxyPort: UInt16?, marker: String? = nil) -> String {
         if let confinement = policy.confined {
-            return renderConfined(confinement, readable: policy.readable.map { resolvePolicyPaths ? SandboxPath.resolve($0.path) : $0.path },
-                                  marker: marker)
+            return renderConfined(confinement, readable: policy.readable, marker: marker)
         }
         func r(_ url: URL) -> String { SandboxPath.resolve(url.path) }
-        func checked(_ url: URL) -> String { resolvePolicyPaths ? r(url) : url.path }
         func subpath(_ p: String) -> String { "(subpath \(quote(p)))" }
         func unique(_ paths: [String]) -> [String] {
             var seen = Set<String>()
             return paths.filter { seen.insert($0).inserted }
         }
-        let writable = unique(policy.writable.map(checked))
-        let readable = unique(policy.readable.map(checked))
+        let writable = unique(policy.writable)
+        let readable = unique(policy.readable)
         let home = r(baseline.userHome)
 
         var lines = ["(version 1)", "(allow default)"]

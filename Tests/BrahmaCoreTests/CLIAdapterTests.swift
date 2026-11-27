@@ -6,7 +6,7 @@ import Foundation
 /// fresh export; the engine captures the demo's output (redacted, capped at 1 MB) and the result is `ran`. FakeSandbox runs
 /// real commands (unsandboxed, the policy recorded).
 @Suite(.scratch) struct CLIAdapterTests {
-    static let policy = SandboxPolicy(writable: [URL(fileURLWithPath: "/nowhere")], readable: [], network: .none, toolchain: false)
+    static let policy = ValidatedPolicy.fixture(writable: [URL(fileURLWithPath: "/nowhere")])
 
     struct Setup {
         let dir: URL

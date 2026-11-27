@@ -405,9 +405,11 @@ public enum ProviderProbe {
             env["HOME"] = home.path
             let out = home.appending(path: "install.out", directoryHint: .notDirectory)
             let command = ShellQuote.joinArgv(["npm", "install", "--prefix", tools.path, "--no-audit", "--no-fund", adapter.cli], rawRefs: [])
+            // Plan S Task S7: the factory's `.providerProbe` rule, the executor's install shape (engine principals: never Full).
+            let decision = ReleaseExecutor.toolDecision(.providerProbe, writable: [resolved], readable: [resolved], network: adapter.toolNetwork,
+                                                        baseline: sandbox.policyBaseline())
             let outcome = await sandbox.run(command: command, cwd: tools, environment: env, timeout: ReleasePolicy.stepTimeout, outputURL: out,
-                                            policy: SandboxPolicy(writable: [resolved], readable: [resolved],
-                                                                  network: .outbound(allow: adapter.toolNetwork), toolchain: true))
+                                            decision: decision)
             _ = try? EngineFiles.removeNoFollow(tools.appending(path: ".brahma-tmp"), under: layout.root)
             let text = store.redactor.apply(EngineFiles.readNoFollow(out, under: layout.root, limit: 1 << 20).map { String(decoding: $0, as: UTF8.self) } ?? outcome.tail)
             _ = try? EngineFiles.removeNoFollow(out, under: layout.root)
@@ -430,9 +432,11 @@ public enum ProviderProbe {
             env["HOME"] = home.path
             for (name, value) in plan.env where name != plan.tokenSecret { env[name] = value }
             let command = ShellQuote.joinArgv(argv, rawRefs: []) + " 2>>" + ShellQuote.quote(err.path)
+            // Plan S Task S7: the factory's `.providerProbe` rule, the executor's token-step shape.
+            let decision = ReleaseExecutor.toolDecision(.providerProbe, writable: [real(home), real(cwd)], readable: [real(cwd), real(tools)],
+                                                        network: plan.network, baseline: sandbox.policyBaseline())
             let outcome = await sandbox.run(command: command, cwd: cwd, environment: env, timeout: ReleasePolicy.stepTimeout, outputURL: out,
-                                            policy: SandboxPolicy(writable: [real(home), real(cwd)], readable: [real(cwd), real(tools)],
-                                                                  network: .outbound(allow: plan.network), toolchain: true))
+                                            decision: decision)
             let pin = Redactor()
             pin.update([(name: plan.tokenSecret, value: token)], version: "pinned")
             func text(_ url: URL) -> String {

@@ -128,18 +128,6 @@ public struct SandboxLayout: Equatable, Sendable {
 
 // MARK: Network
 
-public struct NetworkScope: Equatable, Sendable {
-    /// Bash egress (the proxy's allow-list).
-    public var allowedDomains: [String]
-    /// WebFetch.
-    public var webDomains: [String]
-    public var allowLocalBinding: Bool
-
-    public init(allowedDomains: [String], webDomains: [String], allowLocalBinding: Bool) {
-        self.allowedDomains = allowedDomains; self.webDomains = webDomains; self.allowLocalBinding = allowLocalBinding
-    }
-}
-
 public enum CompanyNetwork {
     public static let defaultRegistries = [
         "registry.npmjs.org", "registry.yarnpkg.com", "pypi.org", "files.pythonhosted.org", "crates.io", "index.crates.io",

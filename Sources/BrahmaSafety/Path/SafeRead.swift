@@ -34,12 +34,24 @@ public enum SafeRead {
     /// The default bound: a pointer file is a line; 4 KiB is generous.
     public static let defaultLimit = 4096
 
-    /// The text of `<root>/<relative>`, or a `SafeReadError`. `relative` is one or more `/`-separated names, none of them
-    /// `.` or `..`.
-    public static func smallText(_ relative: String, under root: URL, limit: Int = defaultLimit) throws -> String {
+    /// The text of `<root>/<relative>`, or a `SafeReadError`, where `root` is a verified `Place` (Plan S Task S7): the
+    /// directory is opened at its resolved path and must still be that directory (`O_NOFOLLOW`, by its kernel path), then
+    /// every component under it is opened as before. `relative` is one or more `/`-separated names, none of them `.` or `..`.
+    public static func smallText(_ relative: String, under root: Place, limit: Int = defaultLimit) throws -> String {
+        guard root.kind == .directory else { throw SafeReadError.io("\(root.resolvedPath) is not a directory") }
+        return try smallText(relative, in: try openPlace(root), shown: root.url, limit: limit)
+    }
+
+    /// S2's form, by a root URL the engine resolves here (`realpath`). Internal since Plan S Task S7: callers outside the
+    /// kernel name the root as a `Place`.
+    static func smallText(_ relative: String, under root: URL, limit: Int = defaultLimit) throws -> String {
+        try smallText(relative, in: try openRoot(root), shown: root, limit: limit)
+    }
+
+    private static func smallText(_ relative: String, in top: EngineFiles.OpenDirectory, shown root: URL, limit: Int) throws -> String {
         let parts = relative.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
         guard let name = parts.last, isValidName(name) else { throw SafeReadError.io("\(relative) is not a valid file name") }
-        var dir = try openRoot(root)
+        var dir = top
         for part in parts.dropLast() {
             do { dir = try dir.child(part) } catch let problem as UnsafeEngineFile { throw SafeReadError.io(problem.description) }
         }
@@ -76,7 +88,7 @@ public enum SafeRead {
 
     /// `root` resolved by the engine and opened as a directory, held as an `OpenDirectory` so each component under it is
     /// opened relative to it and the directory is checked to be where the walk left it.
-    private static func openRoot(_ root: URL) throws -> EngineFiles.OpenDirectory {
+    static func openRoot(_ root: URL) throws -> EngineFiles.OpenDirectory {
         guard let resolved = realpath(root.path, nil) else {
             throw SafeReadError.io("\(root.path) cannot be resolved (\(String(cString: strerror(errno))))")
         }
@@ -85,6 +97,16 @@ public enum SafeRead {
         let fd = open(real, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard fd >= 0 else { throw SafeReadError.io("\(root.path) cannot be opened as a directory (\(String(cString: strerror(errno))))") }
         return EngineFiles.OpenDirectory(fd: fd, real: real, shown: root)
+    }
+
+    /// A `Place`'s directory opened at its resolved path and checked to be where the place says: its path still resolves to
+    /// itself (no link anywhere on the way) and the kernel's path of the open descriptor is that path.
+    private static func openPlace(_ place: Place) throws -> EngineFiles.OpenDirectory {
+        let dir = try openRoot(place.url)
+        guard dir.real == place.resolvedPath, let opened = EngineFiles.path(of: dir.fd), opened.lowercased() == place.resolvedPath.lowercased() else {
+            throw SafeReadError.io("\(place.resolvedPath) moved since it was verified")
+        }
+        return dir
     }
 
     /// At most `count` bytes from `fd`; a read error is a refusal, never a truncated result.

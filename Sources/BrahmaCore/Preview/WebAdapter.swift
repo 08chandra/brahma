@@ -21,9 +21,7 @@ public struct WebAdapter: PreviewAdapter {
     public func availability() -> String? { nil }
     /// Through the runner `deps.runner(for: c)` picks (PR-5), telling `c.onSpawn` the server's pid.
     public func start(_ c: PreviewContext) async -> PreviewUpdate {
-        var routed = deps
-        routed.sandbox = deps.runner(for: c)
-        return await Self.startServer(c, deps: routed, onSpawn: c.onSpawn)
+        await Self.startServer(c, deps: deps, onSpawn: c.onSpawn)
     }
 
     /// One request's own timeout for a demo.
@@ -50,7 +48,8 @@ public struct WebAdapter: PreviewAdapter {
     }
 
     /// The start, in order:
-    /// 1. `build`, if set, through `deps.sandbox.run` in `c.run` under `c.policy` with `c.timeouts.build` (output to the log):
+    /// 1. `build`, if set, through `deps.runner(for: c)` in `c.run` (the sandbox under `c.policy`, or a Full company's
+    ///    unsandboxed runner with its opt-out, PR-5) with `c.timeouts.build` (output to the log):
     ///    a non-zero exit is `failed("build failed (exit <n>)")`, a timeout `failed("build timed out")`, a run that could not
     ///    happen at all `failed("build could not run")`;
     /// 2. `run` with `{port}` substituted, spawned the same way (its process is put in `deps.processes`; `onSpawn` hears its
@@ -66,8 +65,8 @@ public struct WebAdapter: PreviewAdapter {
             return PreviewUpdate(status: .failed, message: "a web preview needs run and url")
         }
         if let build = c.surface.build {
-            let outcome = await deps.sandbox.run(command: build, cwd: c.run, environment: c.environment, timeout: c.timeouts.build,
-                                                 outputURL: c.logURL, policy: c.policy)
+            let outcome = await deps.runner(for: c).run(command: build, cwd: c.run, environment: c.environment, timeout: c.timeouts.build,
+                                                        outputURL: c.logURL)
             if Task.isCancelled { return PreviewUpdate(status: .stopped, message: nil) }
             if outcome.timedOut { return PreviewUpdate(status: .failed, message: "build timed out") }
             guard let code = outcome.exitCode else { return PreviewUpdate(status: .failed, message: "build could not run") }
@@ -76,7 +75,7 @@ public struct WebAdapter: PreviewAdapter {
         let command = run.replacingOccurrences(of: LoopbackURL.placeholder, with: String(c.port))
         let process: any SandboxedProcess
         do {
-            process = try deps.sandbox.spawn(command: command, cwd: c.run, environment: c.environment, logURL: c.logURL, policy: c.policy)
+            process = try deps.runner(for: c).spawn(command: command, cwd: c.run, environment: c.environment, logURL: c.logURL)
         } catch SandboxError.unavailable {
             return PreviewUpdate(status: .unavailable, message: UnavailableSandboxRunner.tail)
         } catch {

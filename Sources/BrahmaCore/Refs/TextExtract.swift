@@ -92,11 +92,17 @@ public struct SandboxedUnzipReader: ArchiveReader {
     /// The sandbox of one read (round 4): `held` (the copy) the only tree it reads besides the system; `unzip` the only
     /// program (nothing else runs, nothing forks); no file it may write (`out` is the runner's own; the engine writes the
     /// output there); no network; the memory limit.
-    static func policy(unzip: URL, held: URL, out: URL) -> SandboxPolicy {
-        var policy = SandboxPolicy(writable: [out], readable: [held], network: .none, toolchain: false)
-        policy.confined = SandboxConfinement(executables: [unzip], readableFiles: [], listableDirectories: [], writableFiles: [])
-        policy.memoryLimit = memoryLimit
-        return policy
+    /// Plan S Task S7: the one policy not yet decided by purpose (`SandboxPolicyFactory.legacyExtract`, the lint's one
+    /// exception), unchanged from before; S12 moves text extraction into the helper (`.helper(.extractText)`).
+    static func policy(unzip: URL, held: URL, out: URL, baseline: SandboxBaseline) -> PolicyDecision {
+        let (program, heldPlace, outPlace): (Place, Place, Place)
+        do {
+            (program, heldPlace, outPlace) = (try Place.resolved(unzip, kind: .file), try Place.resolved(held, kind: .directory),
+                                              try Place.resolved(out, kind: .directory))
+        } catch {
+            return .refused("the archive reader's places are not safe to use (\(error))")
+        }
+        return SandboxPolicyFactory.legacyExtract(unzipped: outPlace, held: heldPlace, program: program, memoryLimit: memoryLimit, baseline: baseline)   // removed in S12
     }
 
     public func pdfParts(of data: Data, maxBytes: Int, timeout: Duration) throws -> [PDFPart] {
@@ -141,7 +147,7 @@ public struct SandboxedUnzipReader: ArchiveReader {
 
         let (heldDir, outDir) = (held.resolvedForSandbox, out.resolvedForSandbox)
         let program = URL(fileURLWithPath: Self.unzip)
-        let policy = Self.policy(unzip: program, held: heldDir, out: outDir)
+        let policy = Self.policy(unzip: program, held: heldDir, out: outDir, baseline: runner.policyBaseline())
         let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
         // One run, unzip itself, on this thread (`runProgramBlocking`: never a wait on the cooperative pool); the engine reads
         // its output up to the cap.
@@ -149,7 +155,7 @@ public struct SandboxedUnzipReader: ArchiveReader {
                                                     + chosen.map { Self.literal($0.name) },
                                                 cwd: outDir, environment: environment, timeout: Self.timeout,
                                                 outputURL: dir.appending(path: "unzip.log"), stdoutURL: outDir.appending(path: Self.membersName),
-                                                stdoutCap: limits.bytes, policy: policy)
+                                                stdoutCap: limits.bytes, decision: policy)
         if outcome.tail.hasSuffix(GroupRun.outputExceeded) || outcome.tail.hasSuffix(GroupRun.memoryExceeded) { throw ArchiveReadError.expands }
         // Round 3: a run that ran out of time or never ran says so (the gate does not cache those).
         if outcome.timedOut { throw Self.tooLong }

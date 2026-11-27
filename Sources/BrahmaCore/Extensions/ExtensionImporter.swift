@@ -313,9 +313,20 @@ public enum ExtensionImporter {
             + "if [ \"$total\" -gt \(limit) ]; then echo \"\(quotaMarker)\"; exit 3; fi; "
             + "ulimit -f \(blocks) && " + [q("/usr/bin/unzip"), "-q", "-n", q(archive.path), "-d", q(unzipped.path)].joined(separator: " ")
         let env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
-        let policy = SandboxPolicy(writable: [unzipped], readable: [held], network: .none, toolchain: false)
+        // Plan S Task S7: the factory's `.extensionUnzip` rule over the two engine-made places (their parent resolved, the
+        // place itself never followed); the subject is the zip's source (`.external`): never Full, no grant.
+        let decision: PolicyDecision
+        do {
+            decision = SandboxPolicyFactory.decide(.extensionUnzip, principals: PrincipalSet(companyId: "", members: [.external(source: zip.path)],
+                                                                                              ownerProfile: .sandboxed),
+                                                   places: .extensionUnzip(unzipped: try Place.atResolvedParent(unzipped, kind: .directory),
+                                                                           held: try Place.atResolvedParent(held, kind: .directory)),
+                                                   network: .none, baseline: sandbox.policyBaseline())
+        } catch {
+            decision = .refused("the unzip places are not safe to use (\(error))")
+        }
         let out = await sandbox.run(command: command, cwd: unzipped, environment: env, timeout: .seconds(120),
-                                    outputURL: dir.appending(path: ".unzip.log"), policy: policy)
+                                    outputURL: dir.appending(path: ".unzip.log"), decision: decision)
         try? FileManager.default.removeItem(at: dir.appending(path: ".unzip.log"))
         guard out.exitCode == 0 else {
             try? FileManager.default.removeItem(at: unzipped)

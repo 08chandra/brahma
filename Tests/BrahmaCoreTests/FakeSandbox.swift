@@ -5,20 +5,25 @@ import Darwin
 import Glibc
 #endif
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// A `SandboxedRunner` that runs commands unsandboxed (`/bin/sh -c`) through 3a's process-group helpers (`GroupRun` for
 /// `run`, `ProcessGroupChild` for `spawn`: its own process group, signalled only while unreaped), and records every call
-/// (PR-38). Tests only: the policy is recorded, never enforced.
-final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
+/// (PR-38). Tests only: the policy is recorded, never enforced. Plan S Task S7: it is both a sandbox (a `ValidatedPolicy`)
+/// and a Full company's unsandboxed runner (a `FullOptOut`); a call through the latter records `ValidatedPolicy.optedOut`
+/// and its opt-out.
+final class FakeSandbox: SandboxedRunner, UnsandboxedRunning, @unchecked Sendable {
     struct Call: Equatable, Sendable {
         enum Kind: Equatable, Sendable { case run, spawn }
         var kind: Kind
         var command: String
         var cwd: URL
         var environment: [String: String]
-        var policy: SandboxPolicy
+        var policy: ValidatedPolicy
         /// `run`'s `outputURL` or `spawn`'s `logURL`.
         var output: URL
+        /// The Full opt-out a call through `UnsandboxedRunning` carried.
+        var optOut: FullOptOut? = nil
     }
 
     private let lock = NSLock()
@@ -90,8 +95,26 @@ final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
     private func record(_ call: Call) { lock.withLock { recorded.append(call) } }
 
     func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-             policy: SandboxPolicy) async -> CheckOutcome {
-        let call = Call(kind: .run, command: command, cwd: cwd, environment: environment, policy: policy, output: outputURL)
+             optOut: FullOptOut) async -> CheckOutcome {
+        await run(Call(kind: .run, command: command, cwd: cwd, environment: environment, policy: .optedOut, output: outputURL, optOut: optOut),
+                  timeout: timeout)
+    }
+
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, optOut: FullOptOut) throws -> any SandboxedProcess {
+        try spawn(Call(kind: .spawn, command: command, cwd: cwd, environment: environment, policy: .optedOut, output: logURL, optOut: optOut))
+    }
+
+    func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
+             policy: ValidatedPolicy) async -> CheckOutcome {
+        await run(Call(kind: .run, command: command, cwd: cwd, environment: environment, policy: policy, output: outputURL), timeout: timeout)
+    }
+
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: ValidatedPolicy) throws -> any SandboxedProcess {
+        try spawn(Call(kind: .spawn, command: command, cwd: cwd, environment: environment, policy: policy, output: logURL))
+    }
+
+    private func run(_ call: Call, timeout: Duration) async -> CheckOutcome {
+        let (command, cwd, environment, outputURL) = (call.command, call.cwd, call.environment, call.output)
         record(call)
         ranCall(call)
         let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
@@ -107,8 +130,9 @@ final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
         } onCancel: { cancel.set() }
     }
 
-    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
-        record(Call(kind: .spawn, command: command, cwd: cwd, environment: environment, policy: policy, output: logURL))
+    private func spawn(_ call: Call) throws -> any SandboxedProcess {
+        let (command, cwd, environment, logURL) = (call.command, call.cwd, call.environment, call.output)
+        record(call)
         if let spawnError { throw spawnError }
         try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let file = open(logURL.path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
@@ -118,7 +142,7 @@ final class FakeSandbox: SandboxedRunner, @unchecked Sendable {
                                                 workingDirectory: cwd, output: file)
         lock.withLock { spawned.append(child.pid) }
         let process = FakeSandboxProcess(child: child)
-        started(Call(kind: .spawn, command: command, cwd: cwd, environment: environment, policy: policy, output: logURL))
+        started(call)
         return process
     }
 }
@@ -157,3 +181,4 @@ final class FakeSandboxProcess: SandboxedProcess, @unchecked Sendable {
         while !lock.withLock({ reaped }) { try? await AwakeTime.sleep(for: .milliseconds(10)) }
     }
 }
+

@@ -191,7 +191,7 @@ import Foundation
         #expect(call.command.contains("ulimit -f"), "\(call.command)")
         #expect(!call.command.contains(" -o ")); #expect(call.policy.network == .none); #expect(!call.policy.toolchain)
         #expect(call.policy.writable.count == 1); #expect(call.policy.writable[0].lastPathComponent == ".unzip")
-        #expect(call.policy.writable[0].path.hasPrefix(p.extensionsDir.staging.path))
+        #expect(call.policy.writable[0].path.hasPrefix(p.extensionsDir.staging.resolvedForSandbox.path))   // S7: the place by its resolved path
         #expect(!FileManager.default.fileExists(atPath: staged.dir.appending(path: ".unzip").path))
         // A zip bomb (6 MB of zeros, a few KB compressed) is refused by the ratio, before unzip runs.
         let zeros = try tempDir()

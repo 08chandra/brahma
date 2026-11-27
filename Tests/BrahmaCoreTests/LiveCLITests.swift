@@ -312,13 +312,17 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(adapter.deployURL(fromOutput: "http://127.0.0.1:1/\n", settings: settings) == nil)
 
         let sandbox = DevHostSandbox(base: UnavailableSandboxRunner(), hostDir: root)
-        let policy = SandboxPolicy(writable: [dir.appending(path: "home"), dir.appending(path: "upload")], readable: [], network: .outbound(allow: []),
-                                   toolchain: true)
+        // Plan S Task S7: the token step's policy is a validated one (its places real, by their resolved paths), and the
+        // widened copy step's is the factory's decision over them plus the host folder.
+        let real = dir.resolvedForSandbox
+        for d in ["home", "upload"] { try FileManager.default.createDirectory(at: real.appending(path: d), withIntermediateDirectories: true) }
+        let policy = ValidatedPolicy.fixture(writable: [real.appending(path: "home"), real.appending(path: "upload")], network: .outbound(allow: []),
+                                             toolchain: true)
         let copy = ShellQuote.joinArgv(["/bin/cp", "-R", "dist/", root.appending(path: "R-1").path], rawRefs: []) + " 2>>/tmp/x"
-        #expect(sandbox.granted(copy, policy).writable.map(\.path) == [dir.appending(path: "home").path, root.resolvedForSandbox.path,
-                                                                        dir.appending(path: "upload").path])
+        #expect(sandbox.granted(copy, policy).validated?.writable == [real.appending(path: "home").path, root.resolvedForSandbox.path,
+                                                                       real.appending(path: "upload").path])
         for other in ["/bin/echo \(ok)", "mkdir -p dist && cp index.html dist/", "/bin/cp -R dist/ /tmp/elsewhere"] {
-            #expect(sandbox.granted(other, policy) == policy, "\(other)")
+            #expect(sandbox.granted(other, policy) == .sandboxed(policy), "\(other)")
         }
     }
 }

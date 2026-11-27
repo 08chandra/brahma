@@ -136,13 +136,13 @@ struct ExtWorld {
 
 /// Runs the command unsandboxed (tests only) and records what the validator asked for.
 final class RecordingRunner: SandboxedRunner, @unchecked Sendable {
-    struct Call { var command: String; var cwd: URL; var environment: [String: String]; var policy: SandboxPolicy }
+    struct Call { var command: String; var cwd: URL; var environment: [String: String]; var policy: ValidatedPolicy }
     private let lock = NSLock()
     private var _calls: [Call] = []
     var calls: [Call] { lock.withLock { _calls } }
 
     func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-             policy: SandboxPolicy) async -> CheckOutcome {
+             policy: ValidatedPolicy) async -> CheckOutcome {
         lock.withLock { _calls.append(Call(command: command, cwd: cwd, environment: environment, policy: policy)) }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -158,7 +158,7 @@ final class RecordingRunner: SandboxedRunner, @unchecked Sendable {
         return CheckOutcome(exitCode: p.terminationStatus, timedOut: false, tail: String(decoding: data, as: UTF8.self))
     }
 
-    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: ValidatedPolicy) throws -> any SandboxedProcess {
         throw SandboxError.unavailable
     }
 }

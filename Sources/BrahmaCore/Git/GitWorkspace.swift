@@ -890,7 +890,7 @@ public struct GitWorkspace: Sendable {
         case S_IFLNK: return "\(ref) is a symbolic ref (a link)"
         case S_IFREG:
             let text: String
-            do { text = try SafeRead.smallText(ref, under: gitDir) } catch { return "\(ref) is not a plain ref file (\(error))" }
+            do { text = try SafeRead.smallText(ref, under: try Place.resolved(gitDir, kind: .directory)) } catch { return "\(ref) is not a plain ref file (\(error))" }
             guard text.hasPrefix("ref:") else { return nil }
             let target = String(text.dropFirst(4).trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
             return "\(ref) is a symbolic ref to \(Self.shown(target))"
@@ -909,10 +909,10 @@ public struct GitWorkspace: Sendable {
     }
 
     /// The text of the pointer file `name` under `dir` (an admin directory, a worktree, the repository's `.git`), read without
-    /// following a link and bounded (`SafeRead.smallText`, 4 KiB: S2, spec §7.1). Nil when it is a link, not a plain regular
+    /// following a link and bounded (`SafeRead.smallText` under `dir` as a verified `Place`, 4 KiB: S2, spec §7.1; S7). Nil when it is a link, not a plain regular
     /// file of this user's, oversized or unreadable: every caller treats nil as "changed" (fail closed).
     private static func regularText(_ name: String, under dir: URL) -> String? {
-        do { return try SafeRead.smallText(name, under: dir) } catch { return nil }
+        do { return try SafeRead.smallText(name, under: try Place.resolved(dir, kind: .directory)) } catch { return nil }
     }
 
     /// What differs from the engine's record of one item worktree; empty when it is as the engine created it.

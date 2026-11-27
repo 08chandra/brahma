@@ -5,6 +5,7 @@ import GRDB
 import CoreGraphics
 #endif
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// The live goal-to-URL test's owner policy (Plan L Task 15; fix round 1, I2): what it does with each pending-owner ask.
 /// - Approve: the kinds the brief names (`prd`, `architecture`, `deploy`) plus an explicit benign allowlist, `sprintPlan`
@@ -1142,8 +1143,8 @@ struct LiveSmokeTests {
                               usageMode: .low, priorityWeight: 1, createdAt: now)
         let layout = EngineLayout(workspace: ws)
         try PreviewPolicy.prepareAppData(layout, surface: "mac")
-        let policy = PreviewPolicy.guiApp(layout, run: run, company: company, sandbox: SandboxLayout(paths: paths, company: company, agentHandle: "preview"),
-                                          surface: "mac")
+        let policy = try #require(PreviewPolicy.guiApp(layout, run: run, company: company, sandbox: SandboxLayout(paths: paths, company: company, agentHandle: "preview"),
+                                                       surface: "mac"))
         let executable = try ProcessMacAppLauncher().executable(inApp: run.appending(path: "Build/Live.app"), run: run)
         let baseline = SandboxBaseline.current(paths: paths, otherWorkspaces: [], backupTargets: [])
         let proxies = EgressProxyPool()
@@ -1292,23 +1293,27 @@ private struct FakeHostGrant: SandboxedRunner {
     let deployBin: URL
 
     func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-             policy: SandboxPolicy) async -> CheckOutcome {
+             policy: ValidatedPolicy) async -> CheckOutcome {
         await base.run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL,
                        policy: granted(command, policy))
     }
 
-    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: ValidatedPolicy) throws -> any SandboxedProcess {
         try base.spawn(command: command, cwd: cwd, environment: environment, logURL: logURL, policy: granted(command, policy))
     }
+
+    func policyBaseline() -> SandboxBaseline { base.policyBaseline() }
 
     /// The deploy step's policy with the host folder writable (kept off `writable[0]`, the TMPDIR, and the last entry, the
     /// toolchain HOME); any other command's policy as it is. The executor quotes the argv it was given, so both the logical and
     /// the resolved path of the CLI are accepted.
-    func granted(_ command: String, _ policy: SandboxPolicy) -> SandboxPolicy {
+    func granted(_ command: String, _ policy: ValidatedPolicy) -> ValidatedPolicy {
         let prefixes = [deployBin.path, SandboxPath.resolve(deployBin.path)].map { ShellQuote.joinArgv([$0, "deploy"], rawRefs: []) + " " }
         guard prefixes.contains(where: { command.hasPrefix($0) }), !policy.writable.isEmpty else { return policy }
-        var p = policy
-        p.writable.insert(hostDir.resolvedForSandbox, at: 1)
-        return p
+        var writable = policy.writable
+        writable.insert(hostDir.resolvedForSandbox.path, at: 1)
+        // Tests only (Plan S Task S7): the widened policy as a fixture; the real runner checks it again at its start.
+        return ValidatedPolicy(writable: writable, readable: policy.readable, network: policy.network, toolchain: policy.toolchain,
+                               memoryLimit: nil, confined: nil)
     }
 }

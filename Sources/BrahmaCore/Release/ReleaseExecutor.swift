@@ -10,14 +10,14 @@ import Glibc
 /// adapter lookup (PR-25), the wait between smoke rounds, and the environment every step's is built from.
 public struct ReleaseDependencies: Sendable {
     public var sandbox: any SandboxedRunner
-    public var unsandboxed: any SandboxedRunner
+    public var unsandboxed: any UnsandboxedRunning
     public var http: any HTTPProbing
     public var adapters: HostingAdapters.Lookup
     public var sleep: @Sendable (Duration) async -> Void
     /// Nil: the engine's check environment (`Orchestrator.checkBaseEnvironment`).
     public var environment: [String: String]?
 
-    public init(sandbox: any SandboxedRunner, unsandboxed: any SandboxedRunner = UnsandboxedPreviewRunner(),
+    public init(sandbox: any SandboxedRunner, unsandboxed: any UnsandboxedRunning = UnsandboxedPreviewRunner(),
                 http: any HTTPProbing = URLSessionHTTPProbe(), adapters: @escaping HostingAdapters.Lookup = HostingAdapters.production,
                 sleep: @escaping @Sendable (Duration) async -> Void = { try? await AwakeTime.sleep(for: $0) },
                 environment: [String: String]? = nil) {
@@ -67,7 +67,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
     let store: Store
     let paths: BrahmaPaths
     let sandbox: any SandboxedRunner
-    let unsandboxed: any SandboxedRunner
+    let unsandboxed: any UnsandboxedRunning
     let vault: any SecretVault
     let http: any HTTPProbing
     let smoke: Smoke
@@ -101,7 +101,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
     /// owner's stop ends at once (Task 7 M5, L-5lite-A).
     private var smokes: [String: @Sendable () -> Void] = [:]
 
-    public init(store: Store, paths: BrahmaPaths, sandbox: any SandboxedRunner, unsandboxed: any SandboxedRunner = UnsandboxedPreviewRunner(),
+    public init(store: Store, paths: BrahmaPaths, sandbox: any SandboxedRunner, unsandboxed: any UnsandboxedRunning = UnsandboxedPreviewRunner(),
                 vault: any SecretVault, http: any HTTPProbing, smoke: @escaping Smoke,
                 adapters: @escaping HostingAdapters.Lookup = HostingAdapters.adapter,
                 sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
@@ -111,7 +111,7 @@ public actor ReleaseExecutor: EmergencyStopObserver {
                   adapters: adapters, sleep: sleep, clock: clock, blocking: Blocking(), environment: environment, ceiling: ceiling)
     }
 
-    init(store: Store, paths: BrahmaPaths, sandbox: any SandboxedRunner, unsandboxed: any SandboxedRunner, vault: any SecretVault,
+    init(store: Store, paths: BrahmaPaths, sandbox: any SandboxedRunner, unsandboxed: any UnsandboxedRunning, vault: any SecretVault,
          http: any HTTPProbing, smoke: @escaping Smoke, adapters: @escaping HostingAdapters.Lookup,
          sleep: @escaping @Sendable (Duration) async -> Void, clock: @escaping @Sendable () -> Date, blocking: Blocking,
          environment: [String: String], ceiling: PermissionProfile?, stepPoll: Duration = .milliseconds(200)) {
@@ -368,11 +368,12 @@ public actor ReleaseExecutor: EmergencyStopObserver {
             case .deny: throw Self.mismatch
             }
             PrincipalResolver.noteSandboxed(principals, store: store, subject: "\(r.ref) build", kind: .release, now: clock())
-            let full = principals.runsUnsandboxed
             let log = releaseDir.appending(path: "build.log", directoryHint: .notDirectory)
-            let outcome = await runStep(r, runner: full ? unsandboxed : sandbox, command: build, cwd: export, environment: toolEnvironment,
-                                        policy: Store.smokePolicy(company: live, export: export), timeout: ReleasePolicy.buildTimeout,
-                                        log: log)
+            // Plan S Task S7: the build's route is the factory's `.releaseSmoke` decision over the export (the smoke's shape),
+            // with the proposer's principals: the owner's Full opt-out, or the sandbox under the validated policy.
+            let decision = Store.smokeDecision(company: live, export: export, principals: principals, baseline: sandbox.policyBaseline())
+            let outcome = await runStep(r, decision: decision, command: build, cwd: export, environment: toolEnvironment,
+                                        timeout: ReleasePolicy.buildTimeout, log: log)
             let tail = await logs.publish(raw: [log], as: "build.log", header: nil).tail
             switch outcome {
             case .stopped(let cause): throw Stopped(cause: cause)
@@ -537,11 +538,11 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         var env = toolEnvironment
         env["HOME"] = home.path
         let log = layout.releaseDir(r.number).appending(path: "tools.log", directoryHint: .notDirectory)
-        let outcome = await runStep(r, runner: sandbox,
+        // Plan S Task S7: the factory's `.releaseTool` rule, engine principals (an engine-composed install: never Full).
+        let decision = Self.toolDecision(writable: [resolved], readable: [resolved], network: adapter.toolNetwork, baseline: sandbox.policyBaseline())
+        let outcome = await runStep(r, decision: decision,
                                     command: ShellQuote.joinArgv(["npm", "install", "--prefix", tools.path, "--no-audit", "--no-fund", cli], rawRefs: []),
                                     cwd: tools, environment: env,
-                                    policy: SandboxPolicy(writable: [resolved], readable: [resolved], network: .outbound(allow: adapter.toolNetwork),
-                                                          toolchain: true),
                                     timeout: ReleasePolicy.stepTimeout, log: log)
         await blocking.run { _ = try? EngineFiles.removeNoFollow(tools.appending(path: ".brahma-tmp"), under: layout.root) }
         _ = await logs.publish(raw: [log], as: "tools.log", header: nil)
@@ -814,11 +815,23 @@ public actor ReleaseExecutor: EmergencyStopObserver {
     /// One killable step (chief review L5): spawned through `runner`, recorded (`processes`, and `ChildGroups` kind
     /// `release` so `brahma stop` reaches it without the engine), its exit polled every `stepPoll`, its whole group
     /// terminated on `timeout` (awake time) or the owner's stop, and waited for until it is reaped.
-    private func runStep(_ r: Release, runner: any SandboxedRunner, command: String, cwd: URL, environment: [String: String],
-                         policy: SandboxPolicy, timeout: Duration, log: URL) async -> StepOutcome {
+    /// Plan S Task S7: `decision` is the factory's for this step: the sandbox under its validated policy, a Full company's
+    /// unsandboxed runner with its opt-out (the build only), or a refusal, which is a step that could not start.
+    private func runStep(_ r: Release, decision: PolicyDecision, command: String, cwd: URL, environment: [String: String],
+                         timeout: Duration, log: URL) async -> StepOutcome {
         if let cause = stopCause(r.id) { return .stopped(cause) }
         let process: any SandboxedProcess
-        do { process = try runner.spawn(command: command, cwd: cwd, environment: environment, logURL: log, policy: policy) } catch {
+        do {
+            switch decision {
+            case .sandboxed(let policy):
+                process = try sandbox.spawn(command: command, cwd: cwd, environment: environment, logURL: log, policy: policy)
+            case .fullOptOut(let optOut):
+                process = try unsandboxed.spawn(command: command, cwd: cwd, environment: environment, logURL: log, optOut: optOut)
+            case .refused(let why):
+                // The text a policy the sandbox refused at its spawn gave (`Self.text(error)`).
+                return .couldNotStart(why)
+            }
+        } catch {
             if case SandboxError.unavailable = error { return .unavailable }
             return .couldNotStart(Self.text(error))
         }
@@ -877,9 +890,10 @@ public actor ReleaseExecutor: EmergencyStopObserver {
         env["HOME"] = home.path
         for (name, value) in plan.env where name != plan.tokenSecret { env[name] = value }
         let command = ShellQuote.joinArgv(argv, rawRefs: []) + " 2>>" + ShellQuote.quote(stderr.path)
-        let outcome = await runStep(r, runner: sandbox, command: command, cwd: cwd, environment: env,
-                                    policy: SandboxPolicy(writable: [real(home), real(cwd)], readable: [real(cwd), real(tools)],
-                                                          network: .outbound(allow: plan.network), toolchain: true),
+        // Plan S Task S7: the factory's `.releaseTool` rule (engine principals: never Full).
+        let decision = Self.toolDecision(writable: [real(home), real(cwd)], readable: [real(cwd), real(tools)], network: plan.network,
+                                         baseline: sandbox.policyBaseline())
+        let outcome = await runStep(r, decision: decision, command: command, cwd: cwd, environment: env,
                                     timeout: ReleasePolicy.stepTimeout, log: stdout)
         let header = "$ " + ShellQuote.joinArgv(argv, rawRefs: [plan.tokenSecret])
         let published = await logs.publish(raw: [stdout, stderr], as: log, header: header, pinned: [plan.tokenSecret: token])
@@ -887,6 +901,29 @@ public actor ReleaseExecutor: EmergencyStopObserver {
     }
 
     // MARK: Helpers
+
+    /// The principals of an engine-composed step (the pinned CLI's install, a token step): the engine itself, so never Full,
+    /// never a grant (as before Plan S, when these steps always ran in the sandbox).
+    static let enginePrincipals = PrincipalSet(companyId: "", members: [.engine], ownerProfile: .sandboxed)
+
+    /// A provider-tool step's decision (`.releaseTool`): each directory a verified place (its resolved path, reached from its
+    /// parent without a link), the provider's pinned hosts, validated against `baseline`. Shared with `ProviderProbe` (its
+    /// `.providerProbe` steps are these steps, as the probe runs them).
+    static func toolDecision(_ purpose: Purpose = .releaseTool, writable: [URL], readable: [URL], network: [String],
+                             baseline: SandboxBaseline) -> PolicyDecision {
+        func place(_ url: URL) throws -> Place {
+            let resolved = URL(fileURLWithPath: SandboxPath.resolve(url.path), isDirectory: false)
+            return try Place.verify(resolved, kind: .directory, under: resolved.deletingLastPathComponent())
+        }
+        let places: PurposePlaces
+        do {
+            let (w, rd) = (try writable.map(place), try readable.map(place))
+            places = purpose == .providerProbe ? .providerProbe(writable: w, readable: rd) : .releaseTool(writable: w, readable: rd)
+        } catch {
+            return .refused("a release step's place is not safe to use (\(error))")
+        }
+        return SandboxPolicyFactory.decide(purpose, principals: enginePrincipals, places: places, network: .fixed(network), baseline: baseline)
+    }
 
     /// Whether every place a token step's output can land would have `token` replaced (fix I1): the redactor is loaded with
     /// no secret failed (`secretsHeld`), no reload is pending (it knows the stored secrets' current version; a read error

@@ -183,7 +183,7 @@ import Foundation
         let l = EngineLayout(workspace: ws)
         let run = BrahmaPaths(home: home, workspaces: wss).exportDir(runId: "prev-s1-0123456789ab-1")
         try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
-        let p = PreviewPolicy.server(l, run: run, company: company, port: 47123)
+        let p = try #require(PreviewPolicy.server(l, run: run, company: company, port: 47123))
         // F1: only its own export; the engine writes the log, so the logs directory is in no writable list.
         #expect(p.writable == [run.resolvedForSandbox])
         #expect(!p.writable.contains { $0.path.hasPrefix(l.previewDir.resolvedForSandbox.path) })
@@ -198,11 +198,11 @@ import Foundation
         // It passes the sandbox's own policy check (resolved paths, no writable containing a workspace).
         let baseline = SandboxBaseline(userHome: user, protected: [], darwinUserTemp: nil, darwinUserCache: nil,
                                        engineHomes: [home], companyWorkspaces: [ws.resolvedForSandbox])
-        try SandboxPolicyCheck.validate(p, baseline: baseline)
+        try SandboxPolicyCheck.recheck(p, baseline: baseline)
         // An owner-added domain and a grant reach the allow list.
         var wider = company
         wider.allowedDomains = ["api.example.com"]
-        let q = PreviewPolicy.server(l, run: run, company: wider, port: 47123, grantDomains: ["cdn.example.org"])
+        let q = try #require(PreviewPolicy.server(l, run: run, company: wider, port: 47123, grantDomains: ["cdn.example.org"]))
         #expect(q.network == .loopbackListen(allow: CompanyNetwork.scope(company: wider, grantDomains: ["cdn.example.org"],
                                                                          grantWebDomains: []).allowedDomains, ports: [47123]))
     }

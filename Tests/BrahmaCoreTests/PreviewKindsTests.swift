@@ -349,29 +349,29 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
         // cli → oneShot: outbound only, reads and writes only its run (no logs, no shared cache), no toolchain.
         let cli = try #require(x.adapters[.cli]?.starts.first)
         let run = cli.run.resolvedForSandbox
-        #expect(cli.policy == SandboxPolicy(writable: [run], readable: [run], network: .outbound(allow: allow), toolchain: false))
-        #expect(!cli.policy.writable.contains(x.layout.previewLogs.resolvedForSandbox))
-        #expect(!cli.policy.writable.contains(x.sandboxLayout.sharedCache.resolvedForSandbox))
+        #expect(cli.policy == ValidatedPolicy.fixture(writable: [run], readable: [run], network: .outbound(allow: allow), toolchain: false))
+        #expect(cli.policy?.writable.contains(x.layout.previewLogs.resolvedForSandbox) == false)
+        #expect(cli.policy?.writable.contains(x.sandboxLayout.sharedCache.resolvedForSandbox) == false)
         #expect(cli.appPolicy == nil)
         #expect(!FileManager.default.fileExists(atPath: cli.run.appending(path: ".git").path))
         // ios build → appleBuild (the toolchain), derived data inside the run.
         let ios = try #require(x.adapters[.ios]?.starts.first)
         let iosRun = ios.run.resolvedForSandbox
-        #expect(ios.policy == SandboxPolicy(writable: [iosRun], readable: [iosRun], network: .outbound(allow: allow), toolchain: true))
+        #expect(ios.policy == ValidatedPolicy.fixture(writable: [iosRun], readable: [iosRun], network: .outbound(allow: allow), toolchain: true))
         #expect(ios.environment["BRAHMA_DERIVED_DATA"] == ios.run.appending(path: ".build/DerivedData").path)
         // macos: appleBuild for the build, guiApp for the app.
         let mac = try #require(x.adapters[.macos]?.starts.first)
         let macRun = mac.run.resolvedForSandbox
-        #expect(mac.policy == SandboxPolicy(writable: [macRun], readable: [macRun], network: .outbound(allow: allow), toolchain: true))
+        #expect(mac.policy == ValidatedPolicy.fixture(writable: [macRun], readable: [macRun], network: .outbound(allow: allow), toolchain: true))
         // The app-data place is engine-only, named logically under the resolved workspace (fix round 1, I1).
         let appData = URL(fileURLWithPath: x.company.workspacePath).resolvedForSandbox.appending(path: ".brahma/preview/apps/mac")
-        #expect(mac.appPolicy == SandboxPolicy(writable: [appData], readable: [macRun], network: .outbound(allow: allow), toolchain: true))
+        #expect(mac.appPolicy == ValidatedPolicy.fixture(writable: [appData], readable: [macRun], network: .outbound(allow: allow), toolchain: true))
         #expect(mac.environment["BRAHMA_DERIVED_DATA"] == mac.run.appending(path: ".build/DerivedData").path)
         // backend → L's server on its allocated port.
         let api = try #require(x.adapters[.backend]?.starts.first)
         let port = try #require(try x.state("api").port)
         #expect(PortAllocator.range.contains(port) && api.port == port)
-        #expect(api.policy.network == .loopbackListen(allow: allow, ports: [UInt16(port)]))
+        #expect(api.policy?.network == .loopbackListen(allow: allow, ports: [UInt16(port)]))
         #expect(api.policy == PreviewPolicy.server(x.layout, run: api.run, company: x.company, port: port))
         // The static forms agree.
         #expect(PreviewPolicy.oneShot(x.layout, run: cli.run, company: x.company, sandbox: x.sandboxLayout) == cli.policy)
@@ -580,7 +580,7 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
         var st = stat()
         #expect(lstat(logical.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR)
         #expect(SandboxPath.resolve(logical.path) == logical.path)
-        #expect(PreviewPolicy.guiApp(x.layout, run: c.run, company: x.company, sandbox: x.sandboxLayout, surface: "mac").writable == [logical])
+        #expect(PreviewPolicy.guiApp(x.layout, run: c.run, company: x.company, sandbox: x.sandboxLayout, surface: "mac")?.writable == [logical])
         // Nothing under the shared cache is writable any more.
         #expect(c.appPolicy?.writable.contains { $0.path.hasPrefix(x.sandboxLayout.sharedCache.resolvedForSandbox.path) } == false)
         await x.runner.stopAll()
@@ -594,9 +594,10 @@ final class RecordingAdapter: PreviewAdapter, @unchecked Sendable {
         let state = try x.state("mac")
         #expect(state.status == .failed && state.message == "its app data directory is not safe to use", "\(state)")
         #expect(!FileManager.default.fileExists(atPath: outside.appending(path: "mac").path))
-        // The policy itself names the logical path, so the sandbox's own check refuses a linked parent.
+        // The policy itself names the logical path, so the sandbox's own check refuses a linked parent (Plan S Task S7: the
+        // factory runs that check, so the decision is a refusal).
         let linked = PreviewPolicy.guiApp(x.layout, run: c.run, company: x.company, sandbox: x.sandboxLayout, surface: "mac")
-        #expect(linked.writable == [logical] && SandboxPath.resolve(logical.path) != logical.path)
+        #expect(linked == nil && SandboxPath.resolve(logical.path) != logical.path)
     }
 
     @Test func stopAllStopsNonWebKinds() async throws {

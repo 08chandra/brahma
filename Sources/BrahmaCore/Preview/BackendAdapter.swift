@@ -47,9 +47,7 @@ public struct BackendAdapter: PreviewAdapter {
             Self.removeOpenAPICopy(c)
             return PreviewUpdate(status: .failed, message: Self.foreignPort)
         }
-        var routed = deps
-        routed.sandbox = deps.runner(for: c)
-        var update = await WebAdapter.startServer(c, deps: routed, onSpawn: c.onSpawn)
+        var update = await WebAdapter.startServer(c, deps: deps, onSpawn: c.onSpawn)
         guard update.status == .running, let resolved = update.resolvedURL else {
             Self.removeOpenAPICopy(c)
             return update

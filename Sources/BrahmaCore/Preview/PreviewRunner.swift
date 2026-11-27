@@ -230,7 +230,7 @@ public actor PreviewRunner: EmergencyStopObserver {
     /// overtook the pass, whose record it then leaves as the stop wrote it); nil when it left the run running.
     private func stopIfNarrowed(_ id: String, epoch: Int, now: Date) async -> PreviewState? {
         guard let run = runs[id], let context = run.context else { return nil }
-        if let again = redecided(context, kind: run.kind), again.unsandboxed == context.unsandboxed, again.policy == context.policy,
+        if let again = redecided(context, kind: run.kind), again.optOut == context.optOut, again.policy == context.policy,
            again.appPolicy == context.appPolicy {
             return nil
         }
@@ -501,14 +501,25 @@ public actor PreviewRunner: EmergencyStopObserver {
             return
         }
         PrincipalResolver.noteSandboxed(principals, store: engineStore, subject: "Preview \(surface.name)", kind: .preview, now: clock())
-        let policies = PreviewPolicy.forKind(kind, layout: layout, run: run, company: live, sandbox: sandbox, port: port,
-                                             surface: surface.name)
+        // Plan S Task S7: the start's policies (or the owner's Full opt-out) are the factory's, over the run (and a macOS
+        // app's data place) as verified places, validated against the preview sandbox's baseline. A refused policy fails
+        // the start, as a policy the sandbox refused at its spawn did.
+        let policy: ValidatedPolicy?, appPolicy: ValidatedPolicy?, optOut: FullOptOut?
+        switch PreviewPolicy.forKind(kind, layout: layout, run: run, company: live, port: port, surface: surface.name,
+                                     principals: principals, baseline: deps.sandbox.policyBaseline()) {
+        case .sandboxed(let p, let app): (policy, appPolicy, optOut) = (p, app, nil)
+        case .fullOptOut(let full): (policy, appPolicy, optOut) = (nil, nil, full)
+        case .refused(let why):
+            await stopRun(id)
+            finish(.failed, "could not start: \(Store.flat(why, max: 200))")
+            return
+        }
         var environment = PreviewContext.environment(base: baseEnvironment, port: port)
         if kind == .ios || kind == .macos { environment["BRAHMA_DERIVED_DATA"] = PreviewPolicy.derivedData(run: run).path }
         let context = PreviewContext(surface: surface, company: live, layout: layout, run: run, commit: commit, port: port,
-                                     policy: policies.policy, environment: environment, logURL: logURL, timeouts: timeouts,
-                                     outputURL: layout.previewOutput(name: surface.name), appPolicy: policies.appPolicy,
-                                     unsandboxed: principals.runsUnsandboxed,
+                                     policy: policy, environment: environment, logURL: logURL, timeouts: timeouts,
+                                     outputURL: layout.previewOutput(name: surface.name), appPolicy: appPolicy,
+                                     optOut: optOut,
                                      onSpawn: { pid, start in await self.spawned(id, pid: pid, start: start) }, redactor: engineStore.redactor)
         runs[id]?.context = context
         let update = await adapter.start(context)
@@ -564,13 +575,15 @@ public actor PreviewRunner: EmergencyStopObserver {
         }
         let sandbox = sandboxLayout(resolved.company)
         guard sandbox == sandboxLayout(context.company) else { return nil }
-        let policies = PreviewPolicy.forKind(kind, layout: context.layout, run: context.run, company: resolved.company, sandbox: sandbox,
-                                             port: context.port, surface: context.surface.name)
         var c = context
         c.company = resolved.company
-        c.policy = policies.policy
-        c.appPolicy = policies.appPolicy
-        c.unsandboxed = resolved.principals.runsUnsandboxed
+        // Plan S Task S7: decided by the factory again, against the live records; a refused policy skips the demo (nil).
+        switch PreviewPolicy.forKind(kind, layout: context.layout, run: context.run, company: resolved.company, port: context.port,
+                                     surface: context.surface.name, principals: resolved.principals, baseline: deps.sandbox.policyBaseline()) {
+        case .sandboxed(let policy, let app): (c.policy, c.appPolicy, c.optOut) = (policy, app, nil)
+        case .fullOptOut(let optOut): (c.policy, c.appPolicy, c.optOut) = (nil, nil, optOut)
+        case .refused: return nil
+        }
         return c
     }
 

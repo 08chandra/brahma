@@ -75,12 +75,19 @@ public struct SandboxedPDFReader: Sendable {
     /// The sandbox of one read: `held` (the copy) the only tree it reads besides the system; the helper the only program
     /// (round 4: nothing else runs, nothing forks); the helper's directory listable (Foundation looks at its own bundle);
     /// no file it may write (`out` is the runner's own; the engine writes the helper's output there); the memory limit.
-    static func policy(helper: URL, held: URL, out: URL, memoryLimit: Int) -> SandboxPolicy {
-        var policy = SandboxPolicy(writable: [out], readable: [held], network: .none, toolchain: false)
-        policy.confined = SandboxConfinement(executables: [helper], readableFiles: [helper],
-                                             listableDirectories: [helper.deletingLastPathComponent()], writableFiles: [])
-        policy.memoryLimit = memoryLimit
-        return policy
+    /// Plan S Task S7: the factory's `.pdfReader` rule (spec §14.1's added site), over the three as verified places (each
+    /// already resolved by the caller), engine principals, validated against `baseline` (the runner's).
+    static func policy(helper: URL, held: URL, out: URL, memoryLimit: Int, baseline: SandboxBaseline) -> PolicyDecision {
+        let places: PurposePlaces
+        do {
+            places = .pdfReader(helper: try Place.resolved(helper, kind: .file), held: try Place.resolved(held, kind: .directory),
+                                out: try Place.resolved(out, kind: .directory))
+        } catch {
+            return .refused("the PDF reader's places are not safe to use (\(error))")
+        }
+        return SandboxPolicyFactory.decide(.pdfReader(memoryLimit: memoryLimit),
+                                           principals: PrincipalSet(companyId: "", members: [.engine], ownerProfile: .sandboxed),
+                                           places: places, network: .none, baseline: baseline)
     }
 
     let runner: any SandboxedRunner
@@ -125,13 +132,13 @@ public struct SandboxedPDFReader: Sendable {
         let (heldDir, outDir) = (held.resolvedForSandbox, out.resolvedForSandbox)
         let program = helper.resolvedForSandbox
         let input = heldDir.appending(path: "input.pdf").path
-        let policy = Self.policy(helper: program, held: heldDir, out: outDir, memoryLimit: memoryLimit)
+        let policy = Self.policy(helper: program, held: heldDir, out: outDir, memoryLimit: memoryLimit, baseline: runner.policyBaseline())
         let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
         let limit = min(timeout, Self.timeout)
         // Round 4 (R4-4): the helper itself, no shell; the engine reads its output up to the cap (one byte more kills it).
         let outcome = runner.runProgramBlocking(arguments: [program.path, input, String(maxBytes), String(helperMemoryLimit)], cwd: outDir,
                                                 environment: environment, timeout: limit, outputURL: dir.appending(path: "helper.log"),
-                                                stdoutURL: outDir.appending(path: Self.partsName), stdoutCap: maxBytes, policy: policy)
+                                                stdoutURL: outDir.appending(path: Self.partsName), stdoutCap: maxBytes, decision: policy)
         if outcome.tail.hasSuffix(GroupRun.memoryExceeded) { throw Self.tooMuchMemory }
         if outcome.tail.hasSuffix(GroupRun.outputExceeded) { throw ArchiveMemberScan.overBudget }
         if outcome.timedOut { throw Self.tooLong }
@@ -185,12 +192,12 @@ public struct SandboxedPDFReader: Sendable {
         let (heldDir, outDir) = (held.resolvedForSandbox, out.resolvedForSandbox)
         let program = helper.resolvedForSandbox
         let input = heldDir.appending(path: "input.pdf").path
-        let policy = Self.policy(helper: program, held: heldDir, out: outDir, memoryLimit: memoryLimit)
+        let policy = Self.policy(helper: program, held: heldDir, out: outDir, memoryLimit: memoryLimit, baseline: runner.policyBaseline())
         let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
         let outcome = runner.runProgramBlocking(arguments: [program.path, "--flatten", input, String(maxBytes), String(helperMemoryLimit)],
                                                 cwd: outDir, environment: environment, timeout: min(timeout, Self.timeout),
                                                 outputURL: dir.appending(path: "helper.log"),
-                                                stdoutURL: outDir.appending(path: Self.partsName), stdoutCap: maxBytes, policy: policy)
+                                                stdoutURL: outDir.appending(path: Self.partsName), stdoutCap: maxBytes, decision: policy)
         if outcome.tail.hasSuffix(GroupRun.memoryExceeded) || outcome.tail.hasSuffix(GroupRun.outputExceeded) { throw Self.flattenFailed }
         if outcome.timedOut { throw Self.tooLong }
         guard let code = outcome.exitCode else { throw Self.couldNotRun }

@@ -959,7 +959,7 @@ public enum EngineFiles {
     }
 
     /// The path the kernel has for an open descriptor.
-    private static func path(of fd: Int32) -> String? {
+    static func path(of fd: Int32) -> String? {
         #if canImport(Darwin)
         var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
         guard fcntl(fd, F_GETPATH, &buffer) == 0 else { return nil }

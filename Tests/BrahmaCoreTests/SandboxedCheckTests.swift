@@ -14,7 +14,7 @@ import GRDB
             var environment: [String: String]
             var timeout: Duration
             var outputURL: URL
-            var policy: SandboxPolicy
+            var policy: ValidatedPolicy
         }
         private let lock = NSLock()
         private var _calls: [Call] = []
@@ -22,14 +22,14 @@ import GRDB
         var outcome = CheckOutcome(exitCode: 0, timedOut: false, tail: "sandboxed pass")
 
         func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-                 policy: SandboxPolicy) async -> CheckOutcome {
+                 policy: ValidatedPolicy) async -> CheckOutcome {
             lock.withLock { _calls.append(Call(command: command, cwd: cwd, environment: environment, timeout: timeout,
                                                outputURL: outputURL, policy: policy)) }
             return outcome
         }
 
         func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL,
-                   policy: SandboxPolicy) throws -> any SandboxedProcess {
+                   policy: ValidatedPolicy) throws -> any SandboxedProcess {
             throw SandboxError.unavailable
         }
     }
@@ -293,7 +293,7 @@ import GRDB
 
     @Test func unavailableRunnerFailsClosed() async throws {
         let dir = try tempDir().resolvedForSandbox
-        let policy = SandboxPolicy(writable: [dir], readable: [], network: .none, toolchain: false)
+        let policy = ValidatedPolicy.fixture(writable: [dir])
         let fallback = FakeCheckRunner()
         let runner = SandboxedCheckRunner(sandbox: UnavailableSandboxRunner(), route: { _ in .sandboxed(policy) }, fallback: fallback)
         let out = dir.appending(path: "out.log")
@@ -391,13 +391,13 @@ import GRDB
         let env = ["PATH": "/usr/bin:/bin"]
         let repo = mergeRepo.resolvedForSandbox.path
         let ok = await seatbelt.run(command: "touch built && cat f.txt", cwd: export, environment: env, timeout: .seconds(30),
-                                    outputURL: out, policy: SandboxPolicy(writable: policy.writable, readable: policy.readable,
-                                                                          network: .none, toolchain: false))
+                                    outputURL: out, policy: ValidatedPolicy.fixture(writable: policy.writable.map { URL(fileURLWithPath: $0) },
+                                                                                    readable: policy.readable.map { URL(fileURLWithPath: $0) }))
         #expect(ok.exitCode == 0, "\(ok.tail)"); #expect(ok.tail.contains("exported"))
         for command in ["cat '\(repo)/config'", "echo x >> '\(repo)/config'", "touch '\(repo)/objects/planted'", "ls '\(repo)'"] {
             let outcome = await seatbelt.run(command: command, cwd: export, environment: env, timeout: .seconds(30), outputURL: out,
-                                             policy: SandboxPolicy(writable: policy.writable, readable: policy.readable, network: .none,
-                                                                   toolchain: false))
+                                             policy: ValidatedPolicy.fixture(writable: policy.writable.map { URL(fileURLWithPath: $0) },
+                                                                                             readable: policy.readable.map { URL(fileURLWithPath: $0) }))
             #expect(outcome.exitCode != 0, "\(command) reached the merge repository")
         }
         #expect(try String(contentsOf: mergeRepo.appending(path: "config"), encoding: .utf8) == "[core]\n\tbare = true\n")

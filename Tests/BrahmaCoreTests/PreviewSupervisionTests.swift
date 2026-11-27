@@ -9,7 +9,7 @@ import Glibc
 
 /// The supervision helpers, with real processes (FakeSandbox: unsandboxed, its own process group).
 @Suite(.scratch) struct PreviewSupervisionTests {
-    static let policy = SandboxPolicy(writable: [URL(fileURLWithPath: "/nowhere")], readable: [], network: .none, toolchain: false)
+    static let policy = ValidatedPolicy.fixture(writable: [URL(fileURLWithPath: "/nowhere")])
 
     /// The pids whose process group is `pgid` (`ps`, the whole table).
     static func members(of pgid: Int32) throws -> [Int32] {

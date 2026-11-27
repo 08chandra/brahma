@@ -146,7 +146,7 @@ enum AppleBuild {
         var environment = c.environment
         if environment["BRAHMA_DERIVED_DATA"] == nil { environment["BRAHMA_DERIVED_DATA"] = PreviewPolicy.derivedData(run: c.run).path }
         let outcome = await deps.runner(for: c).run(command: command(build), cwd: c.run, environment: environment, timeout: c.timeouts.build,
-                                                    outputURL: c.logURL, policy: c.policy)
+                                                    outputURL: c.logURL)
         _ = CLIAdapter.seal(c.logURL, redactor: c.redactor)
         if Task.isCancelled { return PreviewUpdate(status: .stopped, message: nil) }
         if CLIAdapter.isUnavailable(outcome) { return PreviewUpdate(status: .unavailable, message: UnavailableSandboxRunner.tail) }
@@ -298,11 +298,10 @@ public struct MacAppAdapter: PreviewAdapter {
         } catch {
             return PreviewUpdate(status: .failed, message: PreviewRunner.text(error))
         }
-        let runner = deps.runner(for: c)
+        let runner = deps.runner(for: c, app: true)
         let process: any SandboxedProcess
         do {
-            process = try runner.spawn(command: Self.launchCommand(executable), cwd: c.run, environment: c.environment, logURL: c.logURL,
-                                       policy: c.appPolicy ?? c.policy)
+            process = try runner.spawn(command: Self.launchCommand(executable), cwd: c.run, environment: c.environment, logURL: c.logURL)
         } catch SandboxError.unavailable {
             return PreviewUpdate(status: .unavailable, message: UnavailableSandboxRunner.tail)
         } catch {

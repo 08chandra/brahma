@@ -327,10 +327,27 @@ public enum PreviewPolicy {
     /// in no writable list and a server cannot swap it for a link (F1); reads only `run`; listens on and connects to only its own loopback `port`, and reaches the
     /// company's allowed domains (registries, owner-added, `grantDomains`) only through the egress proxy. No writable shared
     /// cache (PR-19): nothing one build plants can run in a later one. Every path is resolved (`SandboxPolicyCheck`).
-    public static func server(_ l: EngineLayout, run: URL, company: Company, port: Int, grantDomains: [String] = []) -> SandboxPolicy {
-        let allow = CompanyNetwork.scope(company: company, grantDomains: grantDomains, grantWebDomains: []).allowedDomains
-        let ports = UInt16(exactly: port).map { [$0] } ?? []
-        return SandboxPolicy(writable: [run.resolvedForSandbox], readable: [run.resolvedForSandbox],
-                             network: .loopbackListen(allow: allow, ports: ports), toolchain: true)
+    /// Plan S Task S7: the factory's `.previewServer` rule (`SandboxPolicyFactory.decide`), over the run as a verified
+    /// `Place`; the grants are the principal set's common grants (B3; none with an unknown member), the Full opt-out the
+    /// owner's (`principals`).
+    public static func server(_ l: EngineLayout, run: URL, company: Company, port: Int, principals: PrincipalSet,
+                              baseline: SandboxBaseline) -> PolicyDecision {
+        decide(.previewServer(port: LoopbackPort(port)), run: run, company: company, principals: principals, baseline: baseline) {
+            .previewServer(run: $0)
+        }
+    }
+
+    /// `run` as a verified place (its resolved path, a real directory reached from its parent without a link), then the
+    /// factory's decision for `purpose` over the places `places` builds from it.
+    static func decide(_ purpose: Purpose, run: URL, company: Company, principals: PrincipalSet, baseline: SandboxBaseline,
+                       _ places: (Place) throws -> PurposePlaces) -> PolicyDecision {
+        let resolved = run.resolvedForSandbox
+        let chosen: PurposePlaces
+        do { chosen = try places(try Place.verify(resolved, kind: .directory, under: resolved.deletingLastPathComponent())) } catch {
+            return .refused("the preview's place is not safe to use (\(error))")
+        }
+        return SandboxPolicyFactory.decide(purpose, principals: principals, places: chosen,
+                                           network: CompanyNetwork.scope(company: company, grantDomains: [], grantWebDomains: []),
+                                           baseline: baseline)
     }
 }

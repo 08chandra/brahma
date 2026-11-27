@@ -10,7 +10,7 @@ import Glibc
 /// One start of a web preview (`WebAdapter.startServer`): build, spawn, readiness, the loopback check. FakeSandbox (real
 /// processes in their own group, unsandboxed) and fake probes; one test runs a real server under the real Seatbelt runner.
 @Suite(.scratch) struct WebAdapterTests {
-    static let policy = SandboxPolicy(writable: [URL(fileURLWithPath: "/nowhere")], readable: [], network: .none, toolchain: false)
+    static let policy = ValidatedPolicy.fixture(writable: [URL(fileURLWithPath: "/nowhere")])
 
     struct Setup {
         let dir: URL
@@ -144,7 +144,7 @@ import Glibc
         let runner = UnsandboxedPreviewRunner()
         let log = dir.appending(path: "logs/web.log")
         let process = try runner.spawn(command: "echo up; sleep 300 & sleep 300 & wait", cwd: dir, environment: ["PATH": "/bin:/usr/bin"],
-                                       logURL: log, policy: Self.policy)
+                                       logURL: log, optOut: .fixture)
         let pgid = process.pid
         #expect(getpgid(pgid) == pgid, "its own group")
         #expect(process.isAlive() && Self.groupAlive(pgid))
@@ -158,7 +158,7 @@ import Glibc
         #expect(!process.isAlive() && process.exitStatus() != nil)
         let out = dir.appending(path: "build.log")
         let outcome = await runner.run(command: "echo built; exit 4", cwd: dir, environment: ["PATH": "/bin:/usr/bin"], timeout: .seconds(60),
-                                       outputURL: out, policy: Self.policy)
+                                       outputURL: out, optOut: .fixture)
         #expect(outcome.exitCode == 4 && !outcome.timedOut)
         #expect(try String(contentsOf: out, encoding: .utf8) == "built\n")
     }
@@ -203,7 +203,7 @@ import Glibc
         let surface = PreviewSurface(id: "s1", companyId: "c1", name: "web", position: 0, build: nil,
                                      run: "python3 -m http.server {port} --bind 127.0.0.1", url: "http://127.0.0.1:{port}/",
                                      setById: "owner", createdAt: now, updatedAt: now)
-        let policy = PreviewPolicy.server(layout, run: run, company: company, port: port)
+        let policy = try #require(PreviewPolicy.server(layout, run: run, company: company, port: port))
         let realHome = FileManager.default.homeDirectoryForCurrentUser.resolvedForSandbox  // raw-temp-api: read-only, the home the policy denies
         let baseline = SandboxBaseline.current(paths: BrahmaPaths(home: realHome.appending(path: "Library/Application Support/Brahma"),
                                                                   workspaces: realHome.appending(path: "Brahma")),

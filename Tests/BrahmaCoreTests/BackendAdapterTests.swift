@@ -10,7 +10,7 @@ import Glibc
 /// A backend preview (Plan 4a Task 5): L's server start, then the surface's smoke requests against the preview's own loopback
 /// origin, and the engine's confined copy of its OpenAPI file. FakeSandbox (real processes, unsandboxed) and fake probes.
 @Suite(.scratch) struct BackendAdapterTests {
-    static let policy = SandboxPolicy(writable: [URL(fileURLWithPath: "/nowhere")], readable: [], network: .none, toolchain: false)
+    static let policy = ValidatedPolicy.fixture(writable: [URL(fileURLWithPath: "/nowhere")])
 
     struct Setup {
         let dir: URL

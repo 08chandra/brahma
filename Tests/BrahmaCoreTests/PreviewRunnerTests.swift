@@ -739,11 +739,11 @@ final class GatedSandbox: SandboxedRunner, @unchecked Sendable {
     init(marker: String) { self.marker = marker }
 
     func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-             policy: SandboxPolicy) async -> CheckOutcome {
+             policy: ValidatedPolicy) async -> CheckOutcome {
         await inner.run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, policy: policy)
     }
 
-    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: ValidatedPolicy) throws -> any SandboxedProcess {
         let process = try inner.spawn(command: command, cwd: cwd, environment: environment, logURL: logURL, policy: policy)
         return command.contains(marker) ? GatedProcess(inner: process, gate: gate) : process
     }

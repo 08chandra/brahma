@@ -72,28 +72,31 @@ extension PreviewPolicy {
     /// with the toolchain, its per-run HOME and caches), reads only `run`, and reaches the company's allowed domains only
     /// through the egress proxy; no listening. As L's `server`, neither the logs directory (the engine writes the log and the
     /// output, F1) nor the shared cache (PR-19, and 5-lite's "no writable shared cache at all") is writable, so nothing one
-    /// run plants reaches another surface's build or a check.
-    public static func oneShot(_ l: EngineLayout, run: URL, company: Company, sandbox: SandboxLayout) -> SandboxPolicy {
-        SandboxPolicy(writable: [run.resolvedForSandbox], readable: [run.resolvedForSandbox],
-                      network: .outbound(allow: allowedDomains(company)), toolchain: false)
+    /// run plants reaches another surface's build or a check. The factory's `.previewOneShot` rule (Plan S Task S7).
+    public static func oneShot(_ l: EngineLayout, run: URL, company: Company, principals: PrincipalSet, baseline: SandboxBaseline) -> PolicyDecision {
+        decide(.previewOneShot, run: run, company: company, principals: principals, baseline: baseline) { .previewOneShot(run: $0) }
     }
 
     /// An iOS or macOS build: `oneShot` with the toolchain. Its derived data goes inside the run (`derivedData(run:)`, carried
-    /// as `BRAHMA_DERIVED_DATA`; the role guide says to pass `-derivedDataPath`), never in a cache another build reads.
-    public static func appleBuild(_ l: EngineLayout, run: URL, company: Company, sandbox: SandboxLayout) -> SandboxPolicy {
-        SandboxPolicy(writable: [run.resolvedForSandbox], readable: [run.resolvedForSandbox],
-                      network: .outbound(allow: allowedDomains(company)), toolchain: true)
+    /// as `BRAHMA_DERIVED_DATA`; the role guide says to pass `-derivedDataPath`), never in a cache another build reads. The
+    /// factory's `.appleBuild` rule.
+    public static func appleBuild(_ l: EngineLayout, run: URL, company: Company, principals: PrincipalSet, baseline: SandboxBaseline) -> PolicyDecision {
+        decide(.appleBuild, run: run, company: company, principals: principals, baseline: baseline) { .appleBuild(run: $0) }
     }
 
     /// A built macOS app, running: writes only its own app-data place (`appData`), reads only `run` (its bundle is there),
     /// reaches the allowed domains through the proxy. The place is engine-only (`.brahma/preview` is write-denied to every
     /// turn and in no check's, build's or server's writable set), the engine makes it without following a link before each
-    /// start (`prepareAppData`), and the policy names it logically, never resolved, so a link the app's previous run (the one
-    /// thing that can write there) left at it or on its way fails `SandboxPolicyCheck` instead of widening the grant (fix
-    /// round 1, I1). `sandbox` is kept for the plan's signature; nothing of it is used.
-    public static func guiApp(_ l: EngineLayout, run: URL, company: Company, sandbox: SandboxLayout, surface: String) -> SandboxPolicy {
-        SandboxPolicy(writable: [appData(l, surface: surface)], readable: [run.resolvedForSandbox],
-                      network: .outbound(allow: allowedDomains(company)), toolchain: true)
+    /// start (`prepareAppData`), and the policy names it logically (`Place.logical`), never resolved, so a link the app's
+    /// previous run (the one thing that can write there) left at it or on its way fails `SandboxPolicyCheck` instead of
+    /// widening the grant (fix round 1, I1). The factory's `.guiApp` rule.
+    public static func guiApp(_ l: EngineLayout, run: URL, company: Company, surface: String, principals: PrincipalSet,
+                              baseline: SandboxBaseline) -> PolicyDecision {
+        decide(.guiApp(surface: surface), run: run, company: company, principals: principals, baseline: baseline) { run in
+            let ws = l.workspace.resolvedForSandbox
+            let workspace = try Place.verify(ws, kind: .directory, under: ws)
+            return .guiApp(run: run, appData: try Place.logical(appData(l, surface: surface), under: workspace))
+        }
     }
 
     /// Where every macOS app's data lives, relative to the workspace (under L's engine-only `.brahma/preview`).
@@ -126,19 +129,38 @@ extension PreviewPolicy {
         CompanyNetwork.scope(company: company, grantDomains: [], grantWebDomains: []).allowedDomains
     }
 
-    /// The policies one start of `kind` runs under: its build and command (`policy`), and the long-running app's when that
-    /// differs (`appPolicy`). web and backend: L's `server` on `port`; cli: `oneShot`; ios: `appleBuild` (the Simulator runs
-    /// the app itself, outside any sandbox, behind the owner's approval); macos: `appleBuild`, then `guiApp`.
-    static func forKind(_ kind: PreviewKind, layout: EngineLayout, run: URL, company: Company, sandbox: SandboxLayout, port: Int,
-                        surface: String) -> (policy: SandboxPolicy, appPolicy: SandboxPolicy?) {
+    /// The route one start of `kind` runs under: its build and command (`policy`), and the long-running app's when that
+    /// differs (`appPolicy`), or the owner's Full opt-out for the whole start, or a refusal. web and backend: L's `server` on
+    /// `port`; cli: `oneShot`; ios: `appleBuild` (the Simulator runs the app itself, outside any sandbox, behind the owner's
+    /// approval); macos: `appleBuild`, then `guiApp`. Plan S Task S7: every one is `SandboxPolicyFactory.decide`.
+    static func forKind(_ kind: PreviewKind, layout: EngineLayout, run: URL, company: Company, port: Int, surface: String,
+                        principals: PrincipalSet, baseline: SandboxBaseline) -> PreviewDecision {
+        let first: PolicyDecision
+        var app: PolicyDecision?
         switch kind {
-        case .web, .backend: (server(layout, run: run, company: company, port: port), nil)
-        case .cli, .artifact: (oneShot(layout, run: run, company: company, sandbox: sandbox), nil)
-        case .ios: (appleBuild(layout, run: run, company: company, sandbox: sandbox), nil)
-        case .macos: (appleBuild(layout, run: run, company: company, sandbox: sandbox),
-                      guiApp(layout, run: run, company: company, sandbox: sandbox, surface: surface))
+        case .web, .backend: first = server(layout, run: run, company: company, port: port, principals: principals, baseline: baseline)
+        case .cli, .artifact: first = oneShot(layout, run: run, company: company, principals: principals, baseline: baseline)
+        case .ios: first = appleBuild(layout, run: run, company: company, principals: principals, baseline: baseline)
+        case .macos:
+            first = appleBuild(layout, run: run, company: company, principals: principals, baseline: baseline)
+            app = guiApp(layout, run: run, company: company, surface: surface, principals: principals, baseline: baseline)
+        }
+        switch (first, app) {
+        case (.refused(let why), _), (_, .refused(let why)?): return .refused(why)
+        case (.fullOptOut(let optOut), nil), (.fullOptOut(let optOut), .fullOptOut?): return .fullOptOut(optOut)
+        case (.sandboxed(let policy), nil): return .sandboxed(policy: policy, app: nil)
+        case (.sandboxed(let policy), .sandboxed(let appPolicy)?): return .sandboxed(policy: policy, app: appPolicy)
+        case (.fullOptOut, .sandboxed?), (.sandboxed, .fullOptOut?):
+            return .refused("the build and the app of one preview were decided differently")
         }
     }
+}
+
+/// What one start of a preview runs under (`PreviewPolicy.forKind`).
+enum PreviewDecision: Sendable, Equatable {
+    case sandboxed(policy: ValidatedPolicy, app: ValidatedPolicy?)
+    case fullOptOut(FullOptOut)
+    case refused(String)
 }
 
 // MARK: Demo

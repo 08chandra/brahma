@@ -601,7 +601,7 @@ import GRDB
         let run = MergeRun(id: runId, companyId: company.id, requestId: nil, kind: .item, itemId: i.id, status: .running)
         try await m.store.writer.write { try run.insert($0) }
         guard case .sandboxed(let policy) = route(dir.path) else { Issue.record("not sandboxed: \(route(dir.path))"); return }
-        #expect(policy.writable.map { $0.resolvingSymlinksInPath().path } == [dir.resolvingSymlinksInPath().path])
+        #expect(policy.writable.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path } == [dir.resolvingSymlinksInPath().path])
         // Another directory with that run's name, or a finished run: refused.
         #expect(refused(route(dir.deletingLastPathComponent().appending(path: "elsewhere").path)))
         try m.exec("UPDATE mergeRun SET status = 'passed' WHERE id = ?", [runId])

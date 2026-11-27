@@ -648,6 +648,22 @@ public struct SandboxCanary: SandboxCanaryRunning {
 
     // MARK: sandbox-backend
 
+    /// The canary's own runs are the engine's: never Full, no grant.
+    static let enginePrincipals = PrincipalSet(companyId: "", members: [.engine], ownerProfile: .sandboxed)
+
+    /// A turn scope's places as verified places (Plan S Task S7): each a real directory or file as the scope names it (link-free
+    /// when computed; its parent resolved, itself never followed). One that does not exist is left out: a rule for nothing
+    /// there allowed nothing. A link, or anything else, refuses the run, as the policy check refused it before.
+    static func scopePlaces(_ urls: [URL]) throws -> [Place] {
+        try urls.compactMap { url in
+            switch SandboxPath.kind(url.path) {
+            case .missing: return nil
+            case .file: return try Place.atResolvedParent(url, kind: .file)
+            case .directory, .link, .other: return try Place.atResolvedParent(url, kind: .directory)
+            }
+        }
+    }
+
     /// `sandbox-backend`: the sandboxed runner's `cat` of the planted data-home token fails and prints nothing of it. No model.
     static func backendItem(token: URL, secret: String, sandbox: (any SandboxedRunner)?) async -> DoctorItem {
         let name = "sandbox-backend"
@@ -660,7 +676,16 @@ public struct SandboxCanary: SandboxCanaryRunning {
         }
         let cwd = scratch.resolvedForSandbox
         let environment = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
-        let policy = SandboxPolicy(writable: [cwd], readable: [], network: .none, toolchain: false)
+        // Plan S Task S7: the factory's `.canary(.backend)` rule: the scratch (resolved, a verified place) writable, nothing
+        // readable, no network; engine principals.
+        let policy: PolicyDecision
+        do {
+            policy = SandboxPolicyFactory.decide(.canary(.backend), principals: Self.enginePrincipals,
+                                                 places: .canary(writable: [try Place.resolved(cwd, kind: .directory)], readable: []),
+                                                 network: .none, baseline: sandbox.policyBaseline())
+        } catch {
+            policy = .refused("the scratch directory is not safe to use (\(error))")
+        }
         // Positive control first: the same policy must run a command that reads a file of its own; otherwise a refusal below
         // could only mean the sandboxed runner runs nothing at all.
         let control = cwd.appending(path: "control.txt"), controlText = "BRAHMA-CONTROL-\(UUID().uuidString)"
@@ -668,13 +693,13 @@ public struct SandboxCanary: SandboxCanaryRunning {
             return DoctorItem(name: name, status: .fail, detail: "can't prepare the control file: \(error)")
         }
         let ok = await sandbox.run(command: "/bin/cat '\(control.path)'", cwd: cwd, environment: environment, timeout: .seconds(30),
-                                   outputURL: cwd.appending(path: "control.log"), policy: policy)
+                                   outputURL: cwd.appending(path: "control.log"), decision: policy)
         guard ok.exitCode == 0, ok.tail.contains(controlText) else {
             return DoctorItem(name: name, status: .fail,
                               detail: "the sandboxed runner could not run a command (control: exit \(ok.exitCode.map(String.init) ?? "none"))")
         }
         let out = await sandbox.run(command: "/bin/cat '\(token.path)'", cwd: cwd, environment: environment,
-                                    timeout: .seconds(30), outputURL: cwd.appending(path: "out.log"), policy: policy)
+                                    timeout: .seconds(30), outputURL: cwd.appending(path: "out.log"), decision: policy)
         if CanaryLeakMatcher(token: secret).found(in: out.tail) || out.exitCode == 0 {
             return DoctorItem(name: name, status: .fail, detail: "a sandboxed command read a file in the data home: the sandbox does not hold")
         }
@@ -734,8 +759,18 @@ public struct SandboxCanary: SandboxCanaryRunning {
             try BrahmaPaths.ensurePrivateDirectory(scratch)
             try BrahmaPaths.ensurePrivateDirectory(logs)
         } catch { return fail("can't prepare a scratch directory: \(error)") }
-        let policy = SandboxPolicy(writable: [scratch.resolvedForSandbox] + scope.writable, readable: scope.readable,
-                                   network: .none, toolchain: false)
+        // Plan S Task S7: the factory's `.canary(.localLayer)` rule: the scratch first, then the scope's writable places,
+        // writable; the scope's readable places readable; no network; engine principals. Each place as the scope names it
+        // (resolved or logical, link-free when computed), verified now.
+        let policy: PolicyDecision
+        do {
+            policy = SandboxPolicyFactory.decide(.canary(.localLayer), principals: Self.enginePrincipals,
+                                                 places: .canary(writable: [try Place.resolved(scratch, kind: .directory)] + (try Self.scopePlaces(scope.writable)),
+                                                                 readable: try Self.scopePlaces(scope.readable)),
+                                                 network: .none, baseline: runner.policyBaseline())
+        } catch {
+            policy = .refused("a place of the canary's scope is not safe to use (\(error))")
+        }
         var env = ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .general)
         env.merge(p.variables) { _, new in new }
         let command = "exec '\(prefix)' \"$\(probeVariable)\""
@@ -745,7 +780,7 @@ public struct SandboxCanary: SandboxCanaryRunning {
             var e = env
             e[probeVariable] = text
             let log = resolvedLogs.appending(path: "\(n).log")
-            let out = await runner.run(command: command, cwd: scope.cwd, environment: e, timeout: timeout, outputURL: log, policy: policy)
+            let out = await runner.run(command: command, cwd: scope.cwd, environment: e, timeout: timeout, outputURL: log, decision: policy)
             let logged = EngineFiles.readNoFollow(log, under: resolvedLogs, limit: ProcessCheckRunner.outputCap + 4096)
                 .map { String(decoding: $0, as: UTF8.self) } ?? ""
             return (out, logged + "\n" + out.tail)

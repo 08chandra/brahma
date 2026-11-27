@@ -47,6 +47,9 @@ public struct SeatbeltRunner: SandboxedRunner {
         self.onStraggler = onStraggler; self.afterValidate = afterValidate
     }
 
+    /// The baseline every run starts from (`baseline`, read now).
+    public func policyBaseline() -> SandboxBaseline { baseline() }
+
     /// A unique per-run mach global name the profile allows and the sweep probes for (B-I4).
     static let markerPrefix = "dev.brahma.run."
     static func runMarker() -> String { markerPrefix + UUID().uuidString.lowercased() }
@@ -56,24 +59,26 @@ public struct SeatbeltRunner: SandboxedRunner {
         var environment: [String: String]
     }
 
-    /// Validates, renders and builds the argv and environment; creates `TMPDIR` (and, with `toolchain`, the cache's tool
-    /// directories) without following a link. The profile is rendered from the very paths the check saw (no second resolve:
-    /// `resolvePolicyPaths: false`), so a link swapped in between the check and the render cannot widen it (Task 7, obligation
-    /// d); the `TMPDIR` step then opens the writable entry with `O_NOFOLLOW`, so a swapped writable entry fails here.
+    /// Checks again, renders and builds the argv and environment; creates `TMPDIR` (and, with `toolchain`, the cache's tool
+    /// directories) without following a link. The validated strings are checked against this run's baseline
+    /// (`SandboxPolicyCheck.recheck`: a link planted since `decide`, or a protected path added since, refuses the run), and
+    /// the profile is rendered from those very strings (`SeatbeltProfile.render(_:…)` resolves nothing), so a link swapped in
+    /// between the check and the render cannot widen it (Task 7, obligation d; Plan S Task S7, `ValidatedPolicy`); the
+    /// `TMPDIR` step then opens the writable entry with `O_NOFOLLOW`, so a swapped writable entry fails here.
     /// `prepare(program:)` for a shell command (`/bin/sh -c <command>`).
-    func prepare(command: String, environment: [String: String], policy: SandboxPolicy, proxyPort: UInt16?, marker: String?) throws -> Prepared {
+    func prepare(command: String, environment: [String: String], policy: ValidatedPolicy, proxyPort: UInt16?, marker: String?) throws -> Prepared {
         try prepare(program: Self.shell(command), environment: environment, policy: policy, proxyPort: proxyPort, marker: marker)
     }
 
     /// `program` is what `sandbox-exec` runs (argv): `/bin/sh -c <command>` (`shell`), or one program as itself (C2b fix
     /// round 4, `runProgramBlocking`).
-    func prepare(program: [String], environment: [String: String], policy: SandboxPolicy, proxyPort: UInt16?, marker: String?) throws -> Prepared {
+    func prepare(program: [String], environment: [String: String], policy: ValidatedPolicy, proxyPort: UInt16?, marker: String?) throws -> Prepared {
         let base = baseline()
-        try SandboxPolicyCheck.validate(policy, baseline: base)
+        try SandboxPolicyCheck.recheck(policy, baseline: base)
         afterValidate?()
-        let profile = SeatbeltProfile.render(policy: policy, baseline: base, proxyPort: proxyPort, marker: marker, resolvePolicyPaths: false)
+        let profile = SeatbeltProfile.render(policy, baseline: base, proxyPort: proxyPort, marker: marker)
         var env = environment
-        let first = policy.writable[0]
+        guard let first = policy.tempRoot else { throw SandboxError.invalidPath("a sandbox policy needs a writable directory") }
         // B-I2: every engine file op is anchored at the parent of the writable entry and opened with O_NOFOLLOW, so an entry
         // the check replaced with a link throws instead of being followed to the link's target.
         try Self.ensureUnder(first, Self.tmpName, mode: 0o700)
@@ -111,15 +116,15 @@ public struct SeatbeltRunner: SandboxedRunner {
 
     /// Removes `TMPDIR`, anchored at the writable entry's parent so a link at the entry is not followed (B-I2); the entry is
     /// opened O_NOFOLLOW, and the removal itself works on descriptors only.
-    static func removeTemp(_ policy: SandboxPolicy) {
-        guard let first = policy.writable.first else { return }
+    static func removeTemp(_ policy: ValidatedPolicy) {
+        guard let first = policy.tempRoot else { return }
         bestEffort("removing a check's TMPDIR") {
             _ = try EngineFiles.removeNoFollow(first.appending(path: tmpName), under: first.deletingLastPathComponent())
         }
     }
 
     public func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-                    policy: SandboxPolicy) async -> CheckOutcome {
+                    policy: ValidatedPolicy) async -> CheckOutcome {
         var port: UInt16?
         if let allow = policy.allowedDomains {
             do { port = try await proxies.proxy(for: allow).port } catch {
@@ -146,7 +151,7 @@ public struct SeatbeltRunner: SandboxedRunner {
     /// C2b fix round 2: the whole run on the calling thread (every step of it blocks anyway), for synchronous callers that
     /// must not wait on the cooperative pool. A policy with network needs its egress proxy started first (`proxyNow`).
     public func runBlocking(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-                            policy: SandboxPolicy) -> CheckOutcome {
+                            policy: ValidatedPolicy) -> CheckOutcome {
         let port: UInt16?
         do { port = try policy.allowedDomains.map { try proxies.proxyNow(for: $0).port } } catch {
             return GroupRun.fail("could not run the check: the egress proxy did not start (\(error))", outputURL: outputURL)
@@ -159,7 +164,7 @@ public struct SeatbeltRunner: SandboxedRunner {
     /// new session, its standard output capped (`SandboxedRunner.runProgramBlocking`). No network. A confined policy runs
     /// only one of its own programs.
     public func runProgramBlocking(arguments: [String], cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-                                   stdoutURL: URL, stdoutCap: Int, policy: SandboxPolicy) -> CheckOutcome {
+                                   stdoutURL: URL, stdoutCap: Int, policy: ValidatedPolicy) -> CheckOutcome {
         guard let program = arguments.first, policy.allowedDomains == nil, stdoutCap >= 0 else {
             return GroupRun.fail("could not run the program in the sandbox: no program, or a network it may not have", outputURL: outputURL)
         }
@@ -174,7 +179,7 @@ public struct SeatbeltRunner: SandboxedRunner {
     static func shell(_ command: String) -> [String] { ["/bin/sh", "-c", command] }
 
     /// One run, start to end, on the current thread: `prepare`, the run, the B-I4 sweep, the temp removal.
-    func runHere(program: [String], cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL, policy: SandboxPolicy,
+    func runHere(program: [String], cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL, policy: ValidatedPolicy,
                  port: UInt16?, cancel: GroupRun.CancelFlag, groups: ChildGroups?, stdout: (url: URL, cap: Int)? = nil,
                  newSession: Bool = false) -> CheckOutcome {
         let (grace, clock) = (termGrace, self.clock)
@@ -197,7 +202,7 @@ public struct SeatbeltRunner: SandboxedRunner {
         // reported; only ones that could not be killed or classified, or an unreadable process table, make the
         // run inconclusive — nothing unaccounted for is ever counted as a pass or a failure.
         let swept = SandboxSweep.run(probe: SandboxProbe(machMarker: marker), since: since)
-        if !swept.clean { onStraggler?(StragglerReport(checkout: policy.writable[0], result: swept)) }
+        if !swept.clean { onStraggler?(StragglerReport(checkout: policy.tempRoot, result: swept)) }
         if swept.inconclusive {
             let why = swept.tableUnreadable ? "the process table could not be read"
                 : "\(swept.survivors.count) process(es) could not be killed or identified"
@@ -209,7 +214,7 @@ public struct SeatbeltRunner: SandboxedRunner {
         return result
     }
 
-    public func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
+    public func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: ValidatedPolicy) throws -> any SandboxedProcess {
         let port = try policy.allowedDomains.map { try proxies.proxyNow(for: $0).port }
         let marker = Self.runMarker()
         let prepared = try prepare(program: Self.shell(command), environment: environment, policy: policy, proxyPort: port, marker: marker)

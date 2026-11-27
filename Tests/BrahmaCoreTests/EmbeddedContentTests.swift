@@ -7,6 +7,7 @@ import PDFKit
 import Compression
 #endif
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// Builds real PDFs for the gate's tests: objects numbered from 1 with a classic cross-reference table whose offsets are
 /// right, so every reader opens them without a repair.
@@ -200,19 +201,19 @@ struct ScriptedRunner: SandboxedRunner {
     var record: Record? = nil
 
     func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-             policy: SandboxPolicy) async -> CheckOutcome {
+             policy: ValidatedPolicy) async -> CheckOutcome {
         record?.lock.withLock { record?.commands += 1 }
         return GroupRun.fail("a shell command was run", outputURL: outputURL)
     }
 
     func runProgramBlocking(arguments: [String], cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-                            stdoutURL: URL, stdoutCap: Int, policy: SandboxPolicy) -> CheckOutcome {
+                            stdoutURL: URL, stdoutCap: Int, policy: ValidatedPolicy) -> CheckOutcome {
         record?.lock.withLock { record?.arguments = arguments; record?.stdoutCap = stdoutCap }
         if let parts { try? parts.write(to: stdoutURL) }
         return outcome
     }
 
-    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: ValidatedPolicy) throws -> any SandboxedProcess {
         throw SandboxError.unavailable
     }
 }
@@ -808,7 +809,7 @@ struct SeededBytes {
         let cf = try CollabFixture()
         let held = URL(fileURLWithPath: "/private/tmp/held"), out = URL(fileURLWithPath: "/private/tmp/out")
         let policy = SandboxedPDFReader.policy(helper: URL(fileURLWithPath: "/opt/h/brahma-pdf"), held: held, out: out, memoryLimit: 1 << 30)
-        let profile = SeatbeltProfile.render(policy: policy, baseline: SandboxBaseline.current(paths: cf.paths, otherWorkspaces: [], backupTargets: []),
+        let profile = SeatbeltProfile.render(try #require(policy), baseline: SandboxBaseline.current(paths: cf.paths, otherWorkspaces: [], backupTargets: []),
                                              proxyPort: nil, marker: "dev.brahma.run.test")
         #expect(profile.contains("(deny default)") && !profile.contains("(allow default)"))
         #expect(!profile.contains("network-outbound") && !profile.contains("network-bind"))
@@ -816,7 +817,7 @@ struct SeededBytes {
         #expect(profile.components(separatedBy: "mach-lookup").count == 2)
         #expect(profile.contains("(literal \"/opt/h/brahma-pdf\")") && !profile.contains("/private/tmp/out/parts"))
         #expect(!profile.contains("(allow file-write* (subpath"))
-        #expect(policy.memoryLimit == 1 << 30)
+        #expect(policy?.memoryLimit == 1 << 30)
         guard Toolchain.seatbeltAvailable else { return }
         let home = try Scratch.homeDir().resolvedForSandbox
         let sbPaths = BrahmaPaths(home: home.appending(path: "home"), workspaces: home.appending(path: "ws"))
@@ -953,7 +954,7 @@ struct SeededBytes {
         let cf = try CollabFixture()
         let held = URL(fileURLWithPath: "/private/tmp/held"), out = URL(fileURLWithPath: "/private/tmp/out")
         let policy = SandboxedPDFReader.policy(helper: URL(fileURLWithPath: "/opt/h/brahma-pdf"), held: held, out: out, memoryLimit: 1 << 30)
-        let profile = SeatbeltProfile.render(policy: policy, baseline: SandboxBaseline.current(paths: cf.paths, otherWorkspaces: [], backupTargets: []),
+        let profile = SeatbeltProfile.render(try #require(policy), baseline: SandboxBaseline.current(paths: cf.paths, otherWorkspaces: [], backupTargets: []),
                                              proxyPort: nil, marker: "dev.brahma.run.test")
         #expect(profile.contains("(allow process-exec (literal \"/opt/h/brahma-pdf\"))"))
         #expect(!profile.contains("process-fork") && !profile.contains("/bin/sh") && !profile.contains("/usr/bin/head")
@@ -962,11 +963,14 @@ struct SeededBytes {
         // The reader hands the runner the helper's own argv and the cap; nothing is a shell command.
         let recorder = ScriptedRunner.Record()
         let good = Self.framed([(0x44, Data("BT (hello) Tj ET".utf8))])
+        // Plan S Task S7: the policy names the helper as a verified place, so the stand-in helper is a real file.
+        let standIn = try tempDir().resolvedForSandbox.appending(path: "brahma-pdf")
+        try Data("#!/bin/sh\n".utf8).write(to: standIn)
         let scripted = SandboxedPDFReader(runner: ScriptedRunner(parts: good, outcome: CheckOutcome(exitCode: 0, timedOut: false, tail: ""), record: recorder),
-                                          helper: URL(fileURLWithPath: "/opt/h/brahma-pdf"), scratch: { try cf.vault.makeTempDir() })
+                                          helper: standIn, scratch: { try cf.vault.makeTempDir() })
         #expect(try scripted.parts(of: PDFBuild.flate("hello"), maxBytes: 5000).count == 1)
         let argv = recorder.arguments
-        #expect(argv.count == 4 && argv.first == "/opt/h/brahma-pdf" && argv.last == String(SandboxedPDFReader.memoryLimit))
+        #expect(argv.count == 4 && argv.first == standIn.path && argv.last == String(SandboxedPDFReader.memoryLimit))
         #expect(argv.count == 4 && argv[1].hasSuffix("/held/input.pdf") && argv[2] == "5000")
         #expect(recorder.stdoutCap == 5000 && recorder.commands == 0)
 
@@ -1008,13 +1012,13 @@ struct SeededBytes {
         let held = URL(fileURLWithPath: "/private/tmp/held"), out = URL(fileURLWithPath: "/private/tmp/out")
         let unzip = URL(fileURLWithPath: SandboxedUnzipReader.unzip)
         let policy = SandboxedUnzipReader.policy(unzip: unzip, held: held, out: out)
-        let profile = SeatbeltProfile.render(policy: policy, baseline: SandboxBaseline.current(paths: cf.paths, otherWorkspaces: [], backupTargets: []),
+        let profile = SeatbeltProfile.render(try #require(policy), baseline: SandboxBaseline.current(paths: cf.paths, otherWorkspaces: [], backupTargets: []),
                                              proxyPort: nil, marker: "dev.brahma.run.test")
         #expect(profile.contains("(deny default)") && !profile.contains("(allow default)"))
         #expect(profile.contains("(allow process-exec (literal \"/usr/bin/unzip\"))"))
         #expect(!profile.contains("process-fork") && !profile.contains("/bin/sh") && !profile.contains("/usr/bin/head"))
         #expect(!profile.contains("(allow file-write*") && !profile.contains("network-outbound"))
-        #expect(policy.memoryLimit == SandboxedUnzipReader.memoryLimit)
+        #expect(policy?.memoryLimit == SandboxedUnzipReader.memoryLimit)
         // One run: the argv, the cap, nothing through a shell; members split by size and checked by CRC.
         let zip = try SecretGateTests.zip { z in z.add("a.txt", "alpha"); z.add("b/[c].txt", "bravo charlie") }
         func scripted(_ parts: Data?, _ outcome: CheckOutcome, _ record: ScriptedRunner.Record? = nil) -> SandboxedUnzipReader {
@@ -1085,7 +1089,7 @@ struct SeededBytes {
             let p = SandboxedUnzipReader.policy(unzip: probe, held: heldDir.resolvedForSandbox, out: outDir.resolvedForSandbox)
             return runner.runProgramBlocking(arguments: [probe.path, ordersFile.resolvedForSandbox.path], cwd: outDir.resolvedForSandbox,
                                              environment: [:], timeout: .seconds(30), outputURL: dir.appending(path: "log"),
-                                             stdoutURL: outDir.resolvedForSandbox.appending(path: "members"), stdoutCap: 10_000, policy: p)
+                                             stdoutURL: outDir.resolvedForSandbox.appending(path: "members"), stdoutCap: 10_000, policy: try #require(p))
         }
         #expect(try run("read /System/Library/CoreServices/SystemVersion.plist").exitCode == 1, "the stand-in sees what is allowed")
         for orders in ["fork", "exec /bin/sh", "exec /usr/bin/unzip", "spawn /bin/sh", "setsid", "connect 22", "read \(outside.path)",

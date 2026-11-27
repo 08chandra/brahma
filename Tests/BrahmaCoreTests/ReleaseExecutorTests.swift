@@ -268,13 +268,15 @@ import Glibc
         let guarded = [try fx.deployTools(), try fx.upload(), try fx.home()].map { SandboxPath.resolve($0.path) }
         var writable: [URL] = []
         // Every build the executor ran, every main smoke.
-        writable += fx.calls(in: fx.export(r)).flatMap(\.policy.writable)
-        writable += fx.smokeSandbox.calls.flatMap(\.policy.writable)
+        writable += fx.calls(in: fx.export(r)).flatMap { $0.policy.writable.map { URL(fileURLWithPath: $0) } }
+        writable += fx.smokeSandbox.calls.flatMap { $0.policy.writable.map { URL(fileURLWithPath: $0) } }
         #expect(!writable.isEmpty)
         // A preview server's policy (its own export), and 5-lite's check places (a submission's checkout, a merge's export).
         let git = fx.store.gitWorkspace(root: fx.ws, companyId: fx.company.id)
-        writable += PreviewPolicy.server(EngineLayout(workspace: fx.ws), run: git.exportPath(runId: "prev-x"), company: fx.company,
-                                         port: 47100).writable
+        // (Plan S Task S7: the factory names only a real place, so the preview's export is made first.)
+        try FileManager.default.createDirectory(at: git.exportPath(runId: "prev-x"), withIntermediateDirectories: true)
+        writable += try #require(PreviewPolicy.server(EngineLayout(workspace: fx.ws), run: git.exportPath(runId: "prev-x"), company: fx.company,
+                                                      port: 47100)).writable.map { URL(fileURLWithPath: $0) }
         writable += [git.checkoutPath(runId: "chk-1"), git.exportPath(runId: "chk-1")]
         // An item turn's scope.
         let eng = try fx.w.hire(fx.company, "eng-1", role: "engineer")

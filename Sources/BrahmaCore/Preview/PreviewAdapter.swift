@@ -25,16 +25,21 @@ public struct PreviewContext: Sendable {
     public var run: URL
     public var commit: String
     public var port: Int
-    public var policy: SandboxPolicy
+    /// The sandboxed route's policy for the build and the command (`PreviewPolicy.decide`, Plan S Task S7); nil on the Full
+    /// route (`optOut`).
+    public var policy: ValidatedPolicy?
     public var environment: [String: String]
     public var logURL: URL
     public var timeouts: PreviewTimeouts
     /// Where a one-shot preview's output goes (Plan 4a; the runner uses `EngineLayout.previewOutput(name:)`).
     public var outputURL: URL
     /// The policy of the long-running app when it is not `policy` (a macOS app: `PreviewPolicy.guiApp`); nil otherwise.
-    public var appPolicy: SandboxPolicy? = nil
-    /// The start runs through `PreviewDependencies.unsandboxed` (a Full company, PR-5): use `deps.runner(for:)`.
-    public var unsandboxed: Bool = false
+    public var appPolicy: ValidatedPolicy? = nil
+    /// The company owner's Full opt-out for this start (`SandboxPolicyFactory`): the start runs through
+    /// `PreviewDependencies.unsandboxed` (PR-5). Use `deps.runner(for:)`.
+    public var optOut: FullOptOut? = nil
+    /// The start runs through `PreviewDependencies.unsandboxed` (a Full company): exactly when there is an `optOut`.
+    public var unsandboxed: Bool { optOut != nil }
     /// Hears the pid of a long-running process as soon as it is spawned (the runner records it, so a stop reaches it).
     public var onSpawn: (@Sendable (Int32, Double) async -> Void)? = nil
     /// What scrubs the captured output, the build log and the smoke results before anything keeps them (the runner passes
@@ -45,13 +50,13 @@ public struct PreviewContext: Sendable {
     public var demoSprint: Int? = nil
 
     public init(surface: PreviewSurface, company: Company, layout: EngineLayout, run: URL, commit: String, port: Int,
-                policy: SandboxPolicy, environment: [String: String], logURL: URL, timeouts: PreviewTimeouts = PreviewTimeouts(),
-                outputURL: URL? = nil, appPolicy: SandboxPolicy? = nil, unsandboxed: Bool = false,
+                policy: ValidatedPolicy?, environment: [String: String], logURL: URL, timeouts: PreviewTimeouts = PreviewTimeouts(),
+                outputURL: URL? = nil, appPolicy: ValidatedPolicy? = nil, optOut: FullOptOut? = nil,
                 onSpawn: (@Sendable (Int32, Double) async -> Void)? = nil, redactor: Redactor? = nil) {
         self.surface = surface; self.company = company; self.layout = layout; self.run = run; self.commit = commit
         self.port = port; self.policy = policy; self.environment = environment; self.logURL = logURL; self.timeouts = timeouts
         self.outputURL = outputURL ?? layout.previewOutput(name: surface.name)
-        self.appPolicy = appPolicy; self.unsandboxed = unsandboxed; self.onSpawn = onSpawn; self.redactor = redactor
+        self.appPolicy = appPolicy; self.optOut = optOut; self.onSpawn = onSpawn; self.redactor = redactor
     }
 
     /// A preview's environment: `ChildEnvironment.make` of `base` as for a check (`BRAHMA_AGENT_ID=preview`, nothing
@@ -110,8 +115,9 @@ public struct PreviewDependencies: Sendable {
     public var http: any HTTPProbing
     public var listen: any ListenProbing
     public var processes: SpawnedProcesses
-    /// What a Full company's previews run through when its checks would run unsandboxed too (PR-5).
-    public var unsandboxed: any SandboxedRunner
+    /// What a Full company's previews run through when its checks would run unsandboxed too (PR-5): only with the start's
+    /// `FullOptOut`.
+    public var unsandboxed: any UnsandboxedRunning
     /// The iOS Simulator (Plan 4a; Task 7 provides the real one).
     public var simulator: any SimulatorControlling = UnavailableSimulator()
     /// macOS app launching (Plan 4a; Task 7 provides the real one).
@@ -121,20 +127,59 @@ public struct PreviewDependencies: Sendable {
     public var adapters: [PreviewKind: any PreviewAdapter]? = nil
 
     public init(sandbox: any SandboxedRunner, http: any HTTPProbing, listen: any ListenProbing, processes: SpawnedProcesses,
-                unsandboxed: any SandboxedRunner = UnsandboxedPreviewRunner(), simulator: any SimulatorControlling = UnavailableSimulator(),
+                unsandboxed: any UnsandboxedRunning = UnsandboxedPreviewRunner(), simulator: any SimulatorControlling = UnavailableSimulator(),
                 macApps: any MacAppLaunching = UnavailableMacApps()) {
         self.sandbox = sandbox; self.http = http; self.listen = listen; self.processes = processes; self.unsandboxed = unsandboxed
         self.simulator = simulator; self.macApps = macApps
     }
 
-    /// The runner one start's agent-written commands go through: `unsandboxed` exactly when the runner routed the start
-    /// there (`PreviewContext.unsandboxed`, PR-5), else the sandbox.
-    public func runner(for c: PreviewContext) -> any SandboxedRunner { c.unsandboxed ? unsandboxed : sandbox }
+    /// The runner one start's agent-written commands go through: `unsandboxed` with the start's `FullOptOut` exactly when the
+    /// factory decided the owner's opt-out (`PreviewContext.optOut`, PR-5), else the sandbox under the start's policy (`app`:
+    /// the long-running app's, `appPolicy`, when there is one).
+    public func runner(for c: PreviewContext, app: Bool = false) -> PreviewRoute {
+        if let optOut = c.optOut { return PreviewRoute(route: .full(unsandboxed, optOut)) }
+        return PreviewRoute(route: .sandboxed(sandbox, app ? (c.appPolicy ?? c.policy) : c.policy))
+    }
 
     /// The real probes (`URLSessionHTTPProbe`, `LsofListenProbe`), a fresh process table around `sandbox`, the real Simulator
     /// controller (`xcrun simctl`) and macOS app launcher (Plan 4a Task 7; each says when it cannot work here).
     public static func live(sandbox: any SandboxedRunner) -> PreviewDependencies {
         PreviewDependencies(sandbox: sandbox, http: URLSessionHTTPProbe(), listen: LsofListenProbe(), processes: SpawnedProcesses(),
                             simulator: SimctlController(), macApps: ProcessMacAppLauncher())
+    }
+}
+
+/// One start's runner and what it runs under (`PreviewDependencies.runner(for:)`): the sandbox with the start's validated
+/// policy, or the unsandboxed runner with the owner's `FullOptOut`. A sandboxed route without a policy runs nothing.
+public struct PreviewRoute: Sendable {
+    enum Route: Sendable {
+        case sandboxed(any SandboxedRunner, ValidatedPolicy?)
+        case full(any UnsandboxedRunning, FullOptOut)
+    }
+
+    let route: Route
+
+    static let noPolicy = "no sandbox policy was decided for this preview"
+
+    public func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL) async -> CheckOutcome {
+        switch route {
+        case .sandboxed(let runner, let policy?):
+            return await runner.run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, policy: policy)
+        case .sandboxed(_, nil):
+            return GroupRun.fail(PolicyRefusal.tail(Self.noPolicy), outputURL: outputURL)
+        case .full(let runner, let optOut):
+            return await runner.run(command: command, cwd: cwd, environment: environment, timeout: timeout, outputURL: outputURL, optOut: optOut)
+        }
+    }
+
+    public func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL) throws -> any SandboxedProcess {
+        switch route {
+        case .sandboxed(let runner, let policy?):
+            return try runner.spawn(command: command, cwd: cwd, environment: environment, logURL: logURL, policy: policy)
+        case .sandboxed(_, nil):
+            throw SandboxError.invalidPath(Self.noPolicy)
+        case .full(let runner, let optOut):
+            return try runner.spawn(command: command, cwd: cwd, environment: environment, logURL: logURL, optOut: optOut)
+        }
     }
 }

@@ -33,7 +33,7 @@ public struct CLIAdapter: PreviewAdapter {
         let runner = deps.runner(for: c)
         if let build = c.surface.build {
             let outcome = await runner.run(command: build, cwd: c.run, environment: c.environment, timeout: c.timeouts.build,
-                                           outputURL: c.logURL, policy: c.policy)
+                                           outputURL: c.logURL)
             _ = Self.seal(c.logURL, redactor: c.redactor)
             if Task.isCancelled { return PreviewUpdate(status: .stopped, message: nil) }
             if Self.isUnavailable(outcome) { return PreviewUpdate(status: .unavailable, message: UnavailableSandboxRunner.tail) }
@@ -75,9 +75,9 @@ public struct CLIAdapter: PreviewAdapter {
     struct Ran { var end: End; var outputPath: String?; var lines: Int }
 
     /// The demo, to completion or `c.timeouts.demo`, its output sealed.
-    func runDemo(_ command: String, _ c: PreviewContext, runner: any SandboxedRunner) async -> Ran {
+    func runDemo(_ command: String, _ c: PreviewContext, runner: PreviewRoute) async -> Ran {
         let outcome = await runner.run(command: command, cwd: c.run, environment: c.environment, timeout: c.timeouts.demo,
-                                       outputURL: c.outputURL, policy: c.policy)
+                                       outputURL: c.outputURL)
         let sealed = Self.seal(c.outputURL, redactor: c.redactor)
         let path = sealed.kept ? c.outputURL.path : nil
         if Task.isCancelled { return Ran(end: .cancelled, outputPath: path, lines: sealed.lines) }

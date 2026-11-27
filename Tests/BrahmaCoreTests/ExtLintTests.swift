@@ -139,7 +139,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         for line in argv { #expect(!line.contains(staged.dir.path), "only the allowlisted copy is ever named") }
         for c in calls {
             #expect(c.cwd == scratch); #expect(c.policy.network == .none); #expect(!c.policy.toolchain)
-            #expect(c.policy.writable == [scratch])
+            #expect(c.policy.writable == [scratch.resolvedForSandbox])   // S7: the place by its resolved path
             #expect(c.policy.readable.allSatisfy { claude.resolvedForSandbox.path.hasPrefix($0.path + "/") }, "only the claude binary's own directory is readable: \(c.policy.readable)")
             #expect(c.environment["CLAUDE_CONFIG_DIR"] == scratch.appending(path: "cc").path)
             #expect(c.environment["HOME"] == scratch.appending(path: "home").path)

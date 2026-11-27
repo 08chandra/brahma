@@ -3,9 +3,10 @@ import GRDB
 
 /// How one engine-run check is run, decided from its working directory.
 public enum CheckRoute: Sendable {
-    case sandboxed(SandboxPolicy)
-    /// The company runs Full: the plain `ProcessCheckRunner`.
-    case unsandboxed
+    /// The `.check` purpose's policy (`SandboxPolicyFactory.decide`, Plan S Task S7).
+    case sandboxed(ValidatedPolicy)
+    /// The company runs Full (the factory's `FullOptOut`, never a `Bool`): the plain `ProcessCheckRunner`.
+    case unsandboxed(FullOptOut)
     /// Not a place the engine runs a check in (or its own places could not be prepared): nothing runs, with a precise
     /// reason for the log and the outcome tail (B-I2c).
     case refused(String)
@@ -80,7 +81,13 @@ extension Orchestrator {
     ///
     /// `ceiling` is the engine's (`brahma run --profile`, final review I4): it narrows the company's and the role's profile
     /// exactly as it does for turns (`turnProfile`), so a check runs unsandboxed only when the narrowed profile is still Full.
-    public static func checkRoute(store: Store, ceiling: PermissionProfile? = nil) -> @Sendable (String) -> CheckRoute {
+    ///
+    /// Plan S Task S7: the route is `SandboxPolicyFactory.decide(.check(…))` over the checkout and the workspace as verified
+    /// `Place`s and the principals resolved above; the policy is validated against `baseline` (the check runner's, taken now;
+    /// the owner's when none is given), and a policy the factory refuses is `.refused` with the runner's own refusal text.
+    public static func checkRoute(store: Store, ceiling: PermissionProfile? = nil,
+                                  baseline: @escaping @Sendable () -> SandboxBaseline = { SandboxBaseline.owner() })
+        -> @Sendable (String) -> CheckRoute {
         { cwd in
             let dir = URL(fileURLWithPath: cwd, isDirectory: true)
             let runId = dir.lastPathComponent
@@ -142,26 +149,41 @@ extension Orchestrator {
             case .deny(let why): return .refused(why)
             }
             guard live.workspacePath == company.workspacePath else { return .refused("the company of run \(runId) changed while it was starting") }
-            if principals.runsUnsandboxed { return .unsandboxed }
-            if !record.isMergeRun, principals.unconfirmedInFullCompany != nil {
+            if !principals.runsUnsandboxed, !record.isMergeRun, principals.unconfirmedInFullCompany != nil {
                 PrincipalResolver.noteSandboxed(principals, store: store, subject: itemSubject(store: store, companyId: record.companyId,
                                                                                                itemId: record.itemId, runId: runId),
                                                 kind: .work, agentId: record.requestedBy)
             }
 
-            // The workspace may sit behind a link the owner chose; everything under it is built logically and must be real.
+            // The workspace may sit behind a link the owner chose; everything under it is built logically and must be real:
+            // a real directory, named by its resolved path (`Place.verify`).
             let wsReal = ws.resolvedForSandbox
-            guard SandboxPath.kind(wsReal.path) == .directory else { return .refused("the workspace of \(company.id) is not a directory") }
-            // The engine made the checkout/export; it must be a real directory, named by its resolved path.
+            let workspacePlace: Place
+            do { workspacePlace = try Place.verify(wsReal, kind: .directory, under: wsReal) } catch {
+                return .refused("the workspace of \(company.id) is not a directory")
+            }
+            // The engine made the checkout/export; it must be a real directory, named by its resolved path, reached from its
+            // parent without following a link.
             let checkout = URL(fileURLWithPath: SandboxPath.resolve(placeURL.path), isDirectory: false)
-            guard SandboxPath.kind(checkout.path) == .directory else { return .refused("the \(record.purpose) place of \(runId) is missing") }
+            let checkoutPlace: Place
+            do { checkoutPlace = try Place.verify(checkout, kind: .directory, under: checkout.deletingLastPathComponent()) } catch {
+                return .refused("the \(record.purpose) place of \(runId) is missing")
+            }
 
-            let network = CompanyNetwork.scope(company: live, grantDomains: [], grantWebDomains: []).allowedDomains
             // A check writes only its own checkout/export — no writable shared cache at all (A re-review ruling). Every
             // toolchain cache is per-run under TMPDIR (SeatbeltRunner), so nothing a check plants can run in a later check
-            // or a merge check, and there is no shared `npm` a check could break for its company's later runs.
-            return .sandboxed(SandboxPolicy(writable: [checkout], readable: [wsReal], network: .outbound(allow: network),
-                                            toolchain: true))
+            // or a merge check, and there is no shared `npm` a check could break for its company's later runs. The factory's
+            // `.check` rule: writable the checkout, readable the workspace, the live company's domains, the toolchain; Full
+            // only when every principal and the company narrow to Full (`runsUnsandboxed`).
+            let kind: CheckKind = record.isMergeRun ? .mergeQueue : (record.purpose == "merge" ? .merge : .submit)
+            switch SandboxPolicyFactory.decide(.check(kind), principals: principals,
+                                               places: .check(checkout: checkoutPlace, workspace: workspacePlace),
+                                               network: CompanyNetwork.scope(company: live, grantDomains: [], grantWebDomains: []),
+                                               baseline: baseline()) {
+            case .sandboxed(let policy): return .sandboxed(policy)
+            case .fullOptOut(let optOut): return .unsandboxed(optOut)
+            case .refused(let why): return .refused(PolicyRefusal.tail(why))
+            }
         }
     }
 
@@ -186,7 +208,7 @@ extension Orchestrator {
         let onStraggler: @Sendable (StragglerReport) -> Void = { report in reportStragglers(report, store: store) }
         return SandboxedCheckRunner(sandbox: SandboxRunners.platformDefault(baseline: baseline, proxies: EgressProxyPool(),
                                                                             onStraggler: onStraggler),
-                                    route: checkRoute(store: store, ceiling: ceiling))
+                                    route: checkRoute(store: store, ceiling: ceiling, baseline: baseline))
     }
 
     /// What a sandboxed check left behind, as an owner-visible activity line on its item's company (and the engine log):

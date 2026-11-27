@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 @testable import BrahmaCore
+@testable import BrahmaSafety
 
 /// `SafeRead.smallText` (spec §6.9 item 2): the one bounded no-follow reader for small engine-verified files. Every component
 /// is opened `O_NOFOLLOW` from the resolved root, the open descriptor is judged (regular, one link, this user's, within the

@@ -40,9 +40,19 @@ extension Doctor {
             return DoctorItem(name: name, status: .warn, detail: "the claude binary at \(claudePath) sits in a directory the sandbox may not read whole")
         }
         let command = ExtensionValidator.claudeCommand(claudePath, ["--plugin-dir", plugin.path, "plugin", "details", "doctor-fixture"])
+        // Plan S Task S7: the factory's `.doctorExtensions` rule (the scratch writable, its parent resolved; the claude
+        // binary's resolved directory readable); the doctor's own fixture: engine bytes.
+        let decision: PolicyDecision
+        do {
+            decision = SandboxPolicyFactory.decide(.doctorExtensions, principals: PrincipalSet(companyId: "", members: [.engine], ownerProfile: .sandboxed),
+                                                   places: .doctorExtensions(scratch: try Place.atResolvedParent(scratch, kind: .directory),
+                                                                             readable: try readable.map { try Place.resolved($0, kind: .directory) }),
+                                                   network: .none, baseline: sandbox.policyBaseline())
+        } catch {
+            decision = .refused("the doctor's places are not safe to use (\(error))")
+        }
         let out = await sandbox.run(command: command, cwd: scratch, environment: env, timeout: .seconds(120),
-                                    outputURL: scratch.appending(path: "details.log"),
-                                    policy: SandboxPolicy(writable: [scratch], readable: readable, network: .none, toolchain: false))
+                                    outputURL: scratch.appending(path: "details.log"), decision: decision)
         let ran = markers.filter { FileManager.default.fileExists(atPath: $0.value) }.keys.sorted()
         if !ran.isEmpty {
             return DoctorItem(name: name, status: .fail, detail: "claude plugin details ran the fixture's \(ran.joined(separator: ", ")); "

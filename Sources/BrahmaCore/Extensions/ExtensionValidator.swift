@@ -674,10 +674,21 @@ public enum ExtensionValidator {
         guard let readable = readableClaudeDirectory(check.claudePath, userHome: check.userHome) else {
             return unavailable("the claude binary at \(check.claudePath) sits in a directory the sandbox may not read whole")
         }
-        let policy = SandboxPolicy(writable: [check.scratch], readable: readable, network: .none, toolchain: false)
+        // Plan S Task S7: the factory's `.extensionValidate` rule: the scratch (its parent resolved, itself never followed)
+        // writable, the claude binary's resolved directory readable; the subject is the package (`.external`).
+        let decision: PolicyDecision
+        do {
+            decision = SandboxPolicyFactory.decide(.extensionValidate, principals: PrincipalSet(companyId: "", members: [.external(source: id)],
+                                                                                                 ownerProfile: .sandboxed),
+                                                   places: .extensionValidate(scratch: try Place.atResolvedParent(check.scratch, kind: .directory),
+                                                                              readable: try readable.map { try Place.resolved($0, kind: .directory) }),
+                                                   network: .none, baseline: check.runner.policyBaseline())
+        } catch {
+            decision = .refused("the check's places are not safe to use (\(error))")
+        }
         let validateOut = await check.runner.run(command: claudeCommand(check.claudePath, ["plugin", "validate", "--strict", copy.path]),
                                                  cwd: check.scratch, environment: env, timeout: check.timeout,
-                                                 outputURL: check.scratch.appending(path: "validate.log"), policy: policy)
+                                                 outputURL: check.scratch.appending(path: "validate.log"), decision: decision)
         switch validateOut.exitCode {
         case 0?: break
         case nil:
@@ -692,7 +703,7 @@ public enum ExtensionValidator {
         }
         let detailsOut = await check.runner.run(command: claudeCommand(check.claudePath, ["--plugin-dir", copy.path, "plugin", "details", id]),
                                                 cwd: check.scratch, environment: env, timeout: check.timeout,
-                                                outputURL: check.scratch.appending(path: "details.log"), policy: policy)
+                                                outputURL: check.scratch.appending(path: "details.log"), decision: decision)
         if detailsOut.exitCode == 0, let tokens = alwaysOnTokens(in: detailsOut.tail) {
             out.alwaysOnTokens = tokens
         } else {

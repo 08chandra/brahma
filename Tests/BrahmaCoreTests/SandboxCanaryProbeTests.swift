@@ -30,7 +30,7 @@ private final class CanaryFakeSandbox: SandboxedRunner, @unchecked Sendable {
     }
 
     func run(command: String, cwd: URL, environment: [String: String], timeout: Duration, outputURL: URL,
-             policy: SandboxPolicy) async -> CheckOutcome {
+             policy: ValidatedPolicy) async -> CheckOutcome {
         let out: CheckOutcome
         if let probe = environment[SandboxCanary.probeVariable] {
             lock.withLock { _probes.append(probe) }
@@ -45,7 +45,7 @@ private final class CanaryFakeSandbox: SandboxedRunner, @unchecked Sendable {
         return out
     }
 
-    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: SandboxPolicy) throws -> any SandboxedProcess {
+    func spawn(command: String, cwd: URL, environment: [String: String], logURL: URL, policy: ValidatedPolicy) throws -> any SandboxedProcess {
         throw SandboxError.unavailable
     }
 }

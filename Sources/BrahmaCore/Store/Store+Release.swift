@@ -275,15 +275,21 @@ extension Store {
             return try requeueOrError(run, tail: Self.smokeChangedWhileStarting, now: clock())
         }
         PrincipalResolver.noteSandboxed(principals, store: self, subject: "The main smoke check", kind: .release, now: clock())
-        let unsandboxed = principals.runsUnsandboxed
-        let runner = unsandboxed ? checks.unsandboxed : checks.sandbox
-        let policy = Self.smokePolicy(company: live, export: export)
         let environment = ChildEnvironment.make(base: checks.environment,
                                                 extra: company.smokeCheckSetById.map { ["BRAHMA_AGENT_ID": $0] } ?? [:],
                                                 purpose: .check)
-        var outcome = await runner.run(command: spec.command, cwd: export, environment: environment,
-                                       timeout: .seconds(spec.timeoutSeconds), outputURL: output, policy: policy)
-        if !unsandboxed { outcome = SandboxedCheckRunner.reclassifyNestedSandbox(outcome) }
+        // Plan S Task S7: the factory's `.releaseSmoke` decision: the owner's Full opt-out (the unsandboxed runner), the
+        // sandbox under the validated policy, or a refusal (the run could not start, as a policy the sandbox refused).
+        var outcome: CheckOutcome
+        switch Self.smokeDecision(company: live, export: export, principals: principals, baseline: checks.sandbox.policyBaseline()) {
+        case .fullOptOut(let optOut):
+            outcome = await checks.unsandboxed.run(command: spec.command, cwd: export, environment: environment,
+                                                   timeout: .seconds(spec.timeoutSeconds), outputURL: output, optOut: optOut)
+        case let decision:
+            outcome = await checks.sandbox.run(command: spec.command, cwd: export, environment: environment,
+                                               timeout: .seconds(spec.timeoutSeconds), outputURL: output, decision: decision)
+            outcome = SandboxedCheckRunner.reclassifyNestedSandbox(outcome)
+        }
         let cancelled = Task.isCancelled
         // The export is deleted; the log (agent output) is scrubbed in place, or removed and its tail withheld.
         let scrubbed: Bool = await blocking.run {
@@ -302,12 +308,18 @@ extension Store {
         catch { return false }
     }
 
-    /// The check-shaped policy of a sandboxed smoke (PR-5): writes and reads only its export, the company's outbound
-    /// registries (`CompanyNetwork.scope`), the toolchain.
-    static func smokePolicy(company: Company, export: URL) -> SandboxPolicy {
-        let dir = URL(fileURLWithPath: SandboxPath.resolve(export.path), isDirectory: true)
-        let network = CompanyNetwork.scope(company: company, grantDomains: [], grantWebDomains: []).allowedDomains
-        return SandboxPolicy(writable: [dir], readable: [dir], network: .outbound(allow: network), toolchain: true)
+    /// The check-shaped route of a smoke (PR-5), and of a release build: the factory's `.releaseSmoke` rule (Plan S Task S7):
+    /// writes and reads only its export (a verified place, by its resolved path), the company's outbound registries
+    /// (`CompanyNetwork.scope`), the toolchain; the owner's Full opt-out when `principals` and the company run Full.
+    static func smokeDecision(company: Company, export: URL, principals: PrincipalSet, baseline: SandboxBaseline) -> PolicyDecision {
+        let dir = URL(fileURLWithPath: SandboxPath.resolve(export.path), isDirectory: false)
+        let place: Place
+        do { place = try Place.verify(dir, kind: .directory, under: dir.deletingLastPathComponent()) } catch {
+            return .refused("the export is not safe to use (\(error))")
+        }
+        return SandboxPolicyFactory.decide(.releaseSmoke, principals: principals, places: .releaseSmoke(dir: place),
+                                           network: CompanyNetwork.scope(company: company, grantDomains: [], grantWebDomains: []),
+                                           baseline: baseline)
     }
 
     /// Records the outcome: `passed` (exit 0), `failed` (another exit, or timed out), `error` (it did not run). Then the
