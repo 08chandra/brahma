@@ -51,11 +51,15 @@ extension Store {
         }
     }
 
-    /// Whether any push of the company ever reached GitHub (a landing past `pushing`, in any later state): the first push asks
+    /// The landing states that prove the branch reached GitHub. Not `pushing` (it may have failed), and not `abandoned` or
+    /// `closedUpstream` (an owner may abandon a landing whose push never landed).
+    static let pushedEvidence: [PRLandingState] = [.pushed, .opening, .open, .checksFailed, .changesRequested, .mergeable, .merging, .merged]
+
+    /// Whether some push of the company is known to have reached GitHub: the company's first push asks
     /// (`GitHubRules.firstPushAsks`) until one has.
     public func hasPushedPRLanding(companyId: String) throws -> Bool {
         try writer.read { db in
-            try PRLanding.filter(Column("companyId") == companyId && Column("state") != PRLandingState.pushing.rawValue).fetchCount(db) > 0
+            try PRLanding.filter(Column("companyId") == companyId && Self.pushedEvidence.map(\.rawValue).contains(Column("state"))).fetchCount(db) > 0
         }
     }
 

@@ -44,8 +44,11 @@ public final class TokenHandle: @unchecked Sendable, CustomStringConvertible, Cu
         var fds: [Int32] = [-1, -1]
         guard pipe(&fds) == 0 else { throw SecretError.vaultFailed("cannot make the credential pipe (\(String(cString: strerror(errno))))") }
         let (readEnd, writeEnd) = (fds[0], fds[1])
-        _ = fcntl(readEnd, F_SETFD, FD_CLOEXEC)
-        _ = fcntl(writeEnd, F_SETFD, FD_CLOEXEC)
+        guard fcntl(readEnd, F_SETFD, FD_CLOEXEC) == 0, fcntl(writeEnd, F_SETFD, FD_CLOEXEC) == 0 else {
+            let why = String(cString: strerror(errno))
+            close(readEnd); close(writeEnd)
+            throw SecretError.vaultFailed("cannot make the credential pipe close-on-exec (\(why))")
+        }
         defer { close(readEnd) }
         let line = bytes + [0x0A]
         var written = 0

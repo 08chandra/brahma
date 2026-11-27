@@ -173,7 +173,7 @@ public struct GitPush: Sendable {
 
         let helper = callDir.appending(path: "credential-helper")
         try Self.writeHelper(helper, loopback: loopbackRemote)
-        var args = ["-c", "credential.helper=\(helper.path)", "-c", "credential.useHttpPath=false"]
+        var args = ["-c", Self.helperConfig(helper), "-c", "credential.useHttpPath=false"]
         if let loopbackRemote { args += ["-c", "protocol.http.allow=always", "-c", "url.\(loopbackRemote)/.insteadOf=https://github.com/"] }
         args += ["push", "--no-tags", "--porcelain", "--no-verify", "--recurse-submodules=no", r.url, "\(r.sha):\(r.ref)"]
         let line: (args: [String], environment: [String: String])
@@ -212,6 +212,13 @@ public struct GitPush: Sendable {
         }
     }
 
+    /// `credential.helper=!'<path>'`: git runs a `!` helper as a shell snippet (`<snippet> get`), so the path is single-quoted
+    /// (each `'` as `'\''`) and survives the spaces of the default data home (`~/Library/Application Support/Brahma`). A bare
+    /// absolute path would be split by that shell.
+    static func helperConfig(_ helper: URL) -> String {
+        "credential.helper=!'" + helper.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     static func refusalText(_ e: GitError) -> String {
         if case .failed(_, _, let stderr) = e, e.isRepositoryRefusal { return Store.flat(stderr, max: 400) }
         return Store.flat(e.description, max: 400)
@@ -230,7 +237,10 @@ public struct GitPush: Sendable {
             let fields = line.split(separator: "\t")
             return fields.count >= 2 && fields[1].hasSuffix(":" + ref)
         }
-        if result.status == 0, let flag = mine?.first, [" ", "*", "="].contains(flag) { return .pushed(remoteHead: sha) }
+        if let flag = mine?.first, [" ", "*", "="].contains(flag) {
+            // Git reported the ref taken but exited non-zero: what GitHub holds is read back, never assumed either way.
+            return result.status == 0 ? .pushed(remoteHead: sha) : .unknown("git push reported \(ref) but exited \(result.status)")
+        }
         if let mine, mine.first == "!" {
             let summary = mine.split(separator: "\t").dropFirst(2).first.map(String.init) ?? "rejected"
             return .failed(shown(Data(summary.utf8), token: token))

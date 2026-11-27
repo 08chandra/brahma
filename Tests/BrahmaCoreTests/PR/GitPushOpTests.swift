@@ -2,6 +2,13 @@ import Foundation
 import Testing
 @testable import BrahmaCore
 
+/// The helper's path from its `credential.helper=!'<path>'` argument (single quotes undone), nil for any other argument.
+func pushHelperPath(_ arg: String) -> String? {
+    let prefix = "credential.helper=!'"
+    guard arg.hasPrefix(prefix), arg.hasSuffix("'"), arg.count > prefix.count + 1 else { return nil }
+    return String(arg.dropFirst(prefix.count).dropLast()).replacingOccurrences(of: "'\\''", with: "'")
+}
+
 /// A `GitPushRunning` that runs nothing: it records every call (argv, environment, whether a credential was handed over, the
 /// helper script's bytes as they were on disk during the call) and answers from a script.
 final class RecordingPushRunner: GitPushRunning, @unchecked Sendable {
@@ -16,6 +23,8 @@ final class RecordingPushRunner: GitPushRunning, @unchecked Sendable {
         var helperBytes: Data?
         var helperMode: Int?
         var callDirMode: Int?
+        /// The thread it ran on (`brahma-blocking` when the caller went through the engine's `Blocking`).
+        var thread: String?
     }
     private let lock = NSLock()
     private var recorded: [Call] = []
@@ -29,9 +38,8 @@ final class RecordingPushRunner: GitPushRunning, @unchecked Sendable {
     func run(args: [String], env: [String: String], credential: TokenHandle?, workingDirectory: URL, timeout: Duration,
              outputCap: Int) throws -> GitPushProcessResult {
         var call = Call(args: args, env: env, hadCredential: credential != nil, workingDirectory: workingDirectory, timeout: timeout,
-                        outputCap: outputCap)
-        if let helper = args.first(where: { $0.hasPrefix("credential.helper=") && $0.count > "credential.helper=".count }) {
-            let path = String(helper.dropFirst("credential.helper=".count))
+                        outputCap: outputCap, thread: Thread.current.name)
+        if let path = args.lazy.compactMap(pushHelperPath).first {
             call.helperBytes = FileManager.default.contents(atPath: path)
             call.helperMode = (try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber)?.intValue
             call.callDirMode = (try FileManager.default.attributesOfItem(atPath: URL(fileURLWithPath: path).deletingLastPathComponent().path)[.posixPermissions] as? NSNumber)?.intValue
@@ -167,7 +175,8 @@ final class RecordingPushRunner: GitPushRunning, @unchecked Sendable {
         let helpers = call.args.filter { $0.hasPrefix("credential.helper=") }
         #expect(helpers.count == 2 && helpers.first == "credential.helper=" && helpers.last != "credential.helper=", "\(helpers)")
         // The call dir (helper included) is gone afterwards.
-        let path = String(try #require(helpers.last).dropFirst("credential.helper=".count))
+        let last = try #require(helpers.last)
+        let path = try #require(pushHelperPath(last))
         #expect(!FileManager.default.fileExists(atPath: URL(fileURLWithPath: path).deletingLastPathComponent().path))
         // The handle itself never prints its value.
         let handle = try Self.handle()
@@ -205,6 +214,50 @@ final class RecordingPushRunner: GitPushRunning, @unchecked Sendable {
         #expect(call.args.contains("--no-verify") && call.args.contains("core.hooksPath=/dev/null"))
         #expect(call.args.contains("https://github.com/acme/app.git"), "the URL is the argument's")
         #expect(!call.args.contains("origin"))
+    }
+
+    /// The default data home has a space (`~/Library/Application Support/Brahma`): the helper's path is quoted for the shell git
+    /// runs it through, and a `'` in it is escaped. The shell finds it (`erase` exits 0); the unquoted form it replaces does not.
+    @Test func helperPathSurvivesSpacesAndQuotes() throws {
+        let repo = try Repo()
+        let runner = RecordingPushRunner()
+        let root = try tempDir().appending(path: "Application Support/it's Brahma", directoryHint: .isDirectory)
+        var push = GitPush(runner: runner, tempRoot: root)
+        push.engineEnvironment = ["PATH": "/usr/bin:/bin"]
+        _ = try push.run(repo.request(), token: try Self.handle())
+        let call = try #require(runner.pushes.first)
+        let arg = try #require(call.args.first { pushHelperPath($0) != nil })
+        let path = try #require(pushHelperPath(arg))
+        #expect(path.contains("Application Support/it's Brahma/"), "\(path)")
+        #expect(arg == GitPush.helperConfig(URL(fileURLWithPath: path)))
+        #expect(call.helperBytes != nil, "the helper was there at that path during the push")
+        // What git does with it: `sh -c "<value without !> <action>"`.
+        let dir = URL(fileURLWithPath: path).deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try GitPush.writeHelper(URL(fileURLWithPath: path), loopback: nil)
+        func shell(_ snippet: String) throws -> Int32 {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.arguments = ["-c", snippet + " erase"]
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
+            try p.run(); p.waitUntilExit()
+            return p.terminationStatus
+        }
+        #expect(try shell(String(arg.dropFirst("credential.helper=!".count))) == 0, "the quoted helper runs")
+        #expect(try shell(path) != 0, "positive control: the unquoted path is split by the shell")
+        try FileManager.default.removeItem(at: dir)
+    }
+
+    /// A non-zero exit that still reports the ref taken is unknown (reconciled by reading the branch), never a known failure.
+    @Test func nonZeroExitWithATakenRefIsUnknown() throws {
+        let repo = try Repo()
+        let runner = RecordingPushRunner()
+        let push = try Self.push(runner)
+        for flag in [" ", "*", "="] {
+            runner.pushResult = GitPushProcessResult(status: 1, stdout: Data("\(flag)\t\(repo.sha):refs/heads/brahma/A-7-fix\t[new branch]\nDone\n".utf8),
+                                                     stderr: Data("error: something after the update\n".utf8), timedOut: false)
+            guard case .unknown = try push.run(repo.request(), token: try Self.handle()) else { Issue.record("flag [\(flag)]: not unknown"); continue }
+        }
     }
 
     @Test func stderrSanitizedAndCapped() throws {

@@ -18,7 +18,8 @@ public enum PushBranchOutcome: Equatable, Sendable {
 /// 3. `auto` only: the landing is recorded `pushing` (sending), the token read from the secret store into a `TokenHandle`, and
 ///    `GitPush` run; `pushed` records `pushed`; `unknown` is reconciled by reading the branch (`GitHubAPI.branch`: its head is
 ///    the commit → pushed, else failed), never by pushing again.
-/// Every git and GitHub wait happens on the caller's task (a detached merge task), never on an actor.
+/// The scans, the token read and the push run through the engine's `Blocking` (threads of their own, never a Swift concurrency
+/// worker: `Blocking.swift`); only the GitHub reads and the database records are awaited on the caller's task.
 public struct PushBranchStage: Sendable {
     let store: Store
     let github: any GitHubAPI
@@ -30,12 +31,22 @@ public struct PushBranchStage: Sendable {
     /// The company's secret values the scan looks for (`Store.knownSecretValues`).
     let knownValues: @Sendable (_ companyId: String) -> [(String, String)]
     let clock: @Sendable () -> Date
+    /// Where the git work runs: the engine's own (`Orchestrator.blocking`) when Task 3 wires the stage, else one of its own.
+    let blocking: Blocking
 
     public init(store: Store, github: any GitHubAPI, gate: any PRActionGate, push: GitPush, blobs: any BlobPointerScanning,
                 token: @escaping @Sendable (String) throws -> TokenHandle, knownValues: @escaping @Sendable (String) -> [(String, String)],
                 clock: @escaping @Sendable () -> Date = Store.now) {
+        self.init(store: store, github: github, gate: gate, push: push, blobs: blobs, token: token, knownValues: knownValues, clock: clock,
+                  blocking: Blocking())
+    }
+
+    /// The engine's: its `Blocking`, so the push's git shares the engine's slots.
+    init(store: Store, github: any GitHubAPI, gate: any PRActionGate, push: GitPush, blobs: any BlobPointerScanning,
+         token: @escaping @Sendable (String) throws -> TokenHandle, knownValues: @escaping @Sendable (String) -> [(String, String)],
+         clock: @escaping @Sendable () -> Date = Store.now, blocking: Blocking) {
         self.store = store; self.github = github; self.gate = gate; self.push = push; self.blobs = blobs
-        self.token = token; self.knownValues = knownValues; self.clock = clock
+        self.token = token; self.knownValues = knownValues; self.clock = clock; self.blocking = blocking
     }
 
     /// The production token source: `GITHUB_PUSH_TOKEN` of the company, engine-only, read without prompting.
@@ -50,9 +61,11 @@ public struct PushBranchStage: Sendable {
         let target = PushTarget(itemKey: item.key, ref: PRBranch.ref(branch), url: repo.pushURL)
         // 1. The scans, before any request exists.
         let scanned: PRDecision<PushPayload>
+        let (blobs, known) = (self.blobs, knownValues(item.companyId))
         do {
-            scanned = try PrePushScan.run(target: target, base: base, head: verifiedSHA, git: git, blobs: blobs,
-                                          knownValues: knownValues(item.companyId))
+            scanned = try await blocking.tryRun {
+                try PrePushScan.run(target: target, base: base, head: verifiedSHA, git: git, blobs: blobs, knownValues: known)
+            }
         } catch {
             return .refused("the pre-push scan could not run: \(Store.flat("\(error)", max: 200))")
         }
@@ -80,13 +93,15 @@ public struct PushBranchStage: Sendable {
             return .refused("could not record the push: \(Store.flat("\(error)", max: 200))")
         }
         let handle: TokenHandle
-        do { handle = try token(item.companyId) } catch {
+        let (token, companyId) = (self.token, item.companyId)
+        do { handle = try await blocking.tryRun { try token(companyId) } } catch {
             return fail(item, branch, verifiedSHA, "the push token \(LandingSwitch.tokenSecretName) is not usable: \(Store.flat("\(error)", max: 160))")
         }
         let outcome: GitPushOutcome
+        let (push, pushRequest) = (self.push, GitPushRequest(gitCommonDir: git.root.appending(path: ".git", directoryHint: .isDirectory),
+                                                        sha: verifiedSHA, ref: target.ref, url: target.url))
         do {
-            outcome = try push.run(GitPushRequest(gitCommonDir: git.root.appending(path: ".git", directoryHint: .isDirectory),
-                                                  sha: verifiedSHA, ref: target.ref, url: target.url), token: handle)
+            outcome = try await blocking.tryRun { try push.run(pushRequest, token: handle) }
         } catch {
             return fail(item, branch, verifiedSHA, "the push could not start: \(Store.flat("\(error)", max: 200))")
         }

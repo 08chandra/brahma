@@ -14,7 +14,7 @@ public struct PRActionRequest: Equatable, Sendable {
     public var itemTainted: Bool
     /// The action carries text from outside (an issue body, review text).
     public var externalInput: Bool
-    /// The company's first action of this type (`GitHubRules.firstPushAsks`).
+    /// No action of this type of the company is known to have reached GitHub yet (`GitHubRules.firstPushAsks`).
     public var firstUse: Bool
     /// The repository's visibility, read fresh from `GitHubAPI.repo` for this action (never the value seen at connect time).
     public var repoVisibility: String
@@ -51,7 +51,7 @@ public struct NoChannelGate: PRActionGate {
 public enum GitHubRules {
     /// The company's first push asks (X4 rule 2).
     public static func firstPushAsks(_ r: PRActionRequest) -> String? {
-        r.type == .pushBranch && r.firstUse ? "the first push to this repository asks you first" : nil
+        r.type == .pushBranch && r.firstUse ? "the company's first push to GitHub asks you first" : nil
     }
 
     /// Anything tainted asks (X4 rule 3): the session, the item or the input came from outside.

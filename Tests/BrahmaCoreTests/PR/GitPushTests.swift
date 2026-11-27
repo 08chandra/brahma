@@ -27,6 +27,7 @@ import GRDB
         private(set) var spawns: [(executable: String, argv: [String], env: [String: String])] = []
         private(set) var outputs: [Data] = []
         private(set) var helperBytes: [Data] = []
+        private(set) var threads: [String?] = []
         var live = LivePushRunner()
 
         init(trace: URL) {
@@ -36,10 +37,11 @@ import GRDB
 
         func run(args: [String], env: [String: String], credential: TokenHandle?, workingDirectory: URL, timeout: Duration,
                  outputCap: Int) throws -> GitPushProcessResult {
-            if let helper = args.first(where: { $0.hasPrefix("credential.helper=/") }),
-               let bytes = FileManager.default.contents(atPath: String(helper.dropFirst("credential.helper=".count))) {
+            if let path = args.lazy.compactMap(pushHelperPath).first, let bytes = FileManager.default.contents(atPath: path) {
                 lock.withLock { helperBytes.append(bytes) }
             }
+            let name = Thread.current.name
+            lock.withLock { threads.append(name) }
             let r = try live.run(args: args, env: env, credential: credential, workingDirectory: workingDirectory, timeout: timeout,
                                  outputCap: outputCap)
             lock.withLock { outputs += [r.stdout, r.stderr] }
@@ -145,7 +147,8 @@ import GRDB
         let sha = try env.commit(["src/login.swift": "let login = true\n"])
         let trace = try tempDir().appending(path: "git-trace.log")
         let spy = SpyRunner(trace: trace)
-        let callRoot = env.paths.home.appending(path: "tmp/push", directoryHint: .isDirectory)
+        // A data home like the default one (`Application Support`): a space, and a quote for good measure.
+        let callRoot = env.paths.home.appending(path: "Application Support/it's tmp/push", directoryHint: .isDirectory)
         var push = GitPush(runner: spy, tempRoot: callRoot)
         push.loopbackRemote = server.base
         let github = FakeGitHub(Self.repo)
@@ -162,7 +165,7 @@ import GRDB
         // helper and git-remote-http included), the helper's bytes on disk during the push, git's output, the run dir, the call
         // dirs, the data home, and every text column.
         let trail = String(decoding: FileManager.default.contents(atPath: trace.path) ?? Data(), as: UTF8.self)
-        #expect(trail.contains("credential-helper get"), "the trace shows git ran the helper: \(trail.prefix(400))")
+        #expect(trail.contains("credential-helper") && trail.contains("get"), "the trace shows git ran the helper: \(trail.prefix(400))")
         #expect(trail.contains("remote-http"), "and its transport")
         var texts: [(String, String)] = [("git trace", trail), ("outcome", "\(outcome)")]
         for (i, s) in spy.spawns.enumerated() {
@@ -172,6 +175,7 @@ import GRDB
         for (i, data) in spy.outputs.enumerated() { texts.append(("git output \(i)", String(decoding: data, as: UTF8.self))) }
         for (i, data) in spy.helperBytes.enumerated() { texts.append(("helper \(i)", String(decoding: data, as: UTF8.self))) }
         #expect(spy.spawns.count == 2 && spy.helperBytes.count == 1, "one probe and one push, one helper")
+        #expect(spy.threads.allSatisfy { $0 == "brahma-blocking" }, "git ran off the cooperative pool: \(spy.threads)")
         let dirs = [env.paths.runDir, callRoot, env.paths.home, URL(fileURLWithPath: env.company.workspacePath).appending(path: ".git")]
         let found = try Self.leaks(of: token, dirs: dirs, texts: texts, store: env.store)
         #expect(found.isEmpty, "the token leaked to \(found)")
@@ -239,6 +243,7 @@ import GRDB
         #expect(reason.contains("public"), "\(reason)")
         #expect(payload.sha == sha2 && payload.paths == ["two.txt"] && payload.diffstat.contains("1 file changed"))
         #expect(runner.pushes.count == 1, "nothing pushed while the owner is asked")
+        #expect(runner.calls.allSatisfy { $0.thread == "brahma-blocking" }, "git ran through the engine's Blocking: \(runner.calls.map(\.thread))")
         #expect(github.requests.filter { $0 == "GET /repos/acme/app" }.count == 2, "read fresh for each push: \(github.requests)")
         // `internal` is not private either.
         github.update(Self.repo) { $0.visibility = "internal" }
@@ -254,7 +259,37 @@ import GRDB
         guard case .needsOwner(let why, _) = await firstStage.run(item: solo, repo: Self.repo, verifiedSHA: sha3, base: fresh.base, git: fresh.ws) else {
             Issue.record("the first push ran without asking"); return
         }
-        #expect(why.contains("first push"))
+        #expect(why == "the company's first push to GitHub asks you first")
+    }
+
+    /// The first-push ask (rule 2) lifts only on evidence that a push reached GitHub: a landing the owner abandoned (or GitHub
+    /// closed) whose push never landed does not count, so the company's real first push still asks.
+    @Test func firstPushAskNeedsEvidenceOfAPush() async throws {
+        let env = try Env()
+        try env.setToken(["evidence", "token", "Mn4Bv8"].joined(separator: "-"))
+        for state in [PRLandingState.pushing, .abandoned, .closedUpstream] {
+            let stale = try env.item("never pushed \(state.rawValue)")
+            try env.store.upsertPRLanding(PRLanding(itemId: stale.id, companyId: env.company.id, branch: "brahma/\(stale.key)",
+                                                    pushedSHA: env.base, state: state, lastError: "the push failed",
+                                                    updatedAt: Date(timeIntervalSince1970: 1_800_000_000)))
+        }
+        #expect(try !env.store.hasPushedPRLanding(companyId: env.company.id))
+        let runner = RecordingPushRunner()
+        let stage = env.stage(github: FakeGitHub(Self.repo), gate: Self.granted(), push: GitPush(runner: runner, tempRoot: try tempDir()))
+        let item = try env.item("Real first")
+        let sha = try env.commit(["f.txt": "f\n"])
+        guard case .needsOwner(let why, _) = await stage.run(item: item, repo: Self.repo, verifiedSHA: sha, base: env.base, git: env.ws) else {
+            Issue.record("the first push ran without asking"); return
+        }
+        #expect(why == "the company's first push to GitHub asks you first")
+        #expect(runner.calls.isEmpty)
+        for state in Store.pushedEvidence {
+            let fresh = try Env()
+            let i = try fresh.item("x")
+            try fresh.store.upsertPRLanding(PRLanding(itemId: i.id, companyId: fresh.company.id, branch: "brahma/\(i.key)", pushedSHA: fresh.base,
+                                                      state: state, updatedAt: Date(timeIntervalSince1970: 1_800_000_000)))
+            #expect(try fresh.store.hasPushedPRLanding(companyId: fresh.company.id), "\(state.rawValue)")
+        }
     }
 
     /// Spec §9.4: the scans run immediately before every push, and a hit files no request at all.
