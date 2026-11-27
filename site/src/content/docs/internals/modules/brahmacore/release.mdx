@@ -1,0 +1,32 @@
+---
+title: Release
+description: "The path from main to a deployed site: the smoke check on main, the release executor's steps, deploy smoke in rounds, milestones, and the dev-only release scenario."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+A `Release` is one proposed deploy of a commit on `main`, approved by the owner. `ReleaseExecutor.advance` carries it out: smoke on `main`, integrity, backup refs, build in a fresh export, stage the upload, install the provider tools, deploy, smoke the deployed copy, roll back on failure. `MainSmokeRun` records the engine's smoke check of `main`. `DeploySmoke` probes the deployed site in rounds until every request passes in one round. `UploadStager` copies a build into the upload folder and refuses a `.env`. `CompanyMilestones` is the path-to-live scorecard. `DevHost` and `DevReleaseScenario` drive the real deploy path against a loopback folder, `BRAHMA_DEV=1` only.
+
+## Key types
+
+- [`Release`](/api/brahmacore/documentation/brahmacore/release/) and [`ReleaseStatus`](/api/brahmacore/documentation/brahmacore/releasestatus/) — one release and where it is.
+- [`ReleaseExecutor`](/api/brahmacore/documentation/brahmacore/releaseexecutor/) and [`ReleaseDependencies`](/api/brahmacore/documentation/brahmacore/releasedependencies/) — the steps and what they run through.
+- [`MainSmokeRun`](/api/brahmacore/documentation/brahmacore/mainsmokerun/) — the smoke check on `main`.
+- [`DeploySmoke`](/api/brahmacore/documentation/brahmacore/deploysmoke/) — the deployed site's smoke rounds.
+- [`ReleaseLayout`](/api/brahmacore/documentation/brahmacore/releaselayout/) and [`UploadStager`](/api/brahmacore/documentation/brahmacore/uploadstager/) — where a release's files live and how they get there.
+- [`CompanyMilestones`](/api/brahmacore/documentation/brahmacore/companymilestones/) — the path-to-live scorecard.
+
+## How it connects
+
+- **Called by Orchestrator.** The engine builds the `ReleaseExecutor` at init and exposes `runSmoke` for the smoke check on `main`.
+- **Called by MCP.** `propose_deploy` files a release through `store.proposeDeploy`.
+- **Called by Store.** `Store+Release` queues and lists `MainSmokeRun`s, records each `CheckOutcome`, and reclassifies a nested-sandbox failure through `SandboxedCheckRunner`.
+- **Calls Hosting.** The executor looks the adapter up by provider for deploy and rollback.
+- **Calls Preview.** Deploy smoke runs the preview area's `SmokeRequest`s through its `HTTPProbing`.
+
+<ModuleFacts module="BrahmaCore" area="Release" />
+
+<SourceLink path="Sources/BrahmaCore/Release" />

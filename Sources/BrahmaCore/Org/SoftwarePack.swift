@@ -13,14 +13,6 @@ public enum SoftwarePack {
     /// playbooks.
     public static let researchLine = "Write research as handbook pages under Research/ with kb_write, and list every source you used in sources."
 
-    /// Role id -> provenance line for the card front matter.
-    static let adaptedFrom: [String: String] = [
-        "ceo": "gstack office-hours + plan-ceo-review (MIT)", "ceo-cpo": "gstack office-hours + plan-ceo-review (MIT)",
-        "manager": "gstack plan-eng-review + retro (MIT)", "director": "gstack plan-eng-review + retro (MIT)",
-        "designer": "gstack plan-design-review + design-review (MIT)", "qa": "gstack qa + qa-only (MIT)",
-        "security": "gstack cso (MIT)", "devops": "gstack ship + land-and-deploy + canary (MIT)",
-    ]
-
     private static let exec = CompanyToolNames.base + CompanyToolNames.work + CompanyToolNames.lead + CompanyToolNames.executive
         + CompanyToolNames.ops + CompanyToolNames.design
     private static let ic = CompanyToolNames.base + CompanyToolNames.work

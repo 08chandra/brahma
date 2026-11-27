@@ -1,0 +1,261 @@
+---
+/**
+ * The four-step strip on Home: Install → Connect `claude` → Create a company → Give it a
+ * goal. One hairline band split into four cells; each cell has an engraved serif numeral
+ * (text2 at ≥ 48 px, the large-text exception), a sans title linking to the same step on
+ * /start, one sentence and the command that does it, in mono, with a Copy button. The
+ * commands are the quick start's, in its order (src/content/quickstart/*.sh, which
+ * scripts/site-quickstart-check.sh runs), so Home summarises and /start instructs; a step
+ * with two commands shows and copies them as two lines. The buttons stay hidden until the
+ * inline script (< 520 bytes) finds the Clipboard API, so no-JS readers never see a dead
+ * control; a refused write says "Failed" and a polite live region announces "Copied …" or
+ * "Copy failed". Four across from 64 em, two across from 40 em, stacked below.
+ */
+import Button from './Button.astro';
+
+interface Props {
+  headingId: string;
+}
+const { headingId } = Astro.props;
+
+// `href` is the step's anchor on /start (start.astro's `route` ids).
+const steps = [
+  {
+    title: 'Install',
+    href: '/start/#install',
+    body: 'Build the brahma CLI from source with Swift 6 on macOS 14 or later, then put .build/debug on your PATH. An installer arrives with the first stable release.',
+    commands: ['swift build'],
+  },
+  {
+    title: 'Connect claude',
+    href: '/start/#connect',
+    body: 'Brahma drives the claude CLI you already use, signed in to your own plan. brahma owner init creates the owner key; brahma doctor checks the CLI with a few real probe turns.',
+    commands: ['brahma owner init', 'brahma doctor'],
+  },
+  {
+    title: 'Create a company',
+    href: '/start/#company',
+    body: 'A git workspace, channels and the software pack’s default org, five agents and one open seat, all on your Mac.',
+    commands: ['brahma company create Acme --goal "Build a todo app"'],
+  },
+  {
+    title: 'Give it a goal',
+    href: '/start/#run',
+    body: 'Start the engine after the sandbox canary passes (see the Quick start) and the org works toward the goal: agents claim items and open reviews, the engine runs the checks and merges what passes. Anything only you can decide lands in your Inbox.',
+    commands: ['brahma run'],
+  },
+];
+// Command names in the copy are set in mono (longer phrases first).
+const codeWords = /(brahma owner init|brahma doctor|brahma|claude|swift build|\.build\/debug|PATH)/g;
+const parts = (text: string) => text.split(codeWords).map((part, i) => ({ text: part, code: i % 2 === 1 }));
+---
+
+<ol class="steps" aria-labelledby={headingId}>
+  {
+    steps.map((step, index) => (
+      <li class="step">
+        <span class="step__num" aria-hidden="true">
+          {index + 1}
+        </span>
+        <h3 class="step__title">
+          <a class="step__link" href={step.href}>
+            <span class="sr-only">Step {index + 1}: </span>
+            {parts(step.title).map((p) => (p.code ? <code>{p.text}</code> : p.text))}
+          </a>
+        </h3>
+        <p class="step__body">{parts(step.body).map((p) => (p.code ? <code>{p.text}</code> : p.text))}</p>
+        <div class="step__cmd">
+          <code class="step__code">
+            {step.commands.map((command) => (
+              <span class="step__line">
+                <span class="step__prompt" aria-hidden="true">$</span>
+                <span>
+                  {command.split(' ').map((token, i) => (
+                    <>
+                      {i > 0 && ' '}
+                      <span class="step__tok">{token}</span>
+                    </>
+                  ))}
+                </span>
+              </span>
+            ))}
+          </code>
+          <Button
+            size="sm"
+            class="step__copy"
+            data-copy={step.commands.join('\n')}
+            aria-label={`Copy command: ${step.commands.join('; ')}`}
+            hidden
+          >
+            Copy
+          </Button>
+        </div>
+      </li>
+    ))
+  }
+</ol>
+<!-- One polite live region for every copy button: "Copied …" or "Copy failed" is announced
+     without moving focus; the button's own label shows the same word for 1.5 s. -->
+<p class="sr-only" role="status" data-copy-status></p>
+
+<script is:inline>
+  if (navigator.clipboard) for (const b of document.querySelectorAll('.step__copy[data-copy]')) {
+    const l = b.querySelector('.btn__label'), s = document.querySelector('[data-copy-status]'),
+      say = (t, m) => (l.textContent = t, s.textContent = m, setTimeout(() => l.textContent = 'Copy', 1500));
+    b.hidden = false;
+    b.onclick = () => navigator.clipboard.writeText(b.dataset.copy).then(() => say('Copied', 'Copied ' + b.dataset.copy), () => say('Failed', 'Copy failed'));
+  }
+</script>
+
+<style>
+  .steps {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    border-top: var(--hairline-strong);
+  }
+  @media (min-width: 40em) {
+    .steps {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+  @media (min-width: 64em) {
+    .steps {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+  }
+  .step {
+    display: grid;
+    grid-template-rows: auto auto 1fr auto;
+    gap: var(--s-3);
+    margin: 0;
+    padding: var(--s-5) 0;
+    border-bottom: var(--hairline);
+    min-width: 0;
+  }
+  @media (min-width: 40em) {
+    .step {
+      padding-inline: var(--s-5);
+      border-left: var(--hairline);
+    }
+    .step:nth-child(2n + 1) {
+      border-left: 0;
+      padding-left: 0;
+    }
+    .step:nth-child(2n) {
+      padding-right: 0;
+    }
+  }
+  @media (min-width: 64em) {
+    .step {
+      border-bottom: 0;
+    }
+    .step:nth-child(2n + 1) {
+      border-left: var(--hairline);
+      padding-left: var(--s-5);
+    }
+    .step:nth-child(2n) {
+      padding-right: var(--s-5);
+    }
+    .step:first-child {
+      border-left: 0;
+      padding-left: 0;
+    }
+    .step:last-child {
+      padding-right: 0;
+    }
+  }
+  .step__num {
+    font-family: var(--font-display);
+    font-size: var(--step-4);
+    line-height: 0.9;
+    color: var(--text2); /* large text: 4.39:1 on bg0, above the 3:1 large-text threshold */
+    font-variant-numeric: lining-nums;
+  }
+  .step__title {
+    margin: 0;
+    font-family: var(--font-sans);
+    font-size: var(--step-1);
+    font-weight: 600;
+    line-height: 1.25;
+    color: var(--text0);
+  }
+  /* The title is the link to the step on /start: text0 at rest, an offset underline on hover
+   * (the Home link idiom), the 2 px accent ring on keyboard focus. */
+  .step__link {
+    color: inherit;
+    text-decoration: none;
+  }
+  .step__link:hover {
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 4px;
+    text-decoration-color: var(--text-link);
+  }
+  .step__link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: var(--radius);
+  }
+  .step__body {
+    margin: 0;
+    font-size: var(--text-ui);
+    line-height: 1.55;
+    color: var(--text1);
+    max-width: 38ch;
+  }
+  .step__title code,
+  .step__body code {
+    padding: 1px 5px;
+    border-radius: var(--radius);
+    background: var(--bg3);
+    font-size: 0.92em;
+    color: var(--text0);
+  }
+  /* The command and its Copy button centre on each other: a one-line command sits level with
+   * the 40 px touch button, a wrapped one has the button at its middle. */
+  .step__cmd {
+    display: flex;
+    gap: var(--s-2);
+    align-items: center;
+    justify-content: space-between;
+    min-width: 0;
+    padding: var(--s-2) var(--s-2) var(--s-2) var(--s-3);
+    background: var(--bg1);
+    border: var(--hairline);
+    border-radius: var(--radius);
+  }
+  .step__code {
+    display: grid;
+    gap: 0.125rem;
+    min-width: 0;
+    padding-block: 0.25rem;
+    font-size: var(--step--1);
+    line-height: 1.5;
+    color: var(--text0);
+    overflow-wrap: anywhere;
+  }
+  /* One command per line, each behind its own prompt mark. */
+  .step__line {
+    display: flex;
+    gap: var(--s-2);
+    align-items: baseline;
+    min-width: 0;
+  }
+  /* Lines break only between tokens, so a flag never splits from its dashes. */
+  .step__tok {
+    white-space: nowrap;
+  }
+  .step__cmd :global(.step__copy) {
+    flex: none;
+  }
+  .step__cmd :global(.step__copy[hidden]) {
+    display: none;
+  }
+  .step__prompt {
+    color: var(--text2); /* a decorative mark (aria-hidden), not text */
+    user-select: none;
+  }
+</style>

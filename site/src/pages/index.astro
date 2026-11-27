@@ -1,0 +1,392 @@
+---
+/**
+ * Home (/). One pitch, two actions, a console that replays a demo company's activity, the
+ * real app, four steps and four ways into the docs.
+ *
+ * Grid: 12 columns, 1200 px max. The headline spans the top; below it the page keeps one
+ * axis — words on the left four columns, instruments (console, screenshot, matrix) on the
+ * right eight — broken once by the full-width four-step band. The hero band sits on the
+ * agent-map grid from the visual spec (bg0 with 24 px #18202A lines).
+ *
+ * Rendered through StarlightPage with a bare `hero: {}` so <html> gets `data-has-hero`
+ * (16 px base, the one radial background) while SiteHero renders nothing.
+ */
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import Button from '../components/Button.astro';
+import Label from '../components/Label.astro';
+import Panel from '../components/Panel.astro';
+import ConsoleHero from '../components/ConsoleHero.astro';
+import HowItWorks from '../components/HowItWorks.astro';
+import CapabilityCards from '../components/CapabilityCards.astro';
+import { site } from '../../site.config.ts';
+---
+
+<StarlightPage
+  frontmatter={{
+    title: 'The governed local AI org',
+    description: site.description,
+    template: 'splash',
+    hero: {},
+    // The root page alone puts the name first; every other page is Starlight's "<page> | Brahma".
+    head: [{ tag: 'title', content: `${site.title} · The governed local AI org` }],
+  }}
+>
+  <div class="home not-content">
+    <section class="band map-band" aria-labelledby="home-title">
+      <div class="grid">
+        <h1 id="home-title" class="home__title display-xl reveal" style="--i: 0">
+          <span class="home__title-lead">Agents propose.</span>{' '}
+          <span class="home__title-beat">The engine verifies.</span> <span class="home__title-beat">You approve.</span>
+        </h1>
+
+        <div class="home__intro">
+          <p class="home__lede reveal" style="--i: 1">
+            Brahma is the governed local AI org: agents on your Mac, each turn a headless run of the{' '}
+            <code>claude</code> CLI you already use. The engine schedules turns inside your usage limits, runs each
+            under a safety profile and, on the default Sandboxed profile, alone merges into main. Your Inbox holds
+            what only you can decide.
+          </p>
+          <div class="home__actions reveal" style="--i: 2">
+            <Button variant="primary" href="/start/" trailing="→">Get started</Button>
+            <Button href="/start/#source">Build from source</Button>
+            {
+              site.repoURL !== '' && (
+                <Button href={site.repoURL} trailing="↗">
+                  GitHub
+                </Button>
+              )
+            }
+          </div>
+          <dl class="facts reveal" style="--i: 3">
+            <div class="facts__row">
+              <dt class="label">Runs on</dt>
+              <dd>macOS 14 or later</dd>
+            </div>
+            <div class="facts__row">
+              <dt class="label">Drives</dt>
+              <dd><code>claude</code> CLI, your plan</dd>
+            </div>
+            <div class="facts__row">
+              <dt class="label">License</dt>
+              <dd><a href="/license/">{site.license}</a></dd>
+            </div>
+          </dl>
+        </div>
+
+        <div class="home__console reveal" style="--i: 2">
+          <ConsoleHero />
+        </div>
+      </div>
+    </section>
+
+    <section class="section grid" aria-labelledby="home-app">
+      <div class="section__copy">
+        <h2 id="home-app" class="section__title">The app is the console.</h2>
+        <p class="section__text">
+          A native macOS app over the same engine as the <code>brahma</code> CLI. Watch agents claim items and review
+          each other’s work, see the engine run the checks and merge what passes, and approve what only you can decide
+          from the Inbox.
+        </p>
+      </div>
+      <figure class="shot">
+        <Panel title="Mission Control · Acme" titleAs="p" flush>
+          <img
+            src="/screenshots/console.png"
+            srcset="/screenshots/console.png 1x, /screenshots/console@2x.png 2x"
+            width="1600"
+            height="1000"
+            alt="Brahma's Mission Control for the demo company Acme: a preview pane and the agent map with four agents above an activity feed."
+            loading="lazy"
+            decoding="async"
+          />
+        </Panel>
+        <figcaption>
+          Mission Control for the seeded demo company Acme, captured from the app: preview pane, agent map and activity
+          feed.
+        </figcaption>
+      </figure>
+    </section>
+
+    <section class="section" aria-labelledby="home-steps">
+      <div class="grid">
+        <h2 id="home-steps" class="section__title section__title--wide">From install to a running company.</h2>
+      </div>
+      <HowItWorks headingId="home-steps" />
+    </section>
+
+    <section class="section grid" aria-labelledby="home-caps">
+      <div class="section__copy">
+        <h2 id="home-caps" class="section__title">The parts worth knowing.</h2>
+        <p class="section__text">
+          How work moves, what a turn may touch, where previews come from, and how Brahma is put together.
+        </p>
+        <p class="section__more">
+          <Label>All docs</Label>
+          <a href="/docs/">Using Brahma</a>
+          <a href="/internals/">Inside Brahma</a>
+          <a href={`${site.apiBase}/`}>API reference</a>
+        </p>
+      </div>
+      <div class="section__wide">
+        <CapabilityCards headingId="home-caps" />
+      </div>
+    </section>
+  </div>
+</StarlightPage>
+
+<style>
+  /* Hallmark · genre: modern-minimal · macrostructure: Workbench (console-led) · theme: custom "Brahma console"
+   * enrichment: live console replay + real app capture · nav: Starlight header · footer: Ft2 inline colophon
+   * pre-emit critique: P5 H4 E4 S5 R5 V4 */
+  /* Home is wider than Starlight's splash column: the 1200 px grid. */
+  :global(html[data-has-hero]:not([data-has-sidebar])) {
+    --sl-content-width: var(--grid-max);
+  }
+
+  .home {
+    --section-gap: var(--s-8);
+  }
+  @media (min-width: 64em) {
+    .home {
+      --section-gap: var(--s-9);
+    }
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    column-gap: var(--grid-gutter);
+    row-gap: var(--s-6);
+  }
+  @media (min-width: 64em) {
+    .grid {
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+    }
+  }
+
+  /* ---- Hero band on the agent-map grid ---------------------------------------------- */
+  /* The grid itself is the shared `.map-band` (starlight.css). */
+  .band {
+    padding-block: var(--s-6) var(--s-7);
+  }
+  @media (min-width: 64em) {
+    .band {
+      padding-block: var(--s-8) var(--s-8);
+    }
+  }
+
+  /* Three beats: the first on its own line at every width, the other two never split inside
+   * a sentence — two lines on desktop ("Agents propose. / The engine verifies. You approve."),
+   * three on a phone. */
+  .home__title {
+    margin: 0;
+    max-width: none;
+    text-wrap: wrap;
+  }
+  .home__title-lead {
+    display: block;
+  }
+  .home__title-beat {
+    white-space: nowrap;
+  }
+  /* Under 24 em "The engine verifies." (≈ 304 px at 44 px) no longer fits one line; let it wrap. */
+  @media (max-width: 23.99em) {
+    .home__title-beat {
+      white-space: normal;
+    }
+  }
+  @media (min-width: 64em) {
+    .home__title {
+      grid-column: 1 / span 12;
+    }
+    /* 64–80 em: four columns are too narrow for the lede (it ran far below the console), so
+     * the words take five and the console seven; the 4 / 8 split returns from 80 em. */
+    .home__intro {
+      grid-column: 1 / span 5;
+    }
+    .home__console {
+      grid-column: 6 / span 7;
+    }
+  }
+  @media (min-width: 80em) {
+    .home__intro {
+      grid-column: 1 / span 4;
+    }
+    .home__console {
+      grid-column: 5 / span 8;
+    }
+  }
+
+  .home__intro {
+    display: grid;
+    align-content: start;
+    gap: var(--s-5);
+  }
+  .home__lede {
+    margin: 0;
+    font-size: var(--step-1);
+    line-height: 1.5;
+    color: var(--text1);
+    text-wrap: pretty;
+  }
+  .home__lede code,
+  .section__text code {
+    padding: 1px 5px;
+    border-radius: var(--radius);
+    background: var(--bg3);
+    font-size: 0.9em;
+    color: var(--text0);
+  }
+  .facts code {
+    font-size: inherit; /* the dd is already mono at 12 px */
+    color: var(--text0);
+  }
+
+  .home__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s-3);
+  }
+  /* Hero-scale buttons: 40 px (44 on touch, from Button). */
+  .home__actions :global(.btn) {
+    --btn-h: 2.5rem;
+    padding-inline: var(--s-4);
+    font-size: var(--step-0);
+  }
+  @media (pointer: coarse) {
+    .home__actions :global(.btn) {
+      --btn-h: 2.75rem;
+    }
+  }
+
+  /* Inspector-style key–value facts. */
+  .facts {
+    margin: 0;
+    display: grid;
+    border-top: var(--hairline);
+  }
+  .facts__row {
+    display: grid;
+    grid-template-columns: 6rem minmax(0, 1fr);
+    gap: var(--s-3);
+    align-items: baseline;
+    padding-block: var(--s-2);
+    border-bottom: var(--hairline);
+  }
+  .facts dt {
+    margin: 0;
+  }
+  .facts dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--text0);
+  }
+  .facts a {
+    color: var(--text-link);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+    text-decoration-color: color-mix(in srgb, var(--text-link) 45%, transparent);
+  }
+  .facts a:hover {
+    color: var(--text0);
+    text-decoration-color: var(--text-link);
+  }
+  /* Touch: a ≥ 40 px target that does not make the licence row taller than its neighbours
+   * (the padding is taken back by the negative margin, so every row keeps the same height). */
+  @media (pointer: coarse) {
+    .facts a {
+      display: inline-block;
+      padding-block: 0.6875rem;
+      margin-block: -0.6875rem;
+    }
+  }
+
+  /* ---- Sections ------------------------------------------------------------------------ */
+  .section {
+    margin-top: var(--section-gap);
+  }
+  .section__copy {
+    display: grid;
+    align-content: start;
+    gap: var(--s-4);
+  }
+  @media (min-width: 64em) {
+    .section__copy {
+      grid-column: 1 / span 4;
+      position: sticky;
+      top: calc(var(--sl-nav-height) + var(--s-6));
+      align-self: start;
+    }
+    .shot,
+    .section__wide {
+      grid-column: 5 / span 8;
+    }
+    .section__title--wide {
+      grid-column: 1 / span 8;
+    }
+  }
+  .section__title {
+    margin: 0;
+    font-size: var(--step-4);
+    line-height: 1.06;
+  }
+  .section__title--wide {
+    margin-bottom: var(--s-6);
+  }
+  .section__text {
+    margin: 0;
+    font-size: var(--step-0);
+    line-height: 1.55;
+    color: var(--text1);
+    max-width: 40ch;
+  }
+  .section__more {
+    margin: var(--s-2) 0 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--s-2) var(--s-4);
+    font-size: var(--text-ui);
+  }
+  .section__more :global(.label) {
+    flex-basis: 100%;
+  }
+  .section__more a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.5rem;
+    color: var(--text-link);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+    text-decoration-color: color-mix(in srgb, var(--text-link) 45%, transparent);
+  }
+  .section__more a:hover {
+    color: var(--text0);
+    text-decoration-color: var(--text-link);
+  }
+  @media (pointer: coarse) {
+    .section__more a {
+      min-height: 2.5rem;
+    }
+  }
+
+  .shot {
+    margin: 0;
+    min-width: 0;
+  }
+  .shot img {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  .shot figcaption {
+    margin-top: var(--s-3);
+    font-size: var(--step--1);
+    line-height: 1.5;
+    color: var(--text1);
+    max-width: 72ch;
+  }
+</style>

@@ -1,0 +1,32 @@
+---
+title: Resources
+description: "Files and links the owner drops into a company: fail-closed inspection, default trust, a streamed secret scan, and the content vault outside every workspace."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+A resource is a file or link the owner gives a company. `ResourceIntake.inspect` opens every dropped file without following links, checks the drop rules, assigns a default trust and scans for secrets through the same descriptor, before anything is copied. `DropTrust` is the default: files from a workspace or the data home, document types, large text files and anything macOS marked as downloaded are external until the owner says otherwise. `ContentScan` streams the secret scan in chunks. `ContentVault` keeps the bytes outside every workspace as engine-named read-only files. Store operations here are the owner's; agents only read through `recall`.
+
+## Key types
+
+- [`Resource`](/api/brahmacore/documentation/brahmacore/resource/) and [`ResourceKind`](/api/brahmacore/documentation/brahmacore/resourcekind/) — one resource, file or link.
+- [`ResourceIntake`](/api/brahmacore/documentation/brahmacore/resourceintake/) and [`DropPlan`](/api/brahmacore/documentation/brahmacore/dropplan/) — the inspection and what it decided.
+- [`DropTrust`](/api/brahmacore/documentation/brahmacore/droptrust/) and [`TrustChoice`](/api/brahmacore/documentation/brahmacore/trustchoice/) — the default trust and the owner's choice.
+- [`ContentScan`](/api/brahmacore/documentation/brahmacore/contentscan/) — the streamed secret scan.
+- [`ContentVault`](/api/brahmacore/documentation/brahmacore/contentvault/) — where the bytes live.
+- [`ResourcePolicy`](/api/brahmacore/documentation/brahmacore/resourcepolicy/) — the fixed drop rules.
+
+## How it connects
+
+- **Called by Store.** `Store+Resources` validates links with `ResourceIntake.link` and indexes each resource into memory as a `MemoryIngestDoc`.
+- **Called by Orchestrator.** The handbook refresh is given a `ContentVault` so auto pages can mirror resources.
+- **Calls Safety.** The scan's results are `ScanFinding`s from the secret scanner.
+- **Calls Platform.** The intake asks `Quarantine.isQuarantined(fd:)`.
+- **Calls Util and Model.** The vault writes through `EngineFiles`; refused extensions are checked with `ArtifactKind.ext`.
+
+<ModuleFacts module="BrahmaCore" area="Resources" />
+
+<SourceLink path="Sources/BrahmaCore/Resources" />

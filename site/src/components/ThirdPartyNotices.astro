@@ -1,0 +1,12 @@
+---
+/**
+ * Renders the repository's THIRD_PARTY_NOTICES.md at build time, so the page can never drift
+ * from the file. The file's own `# Third-party notices` heading is dropped: the page's
+ * frontmatter title is the h1.
+ */
+import { compiledContent } from '../../../THIRD_PARTY_NOTICES.md';
+
+const html = (await compiledContent()).replace(/^\s*<h1[^>]*>[\s\S]*?<\/h1>\s*/, '');
+---
+
+<Fragment set:html={html} />

@@ -1,0 +1,51 @@
+---
+title: BrahmaCore
+description: "The library every other target links: 29 areas, what each one is for, and where to start reading."
+sidebar:
+  order: 0
+  label: Overview
+---
+
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+`BrahmaCore` is the one library in the package. The Mac app, the `brahma` CLI and the MCP server all link it; it depends on GRDB for SQLite and on the `CSandboxCheck` C target, nothing else. Its source is split into 28 directories under `Sources/BrahmaCore/` plus the orchestrator, whose files sit at the top level. The [architecture](/internals/architecture/) page shows how the areas fit together at run time.
+
+## Areas
+
+| Area | What it is for |
+| --- | --- |
+| [Access](/internals/modules/brahmacore/access/) | Grants that widen one turn's sandbox: an egress domain, a fetch domain, a read-only path. |
+| [Backup](/internals/modules/brahmacore/backup/) | Database snapshots, data-home snapshots, company export, restore and optional WAL shipping. |
+| [Engine](/internals/modules/brahmacore/engine/) | Engine-wide health: the `claude` doctor, holds, alerts, the plan tier and the company clock. |
+| [Extensions](/internals/modules/brahmacore/extensions/) | Extension packages: import, validate, install, mount per role, try. |
+| [Git](/internals/modules/brahmacore/git/) | One company workspace as a git repository: worktrees per item, merges, exports, imports. |
+| [Handbook](/internals/modules/brahmacore/handbook/) | The company handbook: pages, sections, access, engine-rendered pages and the mirror. |
+| [Hosting](/internals/modules/brahmacore/hosting/) | Hosting providers a company deploys to: Cloudflare Pages and Vercel adapters. |
+| [Lifecycle](/internals/modules/brahmacore/lifecycle/) | The legal agent state transitions and the store call that applies them. |
+| [MCP](/internals/modules/brahmacore/mcp/) | The MCP server over stdio and the company tools agents call. |
+| [Memory](/internals/modules/brahmacore/memory/) | Company memory: the scoped index, auto-ingest, episodes, access classes, replay. |
+| [Messaging](/internals/modules/brahmacore/messaging/) | Posting messages and deciding who they wake. |
+| [Model](/internals/modules/brahmacore/model/) | The record types: company, agent, work item, ask, message, turn, sprint. |
+| [Modes](/internals/modules/brahmacore/modes/) | Ultra admission, reservations and the probe gates behind work modes. |
+| [Orchestrator](/internals/modules/brahmacore/orchestrator/) | The one engine per machine: the tick, turn launch, and the lock. |
+| [Org](/internals/modules/brahmacore/org/) | Industry packs, role templates, org generation, repository import, demo seeds. |
+| [Owner](/internals/modules/brahmacore/owner/) | What reaches the owner: notices, digests, human tasks, phone pushes. |
+| [Platform](/internals/modules/brahmacore/platform/) | The macOS quarantine attribute check. |
+| [Preview](/internals/modules/brahmacore/preview/) | Running preview surfaces from `main` in fresh engine exports. |
+| [Release](/internals/modules/brahmacore/release/) | Smoke checks on `main`, the release executor and milestones. |
+| [Resources](/internals/modules/brahmacore/resources/) | Files and links the owner drops: inspection, trust, scanning, the content vault. |
+| [Safety](/internals/modules/brahmacore/safety/) | Secrets and the redactor, taint, the emergency stop, the sandbox canary, the sleep guard. |
+| [Sandbox](/internals/modules/brahmacore/sandbox/) | What a turn may touch, compiled into the `claude` CLI's settings file and Seatbelt profiles. |
+| [Scheduler](/internals/modules/brahmacore/scheduler/) | Which ready agents run this tick, under the caps and the usage gate. |
+| [Store](/internals/modules/brahmacore/store/) | The one SQLite database and every operation on it. |
+| [Timers](/internals/modules/brahmacore/timers/) | Calendar timers and the jobs they fire. |
+| [Turns](/internals/modules/brahmacore/turns/) | One `claude -p` process per agent turn: profile, prompt, stream, audit. |
+| [Util](/internals/modules/brahmacore/util/) | Awake-time clock, blocking threads, descriptor-safe files, hashing, the owner key. |
+| [Verify](/internals/modules/brahmacore/verify/) | Running an item's check command and recording the outcome. |
+| [Work](/internals/modules/brahmacore/work/) | Work policy: who may change what, autonomy, budgets, modes, review, liveness. |
+
+## Where to start
+
+Read [Orchestrator](/internals/modules/brahmacore/orchestrator/) first: its tick calls almost every other area. Then [Store](/internals/modules/brahmacore/store/), which everything writes through, and [Turns](/internals/modules/brahmacore/turns/) and [Sandbox](/internals/modules/brahmacore/sandbox/), which together decide how one agent turn is launched and what it may touch.
+
+<SourceLink path="Sources/BrahmaCore" />

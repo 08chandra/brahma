@@ -1,0 +1,313 @@
+---
+/**
+ * Console hero: a Panel styled as the app's ACTIVITY feed, replaying invented demo lines
+ * (src/data/hero-activity.json) — `HH:mm:ss` mono, a coloured kind glyph, `@handle`, text —
+ * with the agent-state chips updating as lines arrive. New lines flash bg3 for 600 ms, as in
+ * the app.
+ *
+ * The feed is a fixed-height log window anchored at its newest line, like the app's: older
+ * lines scroll off the top. The server renders the FINAL frame (every line, final counts,
+ * data-hero-state="final"), so with JavaScript off or under prefers-reduced-motion the page
+ * shows a still console. The inline script (< 3 KB) runs only otherwise: it pushes the
+ * not-yet-arrived lines below the window with a transform, then — once the panel is on
+ * screen — replays them on requestAnimationFrame, sliding the list up one line at a time,
+ * counting ticks in `window.__heroFrames`, and sets data-hero-state back to "final" at the
+ * end. Only `transform` and `opacity` change, so the replay shifts no layout (CLS 0).
+ */
+import Panel from './Panel.astro';
+import Chip from './Chip.astro';
+import data from '../data/hero-activity.json';
+
+type Counts = Record<'running' | 'ready' | 'blocked' | 'sleeping', number>;
+const states = ['running', 'ready', 'blocked', 'sleeping'] as const;
+const finalCounts: Counts = data.lines.reduce<Counts>(
+  (counts, line) => ('counts' in line && line.counts ? line.counts : counts),
+  data.initial,
+);
+// Kind → glyph symbol id. Colours live in the stylesheet (.k-<kind>).
+const kinds = ['message', 'turnStarted', 'turnFinished', 'tool', 'state', 'work', 'approval', 'preview'];
+---
+
+<div class="console" data-hero-state="final" data-hero-initial={JSON.stringify(data.initial)}>
+  <svg class="console__sprite" aria-hidden="true" focusable="false">
+    <symbol id="hg-message" viewBox="0 0 12 12"><path d="M2 2.5h8v5.5H6.2L3.8 10V8H2z"></path></symbol>
+    <symbol id="hg-turnStarted" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.5"></circle><path d="M5 4.1 8 6 5 7.9z" class="fill"></path></symbol>
+    <symbol id="hg-turnFinished" viewBox="0 0 12 12"><path d="M3 10.5V1.8M3 2.2h6.2L7.8 4.4l1.4 2.2H3"></path></symbol>
+    <symbol id="hg-tool" viewBox="0 0 12 12"><path d="M2.2 9.8 6.6 5.4M7.9 1.8a2.3 2.3 0 1 0 2.3 2.3L8.6 4.6 7.4 3.4z"></path></symbol>
+    <symbol id="hg-state" viewBox="0 0 12 12"><path d="M2 4h7.6M7.8 2.2 9.6 4 7.8 5.8M10 8H2.4M4.2 6.2 2.4 8l1.8 1.8"></path></symbol>
+    <symbol id="hg-work" viewBox="0 0 12 12"><path d="m1.8 3.2 1 1 1.6-1.7M6 3.6h4.2M1.8 7.7l1 1 1.6-1.7M6 8.1h4.2"></path></symbol>
+    <symbol id="hg-approval" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.5"></circle><path d="m4 6.1 1.4 1.4L8.1 4.8"></path></symbol>
+    <symbol id="hg-preview" viewBox="0 0 12 12"><rect x="1.5" y="2.5" width="9" height="7" rx="0.5"></rect><path d="M5 4.4 7.4 6 5 7.6z" class="fill"></path></symbol>
+  </svg>
+
+  <Panel title="Activity" titleAs="p" dense class="console__panel">
+    <span slot="actions" class="console__meta">{data.company} · demo replay</span>
+    <div class="console__bar">
+      {
+        states.map((state) => (
+          <span class="console__count" data-hero-count={state}>
+            <Chip status={state} label={`${finalCounts[state]} ${state}`} />
+          </span>
+        ))
+      }
+    </div>
+    <div class="feed__window" data-hero-viewport>
+      <ol class="feed" aria-label={`Activity of the demo company ${data.company}`}>
+        {
+          data.lines.map((line) => {
+            const kind = kinds.includes(line.kind) ? line.kind : 'work';
+            return (
+            <li
+              class="feed__line"
+              data-hero-line
+              data-at={line.at}
+              data-counts={'counts' in line && line.counts ? JSON.stringify(line.counts) : undefined}
+            >
+              <span class="feed__time">{line.time}</span>
+              <svg class:list={['feed__glyph', `k-${kind}`]} aria-hidden="true">
+                <use href={`#hg-${kind}`} />
+              </svg>
+              <span class="feed__body">
+                {line.handle ? <span class="feed__handle">@{line.handle}</span> : <span class="feed__engine">engine</span>}{' '}
+                {line.text}
+              </span>
+            </li>
+            );
+          })
+        }
+      </ol>
+    </div>
+  </Panel>
+</div>
+
+<script is:inline>
+  (() => {
+    window.__heroFrames = 0;
+    const root = document.querySelector('[data-hero-state]');
+    if (!root || !window.requestAnimationFrame || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const feed = root.querySelector('.feed');
+    const lines = [...feed.querySelectorAll('[data-hero-line]')];
+    const chips = [...root.querySelectorAll('[data-hero-count]')];
+    const setCounts = (counts) => {
+      for (const chip of chips) {
+        const key = chip.dataset.heroCount;
+        chip.querySelector('.chip__label').textContent = counts[key] + ' ' + key;
+      }
+    };
+    let next = lines.findIndex((line) => Number(line.dataset.at) > 0);
+    if (next < 0) return;
+    // Lines from `next` on wait below the window: shift the list down by their height.
+    const place = () => {
+      const below = next < lines.length ? feed.offsetHeight - lines[next].offsetTop : 0;
+      feed.style.transform = below ? 'translateY(' + below + 'px)' : '';
+    };
+    root.dataset.heroState = 'playing';
+    setCounts(JSON.parse(root.dataset.heroInitial));
+    place();
+    let start;
+    const tick = (now) => {
+      window.__heroFrames++;
+      if (start === undefined) {
+        start = now;
+        feed.classList.add('is-live');
+      }
+      let moved = false;
+      while (next < lines.length && Number(lines[next].dataset.at) <= now - start) {
+        const line = lines[next++];
+        line.classList.add('is-new');
+        if (line.dataset.counts) setCounts(JSON.parse(line.dataset.counts));
+        moved = true;
+      }
+      if (moved) place();
+      if (next < lines.length) requestAnimationFrame(tick);
+      else root.dataset.heroState = 'final';
+    };
+    const begin = () => requestAnimationFrame(tick);
+    if (!('IntersectionObserver' in window)) return begin();
+    const seen = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        seen.disconnect();
+        begin();
+      }
+    }, { threshold: 0.2 });
+    seen.observe(root);
+  })();
+</script>
+
+<style>
+  .console {
+    min-width: 0;
+  }
+  .console__sprite {
+    position: absolute;
+    width: 0;
+    height: 0;
+    overflow: hidden;
+  }
+  .console__meta {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--text1);
+    white-space: nowrap;
+  }
+  /* Agent-state chips: one row when they fit, an aligned 2 × 2 below 30 em (never 3 + 1). */
+  .console__bar {
+    display: grid;
+    grid-template-columns: repeat(2, max-content);
+    gap: var(--s-2);
+    padding: var(--s-1) var(--s-1) var(--s-3);
+    margin-bottom: var(--s-2);
+    border-bottom: var(--hairline);
+  }
+  @media (min-width: 30em) {
+    .console__bar {
+      grid-template-columns: repeat(4, max-content);
+    }
+  }
+  .console__count :global(.chip__label) {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* A log window anchored at its newest line: older lines overflow off the top. */
+  .feed__window {
+    --feed-h: 22rem;
+    height: var(--feed-h);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+  }
+  /* Desktop: the console fills its grid row, so its foot lines up with the intro column's
+   * whatever the lede's length; the window grows from its minimum and stays anchored at the
+   * newest line. */
+  @media (min-width: 64em) {
+    .feed__window {
+      --feed-h: 17.5rem;
+      flex: 1 1 auto; /* the basis stays the definite height, so the row is sized by the intro */
+    }
+    .console,
+    .console :global(.console__panel) {
+      height: 100%;
+    }
+    .console :global(.console__panel) {
+      display: flex;
+      flex-direction: column;
+    }
+    .console :global(.console__panel > .panel__body) {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+  }
+  .feed {
+    position: relative;
+    flex: none;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  .feed.is-live {
+    transition: transform var(--dur) var(--ease);
+  }
+  .feed__line {
+    position: relative;
+    isolation: isolate;
+    display: grid;
+    grid-template-columns: max-content 0.875rem minmax(0, 1fr);
+    column-gap: var(--s-2);
+    align-items: baseline;
+    padding: 0.1875rem var(--s-2);
+    margin: 0;
+  }
+  /* The 600 ms bg3 flash of a new line, as in the app (opacity only). */
+  .feed__line::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background: var(--bg3);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .feed__line.is-new::before {
+    animation: console-flash var(--dur-slow) linear;
+  }
+  @keyframes console-flash {
+    0%,
+    66% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0;
+    }
+  }
+
+  .feed__time {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    font-variant-numeric: tabular-nums;
+    color: var(--text1); /* the app's text2 is below AA at this size */
+  }
+  .feed__glyph {
+    width: 0.75rem;
+    height: 0.75rem;
+    align-self: center;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.3;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .feed__glyph :global(.fill) {
+    fill: currentColor;
+    stroke: none;
+  }
+  .k-message {
+    color: var(--ready);
+  }
+  .k-turnStarted,
+  .k-preview {
+    color: var(--ok);
+  }
+  .k-turnFinished {
+    color: var(--text1);
+  }
+  .k-tool {
+    color: var(--text2);
+  }
+  .k-state {
+    color: var(--series-violet);
+  }
+  .k-work {
+    color: var(--accent); /* a mark, 3.44:1 on bg2 */
+  }
+  .k-approval {
+    color: var(--warn);
+  }
+  .feed__body {
+    font-size: var(--text-ui);
+    line-height: 1.45;
+    color: var(--text1);
+    overflow-wrap: anywhere;
+  }
+  .feed__handle,
+  .feed__engine {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    font-weight: 500;
+  }
+  .feed__handle {
+    color: var(--text0);
+  }
+  .feed__engine {
+    color: var(--text1);
+    letter-spacing: 0.02em;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .feed__line.is-new::before {
+      animation: none;
+    }
+  }
+</style>

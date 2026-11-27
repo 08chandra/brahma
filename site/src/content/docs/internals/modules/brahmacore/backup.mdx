@@ -1,0 +1,32 @@
+---
+title: Backup
+description: "Database snapshots, data-home snapshots, company export, restore with its safety carry-over, and optional Litestream WAL shipping."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+Everything that copies the engine's state somewhere else and brings it back. `BackupService` takes database snapshots; `HomeSnapshot` mirrors the whole data home, hard-linking unchanged files; `CompanyExporter` writes one company as a self-contained copy, its repository as a bundle. `Restore` swaps a snapshot in under the engine lock and carries forward what must never roll back: the owner's stop, revoked grants, used-up uses and taint marks. `BackupTargets` copies backups off the machine; `WALShipping` streams the SQLite WAL through Litestream when it is installed. All file work is descriptor-relative, so a link planted under the home cannot redirect it.
+
+## Key types
+
+- [`BackupService`](/api/brahmacore/documentation/brahmacore/backupservice/) — database snapshots and the restore marker.
+- [`HomeSnapshot`](/api/brahmacore/documentation/brahmacore/homesnapshot/) — a data-home snapshot: `tree/` plus `MANIFEST.json`.
+- [`CompanyExporter`](/api/brahmacore/documentation/brahmacore/companyexporter/) — one company's rows, repository bundle, files and roles.
+- [`RestorePlan`](/api/brahmacore/documentation/brahmacore/restoreplan/) and [`RestoreOutcome`](/api/brahmacore/documentation/brahmacore/restoreoutcome/) — what a restore will do and what it did.
+- [`BackupTargets`](/api/brahmacore/documentation/brahmacore/backuptargets/) — the off-machine copies.
+- [`WALShipper`](/api/brahmacore/documentation/brahmacore/walshipper/) — Litestream WAL shipping, "unavailable" when the binary is missing.
+
+## How it connects
+
+- **Called by Timers.** The system timer registry binds `backup.hourly`, `backup.repos`, `backup.home` and `backup.targets` to the jobs in `BackupJobs`, each run with a `TimerContext`.
+- **Called by Orchestrator.** The engine owns the `WALShipper` and, at start, reads the restore marker through `BackupService.restoreMarker`.
+- **Called by the CLI.** `brahma backup` commands construct `BackupService` directly for manual snapshots and listings.
+- **Calls Handbook and Orchestrator.** A company export writes the handbook mirror through `HandbookExporter.export`; a restore takes the `OrchestratorLock` so no engine runs during the swap.
+- **Calls Util.** `HomeFiles` opens every directory under the data home with `EngineFiles`' descriptor-relative walk.
+
+<ModuleFacts module="BrahmaCore" area="Backup" />
+
+<SourceLink path="Sources/BrahmaCore/Backup" />
