@@ -82,6 +82,9 @@ public enum ChildEnvironment {
             for name in CanaryProbes.variables { if let value = extra[name] { env[name] = value } }
             for (name, value) in engineClaudeVars where Self.engineClaudeVars.contains(name) { env[name] = value }
             if allowBuiltinAgentsSwitch, engineClaudeVars[builtinAgentsSwitch] == "1" { env[builtinAgentsSwitch] = "1" }
+            // Ruling 33: a gateway turn keeps none of the owner's override names, whichever of them `gateway` fills (Node reads
+            // the lower-case proxy names first, so a partial fill must never leave one of the owner's behind).
+            if !gateway.isEmpty { for name in gatewayOverrides { env[name] = nil } }
             env.merge(admittedGateway(gateway)) { $1 }
         }
         for (name, value) in secrets where SecretName.isInjectable(name) { env[name] = value }
@@ -91,9 +94,11 @@ public enum ChildEnvironment {
     /// The part of `gateway` a turn takes (Ruling 32): `gatewayVariables` and `gatewayOverrides`, nothing else. A missing or
     /// malformed turn token (`TurnTokenFormat`) drops the token, the base URL and the model aliases; the deny proxy, the config
     /// dir and the traffic switch still apply, so the child can reach neither the gateway with the owner's login nor the network.
+    /// A well-formed token without a base URL is dropped the same way (Ruling 33): it would go to the default endpoint.
     static func admittedGateway(_ gateway: [String: String]) -> [String: String] {
         let admitted = gateway.filter { gatewayVariables.contains($0.key) || gatewayOverrides.contains($0.key) }
-        guard let token = admitted["ANTHROPIC_API_KEY"], TurnTokenFormat.isWellFormed(token) else {
+        guard let token = admitted["ANTHROPIC_API_KEY"], TurnTokenFormat.isWellFormed(token),
+              let base = admitted["ANTHROPIC_BASE_URL"], !base.isEmpty else {
             return admitted.filter { !gatewayTokenBound.contains($0.key) }
         }
         return admitted

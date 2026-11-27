@@ -7,9 +7,10 @@ import Glibc
 
 /// Where the Claude CLI keeps its session transcripts: `<configDir>/projects/<encoded cwd>/<sessionId>.jsonl`.
 ///
-/// The engine's turns inherit `HOME` and `CLAUDE_CONFIG_DIR` from the engine's own environment (`ChildEnvironment` admits both;
-/// nothing per agent or per company overrides them), so the CLI writes under `$CLAUDE_CONFIG_DIR` when that is set and
-/// `$HOME/.claude` otherwise. Tests pass a temp directory: the owner's real `~/.claude` is never read by a test.
+/// The engine's subscription turns inherit `HOME` and `CLAUDE_CONFIG_DIR` from the engine's own environment (`ChildEnvironment`
+/// admits both), so the CLI writes under `$CLAUDE_CONFIG_DIR` when that is set and `$HOME/.claude` otherwise. A gateway turn
+/// runs with the agent's own config dir instead (Plan X1 Ruling 62): `TranscriptCapture.reading(configDir:)`. Tests pass a temp
+/// directory: the owner's real `~/.claude` is never read by a test.
 public struct TranscriptSource: Sendable, Equatable {
     public let configDir: URL
     public init(configDir: URL) { self.configDir = configDir }
@@ -44,7 +45,7 @@ public struct TranscriptCapture: Sendable {
     }
 
     public let paths: BrahmaPaths
-    public let source: TranscriptSource
+    public private(set) var source: TranscriptSource
     public let compressor: Compressor
     /// Upper bound on the bytes of one capture; the rest is taken by the next one.
     static let maxChunk = 256 * 1024 * 1024
@@ -53,6 +54,15 @@ public struct TranscriptCapture: Sendable {
 
     public init(paths: BrahmaPaths, source: TranscriptSource, compressor: Compressor = .platformDefault) {
         self.paths = paths; self.source = source; self.compressor = compressor
+    }
+
+    /// This capture reading `configDir` instead of the engine's own source: a gateway turn's isolated per-agent
+    /// `CLAUDE_CONFIG_DIR` (`TurnRequest.gateway`, Plan X1 Ruling 62), where its `claude` writes the session. Itself when nil.
+    public func reading(configDir: String?) -> TranscriptCapture {
+        guard let configDir, !configDir.isEmpty else { return self }
+        var copy = self
+        copy.source = TranscriptSource(configDir: URL(fileURLWithPath: configDir, isDirectory: true))
+        return copy
     }
 
     /// Blocking (file reads and a compression process): the caller runs it inside a `Blocking` body.

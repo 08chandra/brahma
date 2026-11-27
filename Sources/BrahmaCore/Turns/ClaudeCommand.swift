@@ -79,6 +79,9 @@ public struct TurnRequest: Sendable {
     /// Plan X1 Task 3: the runtime the turn runs on. The runner compiles and parses through `RuntimeCatalog.runtime(runtime)`;
     /// a runtime the catalog does not have never launches (fail closed).
     public var runtime: RuntimeId = RuntimeCatalog.claude
+    /// Plan X1 Task 12: set, the turn runs through the model gateway (`ClaudeGatewayCompile`: base URL, turn token, aliases,
+    /// deny-all proxy, the agent's isolated config dir); nil, a subscription turn compiled exactly as before.
+    public var gateway: GatewayLaunch? = nil
 
     public init(agent: Agent, company: Company, prompt: String, appendSystemPrompt: String?,
                 mcpConfigPath: String, workingDirectory: String, profile: PermissionProfile,

@@ -53,8 +53,18 @@ public struct ClaudeRuntime: AgentRuntime {
     /// filtered child environment, the profile's working directory and wall clock, and the prompt for stdin. The probe result
     /// does not change a subscription launch today: the gates a turn needs are applied by the engine before it builds the
     /// request (`TurnRequest.taskWebTools`, the mode decision).
+    ///
+    /// A gateway turn (`r.gateway`, Plan X1 Task 12) differs only through `ClaudeGatewayCompile`: the routed aliases join the
+    /// settings' `availableModels`, the child environment takes its `gateway:` variables (and the deny-proxy marker for the
+    /// shell prefix), and `apply` checks the result and rewrites `--model`/`--fallback-model` for a routed class.
     public func compile(_ r: TurnRequest, _ caps: RuntimeProbe) throws(RuntimeCompileError) -> LaunchSpec {
-        let profile = try Self.validatedProfile(r)
+        var profile = try Self.validatedProfile(r)
+        var gatewayEnvironment: [String: String] = [:]
+        if let g = r.gateway {
+            gatewayEnvironment = try ClaudeGatewayCompile.environment(g, owner: baseEnvironment)
+            ClaudeGatewayCompile.settings(&profile.settings, g)
+            profile.environment.merge(ClaudeGatewayCompile.extra(g)) { $1 }
+        }
         var files: [LaunchFile] = []
         if let path = profile.settingsFilePath {
             files.append(LaunchFile(path: path, contents: Data(try Self.settingsText(profile).utf8)))
@@ -71,10 +81,12 @@ public struct ClaudeRuntime: AgentRuntime {
         }
         let environment = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment, engineClaudeVars: profile.environment,
                                                 purpose: .claude, secrets: r.secrets,
-                                                allowBuiltinAgentsSwitch: profile.builtinAgentsDisabled)
-        return LaunchSpec(executable: executable, arguments: TurnProfileCompiler.arguments(profile), environment: environment,
-                          files: files, sandbox: sandbox, workingDirectory: profile.workingDirectory, stdin: r.prompt,
-                          wallClock: profile.wallClock)
+                                                allowBuiltinAgentsSwitch: profile.builtinAgentsDisabled, gateway: gatewayEnvironment)
+        var spec = LaunchSpec(executable: executable, arguments: TurnProfileCompiler.arguments(profile), environment: environment,
+                              files: files, sandbox: sandbox, workingDirectory: profile.workingDirectory, stdin: r.prompt,
+                              wallClock: profile.wallClock)
+        if let g = r.gateway { try ClaudeGatewayCompile.apply(&spec, g, decisionModel: profile.model) }
+        return spec
     }
 
     /// The mode canary's control session (`TurnRunning.control`): the compiled launch with `--input-format stream-json` after

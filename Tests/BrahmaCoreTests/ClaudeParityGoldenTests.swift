@@ -62,8 +62,12 @@ enum ParityShapes {
     static let workSandboxedAmbientAuth = "work-sandboxed-ambient-auth"
     /// The cell the ambient-auth shape compiles: only its base environment differs.
     static let ambientAuthCell = ParityCell(profile: .sandboxed, kind: .work, mode: .standard, launch: .none, network: .default, item: .item)
+    /// Plan X1 Task 12: the same cell compiled for the model gateway with the deep and standard classes routed
+    /// (`GoldenWorld.gatewayLaunch`): `--model`/`--fallback-model brahma-standard`, the gateway's variables, the deny proxy and
+    /// the agent's config dir. Its shape is the `+gateway` key. Every subscription golden is unchanged by it.
+    static let workSandboxedGatewayRouted = "work-sandboxed-gateway-routed"
     static var specialNames: [String] {
-        [conciergeName, workSandboxedAmbientAuth] + ModeCanary.shapes().map { modeCanaryName($0.0) }
+        [conciergeName, workSandboxedAmbientAuth, workSandboxedGatewayRouted] + ModeCanary.shapes().map { modeCanaryName($0.0) }
     }
 
     /// Every golden's name: the cells plus the special shapes.
@@ -235,6 +239,21 @@ struct GoldenWorld {
                                  "ANTHROPIC_DEFAULT_OPUS_MODEL": "owner-model", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"]) { $1 }
     }
 
+    /// Plan X1 Task 12: a gateway launch with the deep and standard classes routed. The token is a fixed well-formed value
+    /// (never in a golden: `ANTHROPIC_API_KEY` is secret-named, so only its name is recorded).
+    func gatewayLaunch(routed: Set<ModelClass> = [.deep, .standard]) -> GatewayLaunch {
+        GatewayLaunch(baseURL: "http://127.0.0.1:4100/t/", token: GatewayToken(value: String(repeating: "0123456789abcdef", count: 4)),
+                      aliases: GatewayLaunch.aliases(for: routed), denyProxy: "http://127.0.0.1:4101",
+                      configDir: ClaudeGatewayCompile.configDir(layout: layout).path)
+    }
+
+    /// The gateway golden's request: the ambient-auth cell with `gatewayLaunch()`.
+    func gatewayRequest(routed: Set<ModelClass> = [.deep, .standard]) throws -> TurnRequest {
+        var r = try request(ParityShapes.ambientAuthCell)
+        r.gateway = gatewayLaunch(routed: routed)
+        return r
+    }
+
     /// The cell's request as `Orchestrator.performTurn`'s `turnRequest` builds it.
     func request(_ cell: ParityCell) throws -> TurnRequest {
         let company = company(cell.network)
@@ -324,10 +343,10 @@ struct GoldenWorld {
     }
 }
 
-// MARK: - Capture
+// MARK: - GoldenCapture
 
 /// What one golden records of a compiled request.
-private struct Capture {
+struct GoldenCapture {
     var argv: [String]
     var settings: Any
     var env: [String: String]
@@ -351,8 +370,8 @@ private func json(_ text: String) throws -> Any { try JSONSerialization.jsonObje
 /// inline `--settings`), its child environment and the MCP config its argv names; the shape is `TurnShape.of(_:auth:)`'s key.
 /// Task 1 recorded the goldens on today's direct path (`TurnProfileCompiler.profile(for:)` → `validate` → `arguments`,
 /// `settingsJSON`, `ChildEnvironment.make(purpose: .claude)`); they match unchanged.
-private func capture(_ r: TurnRequest, world: GoldenWorld, controlSession: Bool = false,
-                     baseEnvironment: [String: String]? = nil) throws -> Capture {
+func capture(_ r: TurnRequest, world: GoldenWorld, controlSession: Bool = false,
+                     baseEnvironment: [String: String]? = nil) throws -> GoldenCapture {
     let runtime = ClaudeRuntime(baseEnvironment: baseEnvironment ?? world.baseEnvironment)
     let caps = RuntimeProbe(runtime: RuntimeCatalog.claude)
     let spec = controlSession ? try runtime.compileControl(r, caps) : try runtime.compile(r, caps)
@@ -363,11 +382,11 @@ private func capture(_ r: TurnRequest, world: GoldenWorld, controlSession: Bool 
     let settingsArgument = try value(after: "--settings")
     let settingsText = spec.files.first { $0.path == settingsArgument }.map { String(decoding: $0.contents, as: UTF8.self) } ?? settingsArgument
     let mcp = try String(contentsOfFile: try value(after: "--mcp-config"), encoding: .utf8)
-    return Capture(argv: spec.arguments, settings: try json(settingsText), env: spec.environment, mcpConfig: try json(mcp),
-                   shape: try TurnShape.of(r, auth: .subscription).key)
+    return GoldenCapture(argv: spec.arguments, settings: try json(settingsText), env: spec.environment, mcpConfig: try json(mcp),
+                   shape: try TurnShape.of(r, auth: r.gateway == nil ? .subscription : .gateway).key)
 }
 
-private func capture(cell: ParityCell, world: GoldenWorld) throws -> Capture {
+private func capture(cell: ParityCell, world: GoldenWorld) throws -> GoldenCapture {
     let r = try world.request(cell)
     // The enumeration must describe the decision truthfully: the mode and the launch are the policy's own.
     let d = try #require(r.mode)
@@ -376,8 +395,9 @@ private func capture(cell: ParityCell, world: GoldenWorld) throws -> Capture {
     return try capture(r, world: world)
 }
 
-private func capture(name: String, world: GoldenWorld) throws -> Capture {
+func capture(name: String, world: GoldenWorld) throws -> GoldenCapture {
     if name == ParityShapes.conciergeName { return try capture(try world.conciergeRequest(), world: world) }
+    if name == ParityShapes.workSandboxedGatewayRouted { return try capture(try world.gatewayRequest(), world: world) }
     if name == ParityShapes.workSandboxedAmbientAuth {
         return try capture(try world.request(ParityShapes.ambientAuthCell), world: world, baseEnvironment: world.ambientAuthEnvironment)
     }
@@ -391,6 +411,7 @@ private func capture(name: String, world: GoldenWorld) throws -> Capture {
 /// The request behind the golden `name`, as `capture(name:)` builds it (shared with Task 2's `RuntimeTypesTests`).
 func goldenRequest(name: String, world: GoldenWorld) throws -> TurnRequest {
     if name == ParityShapes.conciergeName { return try world.conciergeRequest() }
+    if name == ParityShapes.workSandboxedGatewayRouted { return try world.gatewayRequest() }
     if name == ParityShapes.workSandboxedAmbientAuth { return try world.request(ParityShapes.ambientAuthCell) }
     if let canary = ModeCanary.shapes().first(where: { ParityShapes.modeCanaryName($0.0) == name }) {
         return world.modeCanaryRequest(canary.1)

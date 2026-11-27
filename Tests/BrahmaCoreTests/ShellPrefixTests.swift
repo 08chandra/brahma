@@ -106,6 +106,7 @@ private struct PrefixWorld {
         let text = try ShellPrefix.script(layout: w.layout, paths: w.paths, shell: "/bin/bash", keepNames: ["A_KEY", "B"],
                                           mcpServer: w.server("/opt/brahma/bin/brahma"))
         // Fix round 1: absolute tools (I1); the engine's MCP server by a fixed argv, never `$1` (I2); git keys by digits (M1).
+        // Plan X1 Task 12: a gateway turn's deny proxy is dropped and every `ANTHROPIC_*` scrubbed.
         #expect(text == """
             #!/bin/sh
             if [ -n "${BRAHMA_TURN_TOKEN:-}" ]; then
@@ -119,11 +120,20 @@ private struct PrefixWorld {
               echo "brahma: refused" >&2; exit 126
             fi
             if \(ShellPrefix.tools.cat) '\(w.paths.sentinel.path)' >/dev/null 2>&1; then echo "brahma: sandbox is not active; command refused" >&2; exit 126; fi
+            if [ -n "${BRAHMA_DENY_PROXY:-}" ]; then
+              if [ "${HTTPS_PROXY:-}" = "$BRAHMA_DENY_PROXY" ]; then unset HTTPS_PROXY; fi
+              if [ "${HTTP_PROXY:-}" = "$BRAHMA_DENY_PROXY" ]; then unset HTTP_PROXY; fi
+              if [ "${https_proxy:-}" = "$BRAHMA_DENY_PROXY" ]; then unset https_proxy; fi
+              if [ "${http_proxy:-}" = "$BRAHMA_DENY_PROXY" ]; then unset http_proxy; fi
+              if [ "${NO_PROXY:-}" = '127.0.0.1,localhost' ]; then unset NO_PROXY; fi
+              if [ "${no_proxy:-}" = '127.0.0.1,localhost' ]; then unset no_proxy; fi
+              unset BRAHMA_DENY_PROXY
+            fi
             keep=' A_KEY B '
             for n in $(\(ShellPrefix.tools.env) | LC_ALL=C \(ShellPrefix.tools.sed) -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); do
               case "$keep" in *" $n "*) continue;; esac
               case "${n#GIT_CONFIG_KEY_}" in "$n"|'') ;; *[!0123456789]*) ;; *) continue;; esac
-              case "$n" in CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|SSH_AUTH_SOCK|AWS_*|*TOKEN*|*SECRET*|*KEY*|*token*|*secret*|*key*) unset "$n";; esac
+              case "$n" in CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_*|SSH_AUTH_SOCK|AWS_*|*TOKEN*|*SECRET*|*KEY*|*token*|*secret*|*key*) unset "$n";; esac
             done
             export HOME='\(w.home)' XDG_CONFIG_HOME='\(w.home)/.config' XDG_CACHE_HOME='\(w.cache)/xdg'
             export GIT_CONFIG_GLOBAL='\(w.home)/.gitconfig' GIT_CONFIG_NOSYSTEM=1

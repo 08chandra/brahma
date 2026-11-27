@@ -362,6 +362,18 @@ extension Store {
         }
     }
 
+    /// Removes one class's route of one scope and subject (`brahma agent model <co> <handle> <class>=inherit`, Plan X1
+    /// Task 12); returns whether one was there.
+    @discardableResult
+    public func clearRoute(companyId: String, scope: RouteScope, subject: String, modelClass: String) throws -> Bool {
+        try ProcessRole.refuseInAgentProcess()  // Ruling C6-4: never from an agent process
+        return try writer.write { db in
+            try db.execute(sql: "DELETE FROM modelRoute WHERE companyId = ? AND scope = ? AND subject = ? AND \"class\" = ?",
+                           arguments: [companyId, scope.rawValue, subject, modelClass])
+            return db.changesCount > 0
+        }
+    }
+
     // MARK: Probes
 
     public func probeRecord(provider: String, model: String, adapterVersion: String, cliVersion: String) throws -> ModelProbeRecord? {

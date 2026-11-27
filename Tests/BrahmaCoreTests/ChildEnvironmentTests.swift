@@ -102,6 +102,7 @@ private let turnToken = String(repeating: "0123456789abcdef", count: 4)
                          "CLAUDE_CONFIG_DIR": "/agent/cc"]
         var gateway = overrides
         gateway["ANTHROPIC_API_KEY"] = turnToken
+        gateway["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:4100/t/"
         for stray in ["PATH", "HOME", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_SUBAGENT_MODEL", "BRAHMA_AGENT_ID",
                       "NODE_OPTIONS", "SSL_CERT_FILE"] {
             gateway[stray] = "stray"
@@ -121,6 +122,35 @@ private let turnToken = String(repeating: "0123456789abcdef", count: 4)
             let other = ChildEnvironment.make(base: base, purpose: purpose, gateway: gateway)
             #expect(other["ANTHROPIC_API_KEY"] == nil); #expect(other["HTTPS_PROXY"] == "http://owner:3128")
             #expect(other["CLAUDE_CONFIG_DIR"] == "/owner/.claude")
+        }
+    }
+
+    /// Ruling 33 (Plan X1 Task 12): a partial gateway fill never leaves one of the owner's override names behind (Node reads
+    /// the lower-case proxy names first), and a well-formed token without a base URL is dropped with the other token-bound
+    /// names (it would go to the default endpoint).
+    @Test func partialGatewayKeepsNoOwnerOverride() {
+        var base = ["PATH": "/bin", "CLAUDE_CONFIG_DIR": "/owner/.claude"]
+        for name in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] { base[name] = "http://owner:3128" }
+        base["NO_PROXY"] = "*"; base["no_proxy"] = "*"
+        let partial = ["ANTHROPIC_API_KEY": turnToken, "ANTHROPIC_BASE_URL": "http://127.0.0.1:4100/t/", "HTTPS_PROXY": "http://127.0.0.1:4200"]
+        let env = ChildEnvironment.make(base: base, purpose: .claude, gateway: partial)
+        #expect(env["HTTPS_PROXY"] == "http://127.0.0.1:4200")
+        for name in ChildEnvironment.gatewayOverrides where name != "HTTPS_PROXY" { #expect(env[name] == nil, "\(name) kept the owner's value") }
+        #expect(env["ANTHROPIC_API_KEY"] == turnToken); #expect(env["PATH"] == "/bin")
+        // No gateway at all: the owner's values pass as before (a subscription turn is unchanged).
+        let plain = ChildEnvironment.make(base: base, purpose: .claude)
+        for name in ChildEnvironment.gatewayOverrides { #expect(plain[name] == base[name], "\(name)") }
+    }
+
+    @Test func wellFormedTokenWithoutBaseURLDropped() {
+        let gateway = ["ANTHROPIC_API_KEY": turnToken, "ANTHROPIC_DEFAULT_OPUS_MODEL": "brahma-deep", "HTTPS_PROXY": "http://127.0.0.1:4200",
+                       "CLAUDE_CONFIG_DIR": "/agent/cc", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"]
+        for g in [gateway, gateway.merging(["ANTHROPIC_BASE_URL": ""]) { $1 }] {
+            let env = ChildEnvironment.make(base: ["PATH": "/bin"], purpose: .claude, gateway: g)
+            #expect(env["ANTHROPIC_API_KEY"] == nil); #expect(env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == nil)
+            #expect(env["ANTHROPIC_BASE_URL"] == nil)
+            #expect(env["HTTPS_PROXY"] == "http://127.0.0.1:4200"); #expect(env["CLAUDE_CONFIG_DIR"] == "/agent/cc")
+            #expect(env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1")
         }
     }
 

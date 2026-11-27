@@ -1792,7 +1792,9 @@ public actor Orchestrator {
         // Task 13a: the turn's slice of the Claude session transcript, redacted and stored. Never fails the turn.
         if let transcripts, let sessionId = state.result?.sessionId ?? state.inits.last?.sessionId ?? (sawInit ? sentRequest?.agent.sessionId : nil) {
             let (store, turn, ended) = (self.store, turn, now)
-            _ = await blocking.run { transcripts.capture(turn: turn, sessionId: sessionId, store: store, now: ended) }
+            // A gateway turn's session lives in the agent's own config dir (Plan X1 Ruling 62).
+            let capture = transcripts.reading(configDir: sentRequest?.gateway?.configDir)
+            _ = await blocking.run { capture.capture(turn: turn, sessionId: sessionId, store: store, now: ended) }
         }
         if let why = abortReason {
             attempt {

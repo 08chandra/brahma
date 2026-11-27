@@ -142,11 +142,11 @@ public enum ShellPrefix {
             \(serverCase)  echo "brahma: refused" >&2; exit 126
             fi
             if \(tools.cat) '\(sentinel)' >/dev/null 2>&1; then echo "brahma: sandbox is not active; command refused" >&2; exit 126; fi
-            keep=' \(keep.joined(separator: " ")) '
+            \(denyProxyDrop)keep=' \(keep.joined(separator: " ")) '
             for n in $(\(tools.env) | LC_ALL=C \(tools.sed) -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); do
               case "$keep" in *" $n "*) continue;; esac
               case "${n#GIT_CONFIG_KEY_}" in "$n"|'') ;; *[!0123456789]*) ;; *) continue;; esac
-              case "$n" in CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|SSH_AUTH_SOCK|AWS_*|*TOKEN*|*SECRET*|*KEY*|*token*|*secret*|*key*) unset "$n";; esac
+              case "$n" in CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_*|SSH_AUTH_SOCK|AWS_*|*TOKEN*|*SECRET*|*KEY*|*token*|*secret*|*key*) unset "$n";; esac
             done
             export HOME='\(home)' XDG_CONFIG_HOME='\(home)/.config' XDG_CACHE_HOME='\(cache)/xdg'
             export GIT_CONFIG_GLOBAL='\(home)/.gitconfig' GIT_CONFIG_NOSYSTEM=1
@@ -154,6 +154,24 @@ public enum ShellPrefix {
             exec '\(shell)' -c "$1"
 
             """
+    }
+
+    /// Plan X1 Task 12: a gateway turn's `claude` runs with every proxy variable naming its deny-all proxy and `NO_PROXY` the
+    /// loopback names (`ClaudeGatewayCompile`). Agent Bash must keep its own network path, so when the turn's deny-proxy
+    /// marker is set the prefix unsets each proxy variable still holding that value (and `NO_PROXY` still holding the
+    /// gateway's), then the marker: a value Claude Code's sandbox put there for the command is left alone. Unset rather than
+    /// restored: inside the sandbox only the sandbox's own proxy is reachable, so the owner's proxy values would change
+    /// nothing. The scrub then removes every `ANTHROPIC_*` (the turn token in `ANTHROPIC_API_KEY`, the gateway's base URL and
+    /// model names): agent commands get none of the gateway's variables.
+    static var denyProxyDrop: String {
+        let marker = ClaudeGatewayCompile.denyProxyMarker
+        let proxies = ClaudeGatewayCompile.proxyNames.map {
+            "  if [ \"${\($0):-}\" = \"$\(marker)\" ]; then unset \($0); fi\n"
+        }
+        let noProxies = ClaudeGatewayCompile.noProxyNames.map {
+            "  if [ \"${\($0):-}\" = '\(ClaudeGatewayCompile.noProxy)' ]; then unset \($0); fi\n"
+        }
+        return "if [ -n \"${\(marker):-}\" ]; then\n" + (proxies + noProxies).joined() + "  unset \(marker)\nfi\n"
     }
 
     /// Writes `.brahma/bin/shell-<h>.sh` (0755) through `EngineFiles` (no link on the way is followed; a link at the file is

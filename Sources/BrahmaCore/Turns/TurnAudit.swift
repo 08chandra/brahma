@@ -66,6 +66,9 @@ public enum TurnAudit {
             let m = model.lowercased()
             if seen.contains(m) { continue }
             if safetyFallbackModels.contains(m) { f.safetyFallbacks.append(model); continue }
+            // A gateway turn's routed class bills under its alias (X1-0: the modelUsage keys are the alias strings); only a
+            // gateway turn can send one, and the gateway serves only the aliases its grant routes (Ruling 62).
+            if ModelAllowlist.isGatewayAlias(m) { continue }
             if !allowed.contains(where: { matches(model: m, allowed: $0) }) { f.unexpectedModels.append(model) }
         }
         return f

@@ -6,7 +6,7 @@ struct CompanyGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "company", abstract: "Create and manage companies.",
         subcommands: [Create.self, List.self, Pause.self, Resume.self, Mode.self, Weight.self, Reserve.self, Autonomy.self, Auto.self,
-                      SetSetting.self, CompanyProfile.self, TrustImport.self])
+                      SetSetting.self, CompanyProfile.self, TrustImport.self, Models.self])
 
     struct Create: ParsableCommand {
         @Argument(help: "Company name.") var name: String

@@ -31,8 +31,9 @@ import Foundation
             let recorded = try #require(golden["shape"] as? String, "\(name) has no shape")
             let subscription = try TurnShape.of(request, auth: .subscription)
             let gateway = try TurnShape.of(request, auth: .gateway)
-            #expect(subscription.key == recorded, "\(name): subscription key changed")
-            #expect(gateway.key == recorded + "+gateway", "\(name): gateway key")
+            // Plan X1 Task 12: the gateway golden records its `+gateway` key; every other golden the subscription key.
+            #expect((request.gateway == nil ? subscription.key : gateway.key) == recorded, "\(name): shape key changed")
+            #expect(gateway.key == subscription.key + "+gateway", "\(name): gateway key")
             #expect(subscription.auth == .subscription && gateway.auth == .gateway)
             #expect(subscription.profile == request.profile, "\(name)")
             #expect(subscription.kind == request.kind, "\(name)")

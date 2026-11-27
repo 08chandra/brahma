@@ -178,7 +178,14 @@ public struct ModeCaps: Equatable, Sendable {
 
 /// The models a Brahma turn may name, owner pins included (design §4.1).
 public enum ModelAllowlist {
-    public static let models: Set<String> = ["haiku", "sonnet", "opus", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
+    /// The Anthropic aliases and ids, plus the gateway's `brahma-<class>` aliases (Plan X1 Ruling 62): a gateway turn names its
+    /// routed class by alias, and nothing else ever does (`isGatewayAlias` refuses one as an agent's pin).
+    public static let models: Set<String> = Set(["haiku", "sonnet", "opus", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"])
+        .union(gatewayAliases)
+    /// `brahma-deep`, `brahma-standard`, `brahma-fast` (`GatewayLaunch.alias`).
+    public static let gatewayAliases: Set<String> = Set(ModelClass.allCases.map(GatewayLaunch.alias))
+
+    public static func isGatewayAlias(_ model: String) -> Bool { gatewayAliases.contains(model) }
 
     public static func allows(_ model: String) -> Bool { models.contains(model) }
 
@@ -387,7 +394,8 @@ public enum ModePolicy {
     public static func select(_ i: ModeInputs) -> ModeDecision {
         var reasons: [String] = []
         let pin = i.agentModel == "auto" ? nil : i.agentModel
-        if let pin, !ModelAllowlist.allows(pin) {
+        // A gateway alias is the route's to choose (Plan X1 Task 12), never a pin: pinned, it would reach Anthropic as is.
+        if let pin, !ModelAllowlist.allows(pin) || ModelAllowlist.isGatewayAlias(pin) {
             var d = decision(.quick, rung: .r0, model: pin, effort: .low, i: i, reasons: [ModelAllowlist.refusal(pin)])
             d.launch = false
             d.refusal = ModelAllowlist.refusal(pin)
