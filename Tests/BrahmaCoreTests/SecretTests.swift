@@ -847,6 +847,49 @@ private let aws = "AKIA" + "ABCDEFGHIJKLMNOP"   // split so this file does not i
         #expect(try w.store.secrets(companyId: w.company.id).map(\.isTest) == [false])
     }
 
+    /// Ruling X8-19: the GitHub push token and the Linear key are engine-only. They pass the KEY/TOKEN allowlist and no denied
+    /// family, so only the explicit set keeps them out of every turn: never a test key, never in a child environment, never
+    /// taken with `use_secret` (even from a row written by other means), never requested as a test key. `secret set` without
+    /// `--test` still stores them.
+    @Test(arguments: ["GITHUB_PUSH_TOKEN", "LINEAR_API_KEY"])
+    func engineOnlySecretsAreNeverInjectable(_ name: String) throws {
+        #expect(SecretName.engineOnly == ["GITHUB_PUSH_TOKEN", "LINEAR_API_KEY"])
+        #expect(SecretName.engineOnly.contains(name))
+        #expect(!SecretName.isInjectable(name), "\(name)")
+        let w = try W()
+        // A test key (injectable into turns) is refused, with the engine-only reason; the vault is never touched.
+        #expect(throws: SecretError.engineOnly) {
+            try w.store.setSecret(companyId: w.company.id, name: name, value: "engine-only-value-1", isTest: true, vault: w.vault)
+        }
+        #expect(try w.vault.value(companyId: w.company.id, name: name) == nil)
+        #expect(SecretError.engineOnly.message.contains("engine-only"))
+        // Engine-held is stored.
+        try w.store.setSecret(companyId: w.company.id, name: name, value: "engine-only-value-1", isTest: false, vault: w.vault)
+        #expect(try w.store.secrets(companyId: w.company.id).map(\.name) == [name])
+        // A turn profile naming it drops it and reports it.
+        let env = ChildEnvironment.make(base: ["PATH": "/bin", "HOME": "/h"], extra: [:], purpose: .claude, secrets: [name: "evil"])
+        #expect(env[name] == nil)
+        #expect(ChildEnvironment.droppedSecretNames([name: "evil", "STRIPE_TEST_KEY": "v"]) == [name])
+        // A grant: a row flipped to a test key by other means still cannot be taken with use_secret.
+        try w.store.writer.write { db in
+            try db.execute(sql: "UPDATE secret SET isTest = 1 WHERE companyId = ? AND name = ?", arguments: [w.company.id, name])
+        }
+        do {
+            try w.store.openSecretUse(companyId: w.company.id, agentId: w.eng.id, name: name, now: w.now)
+            Issue.record("use_secret granted an engine-only secret")
+        } catch let error as WorkError {
+            #expect(error.message.contains("engine-only"), "\(error.message)")
+        }
+        #expect(try w.store.writer.read { db in try SecretUse.fetchCount(db) } == 0)
+        // Nor can an agent ask for it as a test key.
+        do {
+            try w.store.requestSecret(companyId: w.company.id, agentId: w.eng.id, name: "\(name)", reason: "r", test: true, now: w.now)
+            Issue.record("request_secret accepted an engine-only test key")
+        } catch let error as WorkError {
+            #expect(error.message.contains("engine-only"), "\(error.message)")
+        }
+    }
+
     // MARK: CLI input
 
     @Test func cliSecretSetReadsStdin() throws {

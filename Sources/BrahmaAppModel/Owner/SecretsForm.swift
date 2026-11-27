@@ -24,6 +24,9 @@ public struct SecretsForm: Equatable, Sendable {
         guard SecretName.isValid(name) else {
             return "Name: A-Z, 0-9 and _, starting with a letter, 2 to 64 characters (for example STRIPE_TEST_KEY)."
         }
+        if isTest, SecretName.engineOnly.contains(name) {
+            return "\(name) is engine-only: it is never put in an agent's environment. Turn off Test key."
+        }
         if isTest, !SecretName.isInjectable(name) {
             return "A test key's name must contain KEY, TOKEN or SECRET and not be a variable the shell or Claude reads."
         }

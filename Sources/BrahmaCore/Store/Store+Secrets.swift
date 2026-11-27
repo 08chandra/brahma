@@ -68,6 +68,9 @@ extension Store {
             }
             guard agent.state != .killed else { throw WorkError.forbidden("this agent is not active in the company") }
             guard SecretName.isValid(name) else { throw WorkError.invalid(SecretError.invalidName.message) }
+            if test, SecretName.engineOnly.contains(name) {
+                throw WorkError.invalid("\(name) cannot be a test key: \(SecretError.engineOnly.message)")
+            }
             if test, !SecretName.isInjectable(name) {
                 throw WorkError.invalid("\(name) cannot be a test key (\(SecretError.notInjectable.message)); ask for it engine-held")
             }
@@ -373,6 +376,10 @@ extension Store {
             }
             guard meta.isTest else {
                 throw WorkError.invalid("\(name) is engine-held: connectors use it for you, and agents never receive it")
+            }
+            // Ruling X8-19: even a row flipped to a test key by other means is never granted.
+            guard !SecretName.engineOnly.contains(name) else {
+                throw WorkError.invalid("\(name) is engine-only: \(SecretError.engineOnly.message)")
             }
             guard let lease = try WorkLease.filter(Column("agentId") == agentId).fetchOne(db),
                   let item = try WorkItem.fetchOne(db, key: lease.itemId), item.companyId == companyId else {
@@ -740,7 +747,8 @@ extension Store {
     func validateSecret(companyId: String, name: String, value: String, isTest: Bool) throws {
         guard SecretName.isValid(name) else { throw SecretError.invalidName }
         if isTest {
-            // A test key goes into agents' environments: only names `SecretName.isInjectable` accepts.
+            // A test key goes into agents' environments: only names `SecretName.isInjectable` accepts, never an engine-only one.
+            guard !SecretName.engineOnly.contains(name) else { throw SecretError.engineOnly }
             guard SecretName.isInjectable(name) else { throw SecretError.notInjectable }
         } else {
             guard !ChildEnvironment.isReserved(name) else { throw SecretError.reservedName }

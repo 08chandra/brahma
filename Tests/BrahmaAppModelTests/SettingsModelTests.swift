@@ -124,6 +124,9 @@ import GRDB
         #expect(SecretsForm(name: "DATABASE", value: "x", isTest: true).validate()?.contains("test key") == true,
                 "a test key must be a name agents may be given")
         #expect(SecretsForm(name: "DATABASE", value: "x", isTest: false).validate() == nil)
+        #expect(SecretsForm(name: "GITHUB_PUSH_TOKEN", value: "x", isTest: true).validate()?.contains("engine-only") == true,
+                "Ruling X8-19: an engine-only secret is never a test key")
+        #expect(SecretsForm(name: "LINEAR_API_KEY", value: "x", isTest: false).validate() == nil)
         #expect(SecretsForm.testKeyCaption == "Test keys are given to agents as environment variables. Other keys stay with the engine.")
 
         let s = try await World.make()

@@ -8,6 +8,8 @@ public enum SecretError: Error, Equatable, Sendable, CustomStringConvertible {
     case reservedName
     /// A test key's name must be one `SecretName.isInjectable` accepts: it is put in agents' environments.
     case notInjectable
+    /// The name is in `SecretName.engineOnly` (Ruling X8-19): only engine ops read it; it can never be a test key.
+    case engineOnly
     case emptyValue
     /// The value's bytes are not UTF-8 (refused at input; a stored one fails to load).
     case notUTF8
@@ -26,6 +28,8 @@ public enum SecretError: Error, Equatable, Sendable, CustomStringConvertible {
         case .invalidName: "invalid secret name: use A-Z, 0-9 and _, starting with a letter (2 to 64 characters)"
         case .reservedName: "that name is reserved: the engine sets it in every child's environment"
         case .notInjectable: "a test key's name must contain KEY, TOKEN or SECRET and must not be a variable that changes how programs run (GIT_*, SSH_*, DYLD_*, LD_*, NODE_*, PYTHON*, ...*PATH, ...*_OPTIONS, ...)"
+        case .engineOnly: "that secret is engine-only: only the engine's own GitHub and Linear operations read it, and it is never "
+            + "put in an agent's environment; set it without --test"
         case .emptyValue: "the secret value is empty"
         case .notUTF8: "the secret value is not valid UTF-8 text"
         case .unknownCompany: "no such company"
@@ -55,13 +59,18 @@ public enum SecretName {
     ///   Claude's own variables, and every name `ChildEnvironment` itself sets or passes through.
     /// The one check for test keys: `Store.setSecret(isTest: true)` refuses, and `ChildEnvironment.make` drops, any other name.
     public static func isInjectable(_ name: String) -> Bool {
-        guard isValid(name) else { return false }
+        guard isValid(name), !engineOnly.contains(name) else { return false }
         guard name.contains("KEY") || name.contains("TOKEN") || name.contains("SECRET") else { return false }
         if deniedPrefixes.contains(where: name.hasPrefix) { return false }
         if deniedSuffixes.contains(where: name.hasSuffix) { return false }
         if deniedNames.contains(name) || ChildEnvironment.isReserved(name) { return false }
         return true
     }
+
+    /// Ruling X8-19: secrets only the engine's own operations read (the PR push and the issue import), each into a
+    /// `TokenHandle` at the moment of use. An explicit set, not a prefix rule: they are stored with `brahma secret set` (never
+    /// `--test`), `isInjectable` refuses them, so no turn profile, `use_secret` grant or check environment ever carries one.
+    public static let engineOnly: Set<String> = ["GITHUB_PUSH_TOKEN", "LINEAR_API_KEY"]
 
     /// From the security review, plus `SSL`/`OPENSSL` (TLS key logging and engine loading) and `LC_` (locale, passed through).
     static let deniedPrefixes = ["GIT_", "SSH_", "DYLD_", "LD_", "BASH_FUNC_", "CLAUDE_", "BRAHMA_", "ANTHROPIC_", "NODE_", "NPM_",
