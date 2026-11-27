@@ -76,7 +76,7 @@ final class FakeGitHub: GitHubAPI, @unchecked Sendable {
 
     static func pr(_ repo: GitHubRepoRef, _ p: PullRequest) -> GitHubPR {
         GitHubPR(number: p.number, htmlURL: "https://github.com/\(repo.owner)/\(repo.name)/pull/\(p.number)", state: p.state, merged: p.merged,
-                 headRef: p.head, headSHA: p.headSHA, baseRef: p.base)
+                 headRef: p.head, headSHA: p.headSHA, baseRef: p.base, title: p.title, body: p.body)
     }
 
     func update(_ repo: GitHubRepoRef, _ change: (inout Repo) -> Void) {

@@ -5,15 +5,19 @@ import Foundation
 /// and watches it for a close upstream. Task 4's `PRStep` calls `advance` for every open landing each tick; the waits on checks,
 /// reviews and the merge are Tasks 4–6.
 ///
-/// `pushing` → `pushed` → `opening` → `open`. Every transition is written to `prLanding`; a refused or failed action records
-/// `lastError` and the state stays (the next `advance` tries again, reconciling first). Every action goes through the one gate
-/// (`PRActionGate`; production's `NoChannelGate` refuses everything, so nothing reaches GitHub on this tree):
+/// `pushing` → `pushed` → `opening` → `open`. Every transition is written to `prLanding` as a compare-and-set on the (state,
+/// commit) the pass read (`Store.casPRLanding`): when an owner's abandon, a newer `begin` or a close upstream got there first,
+/// nothing is written and the pass stops — no push is recorded over it and no PR is opened for it. A refused or failed action
+/// records `lastError` and the state stays (the next `advance` tries again, reconciling first). Every action goes through the one
+/// gate (`PRActionGate`; production's `NoChannelGate` refuses everything, so nothing reaches GitHub on this tree):
 /// - `refuse`: `lastError` is the rule;
-/// - `ask`: one owner card (`AskKind.prAction`, `Store.filePRActionCard`), `lastError` "waiting for the owner: <reason>"; the
-///   owner's approval lets exactly that action for exactly that commit run once even though the gate would ask again (that is
-///   the answer to the ask, not a second path), never when the gate refuses; a decline stops it ("the owner declined: ...").
+/// - `ask`: one owner card (`AskKind.prAction`, `Store.filePRActionCard`) bound to the digest of exactly the request it shows
+///   (`PRActionDigest`), `lastError` "waiting for the owner: <reason>"; the owner's approval answers a later `ask` only for a
+///   request with the same digest (`CardGate`), never a `refuse`; any change — title, body, base, commit, visibility, taint,
+///   first use, reason — voids the card and files a fresh one; a decline stops it ("the owner declined: ...").
 /// Reconciling, never pushing or opening blind: a `pushing` landing first reads the branch on GitHub (it may already hold the
-/// commit), and an `opening` one first lists the pull requests for its head.
+/// commit), and an `opening` one (or one with a PR) first reads the pull requests on its head — adopting only the engine's own
+/// (Ruling 28: base, head commit and content digest as sent); any other open PR there holds the landing for the owner.
 public actor PRLandingMachine: PRLandingBeginning {
     let store: Store
     let github: any GitHubAPI
@@ -22,7 +26,7 @@ public actor PRLandingMachine: PRLandingBeginning {
     /// The company's GitHub repository (a channel core will supply it); nil holds every landing of the company.
     let repo: @Sendable (_ companyId: String) -> GitHubRepoRef?
     let clock: @Sendable () -> Date
-    /// Items with a pass in flight: a second call for one of them returns at once (the actor is reentrant across awaits).
+    /// Items with a pass in flight: a second `advance` for one of them returns at once (the actor is reentrant across awaits).
     private var busy: Set<String> = []
 
     public init(store: Store, github: any GitHubAPI, gate: any PRActionGate, push: PushBranchStage,
@@ -33,6 +37,9 @@ public actor PRLandingMachine: PRLandingBeginning {
     static let noRepoText = "no GitHub repository is linked to this company"
     static func waitingText(_ reason: String) -> String { "waiting for the owner: \(reason)" }
     static func declinedText(_ reason: String) -> String { "the owner declined: \(reason)" }
+    static func foreignPRText(_ branch: String, _ number: Int) -> String {
+        "a pull request Brahma did not open exists on \(branch) (#\(number)); close it or abandon the landing"
+    }
 
     // MARK: Entry points
 
@@ -49,9 +56,11 @@ public actor PRLandingMachine: PRLandingBeginning {
     }
 
     /// One pass for one item: `pushing` pushes (then opens), `pushed`/`opening` opens, an open PR is checked for a close upstream.
+    /// The pass stops as soon as the landing is not the one it started on (another commit) or did not move as its step wrote.
     public func advance(itemId: String) async {
         guard busy.insert(itemId).inserted else { return }
         defer { busy.remove(itemId) }
+        var startSHA: String?
         var pushedThisPass = false
         while true {
             let landing: PRLanding, item: WorkItem
@@ -62,12 +71,14 @@ public actor PRLandingMachine: PRLandingBeginning {
                 note("\(itemId): the landing could not be read: \(error)")
                 return
             }
+            if let startSHA, startSHA != landing.pushedSHA { return }
+            startSHA = landing.pushedSHA
             guard let repo = self.repo(landing.companyId) else { return hold(landing, Self.noRepoText) }
             switch landing.state {
             case .pushing where !pushedThisPass:
                 await pushStep(landing, item, repo)
                 pushedThisPass = true
-                continue   // pushed now: open in the same pass
+                continue   // pushed now: open in the same pass (re-read: the CAS tells whether it still is ours)
             case .pushed, .opening:
                 await openStep(landing, item, repo)
             case .open, .checksFailed, .changesRequested, .mergeable:
@@ -105,7 +116,8 @@ public actor PRLandingMachine: PRLandingBeginning {
         // Reconcile: GitHub may already hold the commit (an unknown push, a crash after sending). Never a blind second push.
         do {
             if try await github.branch(repo, name: landing.branch)?.sha == landing.pushedSHA {
-                return transition(landing.itemId, consuming: card) { $0.state = .pushed; $0.lastError = nil }
+                if transition(landing, from: [.pushing], { $0.state = .pushed; $0.lastError = nil }) { consume(card) }
+                return
             }
         } catch {
             return hold(landing, "could not read \(landing.branch) on GitHub: \(Store.flat("\(error)", max: 200))")
@@ -122,16 +134,19 @@ public actor PRLandingMachine: PRLandingBeginning {
         } catch {
             return hold(landing, "the hand-off could not be read: \(Store.flat("\(error)", max: 200))")
         }
-        let stage = push.gated(by: gateFor(card, action: .pushBranch, itemId: item.id))
-        switch await stage.run(item: item, repo: repo, verifiedSHA: landing.pushedSHA, base: base, git: git, branch: landing.branch) {
+        let cardGate = CardGate(inner: gate, action: .pushBranch, itemId: item.id, sha: landing.pushedSHA, open: nil, approved: card.approval)
+        switch await push.gated(by: cardGate).run(item: item, repo: repo, verifiedSHA: landing.pushedSHA, base: base, git: git,
+                                                    branch: landing.branch) {
         case .pushed:
             consume(card)
         case .needsOwner(let reason, let payload):
-            fileCard(landing, action: .pushBranch, reason: reason, card: PRActionCard.push(item: item, payload: payload, reason: reason))
+            guard let digest = cardGate.askedDigest else { return hold(landing, Self.waitingText(reason)) }
+            fileCard(landing, action: .pushBranch, reason: reason, digest: digest, replacing: card,
+                     card: PRActionCard.push(item: item, payload: payload, reason: reason))
         case .refused(let why):
             hold(landing, why)
         case .failed:
-            break   // the stage recorded it: still `pushing`, with `lastError`
+            break   // the stage recorded it (still `pushing`, with `lastError`), unless the landing moved on meanwhile
         }
     }
 
@@ -143,21 +158,30 @@ public actor PRLandingMachine: PRLandingBeginning {
             return hold(landing, "the owner's cards could not be read: \(Store.flat("\(error)", max: 200))")
         }
         if let held = Self.heldByCard(card) { return hold(landing, held) }
+        let info: RepoInfo
+        do { info = try await github.repo(repo) } catch {
+            return hold(landing, "could not read \(repo.owner)/\(repo.name) on GitHub: \(Store.flat("\(error)", max: 200))")
+        }
         // Reconcile: an earlier open whose answer was lost, or this branch's PR from an earlier push of the item.
         if landing.state == .opening || landing.prNumber != nil {
             do {
-                if let pr = try await existingPR(landing, repo) { return opened(landing.itemId, pr, consuming: card) }
+                switch try await headPR(landing, repo, base: info.defaultBranch) {
+                case .ours(let pr): return opened(landing, from: [landing.state], pr, consuming: card)
+                case .foreign(let pr): return hold(landing, Self.foreignPRText(landing.branch, pr.number))
+                case .none: break
+                }
             } catch {
                 return hold(landing, "could not read the pull requests of \(landing.branch): \(Store.flat("\(error)", max: 200))")
             }
         }
-        let info: RepoInfo
         let request: OpenPullRequest
+        let bodyLines: [PRBody.Line]
         let action: PRActionRequest
         do {
-            info = try await github.repo(repo)
-            let body = try PRBodyInputs.recorded(store: store, item: item, repo: repo).render(item: item)
-            request = OpenPullRequest(title: PRBody.title(item: item), head: landing.branch, base: info.defaultBranch, body: body)
+            let inputs = try PRBodyInputs.recorded(store: store, item: item, repo: repo)
+            bodyLines = inputs.lines(item: item)
+            request = OpenPullRequest(title: PRBody.title(item: item), head: landing.branch, base: info.defaultBranch,
+                                      body: bodyLines.map(\.text).joined(separator: "\n") + "\n")
             action = PRActionRequest(type: .openPR, companyId: item.companyId, itemId: item.id, payload: nil,
                                      taintedSession: try PushBranchStage.sessionTainted(item, store: store), itemTainted: item.taintedOrigin,
                                      externalInput: false, firstUse: !(try store.hasOpenedPRLanding(companyId: item.companyId)),
@@ -165,49 +189,77 @@ public actor PRLandingMachine: PRLandingBeginning {
         } catch {
             return hold(landing, "could not prepare the pull request: \(Store.flat("\(error)", max: 200))")
         }
-        switch await gateFor(card, action: .openPR, itemId: item.id).decide(action) {
+        let cardGate = CardGate(inner: gate, action: .openPR, itemId: item.id, sha: landing.pushedSHA, open: request, approved: card.approval)
+        switch await cardGate.decide(action) {
         case .refuse(let rule):
             return hold(landing, rule)
         case .ask(let reason):
             return fileCard(landing, action: .openPR, reason: reason,
-                            card: PRActionCard.openPR(item: item, repo: repo, request: request, sha: landing.pushedSHA, reason: reason))
+                            digest: PRActionDigest.of(action, reason: reason, sha: landing.pushedSHA, open: request), replacing: card,
+                            card: PRActionCard.openPR(item: item, repo: repo, request: request, body: bodyLines, sha: landing.pushedSHA,
+                                                      reason: reason))
         case .auto:
             break
         }
-        // Sending: recorded first, so a crash or a lost answer is reconciled by the head, never opened blind again.
-        transition(landing.itemId) { $0.state = .opening; $0.lastError = nil }
+        // Sending: recorded first (with what is sent), so a crash or a lost answer is reconciled by the head, never opened blind
+        // again. Not recorded (the landing moved on, or the write failed) → nothing is sent.
+        let digest = PRBody.contentDigest(title: request.title, body: request.body)
+        guard transition(landing, from: [landing.state], { $0.state = .opening; $0.lastError = nil; $0.openDigest = digest }) else { return }
+        var sent = landing
+        sent.state = .opening
+        sent.openDigest = digest
         let why: String
         do {
             let pr = try await github.openPR(repo, request)
-            return opened(landing.itemId, pr, consuming: card)
+            return opened(sent, from: [.opening], pr, consuming: card)
         } catch GitHubAPIError.rejected(let status, let message) {
             why = "GitHub refused the pull request (\(status)): \(Store.flat(message, max: 200))"
         } catch {
             why = "the pull request may not have been opened (\(Store.flat("\(error)", max: 160)))"
         }
-        // Read back: GitHub says whether a PR for the head exists (it refuses a second open PR for one head anyway).
+        // Read back: GitHub says whether the engine's PR exists on the head (it refuses a second open PR for one head anyway).
         do {
-            if let pr = try await existingPR(landing, repo) { return opened(landing.itemId, pr, consuming: card) }
-            hold(landing, "\(why); no pull request for \(landing.branch) was found")
+            switch try await headPR(sent, repo, base: info.defaultBranch) {
+            case .ours(let pr): opened(sent, from: [.opening], pr, consuming: card)
+            case .foreign(let pr): hold(sent, Self.foreignPRText(sent.branch, pr.number))
+            case .none: hold(sent, "\(why); no pull request for \(sent.branch) was found")
+            }
         } catch {
-            hold(landing, "\(why); GitHub could not be read: \(Store.flat("\(error)", max: 120))")
+            hold(sent, "\(why); GitHub could not be read: \(Store.flat("\(error)", max: 120))")
         }
     }
 
-    /// The PR for the landing's branch: its recorded one while open, else from the list for `<owner>:<branch>` — an open one at
-    /// the pushed commit first, then any open one, then a closed one at the pushed commit (the watch then ends the landing).
-    private func existingPR(_ landing: PRLanding, _ repo: GitHubRepoRef) async throws -> GitHubPR? {
-        if let number = landing.prNumber, let pr = try await github.pull(repo, number: number), pr.isOpen, pr.headRef == landing.branch {
-            return pr
+    enum HeadPR { case ours(GitHubPR), foreign(GitHubPR), none }
+
+    /// The pull requests on the landing's branch (its recorded one, and `GET /pulls?head=<owner>:<branch>&state=all`). One is the
+    /// engine's (Ruling 28) only when its base is the default branch read now, its head is the pushed commit and its title and
+    /// body digest to what the engine sent (`openDigest`); the open one of those first, else the newest. Any other open PR on the
+    /// head is foreign: never adopted.
+    private func headPR(_ landing: PRLanding, _ repo: GitHubRepoRef, base: String) async throws -> HeadPR {
+        var candidates: [GitHubPR] = []
+        if let number = landing.prNumber, let pr = try await github.pull(repo, number: number), pr.headRef == landing.branch {
+            candidates.append(pr)
         }
-        let all = try await github.pulls(repo, head: "\(repo.owner):\(landing.branch)", state: "all").filter { $0.headRef == landing.branch }
-        return all.first { $0.isOpen && $0.headSHA == landing.pushedSHA }
-            ?? all.first { $0.isOpen }
-            ?? all.filter { !$0.isOpen && $0.headSHA == landing.pushedSHA }.max { $0.number < $1.number }
+        for pr in try await github.pulls(repo, head: "\(repo.owner):\(landing.branch)", state: "all")
+        where pr.headRef == landing.branch && !candidates.contains(where: { $0.number == pr.number }) {
+            candidates.append(pr)
+        }
+        func ours(_ pr: GitHubPR) -> Bool {
+            guard let sent = landing.openDigest else { return false }
+            return pr.baseRef == base && pr.headSHA == landing.pushedSHA && PRBody.contentDigest(title: pr.title, body: pr.body) == sent
+        }
+        let mine = candidates.filter(ours)
+        if let pr = mine.filter(\.isOpen).max(by: { $0.number < $1.number }) ?? mine.max(by: { $0.number < $1.number }) { return .ours(pr) }
+        if let pr = candidates.filter(\.isOpen).min(by: { $0.number < $1.number }) { return .foreign(pr) }
+        return .none
     }
 
-    private func opened(_ itemId: String, _ pr: GitHubPR, consuming card: PRActionCardState) {
-        transition(itemId, consuming: card) { $0.state = .open; $0.prNumber = pr.number; $0.prURL = pr.htmlURL; $0.lastError = nil }
+    private func opened(_ landing: PRLanding, from states: Set<PRLandingState>, _ pr: GitHubPR, consuming card: PRActionCardState) {
+        if transition(landing, from: states, { $0.state = .open; $0.prNumber = pr.number; $0.prURL = pr.htmlURL; $0.lastError = nil }) {
+            consume(card)
+        } else {
+            note("\(landing.itemId): PR #\(pr.number) is on GitHub, but the landing moved on meanwhile; it was not recorded")
+        }
     }
 
     // MARK: Watch
@@ -222,12 +274,15 @@ public actor PRLandingMachine: PRLandingBeginning {
         }
         guard let pr else { return hold(landing, "PR #\(number) was not found on GitHub") }
         if !pr.isOpen, !pr.merged {
-            do { try store.closePRLandingUpstream(itemId: item.id, number: number, now: clock()) } catch {
+            do {
+                try store.closePRLandingUpstream(itemId: item.id, number: number, from: landing.state, sha: landing.pushedSHA, now: clock())
+            } catch {
                 note("\(item.key): the close of PR #\(number) could not be recorded: \(error)")
             }
             return
         }
-        transition(landing.itemId) { $0.lastPolled = self.clock() }
+        let now = clock()
+        transition(landing, from: [landing.state]) { $0.lastPolled = now }
     }
 
     // MARK: Owner cards
@@ -241,16 +296,14 @@ public actor PRLandingMachine: PRLandingBeginning {
         }
     }
 
-    /// The gate, or — when the owner approved exactly this action — the gate with its `ask` for it answered.
-    private func gateFor(_ card: PRActionCardState, action: GitHubActionType, itemId: String) -> any PRActionGate {
-        guard case .approved = card else { return gate }
-        return OwnerApprovedGate(inner: gate, action: action, itemId: itemId)
-    }
-
-    private func fileCard(_ landing: PRLanding, action: GitHubActionType, reason: String, card: PRActionCard) {
+    /// Files the card for the request the gate asked about. An approved card it replaces (its request no longer matches what
+    /// would run) is voided first, so the owner sees the new request on a fresh card.
+    private func fileCard(_ landing: PRLanding, action: GitHubActionType, reason: String, digest: String, replacing old: PRActionCardState,
+                          card: PRActionCard) {
         do {
+            if case .approved(let askId, _) = old { try store.voidPRActionCard(askId: askId, now: clock()) }
             try store.filePRActionCard(companyId: landing.companyId, itemId: landing.itemId, action: action, sha: landing.pushedSHA,
-                                       reason: reason, card: card, now: clock())
+                                       reason: reason, digest: digest, card: card, now: clock())
         } catch {
             return hold(landing, "\(Self.waitingText(reason)) (the card could not be filed: \(Store.flat("\(error)", max: 160)))")
         }
@@ -258,7 +311,7 @@ public actor PRLandingMachine: PRLandingBeginning {
     }
 
     private func consume(_ card: PRActionCardState) {
-        guard case .approved(let askId) = card else { return }
+        guard case .approved(let askId, _) = card else { return }
         do { try store.consumePRActionApproval(askId: askId, now: clock()) } catch {
             note("the approval \(askId) could not be marked used: \(error)")
         }
@@ -266,17 +319,18 @@ public actor PRLandingMachine: PRLandingBeginning {
 
     // MARK: Records
 
-    /// The state stays; `lastError` says why.
+    /// The state stays; `lastError` says why (only while the landing is still where this pass read it).
     private func hold(_ landing: PRLanding, _ why: String) {
-        transition(landing.itemId) { $0.lastError = why }
+        transition(landing, from: [landing.state]) { $0.lastError = why }
     }
 
-    private func transition(_ itemId: String, consuming card: PRActionCardState = .none, _ change: (inout PRLanding) -> Void) {
-        do { try store.updatePRLanding(itemId: itemId, now: clock(), change) } catch {
-            note("\(itemId): the landing could not be recorded: \(error)")
-            return
+    /// Compare-and-set on (`states`, the landing's commit); true when written.
+    @discardableResult
+    private func transition(_ landing: PRLanding, from states: Set<PRLandingState>, _ change: (inout PRLanding) -> Void) -> Bool {
+        do { return try store.casPRLanding(itemId: landing.itemId, from: states, sha: landing.pushedSHA, now: clock(), change) } catch {
+            note("\(landing.itemId): the landing could not be recorded: \(error)")
+            return false
         }
-        consume(card)
     }
 
     private nonisolated func note(_ text: String) {
@@ -284,16 +338,42 @@ public actor PRLandingMachine: PRLandingBeginning {
     }
 }
 
-/// The gate for one action the owner approved (Ruling 26): the inner gate still decides, and its `ask` for exactly that action
-/// of that item is answered by the approval. A `refuse` stands; any other request is the inner gate's alone.
-struct OwnerApprovedGate: PRActionGate {
+extension PRActionCardState {
+    /// The approved card's ask and the digest its approval answers, if approved.
+    var approval: (askId: String, digest: String)? {
+        if case .approved(let askId, let digest) = self { return (askId, digest) }
+        return nil
+    }
+}
+
+/// The gate for one action of one item (Ruling 26, Rulings X8-21 and 29): the inner gate decides; when it asks about exactly
+/// that action of that item, the ask's digest (`PRActionDigest`: the request, the PR content for `open-pr`, the reason) is
+/// remembered, and an owner approval with that very digest answers it (`auto`). A `refuse` stands; another digest stays an ask
+/// (the machine files a fresh card); any other request is the inner gate's alone.
+final class CardGate: PRActionGate, @unchecked Sendable {
     let inner: any PRActionGate
     let action: GitHubActionType
     let itemId: String
+    let sha: String
+    let open: OpenPullRequest?
+    let approved: (askId: String, digest: String)?
+    private let lock = NSLock()
+    private var lastAsk: String?
+
+    init(inner: any PRActionGate, action: GitHubActionType, itemId: String, sha: String, open: OpenPullRequest?,
+         approved: (askId: String, digest: String)?) {
+        self.inner = inner; self.action = action; self.itemId = itemId; self.sha = sha; self.open = open; self.approved = approved
+    }
+
+    /// The digest of the last ask about this action of this item.
+    var askedDigest: String? { lock.withLock { lastAsk } }
 
     func decide(_ r: PRActionRequest) async -> PRActionDecision {
         let decision = await inner.decide(r)
-        guard case .ask = decision, r.type == action, r.itemId == itemId else { return decision }
-        return .auto
+        guard case .ask(let reason) = decision, r.type == action, r.itemId == itemId else { return decision }
+        let digest = PRActionDigest.of(r, reason: reason, sha: sha, open: open)
+        lock.withLock { lastAsk = digest }
+        if let approved, approved.digest == digest { return .auto }
+        return decision
     }
 }

@@ -76,5 +76,11 @@ extension Migrations {
                 """)
             try db.execute(sql: "CREATE UNIQUE INDEX prActionApproval_tuple ON prActionApproval(companyId, itemId, action, sha)")
         }
+        // Task 3 fix round 1: the approval is bound to exactly what the owner saw (Rulings X8-21, 29: `digest` of the canonical
+        // request), and a landing remembers the digest of the PR content it sent (Ruling 28: only that PR is ever adopted).
+        m.registerMigration("vX5-pr-3") { db in
+            try db.alter(table: "prActionApproval") { t in t.add(column: "digest", .text).notNull().defaults(to: "") }
+            try db.alter(table: "prLanding") { t in t.add(column: "openDigest", .text) }
+        }
     }
 }

@@ -30,9 +30,13 @@ public struct PRLanding: Codable, Equatable, Sendable, FetchableRecord, Persista
     /// The merge commit (or `pushedSHA` for a rebase merge) once GitHub reports the PR merged.
     public var mergedSHA: String? = nil
     public var updatedAt: Date
+    /// `PRBody.contentDigest` of the title and body the engine sent with its `open-pr` (`"vX5-pr-3"`): a PR on the branch is the
+    /// engine's only when its content matches (Ruling 28). Nil until the engine has sent one.
+    public var openDigest: String? = nil
 
     public init(itemId: String, companyId: String, branch: String, pushedSHA: String, prNumber: Int? = nil, prURL: String? = nil,
-                state: PRLandingState, lastPolled: Date? = nil, lastError: String? = nil, mergedSHA: String? = nil, updatedAt: Date) {
+                state: PRLandingState, lastPolled: Date? = nil, lastError: String? = nil, mergedSHA: String? = nil, updatedAt: Date,
+                openDigest: String? = nil) {
         self.itemId = itemId
         self.companyId = companyId
         self.branch = branch
@@ -44,5 +48,6 @@ public struct PRLanding: Codable, Equatable, Sendable, FetchableRecord, Persista
         self.lastError = lastError
         self.mergedSHA = mergedSHA
         self.updatedAt = updatedAt
+        self.openDigest = openDigest
     }
 }

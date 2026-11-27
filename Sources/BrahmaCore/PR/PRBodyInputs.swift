@@ -17,15 +17,21 @@ public struct PRBodyInputs: Equatable, Sendable {
                       agentNotes: agentNotes, fixes: fixes)
     }
 
+    /// `render`'s lines, marked engine or agent (the owner card shows every engine line).
+    public func lines(item: WorkItem) -> [PRBody.Line] {
+        PRBody.lines(item: item, pack: pack, acceptance: acceptance, checks: checks, verdict: verdict, walkthroughURL: walkthroughURL,
+                     agentNotes: agentNotes, fixes: fixes)
+    }
+
     /// From the store:
-    /// - pack: the company's;
+    /// - pack: the company's (`none` when its row cannot be found: never a guessed pack);
     /// - acceptance: the item's criteria, one per line (list markers dropped);
     /// - checks: the item's latest engine check run (`verificationRun`): its purpose, status and time;
     /// - verdict: the latest `reviewApproved` event — the reviewer agent's role, or `engine` for the engine's approval;
     /// - agent notes: the author's submit summary (`submitSummary`), as untrusted text;
     /// - fixes: the issue the item was imported from, when it is an issue of `repo`.
     public static func recorded(store: Store, item: WorkItem, repo: GitHubRepoRef) throws -> PRBodyInputs {
-        let pack = try store.company(id: item.companyId)?.packId ?? "software"
+        let pack = try store.company(id: item.companyId).map(\.packId) ?? "none"
         let acceptance = item.acceptanceCriteria.components(separatedBy: .newlines).map(criterion).filter { !$0.isEmpty }
         var checks: [PRBody.CheckRow] = []
         if let run = try store.latestVerification(itemId: item.id) {

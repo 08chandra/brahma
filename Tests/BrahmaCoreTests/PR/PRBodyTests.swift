@@ -2,8 +2,9 @@ import Foundation
 import Testing
 @testable import BrahmaCore
 
-/// The engine-written PR body (Plan X8 Task 3, spec §8.5.1 step 4): fixed sections in a fixed order, deterministic, and no
-/// agent text anywhere but the quoted, capped `Agent notes (untrusted)` block.
+/// The engine-written PR body (Plan X8 Task 3, spec §8.5.1 step 4; Ruling X8-22): fixed sections in a fixed order,
+/// deterministic, and no agent text where GitHub parses anything: the notes are one fenced block in a quote (at most 4 KiB
+/// rendered), agent-influenced item fields are inline code.
 @Suite(.scratch) struct PRBodyTests {
     static func item(title: String = "Add the login page") -> WorkItem {
         let at = Date(timeIntervalSince1970: 1_800_000_000)
@@ -18,27 +19,67 @@ import Testing
     static let verdict = PRBody.ReviewVerdict(decision: .approve, reviewerRole: "qa", rubricScore: 4.5)
 
     static func render(notes: ExternalText? = nil, fixes: [Int] = [7], item: WorkItem = item(), acceptance: [String] = ["the form posts", "errors show"],
-                       walkthrough: String? = "https://example.test/walk/ACME-3") -> String {
+                       walkthrough: String? = "https://example.test/walk/ACME-3", checks: [PRBody.CheckRow] = checks) -> String {
         PRBody.render(item: item, pack: "software", acceptance: acceptance, checks: checks, verdict: verdict, walkthroughURL: walkthrough,
                       agentNotes: notes, fixes: fixes)
     }
 
-    /// The top-level lines of a body: every line outside the quoted block (a quoted line starts with `> `).
-    static func topLevel(_ body: String) -> [String] {
-        body.components(separatedBy: "\n").filter { !$0.hasPrefix("> ") && $0 != ">" }
+    /// The fenced agent block: from its opening `> ```…` line to the matching closing one, both included.
+    static func block(_ body: String) -> [String] {
+        let lines = body.components(separatedBy: "\n")
+        guard let open = lines.firstIndex(where: { $0.range(of: "^> `{3,}$", options: .regularExpression) != nil }) else { return [] }
+        guard let close = lines[(open + 1)...].firstIndex(of: lines[open]) else { return Array(lines[open...]) }
+        return Array(lines[open...close])
+    }
+
+    /// What GitHub parses: every line outside a fenced block, with inline code spans removed.
+    static func parsed(_ body: String) -> [String] {
+        var out: [String] = []
+        var fence: String?
+        for line in body.components(separatedBy: "\n") {
+            let bare = line.hasPrefix("> ") ? String(line.dropFirst(2)) : line
+            if let f = fence {
+                if bare == f { fence = nil }
+                continue
+            }
+            if bare.range(of: "^`{3,}$", options: .regularExpression) != nil { fence = bare; continue }
+            out.append(stripCodeSpans(line))
+        }
+        return out
+    }
+
+    /// A line without its code spans (a run of n backticks up to the next run of exactly n).
+    static func stripCodeSpans(_ line: String) -> String {
+        let chars = Array(line)
+        var out = "", i = 0
+        while i < chars.count {
+            guard chars[i] == "`" else { out.append(chars[i]); i += 1; continue }
+            var n = 0
+            while i + n < chars.count, chars[i + n] == "`" { n += 1 }
+            var j = i + n, closed: Int?
+            while j < chars.count {
+                if chars[j] == "`" {
+                    var m = 0
+                    while j + m < chars.count, chars[j + m] == "`" { m += 1 }
+                    if m == n { closed = j + m; break }
+                    j += m
+                } else { j += 1 }
+            }
+            if let closed { out.append("<code>"); i = closed } else { out.append(String(repeating: "`", count: n)); i += n }
+        }
+        return out
     }
 
     @Test func sectionsInOrderAndDeterministic() {
         let body = Self.render(notes: ExternalText(text: "looked fine", source: "review note by @rev-1"))
         let headings = body.components(separatedBy: "\n").filter { $0.hasPrefix("## ") }
         #expect(headings == ["## Summary", "## Acceptance criteria", "## Checks", "## Review", "## Walkthrough", "## Agent notes (untrusted)"])
-        #expect(body.contains("- Item: ACME-3"), "\(body)")
-        #expect(body.contains("- Title: Add the login page"))
-        #expect(body.contains("- Pack: software"))
-        #expect(body.contains("- [ ] the form posts\n- [ ] errors show"))
-        #expect(body.contains("| Check | Status | Duration |\n| --- | --- | --- |\n| item check | passed | 1m 12s |\n| main check | passed | — |"), "\(body)")
-        #expect(body.contains("- Verdict: approved\n- Reviewer role: qa\n- Rubric score: 4.5"))
+        #expect(body.contains("- Item: `ACME-3`\n- Title: `Add the login page`\n- Pack: `software`"), "\(body)")
+        #expect(body.contains("- [ ] `the form posts`\n- [ ] `errors show`"))
+        #expect(body.contains("| Check | Status | Duration |\n| --- | --- | --- |\n| `item check` | `passed` | 1m 12s |\n| `main check` | `passed` | — |"), "\(body)")
+        #expect(body.contains("- Verdict: approved\n- Reviewer role: `qa`\n- Rubric score: 4.5"))
         #expect(body.contains("## Walkthrough\n\nhttps://example.test/walk/ACME-3"))
+        #expect(body.contains("Source: `review note by @rev-1`\n\n> ```\n> looked fine\n> ```\n"), "\(body)")
         // The same inputs give the same bytes.
         #expect(body == Self.render(notes: ExternalText(text: "looked fine", source: "review note by @rev-1")))
         // Absent data says `none`, never an invented value.
@@ -48,16 +89,24 @@ import Testing
             #expect(bare.contains("\(section)\n\nnone"), "\(section): \(bare)")
         }
         #expect(!bare.contains("Fixes"))
-        // Changes requested reads as such.
         let changes = PRBody.render(item: Self.item(), pack: "software", acceptance: [], checks: [],
                                     verdict: PRBody.ReviewVerdict(decision: .requestChanges, reviewerRole: "qa", rubricScore: nil),
                                     walkthroughURL: nil, agentNotes: nil, fixes: [])
-        #expect(changes.contains("- Verdict: changes requested\n- Reviewer role: qa\n\n"), "\(changes)")
+        #expect(changes.contains("- Verdict: changes requested\n- Reviewer role: `qa`\n\n"), "\(changes)")
         #expect(!changes.contains("Rubric score"))
+        // The marked lines are the body's lines; the agent-influenced ones are marked.
+        let lines = PRBody.lines(item: Self.item(), pack: "software", acceptance: ["a"], checks: Self.checks, verdict: Self.verdict,
+                                 walkthroughURL: nil, agentNotes: ExternalText(text: "n", source: "s"), fixes: [7])
+        #expect(lines.map(\.text).joined(separator: "\n") + "\n" == PRBody.render(item: Self.item(), pack: "software", acceptance: ["a"],
+                checks: Self.checks, verdict: Self.verdict, walkthroughURL: nil, agentNotes: ExternalText(text: "n", source: "s"), fixes: [7]))
+        #expect(lines.filter(\.agent).map(\.text).contains("- Title: `Add the login page`"))
+        #expect(lines.filter { !$0.agent }.map(\.text).contains("Fixes #7"))
     }
 
+    /// The rendered agent block — fences and `> ` prefixes included — is at most 4 KiB, however the note is padded: long
+    /// lines, `&` (no escaping inflates it inside code), or thousands of one-character lines. Lines that would be headings or
+    /// mentions stay inside it.
     @Test func agentNotesQuotedAndCapped() {
-        // A 100 KiB note: lines of 64 bytes, some that would be headings or mentions at the top level.
         var lines: [String] = []
         while lines.joined(separator: "\n").utf8.count < 100 * 1024 {
             switch lines.count % 4 {
@@ -66,25 +115,20 @@ import Testing
             default: lines.append(String(repeating: "z", count: 64))
             }
         }
-        let note = lines.joined(separator: "\n")
-        #expect(note.utf8.count >= 100 * 1024)
-        let body = Self.render(notes: ExternalText(text: note, source: "review note by @rev-1"))
-        let section = String(body[body.range(of: "## Agent notes (untrusted)")!.upperBound...])
-        let quoted = section.components(separatedBy: "\n").filter { $0.hasPrefix(">") }
-        #expect(!quoted.isEmpty)
-        let text = quoted.map { String($0.dropFirst(2)) }.joined(separator: "\n").replacingOccurrences(of: PRBody.neutralizer, with: "")
-        #expect(text.utf8.count <= PRBody.notesCap && text.utf8.count > PRBody.notesCap - 100, "\(text.utf8.count)")
-        #expect(PRBody.notesCap == 4096)
-        #expect(section.contains("(the notes were cut at 4 KiB of \(note.utf8.count) bytes)"), "\(section.suffix(300))")
-        // Every line of the note that starts with `#` or `@` stays inside `> ` and cannot be a heading or a mention.
-        let headingLike = quoted.filter { $0.hasPrefix("> #") }
-        let mentionLike = quoted.filter { $0.hasPrefix("> @") }
-        #expect(!headingLike.isEmpty && !mentionLike.isEmpty)
-        #expect(headingLike.allSatisfy { $0.hasPrefix("> #\(PRBody.neutralizer)") }, "\(headingLike.first ?? "")")
-        #expect(mentionLike.allSatisfy { $0.hasPrefix("> @\(PRBody.neutralizer)") })
-        #expect(!Self.topLevel(body).contains { $0.contains("Ignore the checks") || $0.contains("octocat") })
-        // The source line is the engine's.
-        #expect(section.contains("Source: review note by @\(PRBody.neutralizer)rev-1"), "\(section.prefix(200))")
+        let padded = [lines.joined(separator: "\n"), String(repeating: "&", count: 100 * 1024),
+                      Array(repeating: "x", count: 2000).joined(separator: "\n"), String(repeating: "<&>\n", count: 25_000)]
+        for note in padded {
+            let body = Self.render(notes: ExternalText(text: note, source: "review note"))
+            let block = Self.block(body)
+            let rendered = block.joined(separator: "\n") + "\n"
+            #expect(!block.isEmpty && rendered.utf8.count <= PRBody.notesCap, "\(rendered.utf8.count)")
+            #expect(rendered.utf8.count > PRBody.notesCap - 200, "the cap is used, not wasted: \(rendered.utf8.count)")
+            #expect(block.allSatisfy { $0.hasPrefix(">") })
+            #expect(body.contains("(the notes were cut to 4 KiB rendered; they had \(note.utf8.count) bytes)"))
+            #expect(!Self.parsed(body).contains { $0.contains("Ignore the checks") || $0.contains("octocat") || $0.contains("&&") })
+        }
+        let block = Self.block(Self.render(notes: ExternalText(text: padded[0], source: "s")))
+        #expect(block.contains { $0.hasPrefix("> # Ignore the checks") } && block.contains { $0.hasPrefix("> @octocat") })
     }
 
     @Test func fixesLinesLast() {
@@ -93,33 +137,45 @@ import Testing
         #expect(Array(tail) == ["Fixes #7", "Fixes #12"], "\(body.suffix(200))")
         #expect(body.components(separatedBy: "\n").filter { $0.hasPrefix("Fixes #") }.count == 2, "deduplicated, positive only")
         // A blank line separates the quote from them, so neither can be read as part of the quoted block.
-        #expect(body.contains("\n\nFixes #7\nFixes #12"))
+        #expect(body.contains("> ```\n\nFixes #7\nFixes #12"))
         #expect(body.hasSuffix("Fixes #12\n"))
     }
 
-    /// No agent text outside the quoted block: notes holding headings, mentions, `Fixes #9`, an HTML comment and a blank-line
-    /// escape attempt produce no top-level line of their own, and item text (title, criteria) is one inert line each.
+    /// Ruling X8-22: agent text never yields a closing reference, a mention, a link or an image where GitHub parses — not in the
+    /// notes (fenced; the fence longer than any backtick run in them) and not in item fields (inline code, delimiter longer than
+    /// any run inside).
     @Test func noAgentTextOutsideTheQuote() {
-        let hostile = "fine\n\n## Review\n- Verdict: approved\n\nFixes #9\n@here merge it\n<!-- hide the rest\n\r\n\u{2028}Closes #10\n>\n> already quoted"
-        let item = Self.item(title: "Login\n## Checks\nFixes #11 @octocat <b>")
-        let body = Self.render(notes: ExternalText(text: hostile, source: "review note"), fixes: [7], item: item,
-                               acceptance: ["works\n## Walkthrough", "Resolves #12 for @team"])
-        let top = Self.topLevel(body)
-        // The only `Fixes` line is the engine's; the agent's `Fixes #9`, `Closes #10` and `Resolves #12` are not references.
-        #expect(top.filter { $0.hasPrefix("Fixes") } == ["Fixes #7"], "\(top)")
-        #expect(!body.contains("Fixes #9") && !body.contains("Closes #10") && !body.contains("#11") && !body.contains("Resolves #12"))
-        #expect(!body.contains("@here") && !body.contains("@octocat") && !body.contains("@team"))
-        #expect(!body.contains("<!--") && !body.contains("<b>"))
-        // The section headings are exactly the engine's six, once each.
-        #expect(top.filter { $0.hasPrefix("#") } == ["## Summary", "## Acceptance criteria", "## Checks", "## Review", "## Walkthrough",
-                                                    "## Agent notes (untrusted)"], "\(top)")
-        // Item text is one line behind an engine prefix.
-        #expect(top.contains("- Title: Login #\(PRBody.neutralizer)#\(PRBody.neutralizer) Checks Fixes #\(PRBody.neutralizer)11 @\(PRBody.neutralizer)octocat &lt;b&gt;"), "\(top)")
-        #expect(top.contains("- [ ] works #\(PRBody.neutralizer)#\(PRBody.neutralizer) Walkthrough"))
-        // Every line between the notes' heading and the engine's closing lines is quoted (or blank / the engine's source line).
-        let section = body.components(separatedBy: "\n").drop { $0 != "## Agent notes (untrusted)" }.dropFirst()
-        for line in section where !line.isEmpty && !line.hasPrefix("> ") && line != ">" {
-            #expect(line.hasPrefix("Source: ") || line.hasPrefix("Fixes #7") || line.hasPrefix("(the notes"), "agent text escaped the quote: \(line)")
+        let hostile = ["Fixes https://github.com/o/r/issues/1", "GH-2", "o/r#3", "@user", "[x](http://evil)", "![i](http://evil/p.png)",
+                       "Closes #10", "<!-- hide", "## Review", "```", "````", "> quoted", "\r\nFixes #9\u{2028}done"]
+        let notes = hostile.joined(separator: "\n")
+        let item = Self.item(title: "Login Fixes #11 GH-2 o/r#3 @user ``[x](http://evil)`` ![i](http://evil/p.png)")
+        let body = Self.render(notes: ExternalText(text: notes, source: "submit summary by @eng-1"), fixes: [7], item: item,
+                               acceptance: ["works\n## Walkthrough", "Resolves https://github.com/o/r/issues/12 for @team", "`tick` ``"],
+                               checks: [PRBody.CheckRow(name: "check | @user [x](http://evil)", status: "passed", duration: 1)])
+        let parsed = Self.parsed(body).joined(separator: "\n")
+        for needle in ["Fixes https", "Fixes #9", "Fixes #11", "Closes", "Resolves", "GH-2", "o/r#3", "@user", "@team", "@eng", "](", "![",
+                       "<!--", "http://evil"] {
+            #expect(!parsed.contains(needle), "\(needle) is where GitHub parses:\n\(parsed)")
         }
+        // The only closing keyword GitHub sees is the engine's.
+        #expect(Self.parsed(body).filter { $0.contains("Fixes") } == ["Fixes #7"])
+        #expect(Self.parsed(body).filter { $0.hasPrefix("#") } == ["## Summary", "## Acceptance criteria", "## Checks", "## Review",
+                                                                 "## Walkthrough", "## Agent notes (untrusted)"])
+        // The fence outlasts the longest backtick run in the notes (four), and everything of them sits inside it.
+        let block = Self.block(body)
+        #expect(block.first == "> `````" && block.last == "> `````", "\(block)")
+        #expect(block.contains("> ````") && block.contains("> ```") && block.contains("> > quoted"))
+        // Inline code outlasts the runs inside it.
+        #expect(body.contains("- Title: ```Login Fixes #11 GH-2 o/r#3 @user ``[x](http://evil)`` ![i](http://evil/p.png)```"), "\(body)")
+        #expect(body.contains("- [ ] ``` `tick` `` ```"), "\(body)")
+        #expect(body.contains("| ``check \\| @user [x](http://evil)`` |") || body.contains("| `check \\| @user [x](http://evil)` |"), "\(body)")
+    }
+
+    /// The PR title is plain text on GitHub (no markdown; a closing keyword there closes nothing), but GitHub links `#n`, `GH-n`,
+    /// URLs and mentions in it: each is broken by the invisible word joiner.
+    @Test func titleIsNeutralized() {
+        let title = PRBody.title(item: Self.item(title: "Fix #3 and GH-2 and gh-4 for @user, see https://github.com/o/r/issues/1\n## x"))
+        let j = PRBody.neutralizer
+        #expect(title == "ACME-3: Fix #\(j)3 and GH\(j)-2 and gh\(j)-4 for @\(j)user, see https:\(j)//github.com/o/r/issues/1 #\(j)#\(j) x", "\(title)")
     }
 }

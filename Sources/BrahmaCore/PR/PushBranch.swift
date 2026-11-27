@@ -103,8 +103,13 @@ public struct PushBranchStage: Sendable {
         case .ask(let reason): return .needsOwner(reason: reason, payload: payload)
         case .auto: break
         }
-        // 3. Sending: recorded first, so a crash after this point is reconciled, not pushed blind a second time.
-        do { try record(item, branch: branch, sha: verifiedSHA, state: .pushing, error: nil) } catch {
+        // 3. Sending: recorded first, so a crash after this point is reconciled, not pushed blind a second time. Only while the
+        // landing is still `pushing` this commit (or new): an owner's abandon or a newer commit meanwhile stops the push.
+        do {
+            guard try record(item, branch: branch, sha: verifiedSHA, state: .pushing, error: nil) else {
+                return .refused("the landing moved on before the push (no longer pushing \(verifiedSHA.prefix(7))); nothing was pushed")
+            }
+        } catch {
             return .refused("could not record the push: \(Store.flat("\(error)", max: 200))")
         }
         let handle: TokenHandle
@@ -144,19 +149,17 @@ public struct PushBranchStage: Sendable {
         return agent.sessionTainted
     }
 
-    private func record(_ item: WorkItem, branch: String, sha: String, state: PRLandingState, error: String?) throws {
-        var landing = try store.prLanding(itemId: item.id)
-            ?? PRLanding(itemId: item.id, companyId: item.companyId, branch: branch, pushedSHA: sha, state: state, updatedAt: clock())
-        landing.branch = branch
-        landing.pushedSHA = sha
-        landing.state = state
-        landing.lastError = error
-        landing.updatedAt = clock()
-        try store.upsertPRLanding(landing)
+    /// The landing's record, compare-and-set (`Store.recordPushStage`): false when the landing moved on meanwhile.
+    private func record(_ item: WorkItem, branch: String, sha: String, state: PRLandingState, error: String?) throws -> Bool {
+        try store.recordPushStage(item: item, branch: branch, sha: sha, state: state, error: error, now: clock())
     }
 
     private func pushed(_ item: WorkItem, _ branch: String, _ payload: PushPayload) -> PushBranchOutcome {
-        do { try record(item, branch: branch, sha: payload.sha, state: .pushed, error: nil) } catch {
+        do {
+            guard try record(item, branch: branch, sha: payload.sha, state: .pushed, error: nil) else {
+                return .failed("pushed, but the landing moved on meanwhile (abandoned, closed or a newer commit); the push was not recorded")
+            }
+        } catch {
             // GitHub has the branch; the record is what failed. The next reconcile reads the branch again.
             return .failed("pushed, but the record failed: \(Store.flat("\(error)", max: 200))")
         }
@@ -164,7 +167,11 @@ public struct PushBranchStage: Sendable {
     }
 
     private func fail(_ item: WorkItem, _ branch: String, _ sha: String, _ why: String) -> PushBranchOutcome {
-        do { try record(item, branch: branch, sha: sha, state: .pushing, error: why) } catch {
+        do {
+            guard try record(item, branch: branch, sha: sha, state: .pushing, error: why) else {
+                return .failed("\(why); the landing moved on meanwhile")
+            }
+        } catch {
             return .failed("\(why); the record failed too: \(Store.flat("\(error)", max: 120))")
         }
         return .failed(why)

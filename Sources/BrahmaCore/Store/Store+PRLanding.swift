@@ -1,8 +1,10 @@
 import Foundation
 import GRDB
 
-/// The landing machine's writes (Plan X8 Task 3): every transition of an item's `prLanding` row goes through here or through
-/// `PushBranchStage`'s record of its own push.
+/// The landing machine's writes (Plan X8 Task 3): every transition of an item's `prLanding` row goes through here. The
+/// machine's and the push stage's writes are compare-and-set on the (state, commit) their pass started from, in one transaction
+/// (fix round 1, I1): an owner's abandon, a new `begin` or a close upstream that landed meanwhile is never overwritten, and the
+/// pass stops. `beginPRLanding` and `abandonPRLanding` are the authorities that move a landing on regardless.
 extension Store {
     /// What a non-owner is told when it tries to abandon a landing (Ruling 21).
     static let prAbandonOwnerOnly = "only the owner can abandon a PR landing"
@@ -22,6 +24,7 @@ extension Store {
                 landing.prNumber = nil
                 landing.prURL = nil
                 landing.mergedSHA = nil
+                landing.openDigest = nil
             }
             landing.pushedSHA = sha
             landing.state = .pushing
@@ -33,15 +36,37 @@ extension Store {
         }
     }
 
-    /// Changes the item's landing in one write (`updatedAt` set); nil when there is none.
+    /// Compare-and-set: changes the item's landing (`updatedAt` set) only while it is still in one of `states` at `sha`, in one
+    /// write. False — nothing written — when it moved on (or is gone).
     @discardableResult
-    func updatePRLanding(itemId: String, now: Date, _ change: (inout PRLanding) -> Void) throws -> PRLanding? {
+    func casPRLanding(itemId: String, from states: Set<PRLandingState>, sha: String, now: Date, _ change: (inout PRLanding) -> Void) throws -> Bool {
         try writer.write { db in
-            guard var landing = try PRLanding.fetchOne(db, key: itemId) else { return nil }
+            guard var landing = try PRLanding.fetchOne(db, key: itemId), states.contains(landing.state), landing.pushedSHA == sha else { return false }
             change(&landing)
             landing.updatedAt = now
             try landing.save(db)
-            return landing
+            return true
+        }
+    }
+
+    /// `PushBranchStage`'s record of its own push: creates the landing at `pushing`, or changes one still `pushing` at `sha`
+    /// (CAS, as `casPRLanding`). False — nothing written — when the landing moved on meanwhile.
+    func recordPushStage(item: WorkItem, branch: String, sha: String, state: PRLandingState, error: String?, now: Date) throws -> Bool {
+        try writer.write { db in
+            var landing: PRLanding
+            if let existing = try PRLanding.fetchOne(db, key: item.id) {
+                guard existing.state == .pushing, existing.pushedSHA == sha else { return false }
+                landing = existing
+            } else {
+                guard state == .pushing else { return false }
+                landing = PRLanding(itemId: item.id, companyId: item.companyId, branch: branch, pushedSHA: sha, state: .pushing, updatedAt: now)
+            }
+            landing.branch = branch
+            landing.state = state
+            landing.lastError = error
+            landing.updatedAt = now
+            try landing.save(db)
+            return true
         }
     }
 
@@ -65,10 +90,11 @@ extension Store {
 
     /// The PR was closed on GitHub without being merged: the landing ends `closedUpstream`, its owner cards are void, and the
     /// item's owner agent gets a work notice (a `mergeFailed` event: the item did not land, back to its holder).
-    func closePRLandingUpstream(itemId: String, number: Int, now: Date) throws {
+    /// CAS on (`state`, `sha`) the watch read.
+    func closePRLandingUpstream(itemId: String, number: Int, from state: PRLandingState, sha: String, now: Date) throws {
         try writer.write { db in
-            guard var landing = try PRLanding.fetchOne(db, key: itemId), landing.state.isOpen,
-                  let item = try WorkItem.fetchOne(db, key: itemId) else { return }
+            guard var landing = try PRLanding.fetchOne(db, key: itemId), landing.state == state, landing.pushedSHA == sha,
+                  landing.prNumber == number, let item = try WorkItem.fetchOne(db, key: itemId) else { return }
             landing.state = .closedUpstream
             landing.lastPolled = now
             landing.lastError = "PR #\(number) was closed on GitHub without merging"

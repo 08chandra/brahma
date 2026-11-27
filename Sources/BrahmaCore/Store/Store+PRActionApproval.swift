@@ -16,7 +16,7 @@ extension Store {
             switch ask?.status {
             case .pendingOwner?, .pendingInternal?: return .waiting(reason: row.reason)
             case .rejected?: return .declined(reason: row.reason)
-            case .approved? where row.isUsable: return .approved(askId: row.askId)
+            case .approved? where row.isUsable: return .approved(askId: row.askId, digest: row.digest)
             default:
                 _ = try row.delete(db)
                 return .none
@@ -25,10 +25,10 @@ extension Store {
     }
 
     /// Files the owner's `prAction` card for (item, action, sha), once: while a card for the tuple stands, it is returned
-    /// unchanged. Engine-filed (`requesterId` "system"), straight to the owner. Its request id is
+    /// unchanged. `digest` (`PRActionDigest.of` the request the card shows) is what its approval will answer. Engine-filed (`requesterId` "system"), straight to the owner. Its request id is
     /// `pr-<action>-<itemId>-<sha>` (a later card for the same tuple, after the first was rescinded or narrowed away, adds `-<n>`).
     @discardableResult
-    public func filePRActionCard(companyId: String, itemId: String, action: GitHubActionType, sha: String, reason: String,
+    public func filePRActionCard(companyId: String, itemId: String, action: GitHubActionType, sha: String, reason: String, digest: String,
                                  card: PRActionCard, now: Date = Store.now()) throws -> Ask {
         try writer.write { db in
             if let row = try Self.prActionRow(db, companyId: companyId, itemId: itemId, action: action, sha: sha),
@@ -42,7 +42,7 @@ extension Store {
             // A card for the tuple still pending whose record a restore dropped: the owner's open card is that one again.
             if let pending = earlier.first(where: { $0.status.isPending }) {
                 try PRActionApproval(askId: pending.id, companyId: companyId, itemId: itemId, action: action.name, sha: sha,
-                                     reason: Store.flat(reason, max: 500), createdAt: now).insert(db)
+                                     reason: Store.flat(reason, max: 500), createdAt: now, digest: digest).insert(db)
                 return pending
             }
             let requestId = earlier.isEmpty ? base : "\(base)-\(earlier.count + 1)"
@@ -54,7 +54,7 @@ extension Store {
                 throw WorkError.conflict("\(ask.ref) already stands for this \(action.name) and is \(ask.status.rawValue)")
             }
             try PRActionApproval(askId: ask.id, companyId: companyId, itemId: itemId, action: action.name, sha: sha,
-                                 reason: Store.flat(reason, max: 500), createdAt: now).insert(db)
+                                 reason: Store.flat(reason, max: 500), createdAt: now, digest: digest).insert(db)
             return ask
         }
     }
@@ -64,6 +64,18 @@ extension Store {
         try writer.write { db in
             try db.execute(sql: "UPDATE prActionApproval SET consumedAt = ? WHERE askId = ? AND approvedAt IS NOT NULL AND consumedAt IS NULL",
                            arguments: [now, askId])
+        }
+    }
+
+    /// The card no longer matches what would run (Rulings X8-21, 29: the request changed since the owner saw it): a pending one
+    /// is superseded, an approved one stays in the history but answers nothing; either way it is forgotten, so the next ask files
+    /// a fresh card.
+    public func voidPRActionCard(askId: String, now: Date = Store.now()) throws {
+        try writer.write { db in
+            if var ask = try Ask.fetchOne(db, key: askId), ask.status.isPending {
+                try settle(db, ask: &ask, status: .superseded, decidedBy: "system", tellRequesterToo: false, now: now)
+            }
+            _ = try PRActionApproval.deleteOne(db, key: askId)
         }
     }
 

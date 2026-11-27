@@ -169,7 +169,7 @@ import GRDB
         let acme = try env.company("Acme")
         func card(_ title: String, _ sha: String) throws -> (WorkItem, Ask) {
             let item = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(type: .task, title: title))
-            let ask = try env.store.filePRActionCard(companyId: acme.id, itemId: item.id, action: .pushBranch, sha: sha, reason: "first push",
+            let ask = try env.store.filePRActionCard(companyId: acme.id, itemId: item.id, action: .pushBranch, sha: sha, reason: "first push", digest: "d",
                                                      card: PRActionCard(title: "push-branch \(title)", summary: "first push",
                                                                         payload: AskPayload(details: "Action: push-branch")), now: Self.now)
             return (item, ask)
@@ -208,13 +208,13 @@ import GRDB
         let acme = try env.company("Acme")
         let item = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(type: .task, title: "t"))
         let ask = try env.store.filePRActionCard(companyId: acme.id, itemId: item.id, action: .openPR, sha: String(repeating: "e", count: 40),
-                                                 reason: "tainted", card: PRActionCard(title: "open-pr t", summary: "tainted",
+                                                 reason: "tainted", digest: "d", card: PRActionCard(title: "open-pr t", summary: "tainted",
                                                                                        payload: AskPayload(details: "Action: open-pr")), now: Self.now)
         try env.store.ownerDecide(askId: ask.id, approve: true)
         let waiting = try env.store.createWorkItem(companyId: acme.id, by: .owner, draft: WorkItemDraft(type: .task, title: "w"))
         let pendingCard = PRActionCard(title: "push-branch w", summary: "first push", payload: AskPayload(details: "Action: push-branch"))
         let pending = try env.store.filePRActionCard(companyId: acme.id, itemId: waiting.id, action: .pushBranch, sha: String(repeating: "f", count: 40),
-                                                     reason: "first push", card: pendingCard, now: Self.now)
+                                                     reason: "first push", digest: "d", card: pendingCard, now: Self.now)
         let service = env.service()
         let snapshot = try service.snapshot(reason: .manual)
         try env.store.close()
@@ -229,12 +229,12 @@ import GRDB
         // the owner's open card again (no second one).
         #expect(try restored.prActionCardState(companyId: acme.id, itemId: item.id, action: .openPR, sha: String(repeating: "e", count: 40)) == .none)
         let again = try restored.filePRActionCard(companyId: acme.id, itemId: item.id, action: .openPR, sha: String(repeating: "e", count: 40),
-                                                  reason: "tainted", card: PRActionCard(title: "open-pr t", summary: "tainted",
+                                                  reason: "tainted", digest: "d", card: PRActionCard(title: "open-pr t", summary: "tainted",
                                                                                         payload: AskPayload(details: "Action: open-pr")), now: Self.now)
         #expect(again.id != ask.id && again.status == .pendingOwner)
         #expect(again.requestId == "pr-open-pr-\(item.id)-\(String(repeating: "e", count: 40))-2")
         let same = try restored.filePRActionCard(companyId: acme.id, itemId: waiting.id, action: .pushBranch, sha: String(repeating: "f", count: 40),
-                                                 reason: "first push", card: pendingCard, now: Self.now)
+                                                 reason: "first push", digest: "d", card: pendingCard, now: Self.now)
         #expect(same.id == pending.id)
         #expect(try restored.prActionCardState(companyId: acme.id, itemId: waiting.id, action: .pushBranch,
                                                sha: String(repeating: "f", count: 40)) == .waiting(reason: "first push"))

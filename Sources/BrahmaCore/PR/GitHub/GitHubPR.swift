@@ -15,10 +15,14 @@ public struct GitHubPR: Equatable, Sendable {
     public var headSHA: String
     /// `base.ref`.
     public var baseRef: String
+    /// `title` and `body` (null on GitHub reads as empty): what proves the PR's content is the engine's (Ruling 28).
+    public var title: String
+    public var body: String
 
-    public init(number: Int, htmlURL: String, state: String, merged: Bool, headRef: String, headSHA: String, baseRef: String) {
+    public init(number: Int, htmlURL: String, state: String, merged: Bool, headRef: String, headSHA: String, baseRef: String,
+                title: String, body: String) {
         self.number = number; self.htmlURL = htmlURL; self.state = state; self.merged = merged
-        self.headRef = headRef; self.headSHA = headSHA; self.baseRef = baseRef
+        self.headRef = headRef; self.headSHA = headSHA; self.baseRef = baseRef; self.title = title; self.body = body
     }
 
     public var isOpen: Bool { state == "open" }
