@@ -104,6 +104,7 @@ import GRDB
         }
 
         // 1. The engine runs a turn (the owner's DM wakes the CEO).
+        let testStart = Date().timeIntervalSince1970 - 1
         let first = try Self.startEngine(home: home.url, bin: bin, log: log)
         var engines = [first]
         defer {
@@ -113,6 +114,16 @@ import GRDB
                 _ = Self.waitFor(30) { engine.hasExited() }
                 if !engine.hasExited() { engine.signalGroup(SIGKILL) }
                 engine.finish()
+            }
+            // Then any turn process of this company still alive (a fake `claude` the engines spawned for this test, in its own
+            // session): its group is killed, only while it is still that group's leader and started after this test began, so a
+            // recycled pid is never signalled.
+            let pids = (try? store.writer.read { db in
+                try Int32.fetchAll(db, sql: "SELECT pid FROM turn WHERE companyId = ? AND pid IS NOT NULL", arguments: [company.id])
+            }) ?? []
+            for pid in pids {
+                guard let entry = ProcessTable.entry(pid), !entry.isZombie, entry.pgid == pid, entry.start >= testStart else { continue }
+                killpg(pid, SIGKILL)
             }
         }
         try #require(try Self.brahma(["say", "Acme", "@ceo", "start the soak"], home: home.url).status == 0)

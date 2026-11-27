@@ -4,7 +4,8 @@
 #   BRAHMA_LIVE=1 scripts/soak/run-72h.sh <company> [--hours 72] [--kill-at <h>] [--state <dir>] [--resume]
 #
 # What it does:
-#   - starts `brahma run` itself and records its pid in <state>/engine.pid (there is no engine service on this tree);
+#   - starts `brahma run` itself and records its pid and start time (<state>/engine.pid, engine.lstart); a process is treated
+#     as that engine only while both match and its command line is `brahma run` (there is no engine service on this tree);
 #   - keeps the Mac awake for its own lifetime (`caffeinate -i -w <this script>`);
 #   - takes a checkpoint every hour: `brahma measure <co> --soak-checkpoint <state>/checkpoints/hNN.json`;
 #   - at --kill-at (default 24) checks that the recorded pid's command line is `brahma run`, sends SIGKILL to that pid only
@@ -30,16 +31,19 @@ usage() {
 
 [ $# -ge 1 ] || usage
 CO="$1"; shift
-case "$CO" in -*|"") usage ;; esac
+# The company names a directory under ~/.brahma-soak by default: no path separators, no parent references.
+case "$CO" in -*|""|*/*|*..*) echo "run-72h.sh: the company must be a plain name or slug (no '/' or '..')" >&2; usage ;; esac
 HOURS=72
 KILL_AT=24
 REBOOT_AT=48
 STATE=""
 RESUME=0
+HOURS_GIVEN=0
+KILL_GIVEN=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --hours) [ $# -ge 2 ] || usage; HOURS="$2"; shift 2 ;;
-        --kill-at) [ $# -ge 2 ] || usage; KILL_AT="$2"; shift 2 ;;
+        --hours) [ $# -ge 2 ] || usage; HOURS="$2"; HOURS_GIVEN=1; shift 2 ;;
+        --kill-at) [ $# -ge 2 ] || usage; KILL_AT="$2"; KILL_GIVEN=1; shift 2 ;;
         --state) [ $# -ge 2 ] || usage; STATE="$2"; shift 2 ;;
         --resume) RESUME=1; shift ;;
         *) usage ;;
@@ -67,13 +71,16 @@ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" | tee -a "$LOG"; }
 # The Mac stays awake while this script runs (idle sleep only; the owner's own sleep and the h48 reboot still happen).
 caffeinate -i -w $$ &
 
-# The recorded engine's pid, if that pid is still a `brahma run` (its command line checked), else nothing.
+# The recorded engine's pid, if that pid is still the process this script started: its command line is `brahma run` AND its
+# start time is the one recorded with it (a recycled pid has another), else nothing.
 engine_pid() {
-    local pid cmd
-    [ -f "$STATE/engine.pid" ] || return 0
+    local pid cmd started
+    [ -f "$STATE/engine.pid" ] && [ -f "$STATE/engine.lstart" ] || return 0
     pid="$(cat "$STATE/engine.pid")"
     case "$pid" in ''|*[!0-9]*) return 0 ;; esac
     cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+    started="$(ps -o lstart= -p "$pid" 2>/dev/null || true)"
+    [ -n "$started" ] && [ "$started" = "$(cat "$STATE/engine.lstart")" ] || return 0
     case "$cmd" in
         *brahma\ run|*brahma\ run\ *) echo "$pid" ;;
         *) ;;
@@ -83,6 +90,7 @@ engine_pid() {
 start_engine() {
     "$BRAHMA" run >>"$STATE/engine.log" 2>&1 &
     echo $! > "$STATE/engine.pid"
+    ps -o lstart= -p $! > "$STATE/engine.lstart" 2>/dev/null || true
     sleep 5
     if [ -z "$(engine_pid)" ]; then
         # It exited at once: most often another engine (the Brahma app, another `brahma run`) holds the data home.
@@ -141,18 +149,41 @@ sleep_until_hour() {
     while [ "$(date +%s)" -lt "$due" ]; do sleep 60; done
 }
 
+# Ctrl-C or a TERM stops the soak, never the engine: say what is left running and how to go on.
+on_signal() {
+    local pid
+    pid="$(engine_pid)"
+    if [ -n "$pid" ]; then
+        log "soak script stopped by a signal; brahma run (pid $pid) keeps running. Stop it with: kill -TERM $pid; or go on with --resume"
+    else
+        log "soak script stopped by a signal; no engine of this soak is running"
+    fi
+    exit 130
+}
+trap on_signal INT TERM
+
 if [ "$RESUME" -eq 1 ]; then
-    [ -f "$STATE/started-at" ] && [ -f "$STATE/hour" ] || { echo "run-72h.sh: nothing to resume in $STATE" >&2; exit 2; }
+    [ -f "$STATE/started-at" ] && [ -f "$STATE/hour" ] && [ -f "$STATE/params" ] && [ -f "$STATE/last-checkpoint" ] || { echo "run-72h.sh: nothing to resume in $STATE" >&2; exit 2; }
     START="$(cat "$STATE/started-at")"
     HOUR="$(cat "$STATE/hour")"
-    log "resuming at hour $HOUR after the reboot"
-    if [ -n "$(engine_pid)" ]; then log "an engine from before the reboot is still running (pid $(engine_pid))"; else start_engine; fi
+    case "$START$HOUR" in ''|*[!0-9]*) echo "run-72h.sh: $STATE/started-at or $STATE/hour is not a number" >&2; exit 2 ;; esac
+    # The run's own --hours and --kill-at, unless given again now.
+    read -r SAVED_HOURS SAVED_KILL < "$STATE/params"
+    [ "$HOURS_GIVEN" -eq 1 ] || HOURS="$SAVED_HOURS"
+    [ "$KILL_GIVEN" -eq 1 ] || KILL_AT="$SAVED_KILL"
+    case "$HOURS$KILL_AT" in ''|*[!0-9]*) echo "run-72h.sh: $STATE/params is not two whole numbers" >&2; exit 2 ;; esac
+    log "resuming at hour $HOUR after the reboot ($HOURS h, kill at h$KILL_AT)"
+    # A pid from before the reboot names nothing of ours now.
+    rm -f "$STATE/engine.pid" "$STATE/engine.lstart"
+    start_engine
     verify "$(cat "$STATE/last-checkpoint")" "reboot-h$HOUR"
 else
     [ -f "$STATE/started-at" ] && { echo "run-72h.sh: $STATE already holds a soak; use --resume or another --state" >&2; exit 2; }
     START="$(date +%s)"
     echo "$START" > "$STATE/started-at"
-    date -u +%Y-%m-%d > "$STATE/started-day"
+    echo "$HOURS $KILL_AT" > "$STATE/params"
+    # The owner's local day: `--mission --since` reads a day in the owner's time zone.
+    date +%F > "$STATE/started-day"
     HOUR=0
     log "soak of $CO: $HOURS h, kill at h$KILL_AT, reboot at h$REBOOT_AT, state $STATE"
     [ -n "$(engine_pid)" ] || start_engine
@@ -176,7 +207,7 @@ while [ "$HOUR" -lt "$HOURS" ]; do
             log "kill at h$HOUR skipped: the recorded pid is not a running 'brahma run'"
         else
             log "kill -9 $PID (brahma run) at h$HOUR"
-            kill -KILL "$PID"
+            kill -KILL "$PID" 2>/dev/null || log "pid $PID already gone"
             wait_gone "$PID" 60 || log "pid $PID still there 60 s after SIGKILL"
             start_engine
             verify "$(cat "$STATE/last-checkpoint")" "kill-h$HOUR"
@@ -184,7 +215,7 @@ while [ "$HOUR" -lt "$HOURS" ]; do
     fi
     if [ "$HOUR" -eq "$REBOOT_AT" ] && [ "$RESUME" -eq 0 ] && [ "$HOURS" -gt "$REBOOT_AT" ]; then
         log "hour $HOUR: reboot"
-        echo "Reboot the Mac now, log in, and run: BRAHMA_LIVE=1 $0 $CO --resume --state $STATE"
+        printf 'Reboot the Mac now, log in, and run: BRAHMA_LIVE=1 %q %q --resume --state %q\n' "$0" "$CO" "$STATE"
         exit 0
     fi
 done
@@ -192,7 +223,7 @@ done
 PID="$(engine_pid)"
 if [ -n "$PID" ]; then
     log "stopping brahma run (pid $PID) with SIGTERM"
-    kill -TERM "$PID"
+    kill -TERM "$PID" 2>/dev/null || log "pid $PID already gone"
     wait_gone "$PID" 120 || log "pid $PID still there 120 s after SIGTERM; stop it yourself (Ctrl-C in its terminal or SIGTERM)"
 fi
 echo

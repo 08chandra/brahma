@@ -19,13 +19,26 @@ public final class OrchestratorLock: @unchecked Sendable {
         let path = paths.home.appending(path: "orchestrator.lock").path
         let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw OrchestratorLockError.cannotOpen(errno: errno) }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        // A busy lock is tried again `busyRetries` times, `busyRetryDelay` apart (ruling R42(b)): a reader that holds a shared
+        // lock for an instant (the soak's liveness probe, `SoakEngine.startedAt`) must never refuse a real start. A second engine
+        // that really holds it is still refused, about 100 ms later.
+        var retries = 0
+        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
             let code = errno
-            close(fd)
-            throw code == EWOULDBLOCK ? OrchestratorLockError.alreadyRunning : .cannotOpen(errno: code)
+            if code == EINTR { continue }
+            guard code == EWOULDBLOCK, retries < busyRetries else {
+                close(fd)
+                throw code == EWOULDBLOCK ? OrchestratorLockError.alreadyRunning : .cannotOpen(errno: code)
+            }
+            retries += 1
+            usleep(busyRetryDelay)
         }
         return OrchestratorLock(fd: fd)
     }
+
+    /// How often `acquire` tries a busy lock again before it says another engine is running, and how long it waits between tries.
+    static let busyRetries = 5
+    static let busyRetryDelay: useconds_t = 20_000
 
     /// Unlocked before it is closed. `close` alone frees the lock only once every copy of the descriptor is gone, and a
     /// child that another thread is spawning holds a copy of each one (`O_CLOEXEC` included) until its exec closes them:

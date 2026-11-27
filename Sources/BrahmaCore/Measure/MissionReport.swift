@@ -49,13 +49,13 @@ public enum MissionReport {
 /// `brahma measure <company> --compare <baseline>` (owner ruling R7(e)): two reports over the same window, with the same metric
 /// ids, side by side; each value is the one its own report shows, with its own denominator. The owner runs the same backlog in
 /// a one-agent company (the baseline) and compares; nothing here runs anything. A baseline that does not exist, or that has no
-/// landing in the window, is `not measured: <reason>` in every baseline cell; its report, when there is one, is still carried.
+/// landing in the window, is `not measured: <reason>` in every baseline cell, and its report is null (ruling R42(c)).
 public struct MeasureComparison: Codable, Equatable, Sendable {
     /// The company being measured.
     public var report: MeasureReport
     /// The baseline as the owner named it.
     public var baselineName: String
-    /// The baseline's report over the same window (nil: no such company).
+    /// The baseline's report over the same window; nil when the baseline is not measured (`baselineNotMeasured` says why).
     public var baseline: MeasureReport?
     /// Why the baseline column is not measured, or nil when it is.
     public var baselineNotMeasured: String?
@@ -78,15 +78,16 @@ public struct MeasureComparison: Codable, Equatable, Sendable {
             return MeasureComparison(report: report, baselineName: baselineName, baseline: nil,
                                      baselineNotMeasured: "no company named '\(baselineName)'")
         }
-        let baseline = try measure(company)
-        let landed = try store.landings(companyId: company.id, in: report.window)
-        return MeasureComparison(report: report, baselineName: company.name, baseline: baseline,
-                                 baselineNotMeasured: landed.isEmpty ? "\(company.name) has no landings in the window" : nil)
+        guard !(try store.landings(companyId: company.id, in: report.window)).isEmpty else {
+            return MeasureComparison(report: report, baselineName: company.name, baseline: nil,
+                                     baselineNotMeasured: "\(company.name) has no landings in the window")
+        }
+        return MeasureComparison(report: report, baselineName: company.name, baseline: try measure(company), baselineNotMeasured: nil)
     }
 
     /// `# measure <company> vs <baseline> (baseline) — <window>`, one row per metric of the first report (and its detail rows,
-    /// matched to the baseline's by label), the first report's value then the baseline's. A detail row one side lacks is `—` on
-    /// that side. Plain text: the CLI passes every line through `safe()`.
+    /// matched to the baseline's by label), the first report's value then the baseline's. A detail row one side lacks is
+    /// `not measured: no '<label>' row in <company>'s report` on that side. Plain text: the CLI passes every line through `safe()`.
     public func markdown() -> String {
         var lines = ["# \(report.subset ?? "measure") \(report.company) vs \(baselineName) (baseline) — \(report.windowText)"]
         lines.append("time zone \(report.zoneForDisplay.identifier) · generated \(MeasureReport.iso(report.generatedAt)) · brahma \(report.brahmaBuild)"
@@ -95,13 +96,15 @@ public struct MeasureComparison: Codable, Equatable, Sendable {
         lines.append("| metric | \(cell(report.company)) | \(cell(baselineName)) (baseline) |")
         lines.append("|---|---|---|")
         let notMeasured = baselineNotMeasured.map { "not measured: \($0)" }
+        func missing(_ label: String, in company: String) -> String { "not measured: no '\(label)' row in \(company)'s report" }
         func row(_ label: String, _ a: MetricValue?, _ b: MetricValue?, depth: Int) {
             let indent = depth == 0 ? "" : String(repeating: "  ", count: depth) + "↳ "
-            let right = notMeasured ?? b.map(\.display) ?? ""
-            lines.append("| \(indent)\(cell(label)) | \(cell(a.map(\.display) ?? "")) | \(cell(right)) |")
-            let left = a?.detail ?? [], other = b?.detail ?? []
-            for d in left { row(d.label, d, other.first { $0.label == d.label }, depth: depth + 1) }
-            for d in other where !left.contains(where: { $0.label == d.label }) { row(d.label, nil, d, depth: depth + 1) }
+            let left = a.map(\.display) ?? missing(label, in: report.company)
+            let right = notMeasured ?? b.map(\.display) ?? missing(label, in: baselineName)
+            lines.append("| \(indent)\(cell(label)) | \(cell(left)) | \(cell(right)) |")
+            let mine = a?.detail ?? [], other = b?.detail ?? []
+            for d in mine { row(d.label, d, other.first { $0.label == d.label }, depth: depth + 1) }
+            for d in other where !mine.contains(where: { $0.label == d.label }) { row(d.label, nil, d, depth: depth + 1) }
         }
         for m in report.metrics { row(m.label, m, baseline?.metrics.first { $0.id == m.id }, depth: 0) }
         lines.append("")

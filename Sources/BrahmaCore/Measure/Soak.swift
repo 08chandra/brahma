@@ -243,9 +243,12 @@ public enum SoakVerify {
 
     public static func run(_ before: SoakCheckpoint, store: Store, git: GitWorkspace, now: Date, engineStartedAt: Date?,
                            settle: TimeInterval = defaultSettle) throws -> SoakVerdict {
-        let state = try State.read(store: store, before: before, engineStartedAt: engineStartedAt)
+        // Ruling R42(a): only an engine started after the checkpoint is a restart; an older start (the checkpoint's own, reused)
+        // judges nothing, and turns are never counted from it.
+        let restart = restartedAt(before, engineStartedAt: engineStartedAt)
+        let state = try State.read(store: store, before: before, engineStartedAt: restart)
         var checks: [SoakCheck] = []
-        checks.append(settled(engineStartedAt: engineStartedAt, now: now, settle: settle))
+        checks.append(settled(before, engineStartedAt: engineStartedAt, restart: restart, now: now, settle: settle))
         checks.append(try noLostCommits(before, git: git, restores: state.restores))
         checks.append(leasesRecovered(before, state))
         checks.append(noStuckMerges(before, state, now: now, engineStartedAt: engineStartedAt))
@@ -259,6 +262,7 @@ public enum SoakVerify {
     // MARK: The records, in one read
 
     struct Lease { var itemId: String; var key: String; var agentId: String; var agentName: String?; var agentState: String? }
+    struct Restore { var line: String; var mainCommit: String? }
     struct Batch { var id: String; var number: Int; var step: String; var updatedAt: Date }
     struct ReleaseRow { var id: String; var number: Int; var status: String; var provider: String; var project: String; var commit: String
                         var deployStartedAt: Date? }
@@ -281,8 +285,8 @@ public enum SoakVerify {
         /// The checkpoint's open batches as they are now: id → (number, step).
         var checkpointBatches: [String: (number: Int, step: String)] = [:]
         var releases: [ReleaseRow] = []
-        /// Restores recorded at or after the checkpoint: one line each.
-        var restores: [String] = []
+        /// Restores recorded at or after the checkpoint, each with the `main` it restored to (nil: none recorded).
+        var restores: [Restore] = []
         /// Engine alerts filed for the company at or after the checkpoint: `A-<n> <title>`.
         var alerts: [String] = []
         /// The owner-wide engine hold, if any: `<reason> since <time>`.
@@ -351,13 +355,13 @@ public enum SoakVerify {
                     WHERE m.companyId = ? AND e.restoredAt >= ? ORDER BY e.restoredAt
                     """, arguments: [companyId, before.takenAt]) {
                     let at: Date = row["at"], main: String? = row["mainCommit"]
-                    s.restores.append("restore at \(MeasureReport.iso(at)) (main \(main.map { String($0.prefix(7)) } ?? "not recorded"))")
+                    s.restores.append(Restore(line: "restore at \(MeasureReport.iso(at))", mainCommit: main))
                 }
                 for row in try Row.fetchAll(db, sql: """
                     SELECT createdAt AS at, mainCommit FROM restoreEpoch WHERE companyId = ? AND createdAt >= ? ORDER BY createdAt
                     """, arguments: [companyId, before.takenAt]) {
                     let at: Date = row["at"], main: String? = row["mainCommit"]
-                    s.restores.append("restore at \(MeasureReport.iso(at)) over an unreadable database (main \(main.map { String($0.prefix(7)) } ?? "not recorded"))")
+                    s.restores.append(Restore(line: "restore at \(MeasureReport.iso(at)) over an unreadable database", mainCommit: main))
                 }
                 for row in try Row.fetchAll(db, sql: """
                     SELECT number, title FROM ask WHERE companyId = ? AND kind = ? AND createdAt >= ? ORDER BY number
@@ -382,17 +386,24 @@ public enum SoakVerify {
 
     // MARK: The checks
 
-    static func settled(engineStartedAt: Date?, now: Date, settle: TimeInterval) -> SoakCheck {
-        guard let start = engineStartedAt else {
-            return SoakCheck(name: "settled", result: .wait,
-                             detail: "no engine is running (nothing holds the data home's orchestrator.lock, or it has not finished starting)")
+    /// The engine's start when it is a restart: later than the checkpoint, and not the start the checkpoint recorded.
+    static func restartedAt(_ before: SoakCheckpoint, engineStartedAt: Date?) -> Date? {
+        guard let start = engineStartedAt, start > before.takenAt, start.wholeSeconds != before.engineStartedAt else { return nil }
+        return start
+    }
+
+    static func settled(_ before: SoakCheckpoint, engineStartedAt: Date?, restart: Date?, now: Date, settle: TimeInterval) -> SoakCheck {
+        guard let start = restart else {
+            let why = engineStartedAt.map { "start \(MeasureReport.iso($0)), checkpoint \(MeasureReport.iso(before.takenAt))" }
+                ?? "no engine is running"
+            return SoakCheck(name: "settled", result: .wait, detail: "the engine has not restarted since the checkpoint (\(why))")
         }
         let up = now.timeIntervalSince(start)
         let shown = "engine up \(Int(max(0, up).rounded(.down))) s of the \(Int(settle)) s settle"
         return SoakCheck(name: "settled", result: up >= settle ? .pass : .wait, detail: shown)
     }
 
-    static func noLostCommits(_ before: SoakCheckpoint, git: GitWorkspace, restores: [String]) throws -> SoakCheck {
+    static func noLostCommits(_ before: SoakCheckpoint, git: GitWorkspace, restores: [Restore]) throws -> SoakCheck {
         var named: [(what: String, sha: String)] = [("main", before.mainTip)]
         named += before.itemHeads.sorted { $0.key < $1.key }.map { ("\($0.key) branch", $0.value) }
         named += before.verifiedCommits.sorted { $0.key < $1.key }.map { ("\($0.key) verified", $0.value) }
@@ -400,9 +411,27 @@ public enum SoakVerify {
         var problems = named.filter { missing.contains($0.sha) }.map { "\($0.what) \($0.sha.prefix(7)) is missing" }
         var notes: [String] = []
         if let tip = try git.head(of: GitWorkspace.mainRef) {
-            if !missing.contains(before.mainTip), try !git.isAncestor(before.mainTip, of: tip) {
+            // Strict: a git error is "could not verify" (exit 2), never a rewind.
+            if !missing.contains(before.mainTip), try !git.isAncestorStrict(before.mainTip, of: tip) {
                 let rewind = "main was rewound: \(tip.prefix(7)) does not contain the checkpoint's \(before.mainTip.prefix(7))"
-                if restores.isEmpty { problems.append(rewind) } else { notes.append("\(rewind); explained by \(restores.joined(separator: ", "))") }
+                // A restore explains it only if main still contains the commit the restore put it at (when one is recorded).
+                var explaining: [String] = [], off: [String] = []
+                for restore in restores {
+                    guard let restored = restore.mainCommit else { explaining.append("\(restore.line) (main not recorded)"); continue }
+                    let gone = try missing.contains(restored) || !git.missingCommits([restored]).isEmpty
+                    if gone {
+                        off.append("\(restore.line) to \(restored.prefix(7)), which is missing")
+                    } else if try git.isAncestorStrict(restored, of: tip) {
+                        explaining.append("\(restore.line) (main \(restored.prefix(7)))")
+                    } else {
+                        off.append("\(restore.line) to \(restored.prefix(7)), which is not on main")
+                    }
+                }
+                if explaining.isEmpty {
+                    problems.append(off.isEmpty ? rewind : "\(rewind); not explained by \(off.joined(separator: ", "))")
+                } else {
+                    notes.append("\(rewind); explained by \(explaining.joined(separator: ", "))")
+                }
             }
         } else {
             problems.append("main is gone")
@@ -508,6 +537,12 @@ public enum SoakVerify {
         if !s.companyRunning { problems.append("\(s.companyName) is paused") }
         let turns = s.turnsSinceStart ?? 0
         if s.turnsSinceStart == 0 { problems.append("no turn started since the engine's start") }
+        guard s.turnsSinceStart != nil else {
+            // No restart since the checkpoint (ruling R42(a)): nothing to count turns from.
+            let base = "no restart since the checkpoint to count turns from"
+            return problems.isEmpty ? SoakCheck(name: "companyRunning", result: .pass, detail: base)
+                : SoakCheck(name: "companyRunning", result: .fail, detail: problems.joined(separator: "; ") + " (\(base))")
+        }
         if !s.alerts.isEmpty { problems.append("engine alerts since the checkpoint: \(s.alerts.joined(separator: "; "))") }
         if let hold = s.hold { problems.append("the engine is on hold (\(hold))") }
         let summary = "\(turns) turn\(turns == 1 ? "" : "s") started since the engine's start; no engine alert or hold"

@@ -12,6 +12,37 @@ import Foundation
     _ = try OrchestratorLock.acquire(paths: paths)
 }
 
+/// Ruling R42(b): a probe that holds a shared lock for an instant (`SoakEngine.startedAt`) overlapping a real start must not
+/// refuse it: `acquire` retries a busy lock for up to 5 × 20 ms before it says another engine is running.
+@Test(.scratch) func briefSharedProbeDoesNotRefuseAStart() throws {
+    let root = try tempDir()
+    let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+    try FileManager.default.createDirectory(at: paths.home, withIntermediateDirectories: true)
+    let fd = open(paths.home.appending(path: "orchestrator.lock").path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
+    try #require(fd >= 0)
+    try #require(flock(fd, LOCK_SH | LOCK_NB) == 0)
+    let probe = Thread {
+        Thread.sleep(forTimeInterval: 0.01)
+        flock(fd, LOCK_UN)
+        close(fd)
+    }
+    probe.start()
+    let lock = try OrchestratorLock.acquire(paths: paths)
+    withExtendedLifetime(lock) {}
+}
+
+/// Ruling R42(b): a lock another engine really holds is still refused, after the retries (about 100 ms).
+@Test(.scratch) func heldExclusiveLockStillRefusedAfterRetries() throws {
+    let root = try tempDir()
+    let paths = BrahmaPaths(home: root.appending(path: "home"), workspaces: root.appending(path: "ws"))
+    let first = try OrchestratorLock.acquire(paths: paths)
+    let started = AwakeTime.uptime()
+    #expect(throws: OrchestratorLockError.alreadyRunning) { _ = try OrchestratorLock.acquire(paths: paths) }
+    let waited = AwakeTime.uptime() - started
+    #expect(waited >= 0.09 && waited < 5, "refused after \(waited) s")
+    withExtendedLifetime(first) {}
+}
+
 /// The flake behind `secondOrchestratorLockFailsUntilFirstIsReleased` under load: while another thread of this process is
 /// spawning a child, the child briefly holds a copy of every descriptor (`O_CLOEXEC` ones too, until its exec closes them),
 /// so a lock that was only `close`d stayed held by that copy and the very next acquire saw `.alreadyRunning`. Releasing

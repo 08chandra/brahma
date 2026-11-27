@@ -194,13 +194,14 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 `brahma measure <co> --compare <baseline-co>` prints both companies' reports side by side over **the same window** (the first
 company's: `--since` applies to both) and **the same metric ids**, row by row: `| metric | <co> | <baseline> (baseline) |`.
 Each cell is exactly what that company's own report shows, with its own denominator and status (`97.4% (38/39)` beside
-`insufficient data (n=4)`). Nothing is normalised, subtracted or extrapolated. A detail row only one side has is `—` on the
-other. `--mission --compare` compares the mission subset the same way. `--format json` carries both reports in full
+`insufficient data (n=4)`). Nothing is normalised, subtracted or extrapolated. A detail row only one side has reads
+`not measured: no '<label>' row in <company>'s report` on the other. `--mission --compare` compares the mission subset the same way. `--format json` carries both reports in full
 (`report`, `baseline`, `baselineName`, `baselineNotMeasured`). Comparing a company with itself is refused (exit 2).
 
 **Status of the baseline column:** a company that does not exist prints `not measured: no company named '<name>'` in every
-baseline cell (the JSON's `baseline` is null); a baseline with no landing in the window prints `not measured: <name> has no
-landings in the window` in every baseline cell (its report is still in the JSON). Nothing is ever estimated.
+baseline cell; a baseline with no landing in the window prints `not measured: <name> has no landings in the window` in every
+baseline cell. In both cases the JSON's `baseline` is null and `baselineNotMeasured` holds the reason (ruling R42(c)). Nothing
+is ever estimated.
 
 **The owner's procedure** (no script runs the baseline and nothing here spends usage on the owner's behalf):
 
@@ -234,10 +235,13 @@ while something holds the `flock` on `<home>/orchestrator.lock`, and it started 
   the turns in progress and the engine's start (null with no engine running). It prints one line.
 - `--soak-verify <file> [--format json]` judges the company now against that checkpoint. Exit **0** pass, **1** fail, **3** wait,
   **2** could not verify (no such file, another company's checkpoint, a store or git error). The seven checks:
-  1. `settled` — the engine has run at least 300 s since its start (no engine running, or not yet 300 s: **wait**, never fail);
+  1. `settled` — the engine restarted after the checkpoint (its start is later than the checkpoint and not the start the
+     checkpoint recorded) and has run at least 300 s since; no engine running, no restart since the checkpoint, or not yet
+     300 s: **wait**, never fail (ruling R42(a)). Turns are counted only from such a restart;
   2. `noLostCommits` — every checkpoint commit is still an object of the repository (`git cat-file --batch-check`), and `main`
      still contains the checkpoint's tip, unless a restore recorded after the checkpoint (`restoreMain`/`restoreEvent`,
-     `restoreEpoch`) explains the rewind;
+     `restoreEpoch`) explains the rewind — and `main` must still contain the commit that restore put it at, when one is
+     recorded. A git error is exit 2, never a rewind;
   3. `leasesRecovered` — no item `inProgress` without a lease, no lease held by a killed or missing agent, and every lease of the
      checkpoint still held by the same agent or released with its item no longer `inProgress`;
   4. `noStuckMerges` — no merge batch short of `done` for more than 600 s since the later of its last step and the engine's
@@ -253,12 +257,15 @@ while something holds the `flock` on `<home>/orchestrator.lock`, and it started 
   (`--mission --compare` excepted); a combination is refused with exit 2.
 
 `scripts/soak/run-72h.sh <co> [--hours 72] [--kill-at 24] [--state <dir>] [--resume]` is the owner's 72-hour run. It refuses
-to start without `BRAHMA_LIVE=1` (a real company run spends usage). It starts `brahma run` itself and records its pid, keeps the
+to start without `BRAHMA_LIVE=1` (a real company run spends usage). It starts `brahma run` itself and records its pid and
+start time (a process is that engine only while both match and its command line is `brahma run`), keeps the
 Mac awake with `caffeinate -i` for its own lifetime, takes a checkpoint every hour, at `--kill-at` checks the recorded pid's
 command line is `brahma run` and sends SIGKILL to that pid only, starts `brahma run` again and asks for the verdict after the
 settle time; at hour 48 it prints the reboot instruction and exits, and `--resume` (after the reboot and login) verifies against
-the last checkpoint and continues. At the end it stops its engine with SIGTERM (after the same check), prints `--mission` over
-the soak's days and every verdict. It writes only under `--state` (default `~/.brahma-soak/<co>`).
+the last checkpoint and continues (with the run's saved `--hours` and `--kill-at`; the pre-reboot pid is discarded). Ctrl-C
+stops the script, never the engine, and says how to stop or resume it. At the end it stops its engine with SIGTERM (after the
+same check), prints `--mission` over the soak's days (from its local start day) and every verdict. It writes only under
+`--state` (default `~/.brahma-soak/<co>`; the company must be a plain name, no `/` or `..`).
 
 ---
 

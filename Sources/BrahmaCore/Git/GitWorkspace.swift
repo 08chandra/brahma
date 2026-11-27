@@ -3148,6 +3148,7 @@ public struct GitWorkspace: Sendable {
     public func itemBranchHeads() throws -> [String: String] {
         let prefix = "refs/heads/item/"
         let out = try main.run(["for-each-ref", "--format=%(objectname) %(refname)", prefix])
+        guard !out.cut else { throw GitError.failed(command: "for-each-ref", status: -1, stderr: "the item branch listing was cut") }
         var heads: [String: String] = [:]
         for line in out.text.split(separator: "\n") {
             let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
@@ -3197,6 +3198,18 @@ public struct GitWorkspace: Sendable {
     public func isAncestor(_ ancestor: String, of descendant: String) throws -> Bool {
         try Self.validRef(ancestor); try Self.validRef(descendant)
         return try main.run(["merge-base", "--is-ancestor", ancestor, descendant], allowFailure: true).status == 0
+    }
+
+    /// `isAncestor` that tells "no" from a failure: `merge-base --is-ancestor` exit 0 is true, 1 is false, anything else (a missing
+    /// commit, a broken repository) throws. For checks where a git error must not read as an answer (the soak's rewind check).
+    public func isAncestorStrict(_ ancestor: String, of descendant: String) throws -> Bool {
+        try Self.validRef(ancestor); try Self.validRef(descendant)
+        let out = try main.run(["merge-base", "--is-ancestor", ancestor, descendant], allowFailure: true)
+        switch out.status {
+        case 0: return true
+        case 1: return false
+        default: throw GitError.failed(command: "merge-base --is-ancestor", status: out.status, stderr: String(out.stderr.prefix(2000)))
+        }
     }
 
     /// The engine's backup ref (Plan L): before each deploy it names the release commit, "the last known-good main".

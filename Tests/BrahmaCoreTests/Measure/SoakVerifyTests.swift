@@ -148,6 +148,15 @@ import GRDB
         let lost = try #require(Self.check(try rig.verify(before), "noLostCommits"))
         #expect(lost.result == .pass, "\(lost.detail)")
         #expect(lost.detail.contains("restore"), "\(lost.detail)")
+        // Fix round 1 #6: a restore explains the rewind only when main still contains the commit it restored to. Main moved to
+        // a commit off the restored one (a sibling of it): unexplained.
+        let off = try rig.git.plantCommit(parent: rig.importCommit, path: "z.txt", text: "z\n", message: "elsewhere")
+        let restored = try rig.git.plantCommit(parent: rig.importCommit, path: "r.txt", text: "r\n", message: "restored head")
+        try rig.sql("UPDATE restoreMain SET mainCommit = ? WHERE nonce = ?", [restored, nonce])
+        try rig.git.git(["update-ref", "refs/heads/main", off])
+        let unexplained = try #require(Self.check(try rig.verify(before), "noLostCommits"))
+        #expect(unexplained.result == .fail, "\(unexplained.detail)")
+        #expect(unexplained.detail.contains("rewound") && unexplained.detail.contains("not on main"), "\(unexplained.detail)")
         // A restore before the checkpoint explains nothing.
         let rig2 = try Rig()
         let nonce2 = UUID().uuidString
@@ -157,6 +166,66 @@ import GRDB
         try rig2.git.git(["update-ref", "refs/heads/main", rig2.importCommit])
         try rig2.killAndRestart()
         #expect(Self.check(try rig2.verify(before2), "noLostCommits")?.result == .fail)
+    }
+
+    /// Fix round 1 #9: a restore over an unreadable database (`restoreEpoch`) explains a rewind the same way.
+    @Test func restoreEpochExplainsRewind() throws {
+        let rig = try Rig()
+        let before = try rig.checkpoint()
+        try rig.git.git(["update-ref", "refs/heads/main", rig.importCommit])
+        try rig.sql("INSERT INTO restoreEpoch (id, companyId, mainCommit, listed, source, createdAt) VALUES (?, ?, ?, 0, 'snap', ?)",
+                    [UUID().uuidString, rig.company.id, rig.importCommit, SoakVerifyTests.restarted.addingTimeInterval(-5)])
+        try rig.killAndRestart()
+        let lost = try #require(Self.check(try rig.verify(before), "noLostCommits"))
+        #expect(lost.result == .pass, "\(lost.detail)")
+        #expect(lost.detail.contains("unreadable database"), "\(lost.detail)")
+    }
+
+    /// Fix round 1 #1 (ruling R42(a)): a verdict needs an engine that started after the checkpoint. The checkpoint's own
+    /// engine start, reused (the engine was never killed, or the probe read a stale start), is `wait`, whatever else holds.
+    @Test func staleStartIsWait() throws {
+        let rig = try Rig()
+        let before = try rig.checkpoint()
+        _ = try rig.store.recoverInterruptedTurns(now: SoakVerifyTests.restarted)   // no running turns left
+        for start in [before.engineStartedAt, SoakVerifyTests.taken, nil] {
+            let verdict = try rig.verify(before, engineStartedAt: start)
+            #expect(verdict.result == .wait, "\(String(describing: start)): \(verdict.lines())")
+            let settled = try #require(Self.check(verdict, "settled"))
+            #expect(settled.result == .wait)
+            #expect(settled.detail.hasPrefix("the engine has not restarted since the checkpoint ("), "\(settled.detail)")
+            // Turns are never counted from a start older than the checkpoint.
+            #expect(Self.check(verdict, "companyRunning")?.detail.contains("no restart since the checkpoint") == true,
+                    "\(verdict.lines())")
+        }
+    }
+
+    /// Fix round 1 #9: a paused company, or an engine hold, is not running free.
+    @Test func pausedOrHeldIsNotRunning() throws {
+        let rig = try Rig()
+        let before = try rig.checkpoint()
+        try rig.killAndRestart()
+        #expect(Self.check(try rig.verify(before), "companyRunning")?.result == .pass)
+        try rig.sql("UPDATE company SET status = 'paused' WHERE id = ?", [rig.company.id])
+        let paused = try #require(Self.check(try rig.verify(before), "companyRunning"))
+        #expect(paused.result == .fail && paused.detail.contains("paused"), "\(paused.detail)")
+        try rig.sql("UPDATE company SET status = 'running' WHERE id = ?", [rig.company.id])
+        try rig.sql("INSERT INTO engineHold (id, reason, detail, since) VALUES (1, 'network', 'offline', ?)", [SoakVerifyTests.restarted])
+        let held = try #require(Self.check(try rig.verify(before), "companyRunning"))
+        #expect(held.result == .fail && held.detail.contains("on hold (network"), "\(held.detail)")
+    }
+
+    /// Fix round 1 #9: a lease whose holder is no agent at all.
+    @Test func leaseOfMissingAgentFails() throws {
+        let rig = try Rig()
+        let before = try rig.checkpoint()
+        try rig.killAndRestart()
+        try rig.store.writer.writeWithoutTransaction { db in
+            try db.execute(sql: "PRAGMA foreign_keys = OFF")
+            try db.execute(sql: "UPDATE workLease SET agentId = 'no-such-agent' WHERE itemId = ?", arguments: [rig.item.id])
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+        }
+        let leases = try #require(Self.check(try rig.verify(before), "leasesRecovered"))
+        #expect(leases.result == .fail && leases.detail.contains("no longer exists"), "\(leases.detail)")
     }
 
     @Test func orphanInProgressFails() throws {

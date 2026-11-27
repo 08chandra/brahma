@@ -357,11 +357,31 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(empty.status == 0, "\(empty.stderr)")
         #expect(rows(empty.stdout).allSatisfy { $0.hasSuffix("| not measured: Solo has no landings in the window |") }, "\(empty.stdout)")
         let ejs = try MeasureComparison.decode(Data(try brahma(["measure", "Acme", "--compare", "Solo", "--format", "json"], home: rig.home).stdout.utf8))
-        #expect(ejs.baseline?.company == "Solo", "the baseline's own report is still carried")
+        // Ruling R42(c): a not-measured baseline is null in the JSON, with its reason.
+        #expect(ejs.baseline == nil)
         #expect(ejs.baselineNotMeasured == "Solo has no landings in the window")
         // Comparing a company with itself is refused.
         let same = try brahma(["measure", "Acme", "--compare", "acme"], home: rig.home)
         #expect(same.status == 2 && same.stdout.isEmpty && same.stderr.contains("--compare"), "\(same.stderr)")
+    }
+
+    /// Ruling R42(c): a detail row only one report has is `not measured: no '<label>' row in <company>'s report` on the other side.
+    @Test func oneSidedDetailRowIsNotMeasured() throws {
+        let window = MeasureWindow(since: MeasureFixtures.t0, until: MeasureFixtures.t0.addingTimeInterval(86_400))
+        func report(_ name: String, _ detail: [MetricValue]) -> MeasureReport {
+            MeasureReport(companyId: name, company: name, window: window, timeZone: "UTC",
+                          metrics: [.count(.safety, 0, basis: "b", target: 0, detail: detail)], generatedAt: MeasureFixtures.t0, brahmaBuild: "dev")
+        }
+        let shared = MetricValue.count(.safety, label: "access refusals", 1, basis: "b")
+        let mine = MetricValue.count(.safety, label: "only here", 2, basis: "b")
+        let theirs = MetricValue.count(.safety, label: "only there", 3, basis: "b")
+        let both = MeasureComparison(report: report("Acme", [shared, mine]), baselineName: "Solo", baseline: report("Solo", [shared, theirs]),
+                                     baselineNotMeasured: nil)
+        let md = both.markdown()
+        #expect(md.contains("|   ↳ access refusals | 1 | 1 |"), "\(md)")
+        #expect(md.contains("|   ↳ only here | 2 | not measured: no 'only here' row in Solo's report |"), "\(md)")
+        #expect(md.contains("|   ↳ only there | not measured: no 'only there' row in Acme's report | 3 |"), "\(md)")
+        #expect(!md.contains("| — |"), "\(md)")
     }
 
     /// `--soak-checkpoint <file>` writes the checkpoint 0600 into the directory the owner named; `--soak-verify <file>` with no
@@ -382,7 +402,7 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let wait = try brahma(["measure", "Acme", "--soak-verify", file.path], home: rig.home)
         #expect(wait.status == 3, "\(wait.stdout) \(wait.stderr)")
         #expect(wait.stdout.hasPrefix("soak verify: wait"), "\(wait.stdout)")
-        #expect(wait.stdout.contains("wait settled: no engine is running"), "\(wait.stdout)")
+        #expect(wait.stdout.contains("wait settled: the engine has not restarted since the checkpoint (no engine is running)"), "\(wait.stdout)")
         let js = try brahma(["measure", "Acme", "--soak-verify", file.path, "--format", "json"], home: rig.home)
         #expect(js.status == 3)
         #expect(try SoakVerdict.decode(Data(js.stdout.utf8)).result == .wait)
@@ -399,6 +419,18 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(nodir.status == 2 && nodir.stderr.contains("does not exist"), "\(nodir.stderr)")
         let agent = try brahma(["measure", "Acme", "--soak-verify", file.path], home: rig.home, env: ["BRAHMA_AGENT_ID": "a1"])
         #expect(agent.status == 2 && agent.stdout.isEmpty)
+        // Fix round 1 #9: a crafted checkpoint naming a commit that is not a commit id is refused (exit 2), never judged.
+        var crafted = before
+        crafted.itemHeads["ACME-9"] = "not-a-sha; rm -rf /"
+        let craftedFile = state.appending(path: "crafted.json")
+        try crafted.json().write(to: craftedFile)
+        let bad = try brahma(["measure", "Acme", "--soak-verify", craftedFile.path], home: rig.home)
+        #expect(bad.status == 2 && bad.stdout.isEmpty, "\(bad.stdout) \(bad.stderr)")
+        // A checkpoint name that is a symbolic link is refused (exit 2), never followed.
+        let link = state.appending(path: "link.json")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: file)
+        let linked = try brahma(["measure", "Acme", "--soak-verify", link.path], home: rig.home)
+        #expect(linked.status == 2 && linked.stdout.isEmpty && linked.stderr.contains("symbolic link"), "\(linked.stderr)")
     }
 
     /// The modes are exclusive where combining makes no sense: refused with exit 2 and nothing on stdout. `--mission --compare`
