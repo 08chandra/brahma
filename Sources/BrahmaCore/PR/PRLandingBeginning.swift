@@ -30,4 +30,10 @@ public struct FetchResult: Equatable, Sendable {
 /// `GitCommand.sizeWatch`).
 public protocol RemoteMainFetching: Sendable {
     func fetch(companyId: String) async throws -> FetchResult
+    /// Whether `ancestor` is `descendant` or in its history, in the company's engine repository after a fetch (`git merge-base
+    /// --is-ancestor`, on the engine's `Blocking`). Plan X8 Task 5's completion proof asks it of the merge commit and the
+    /// fetched tip, and of the pushed commit and a merge commit (Ruling 35). Throws when it cannot tell (a commit missing).
+    func isAncestor(_ ancestor: String, of descendant: String, companyId: String) async throws -> Bool
+    /// The parents of `sha` in the company's engine repository after a fetch (a merge commit has more than one).
+    func parents(of sha: String, companyId: String) async throws -> [String]
 }

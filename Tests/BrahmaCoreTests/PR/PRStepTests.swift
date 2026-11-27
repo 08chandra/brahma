@@ -267,7 +267,7 @@ import GRDB
         #expect(alerts.count == 1 && alerts.first?.status == .pendingOwner, "\(alerts)")
         let text = try #require(alerts.first?.summary)
         #expect(text.contains("\(item.key)'s pull request is held. GitHub said: ") && text.contains("rejected"), "\(text)")
-        #expect(text.contains("brahma merge abandon-pr \(w.env.company.slug) \(item.key)") && text.contains("never force-pushes"), "\(text)")
+        #expect(text.contains("brahma merge abandon-pr \(w.env.company.slug) \(item.key)") && text.contains("never overwrites others' commits"), "\(text)")
         // Not retried before `maxBackoff`; retried then, and still one alert.
         await step.tick(now: Self.t0.addingTimeInterval(PRStep.firstBackoff * 4))
         #expect(w.runner.pushes.count == 1)
@@ -511,10 +511,14 @@ import GRDB
     @Test func pushAuthFailureIsAHoldForGood() async throws {
         for why in ["remote: Permission to denied to bot. fatal: unable to access The requested URL returned error: 403",
                     "fatal: Authentication failed for", "fatal: could not read Username for terminal prompts disabled",
-                    "remote: Invalid username or password.", "The requested URL returned error: 401"] {
-            #expect(PRStep.isDurableHold(why), "\(why)")
+                    "The requested URL returned error: 401"] {
+            #expect(PRStep.isDurableHold(why) && PRStep.isRemoteText(why), "\(why)")
         }
-        #expect(!PRStep.isDurableHold("fatal: the remote end hung up unexpectedly"))
+        // Keyed on git's markers only, never GitHub's free text.
+        for why in ["fatal: the remote end hung up unexpectedly", "remote: Permission to the repository denied",
+                    "the pull request may not have been opened (permission to write)"] {
+            #expect(!PRStep.isDurableHold(why) && !PRStep.isCredentialRefusal(why), "\(why)")
+        }
         let w = try World()
         let step = PRStep(store: w.store, machine: w.machine)
         let (item, sha) = try w.handedOff("Token refused", ["t.txt": "t\n"])

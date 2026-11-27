@@ -80,16 +80,18 @@ extension Store {
                                        && Column("subjectId") == Store.engineAlertKey(reason)).fetchCount(db)
             guard filed == 0 else { return false }
             let pr = landing.prNumber.map { "PR #\($0)" } ?? "pull request"
-            try EngineAlerts.raise(store: self, db: db, text: Self.prHoldAlertText(company: company, item: item, pr: pr, why: why),
+            try EngineAlerts.raise(store: self, db: db, text: Self.prHoldAlertText(company: company, item: item, pr: pr, why: why,
+                                                                                  remote: PRStep.isRemoteText(why)),
                                    now: now, reason: reason, companyId: company.id)
             return true
         }
     }
 
-    /// What the alert says: the hold — marked as what GitHub (or git talking to it) said, since it may carry remote text — and
-    /// the owner's two ways out.
-    static func prHoldAlertText(company: Company, item: WorkItem, pr: String, why: String) -> String {
-        "\(company.name): \(item.key)'s \(pr) is held. GitHub said: \(Self.flat(why, max: 300)). Brahma never force-pushes; it retries at most every "
+    /// What the alert says: the hold — marked `GitHub said:` when it carries GitHub's (or git's, talking to GitHub) own words
+    /// (`remote`, `PRStep.isRemoteText`), else Brahma's own text — and the owner's two ways out.
+    static func prHoldAlertText(company: Company, item: WorkItem, pr: String, why: String, remote: Bool) -> String {
+        "\(company.name): \(item.key)'s \(pr) is held\(remote ? ". GitHub said: " : ": ")\(Self.flat(why, max: 300)). Brahma never overwrites "
+            + "others' commits; it retries at most every "
             + "\(Int(PRStep.maxBackoff / 60)) minutes. Fix it on GitHub, or abandon the landing so the item goes back to its owner "
             + "agent: brahma merge abandon-pr \(company.slug) \(item.key)"
     }
@@ -111,6 +113,9 @@ extension Store {
     }
 
     // MARK: Why
+
+    /// `brahma why` for a merged landing whose item waits for the remote main fetch.
+    static let mergedWaitingText = "merged on GitHub; waiting to fetch main"
 
     /// One line per open PR landing of the company that waits on something, for `stallReport` (`brahma why`):
     /// - `@eng-1 waits: PR #12 blocked — required check "ci" failing (brought back as feedback)` (and changes requested);
@@ -135,6 +140,16 @@ extension Store {
                 default:
                     lines.append("\(who) waits: \(pr) held — \(Self.flat(why, max: 300))")
                 }
+            }
+            // Task 5 fix round 1 (X8-32c(d)): merged on GitHub, the item completes once the remote main is fetched.
+            let merged = try PRLanding.fetchAll(db, sql: "SELECT l.* FROM prLanding l WHERE l.companyId = ? AND \(Self.awaitsCompletion) ORDER BY l.updatedAt, l.itemId",
+                                                arguments: [companyId, PRLandingState.merged.rawValue, MergeRequestStatus.handedToPR.rawValue])
+            for landing in merged {
+                guard let item = try WorkItem.fetchOne(db, key: landing.itemId) else { continue }
+                let who = try item.ownerId.flatMap { try Agent.fetchOne(db, key: $0) }.map { "@\($0.name)" } ?? item.key
+                let pr = landing.prNumber.map { "PR #\($0)" } ?? "\(item.key)'s pull request"
+                let more = landing.lastError.flatMap { $0 == PRLandingMachine.waitingForFetchText ? nil : " — \(Self.flat($0, max: 300))" } ?? ""
+                lines.append("\(who) waits: \(pr) \(Self.mergedWaitingText)\(more)")
             }
             return lines
         }

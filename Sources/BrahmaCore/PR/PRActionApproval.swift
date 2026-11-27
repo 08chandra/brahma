@@ -47,6 +47,9 @@ public enum PRActionCardState: Equatable, Sendable {
     case approved(askId: String, digest: String)
     /// The owner declined: nothing runs for this sha.
     case declined(reason: String)
+    /// `merge-pr` only (Task 5 fix round 1): the owner's approval was spent on a merge GitHub refused for good (403, 404, 422).
+    /// The same request is not put in front of the owner again; a changed one (`digest` differs) gets a fresh card.
+    case spent(askId: String, digest: String)
 }
 
 /// The digest an owner card binds its approval to (Rulings X8-21 and 29): the canonical request the owner saw — the action,

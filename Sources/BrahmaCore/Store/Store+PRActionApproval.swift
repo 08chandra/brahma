@@ -17,6 +17,9 @@ extension Store {
             case .pendingOwner?, .pendingInternal?: return .waiting(reason: row.reason)
             case .rejected?: return .declined(reason: row.reason)
             case .approved? where row.isUsable: return .approved(askId: row.askId, digest: row.digest)
+            case .approved? where action == .mergePR && row.approvedAt != nil && row.consumedAt != nil:
+                // Kept only after a merge GitHub refused for good (any other outcome forgets it: `forgetSpentMergeCard`).
+                return .spent(askId: row.askId, digest: row.digest)
             default:
                 _ = try row.delete(db)
                 return .none
@@ -56,6 +59,31 @@ extension Store {
             try PRActionApproval(askId: ask.id, companyId: companyId, itemId: itemId, action: action.name, sha: sha,
                                  reason: Store.flat(reason, max: 500), createdAt: now, digest: digest).insert(db)
             return ask
+        }
+    }
+
+    /// A spent `merge-pr` approval whose merge did not stick for good (409, 405, an unknown outcome read back as not merged): it
+    /// is forgotten, so GitHub's next `clean` asks the owner on a fresh card.
+    func forgetSpentMergeCard(itemId: String, sha: String) throws {
+        try writer.write { db in
+            _ = try PRActionApproval.filter(Column("itemId") == itemId && Column("action") == GitHubActionType.mergePR.name
+                                            && Column("sha") == sha && Column("consumedAt") != nil).deleteAll(db)
+        }
+    }
+
+    /// What a merge card voided by the owner turning `--engine-merge` off says (and `ownerDecide` repeats).
+    static let engineMergeOffVoidText = "voided: engine merge turned off"
+
+    /// `--engine-merge` turned off (`setLanding`): every `merge-pr` card of the company is void — a pending one superseded with
+    /// `engineMergeOffVoidText` (approving it does nothing and says so), an approval not yet used forgotten.
+    func voidEngineMergeCards(_ db: Database, companyId: String, now: Date) throws {
+        let rows = try PRActionApproval.filter(Column("companyId") == companyId && Column("action") == GitHubActionType.mergePR.name).fetchAll(db)
+        for row in rows {
+            if var ask = try Ask.fetchOne(db, key: row.askId), ask.status.isPending {
+                ask.internalNote = Self.engineMergeOffVoidText
+                try settle(db, ask: &ask, status: .superseded, decidedBy: "system", tellRequesterToo: false, now: now)
+            }
+            _ = try row.delete(db)
         }
     }
 

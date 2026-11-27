@@ -182,12 +182,20 @@ public actor PRStep {
             || why.contains(PRLandingMachine.mergeHeldMarker) || isCredentialRefusal(why)
     }
 
-    /// Git's words (as `GitPush` stores them: path-like words dropped) when GitHub turned the push's credential down: a 401 or
-    /// 403 over HTTPS, a failed authentication, no credential at all. Another try with the same token fails the same way.
+    /// Git's own words (as `GitPush` stores them: path-like words dropped) when GitHub turned the push's credential down: the
+    /// HTTP status (`The requested URL returned error: 401`/`403`), `Authentication failed for`, or no credential at all
+    /// (`could not read Username for`). Keyed on git's markers only, never on GitHub's free text. Another try with the same
+    /// token fails the same way.
     static func isCredentialRefusal(_ why: String) -> Bool {
         let lower = why.lowercased()
-        return ["returned error: 401", "returned error: 403", "authentication failed", "could not read username", "could not read password",
-                "invalid username or password", "permission to", "write access to repository not granted"].contains { lower.contains($0) }
+        return ["returned error: 401", "returned error: 403", "authentication failed for", "could not read username for",
+                "could not read password for"].contains { lower.contains($0) }
+    }
+
+    /// Whether a hold carries GitHub's (or git's, talking to GitHub) own words — a refused push, the credential refused, GitHub's
+    /// refusal of an open or a merge — so the owner's alert marks it `GitHub said:`. Brahma's own hold texts are not marked.
+    static func isRemoteText(_ why: String) -> Bool {
+        why.contains("[rejected]") || why.contains("[remote rejected]") || why.contains("GitHub refused") || isCredentialRefusal(why)
     }
 
     /// The statuses an open landing records in `lastError` while it waits on GitHub (not errors: polled at the normal interval).
@@ -217,7 +225,7 @@ public actor PRStep {
         }
         if !pr.isOpen {
             if pr.merged {
-                await machine.mergedUpstream(landing, pr: pr)   // a human merged it on GitHub (Task 5)
+                await machine.mergedOnGitHub(landing, pr: pr)   // a human merged it on GitHub (Task 5): proven, or held
                 return .ok
             }
             do {

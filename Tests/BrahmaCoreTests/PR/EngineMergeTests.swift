@@ -17,18 +17,51 @@ import GRDB
     static let grantedAll = RulesGate(granted: Set(GitHubActionType.all.map(\.name)))
     static let fetchedTip = String(repeating: "c0ffee12", count: 5)
 
-    /// The remote-main fetch Task 6 supplies, faked: records each call.
+    /// The remote-main fetch Task 6 supplies, faked: records each call; answers the completion proof's questions from knobs —
+    /// whether the fetch was `rewound`, whether the fetched tip holds the merge commit (`onMain`), the merge commit's parent
+    /// count, and whether a merge commit carries the pushed commit (`carries`).
     final class FakeRemoteMain: RemoteMainFetching, @unchecked Sendable {
+        struct Knobs { var rewound = false; var onMain = true; var parents = 2; var carries = true }
         private let lock = NSLock()
         private var seen: [String] = []
         private var failing = false
+        private var current = Knobs()
         var calls: [String] { lock.withLock { seen } }
+        var knobs: Knobs {
+            get { lock.withLock { current } }
+            set { lock.withLock { current = newValue } }
+        }
         func fail(_ value: Bool) { lock.withLock { failing = value } }
         func fetch(companyId: String) async throws -> FetchResult {
-            let fail = lock.withLock { seen.append(companyId); return failing }
+            let (fail, k) = lock.withLock { seen.append(companyId); return (failing, current) }
             if fail { throw FakeGitHub.Failure.unavailable }
-            return FetchResult(newTip: EngineMergeTests.fetchedTip, commits: [EngineMergeTests.fetchedTip], rewound: false)
+            return FetchResult(newTip: EngineMergeTests.fetchedTip, commits: [EngineMergeTests.fetchedTip], rewound: k.rewound)
         }
+        func isAncestor(_ ancestor: String, of descendant: String, companyId: String) async throws -> Bool {
+            descendant == EngineMergeTests.fetchedTip ? knobs.onMain : knobs.carries
+        }
+        func parents(of sha: String, companyId: String) async throws -> [String] {
+            (0..<knobs.parents).map { String(repeating: "\($0)", count: 40) }
+        }
+    }
+
+    /// A gate that lets everything run on its own (as no policy should for a merge): rule 4 is the machine's too.
+    struct AutoGate: PRActionGate {
+        func decide(_ r: PRActionRequest) async -> PRActionDecision { .auto }
+    }
+
+    /// The engine alerts about merged PRs Brahma does not record as landed.
+    static func mergedAlerts(_ store: Store) throws -> [Ask] {
+        try store.writer.read { db in
+            try Ask.filter(Column("kind") == AskKind.engineAlert && Column("subjectId").like("hold:prmerged:%")).order(Column("number")).fetchAll(db)
+        }
+    }
+
+    /// Nothing of the item is recorded as landed: not Done, no merged request, no "merged into main" line.
+    static func expectNotLanded(_ w: World, _ item: WorkItem, sourceLocation: SourceLocation = #_sourceLocation) throws {
+        #expect(try w.store.workItem(id: item.id)?.status != .done, sourceLocation: sourceLocation)
+        #expect(try Self.mergeRequestRow(w, item)?.status != .merged, sourceLocation: sourceLocation)
+        #expect(try Self.mergedLines(w.store, item).isEmpty, sourceLocation: sourceLocation)
     }
 
     /// Tick times far enough apart that every landing is due (past any back-off).
@@ -62,6 +95,10 @@ import GRDB
 
     static func mergeRequestRow(_ w: World, _ item: WorkItem) throws -> MergeRequest? { try PRStepTests.request(w.store, item) }
 
+    static func activity(_ store: Store, like pattern: String) throws -> [String] {
+        try store.writer.read { db in try String.fetchAll(db, sql: "SELECT text FROM activityEvent WHERE text LIKE ?", arguments: [pattern]) }
+    }
+
     /// The merge queue's "merged into main" activity lines of the item.
     static func mergedLines(_ store: Store, _ item: WorkItem) throws -> [String] {
         try store.writer.read { db in
@@ -77,6 +114,10 @@ import GRDB
         #expect(!log.contains { $0.hasPrefix("PATCH ") || $0.hasPrefix("DELETE ") }, "\(log)", sourceLocation: sourceLocation)
         #expect(log.filter { $0.hasPrefix("PUT ") }.allSatisfy { $0.hasSuffix("/merge") }, "\(log)", sourceLocation: sourceLocation)
         #expect(!w.github.mergeBodies.contains { $0.lowercased().contains("bypass") }, sourceLocation: sourceLocation)
+        for args in w.runner.pushArguments {
+            #expect(!args.contains { $0 == "--force" || $0 == "-f" || $0 == "--delete" || $0 == "-d" || $0.hasPrefix("+") || $0.hasPrefix(":") },
+                    "\(args)", sourceLocation: sourceLocation)
+        }
         let opened = w.github.openRequests.map { request -> String in
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
@@ -108,6 +149,8 @@ import GRDB
         #expect(merged.state == .merged && merged.mergedSHA == pr.mergeCommitSHA && merged.lastError == nil, "\(merged)")
         #expect(try w.store.workItem(id: item.id)?.status == .done)
         #expect(Self.puts(w).isEmpty)
+        let how = try Self.activity(w.store, like: "\(item.key): PR #1 merged on GitHub as %")
+        #expect(how == ["\(item.key): PR #1 merged on GitHub as a merge commit (\(pr.mergeCommitSHA?.prefix(7) ?? "-")), proven on the fetched main"], "\(how)")
         Self.expectNoBypassOrProtection(w)
     }
 
@@ -443,6 +486,8 @@ import GRDB
         #expect(landing.state == .merged && landing.lastError == "PR merged; waiting for the remote main fetch", "\(landing)")
         #expect(try w.store.workItem(id: item.id)?.status == .inReview)
         #expect(try Self.mergeRequestRow(w, item)?.status == .handedToPR)
+        let reasons = try w.store.stallReport(companyId: w.env.company.id).reasons
+        #expect(reasons.contains("@eng-1 waits: PR #1 merged on GitHub; waiting to fetch main"), "\(reasons)")
         await step.tick(now: ticks.next())
         #expect(try w.store.workItem(id: item.id)?.status == .inReview)
         // A failing fetch keeps it waiting, with why.
@@ -477,6 +522,172 @@ import GRDB
         #expect(landing.state == .mergeable && landing.lastError?.contains("allows no merge method") == true, "\(landing)")
         #expect(try Self.mergeCards(w).isEmpty && Self.puts(w).isEmpty)
         let alerts = try PRStepTests.alerts(w.store)
+        // Brahma's own words, not GitHub's: not marked as GitHub's.
+        #expect(alerts.count == 1 && alerts.first?.summary.contains("is held: PR #1 cannot be merged by Brahma") == true
+                && alerts.first?.summary.contains("GitHub said") == false, "\(alerts.map(\.summary))")
+    }
+
+    // MARK: Fix round 1
+
+    /// X8-34: a third party pushed a commit to the PR's branch and it was merged: Brahma's verified commit is not what merged.
+    /// Held, the owner told once; nothing recorded as landed; the fetch is not even asked.
+    @Test func thirdPartyCommitMergedIsNotLanded() async throws {
+        let fetcher = FakeRemoteMain()
+        let w = try Self.world(engineMerge: false, fetcher: fetcher)
+        let step = PRStep(store: w.store, machine: w.machine)
+        let ticks = Ticks()
+        let (item, sha) = try await Self.mergeable(w, step, ticks, "Someone added a commit")
+        w.github.update(Self.repo) { $0.pulls[0].headSHA = "abad" + String(sha.dropFirst(4)) }
+        w.github.humanMerge(Self.repo, number: 1)
+        await step.tick(now: ticks.next())
+        let landing = try w.landing(item)
+        #expect(landing.state == .merged && landing.lastError?.hasPrefix("merged with changes Brahma did not push") == true, "\(landing)")
+        try Self.expectNotLanded(w, item)
+        #expect(try w.store.workItem(id: item.id)?.status == .inProgress, "back to its holder")
+        #expect(try Self.mergeRequestRow(w, item)?.status == .bounced)
+        #expect(fetcher.calls.isEmpty)
+        var alerts = try Self.mergedAlerts(w.store)
+        #expect(alerts.count == 1 && alerts.first?.summary.contains("does not record it as landed: merged with changes Brahma did not push") == true,
+                "\(alerts.map(\.summary))")
+        for _ in 0..<2 { await step.tick(now: ticks.next()) }
+        alerts = try Self.mergedAlerts(w.store)
+        #expect(alerts.count == 1)
+        try Self.expectNotLanded(w, item)
+    }
+
+    /// Ruling 35: every other unproven merge is held the same way — a base retargeted, no merge commit named, a rewritten remote
+    /// main, a main without the merge commit, a merge commit without the pushed commit. A squash or rebase (one parent) is proven
+    /// by the head and the commit on main.
+    @Test func unprovenMergeIsHeldNeverLanded() async throws {
+        typealias Knobs = FakeRemoteMain.Knobs
+        let cases: [(name: String, github: @Sendable (inout FakeGitHub.Repo) -> Void, knobs: Knobs, held: String?)] = [
+            ("base retargeted", { $0.pulls[0].base = "release" }, Knobs(), "PR #1 was merged into release, not the default branch main"),
+            ("no merge commit", { $0.pulls[0].mergeCommitSHA = nil }, Knobs(), "GitHub reports PR #1 merged but names no merge commit"),
+            ("rewound", { _ in }, Knobs(rewound: true), "the remote main was rewritten"),
+            ("not on main", { _ in }, Knobs(onMain: false), "does not contain PR #1's merge commit"),
+            ("merge commit without the pushed commit", { _ in }, Knobs(parents: 2, carries: false), "does not carry the pushed commit"),
+            ("squash", { _ in }, Knobs(parents: 1, carries: false), nil),
+        ]
+        for c in cases {
+            let fetcher = FakeRemoteMain()
+            fetcher.knobs = c.knobs
+            let w = try Self.world(engineMerge: false, fetcher: fetcher)
+            let step = PRStep(store: w.store, machine: w.machine)
+            let ticks = Ticks()
+            let (item, _) = try await Self.mergeable(w, step, ticks, "Case \(c.name)")
+            w.github.humanMerge(Self.repo, number: 1)
+            w.github.update(Self.repo, c.github)
+            await step.tick(now: ticks.next())
+            await step.tick(now: ticks.next())
+            let landing = try w.landing(item)
+            if let held = c.held {
+                #expect(landing.state == .merged && landing.lastError?.contains(held) == true, "\(c.name): \(landing)")
+                try Self.expectNotLanded(w, item)
+                #expect(try Self.mergedAlerts(w.store).count == 1, "\(c.name)")
+            } else {
+                #expect(landing.state == .merged && landing.lastError == nil, "\(c.name): \(landing)")
+                #expect(try w.store.workItem(id: item.id)?.status == .done, "\(c.name)")
+                #expect(try Self.activity(w.store, like: "%merged on GitHub as squash or rebase%").count == 1)
+                #expect(try Self.mergedAlerts(w.store).isEmpty)
+            }
+        }
+    }
+
+    /// Review I1: rule 4 is the machine's own — a gate that answers `auto` for merge-pr still gets no merge without the owner's
+    /// card; the approval of that card merges once.
+    @Test func gateAutoStillNeedsTheOwnersCard() async throws {
+        let w = try Self.world(engineMerge: true, gate: AutoGate())
+        let step = PRStep(store: w.store, machine: w.machine)
+        let ticks = Ticks()
+        let (item, sha) = try await Self.mergeable(w, step, ticks, "Auto gate")
+        await step.tick(now: ticks.next())
+        await step.tick(now: ticks.next())
+        #expect(Self.puts(w).isEmpty)
+        let cards = try Self.mergeCards(w)
+        #expect(cards.count == 1 && cards.first?.status == .pendingOwner && cards.first?.summary.contains(GitHubRules.irreversibleMergeText) == true)
+        #expect(try w.landing(item).lastError == "waiting for the owner: \(GitHubRules.irreversibleMergeText)")
+        _ = try w.store.ownerDecide(askId: try #require(cards.first).id, approve: true)
+        await step.tick(now: ticks.next())
+        #expect(w.github.mergeBodies == ["{\"merge_method\":\"merge\",\"sha\":\"\(sha)\"}"])
+        #expect(try w.landing(item).state == .merged)
+        // No approval at all (a card that never was): never a merge.
+        #expect(try !w.store.startPRMerge(itemId: item.id, sha: sha, approvalAskId: "no-such-ask", now: Self.t0))
+    }
+
+    /// X8-32c(b): turning `--engine-merge` off voids the merge cards — a pending one says so, approving it does nothing and
+    /// says why; an approval not yet used is gone (turning it on again asks anew).
+    @Test func engineMergeOffVoidsCards() async throws {
+        let w = try Self.world(engineMerge: true)
+        let step = PRStep(store: w.store, machine: w.machine)
+        let ticks = Ticks()
+        let (item, _) = try await Self.mergeable(w, step, ticks, "Turned off")
+        await step.tick(now: ticks.next())
+        let card = try #require(try Self.mergeCards(w).first)
+        try w.store.setLanding(.pr, engineMerge: false, companyId: w.env.company.id, by: .owner)
+        let voided = try #require(try w.store.ask(id: card.id))
+        #expect(voided.status == .superseded && voided.internalNote == "voided: engine merge turned off")
+        do {
+            _ = try w.store.ownerDecide(askId: card.id, approve: true)
+            Issue.record("a voided card was approved")
+        } catch let error as WorkError {
+            #expect(error.message.contains("voided: engine merge turned off"), "\(error.message)")
+        }
+        for _ in 0..<2 { await step.tick(now: ticks.next()) }
+        #expect(try Self.puts(w).isEmpty && w.landing(item).state == .mergeable)
+        // On again: a fresh card; approved; off again before it ran: the approval is gone, nothing merges.
+        try w.store.setLanding(.pr, engineMerge: true, companyId: w.env.company.id, by: .owner)
+        await step.tick(now: ticks.next())
+        let fresh = try #require(try Self.mergeCards(w).last)
+        #expect(fresh.id != card.id && fresh.status == .pendingOwner)
+        _ = try w.store.ownerDecide(askId: fresh.id, approve: true)
+        try w.store.setLanding(.pr, engineMerge: false, companyId: w.env.company.id, by: .owner)
+        #expect(try w.approvals().filter { $0.action == "merge-pr" }.isEmpty)
+        try w.store.setLanding(.pr, engineMerge: true, companyId: w.env.company.id, by: .owner)
+        await step.tick(now: ticks.next())
+        #expect(Self.puts(w).isEmpty)
+        #expect(try Self.mergeCards(w).last?.status == .pendingOwner && Self.mergeCards(w).count == 3)
+    }
+
+    /// X8-32c(c): a PR merged on GitHub after its item was brought back with GitHub's feedback is "merged outside Brahma": the
+    /// owner is told once, nothing moves silently, nothing is recorded as landed.
+    @Test func mergedAfterBroughtBackIsMergedOutsideBrahma() async throws {
+        let w = try Self.world(engineMerge: false)
+        let step = PRStep(store: w.store, machine: w.machine)
+        let ticks = Ticks()
+        let (item, sha) = try await PRStepTests.openPR(w, "Brought back")
+        w.github.update(Self.repo) { $0.checkRuns = [.init(name: "ci", headSHA: sha, conclusion: "failure")] }
+        await step.tick(now: ticks.next())
+        #expect(try w.landing(item).state == .checksFailed && w.store.workItem(id: item.id)?.status == .inProgress)
+        w.github.humanMerge(Self.repo, number: 1)
+        await step.tick(now: ticks.next())
+        let landing = try w.landing(item)
+        #expect(landing.state == .merged && landing.lastError?.hasPrefix("merged outside Brahma") == true, "\(landing)")
+        #expect(try w.store.workItem(id: item.id)?.status == .inProgress)
+        try Self.expectNotLanded(w, item)
+        let alerts = try Self.mergedAlerts(w.store)
+        #expect(alerts.count == 1 && alerts.first?.summary.contains("merged outside Brahma") == true, "\(alerts.map(\.summary))")
+    }
+
+    /// A merge GitHub refused for good (403) is not put in front of the owner again every back-off: only a change in the
+    /// request (here the method) files a fresh card.
+    @Test func refusedForGoodAsksAgainOnlyOnChange() async throws {
+        let w = try Self.world(engineMerge: true)
+        let step = PRStep(store: w.store, machine: w.machine)
+        let ticks = Ticks()
+        let (item, _) = try await Self.mergeable(w, step, ticks, "Forbidden")
+        await step.tick(now: ticks.next())
+        _ = try w.store.ownerDecide(askId: try #require(try Self.mergeCards(w).first).id, approve: true)
+        w.github.failNextMerge(.rejected(403, "Resource not accessible by personal access token"))
+        await step.tick(now: ticks.next())
+        #expect(try w.landing(item).state == .mergeable && w.landing(item).lastError?.contains("GitHub refused the merge (403)") == true)
+        let alerts = try PRStepTests.alerts(w.store)
         #expect(alerts.count == 1 && alerts.first?.summary.contains("GitHub said: ") == true, "\(alerts.map(\.summary))")
+        for _ in 0..<3 { await step.tick(now: ticks.next()) }
+        #expect(try Self.mergeCards(w).count == 1 && Self.puts(w).count == 1)
+        w.github.update(Self.repo) { $0.allowMergeCommit = false }
+        await step.tick(now: ticks.next())
+        let cards = try Self.mergeCards(w)
+        #expect(cards.count == 2 && cards[1].status == .pendingOwner && cards[1].payload?.details?.contains("Merge method: squash") == true)
+        #expect(Self.puts(w).count == 1)
     }
 }

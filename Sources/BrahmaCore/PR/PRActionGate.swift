@@ -70,9 +70,13 @@ public enum GitHubRules {
         payload.touchesWorkflows ? "the change touches .github/workflows/, which runs with the repository's secrets" : nil
     }
 
-    /// Merging is irreversible: it always asks unless the owner opted in with `--engine-merge` and granted `merge-pr`, which X4's
-    /// grant step decides; here it asks.
+    /// Merging is irreversible (spec §8.4.5 rule 4): it always asks the owner — with `--engine-merge` and a `merge-pr` grant
+    /// too; the grant only lets the engine file the request at all. The landing machine enforces it itself as well: it never
+    /// presses merge without the owner's approval of exactly that request, whatever a gate answers.
     public static func mergePRAlwaysAsks(_ type: GitHubActionType) -> String? {
-        type.reversible ? nil : "merging a pull request cannot be undone"
+        type.reversible ? nil : irreversibleMergeText
     }
+
+    /// Why a merge asks.
+    public static let irreversibleMergeText = "merging a pull request cannot be undone"
 }

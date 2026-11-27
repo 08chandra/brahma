@@ -29,6 +29,8 @@ extension Store {
             guard try Company.fetchOne(db, key: companyId) != nil else { throw WorkError.notFound("no such company") }
             _ = try Company.filter(key: companyId)
                 .updateAll(db, Column("landing").set(to: mode), Column("engineMerge").set(to: engineMerge))
+            // Task 5 fix round 1 (X8-32c(b)): without --engine-merge no merge card can decide anything.
+            if !engineMerge { try voidEngineMergeCards(db, companyId: companyId, now: Store.now()) }
         }
     }
 

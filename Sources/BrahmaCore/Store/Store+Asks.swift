@@ -604,7 +604,11 @@ extension Store {
         guard ask.kind.isDecision else {
             throw WorkError.invalid(ask.kind == .info ? "\(ask.ref) is a question; answer it" : "\(ask.ref) is an engine alert; acknowledge it")
         }
-        guard ask.status.isPending else { throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)") }
+        guard ask.status.isPending else {
+            // A card the engine voided says why (Plan X8: a merge card voided when --engine-merge was turned off).
+            let why = ask.status == .superseded && ask.internalNote?.hasPrefix("voided:") == true ? " (\(ask.internalNote ?? ""))" : ""
+            throw WorkError.conflict("\(ask.ref) is already \(ask.status.rawValue)\(why)")
+        }
         if approve, !acknowledgeChange, ask.payload?.documentPath != nil, let proposed = ask.detailsHash,
            let current = currentHash, current != proposed {
             throw WorkError.conflict("\(ask.ref)'s document changed since it was proposed; read it again and approve with --ack-changed")

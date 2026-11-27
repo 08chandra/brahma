@@ -28,6 +28,9 @@ import GRDB
             let tip = try next()
             return FetchResult(newTip: tip, commits: [tip], rewound: false)
         }
+        /// The queue never asks these (the PR landing's completion proof does).
+        func isAncestor(_ ancestor: String, of descendant: String, companyId: String) async throws -> Bool { throw FakeGitHub.Failure.unavailable }
+        func parents(of sha: String, companyId: String) async throws -> [String] { throw FakeGitHub.Failure.unavailable }
     }
 
     func queue(_ m: MergeFixture, landing: FakeLanding?, fetch: FakeRemoteMain?) async -> MergeQueue {

@@ -107,7 +107,9 @@ extension Store {
     /// same write (Plan X8 Task 5, carried from Task 4) the item's merge request handed to the PR is bounced and the item goes
     /// back to its holder through the merge queue's own path (`returnUnmerged`: In progress, a `mergeFailed` notice, a DM), so
     /// nothing stays locked in review — as an owner's abandon does. Without such a request (already released) the item's owner
-    /// agent still gets the `mergeFailed` notice. CAS on (`state`, `sha`, PR number) the watch read.
+    /// agent still gets the `mergeFailed` notice. CAS on (`state`, `sha`, PR number) the watch read. The release is of the
+    /// request handed for `sha`: the PR that closed carries that commit (a request for another commit is not this PR's); the
+    /// owner's abandon releases the latest handed request whatever its commit (`sha: nil`), since it gives the landing up.
     func closePRLandingUpstream(itemId: String, number: Int, from state: PRLandingState, sha: String, now: Date) throws {
         try writer.write { db in
             guard var landing = try PRLanding.fetchOne(db, key: itemId), landing.state == state, landing.pushedSHA == sha,
