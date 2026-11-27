@@ -149,3 +149,13 @@ func requireOwnerShell(quietly: Bool = false) throws -> OwnerPrincipal {
     OwnerPrincipal.enterOwnerProcess()
     do { return try OwnerPrincipal.mint(runningTurnPids: running) } catch { throw refuse("\(error)") }
 }
+
+/// Plan X1 Ruling 21: a read-only owner command refuses inside an agent turn (its environment or its ancestry), with no owner
+/// key needed; a state-changing one calls `requireOwnerShell()` instead.
+func refuseInsideAgentTurn() throws {
+    let running = Store.recordedTurnLeaders(paths: BrahmaPaths.fromEnvironment())
+    if let why = OwnerShellGuard.refusal(environment: ProcessInfo.processInfo.environment,
+                                         ancestors: ProcessAncestry.chain(of: getpid()), runningTurnPids: running) {
+        throw fail(why)
+    }
+}

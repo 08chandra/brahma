@@ -4,8 +4,9 @@ import BrahmaCore
 
 struct SettingsGroup: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "settings", abstract: "Owner-wide settings: time zone, plan tier and weekly share.",
-        subcommands: [TimeZoneSetting.self, Plan.self, Share.self, HotPaths.self, AutoMerge.self, AutoMergePaths.self, UltraShare.self])
+        commandName: "settings", abstract: "Owner-wide settings: time zone, plan tier, weekly share and model prices.",
+        subcommands: [TimeZoneSetting.self, Plan.self, Share.self, HotPaths.self, AutoMerge.self, AutoMergePaths.self, UltraShare.self,
+                      ModelPrice.self])
 
     struct TimeZoneSetting: ParsableCommand {
         static let configuration = CommandConfiguration(
