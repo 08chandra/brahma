@@ -277,6 +277,8 @@ public final class WALShipper: @unchecked Sendable {
     private let onPaused: (@Sendable (PauseReason) -> Void)?
     /// The leader's start time right after a spawn (tests inject a failing one): `ProcessTable.entry(pid)?.start`.
     private let startTimeProbe: @Sendable (Int32) -> Double?
+    /// One raw argv read (`ProcessArguments.once`); tests inject transient failures.
+    private let argvProbe: @Sendable (Int32) -> [String]?
     private let launchProbe: (@Sendable () -> Void)?
 
     /// Why `start` or a restart launched nothing.
@@ -288,6 +290,9 @@ public final class WALShipper: @unchecked Sendable {
         /// The process table could not be read, so a foreign litestream for this database cannot be ruled out (S4 fix round 1,
         /// I2): nothing was started.
         case tableUnreadable
+        /// A live process of this user whose argv stayed unreadable past `ProcessArguments.patience`, so it cannot be ruled out
+        /// as a litestream for this database: nothing was started (fail closed, as `tableUnreadable`).
+        case argvUnreadable(pid: Int32)
     }
     /// Awake seconds, for how long one run lasted (`ShipperBackoff.healthyRun`); a test seam.
     private let awakeUptime: @Sendable () -> TimeInterval
@@ -306,8 +311,10 @@ public final class WALShipper: @unchecked Sendable {
                 note: @escaping @Sendable (String) -> Void = { _ in },
                 awakeUptime: @escaping @Sendable () -> TimeInterval = { AwakeTime.uptime() },
                 onPaused: (@Sendable (PauseReason) -> Void)? = nil,
-                startTimeProbe: (@Sendable (Int32) -> Double?)? = nil) {
+                startTimeProbe: (@Sendable (Int32) -> Double?)? = nil,
+                argvProbe: (@Sendable (Int32) -> [String]?)? = nil) {
         self.onPaused = onPaused
+        self.argvProbe = argvProbe ?? { ProcessArguments.once($0) }
         self.startTimeProbe = startTimeProbe ?? { ProcessTable.entry($0)?.start }
         self.executable = executable
         self.arguments = WALShipping.replicateArguments(paths: paths)
@@ -323,7 +330,8 @@ public final class WALShipper: @unchecked Sendable {
     /// How many times litestream has been started.
     public var startCount: Int { lock.withLock { starts } }
 
-    /// Blocking for at most about `grace` + 2 s when a stale litestream has to be stopped first. Nothing is started while a live
+    /// Blocking for at most about `grace` + 2 s when a stale litestream has to be stopped first (plus `ProcessArguments.patience`
+    /// per argv that will not read). Nothing is started while a live
     /// litestream for this config exists that this engine cannot prove it started: the one the pid file names without a
     /// matching start (`StaleOutcome.unprovenLive`), or any other found by a read-only look at the process table
     /// (`foreignLitestream`, repeated before every launch, Task 9c fix round 3). Two litestreams must not replicate one
@@ -332,10 +340,11 @@ public final class WALShipper: @unchecked Sendable {
     public func start() {
         let paused: PauseReason? = lock.withLock {
             guard task == nil else { return nil }
-            let outcome = Self.reapStale(paths: paths, grace: grace)
+            let outcome = Self.reapStale(paths: paths, grace: grace, argv: argvProbe)
             if let text = outcome.text { note(text) }
             if case .unprovenLive(let pid, _) = outcome { return .foreign(pid: pid) }
-            if let blocked = Self.foreignLitestream(paths: paths, excluding: nil) {
+            if case .argvUnreadable(let pid) = outcome { return .argvUnreadable(pid: pid) }
+            if let blocked = Self.foreignLitestream(paths: paths, excluding: nil, argv: argvProbe) {
                 note(Self.blockedNote(blocked))
                 return blocked
             }
@@ -347,15 +356,21 @@ public final class WALShipper: @unchecked Sendable {
 
     /// What blocks a launch: a live `litestream replicate -config <this config>` of this user other than `excluding` (this
     /// shipper's own child, `.foreign`), or a process table that cannot be read (`.tableUnreadable`: a foreign one cannot be
-    /// ruled out, so it blocks too, S4 fix round 1, I2); nil when nothing does. Read-only: the table is read and argvs looked
-    /// at; nothing is signalled. Zombies and this process are skipped. `table` is injectable for tests.
+    /// ruled out, so it blocks too, S4 fix round 1, I2), or a live process of this user whose argv stayed unreadable
+    /// (`.argvUnreadable`: the same, Ruling S5-11); nil when nothing does. Read-only: the table is read and argvs looked
+    /// at; nothing is signalled. Zombies and this process are skipped. `table` and `argv` (one raw read) are injectable for tests.
     static func foreignLitestream(paths: BrahmaPaths, excluding own: Int32?,
-                                  table: () -> [ProcessEntry]? = ProcessTable.snapshot) -> PauseReason? {
+                                  table: () -> [ProcessEntry]? = ProcessTable.snapshot,
+                                  argv once: (Int32) -> [String]? = { ProcessArguments.once($0) }) -> PauseReason? {
         let config = WALShipping.configURL(paths: paths).path
         let me = getpid(), uid = getuid()
         guard let entries = table() else { return .tableUnreadable }
         for entry in entries where entry.uid == uid && !entry.isZombie && entry.pid != me && entry.pid != own && entry.pid > 1 {
-            if let argv = ProcessArguments.of(entry.pid), isLitestream(argv, config: config) { return .foreign(pid: entry.pid) }
+            switch ProcessArguments.read(entry.pid, once: once) {
+            case .argv(let argv) where isLitestream(argv, config: config): return .foreign(pid: entry.pid)
+            case .unreadable: return .argvUnreadable(pid: entry.pid)          // cannot be ruled out: fail closed (I2)
+            case .argv, .gone: continue
+            }
         }
         return nil
     }
@@ -369,6 +384,8 @@ public final class WALShipper: @unchecked Sendable {
             "the process table could not be read, so another litestream for this database cannot be ruled out; WAL shipping is paused"
         case .startUnreadable:
             "litestream's start time could not be read twice in a row; WAL shipping is paused"
+        case .argvUnreadable(let pid):
+            "the arguments of pid \(pid) could not be read, so it cannot be ruled out as a litestream for this database; WAL shipping is paused"
         }
     }
 
@@ -414,7 +431,7 @@ public final class WALShipper: @unchecked Sendable {
                     return
                 }
                 // Before every launch (a restart too): a litestream for this database that is not ours pauses shipping.
-                if let blocked = Self.foreignLitestream(paths: paths, excluding: nil) {
+                if let blocked = Self.foreignLitestream(paths: paths, excluding: nil, argv: argvProbe) {
                     task = nil
                     lock.unlock()
                     note(Self.blockedNote(blocked))
@@ -515,6 +532,9 @@ public final class WALShipper: @unchecked Sendable {
         case unprovenLive(Int32, StartProblem)
 
         enum StartProblem: Equatable { case missing, mismatched }
+        /// Alive, but its argv stayed unreadable past `ProcessArguments.patience`: never signalled, nothing started, and the
+        /// record is KEPT (it is the only proof this engine started it), so the next start can stop it.
+        case argvUnreadable(Int32)
 
         var text: String? {
             switch self {
@@ -528,6 +548,9 @@ public final class WALShipper: @unchecked Sendable {
             case .unprovenLive(let pid, .mismatched):
                 "litestream.pid named pid \(pid), litestream for this config, but its start time is not the recorded one; it was left alone"
                 + " and WAL shipping is paused until it is stopped"
+            case .argvUnreadable(let pid):
+                "litestream.pid named pid \(pid), whose arguments could not be read; it was left alone, its record kept, and WAL shipping"
+                + " is paused until a relaunch"
             }
         }
     }
@@ -535,22 +558,37 @@ public final class WALShipper: @unchecked Sendable {
     /// A litestream an earlier engine left running for this config (named by the pid file): stopped (SIGTERM, `grace`, SIGKILL)
     /// only when its argv shows it is litestream `replicate -config <this config>` and the record's start time (the third line,
     /// written at spawn) is still that process's. A record without a start time (the two-line form of engines before Task 9c)
-    /// or with another is stale: the process is never signalled (`unprovenLive`). The pid file is removed in every case.
-    static func reapStale(paths: BrahmaPaths, grace: TimeInterval) -> StaleOutcome {
+    /// or with another is stale: the process is never signalled (`unprovenLive`). The argv is read with `ProcessArguments.read`:
+    /// one that stays unreadable for a live process is never "not litestream" (it fails for a live process mid-exec): the
+    /// process is never signalled, nothing is started, and the pid file is KEPT (`argvUnreadable`, Ruling S5-11), the only
+    /// proof this engine started it, so a later start can still stop it. In every other case the pid file is removed.
+    /// `argv` is one raw read (`ProcessArguments.once`), injectable for tests.
+    static func reapStale(paths: BrahmaPaths, grace: TimeInterval,
+                          argv once: (Int32) -> [String]? = { ProcessArguments.once($0) }) -> StaleOutcome {
         let file = pidFile(paths: paths)
         guard let data = EngineFiles.readNoFollow(file, under: paths.runDir, limit: 4096) else { return .nothing }
-        defer { unlink(file.path) }
+        var keepRecord = false
+        defer { if !keepRecord { unlink(file.path) } }
         let config = WALShipping.configURL(paths: paths).path
         let lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
         guard let pid = lines.first.flatMap({ Int32($0) }), pid > 1 else { return .removedUnreadable }
         guard kill(pid, 0) == 0 || errno == EPERM else { return .nothing }          // gone already
-        guard let argv = ProcessArguments.of(pid), isLitestream(argv, config: config) else { return .leftAlone(pid) }
+        // Another user's process holds the pid now: not ours (this engine's litestream runs as this user), and its argv never
+        // reads, so it is not "unreadable" either.
+        if let row = ProcessTable.entry(pid), row.uid != getuid() { return .leftAlone(pid) }
+        // An unreadable argv is not "not litestream" (KERN_PROCARGS2 fails for a live process while it is mid-exec): it is
+        // retried for `ProcessArguments.patience`, then fails closed.
+        switch ProcessArguments.read(pid, once: once) {
+        case .gone: return .nothing
+        case .unreadable: keepRecord = true; return .argvUnreadable(pid)
+        case .argv(let argv): guard isLitestream(argv, config: config) else { return .leftAlone(pid) }
+        }
         guard lines.count > 2, let recordedStart = Double(lines[2]), recordedStart > 0 else { return .unprovenLive(pid, .missing) }
         guard ProcessTable.entry(pid)?.start == recordedStart else { return .unprovenLive(pid, .mismatched) }
         kill(pid, SIGTERM)
         let soft = AwakeTime.uptime() + grace
         while kill(pid, 0) == 0, AwakeTime.uptime() < soft { Thread.sleep(forTimeInterval: 0.01) }
-        if kill(pid, 0) == 0, ProcessArguments.of(pid).map({ isLitestream($0, config: config) }) == true,
+        if kill(pid, 0) == 0, case .argv(let again) = ProcessArguments.read(pid, once: once), isLitestream(again, config: config),
            ProcessTable.entry(pid)?.start == recordedStart {
             kill(pid, SIGKILL)
             let hard = AwakeTime.uptime() + 2
@@ -575,6 +613,10 @@ public final class WALShipper: @unchecked Sendable {
             ("WAL shipping paused",
              "Brahma could not read the process table, so it could not rule out another litestream for this database and started "
              + "none. Relaunch Brahma to try again.")
+        case .argvUnreadable(let pid):
+            ("WAL shipping paused",
+             "Brahma could not read the arguments of process \(pid), so it could not rule out another litestream for this database "
+             + "and started none. Relaunch Brahma to try again.")
         }
     }
 
@@ -587,9 +629,42 @@ public final class WALShipper: @unchecked Sendable {
     }
 }
 
-/// The argv of a running process (another user's, or a gone one, reads as nil).
+/// The argv of a running process. One read (`once`) is nil for another user's process, a gone one, or a live one whose read
+/// failed (mid-exec); `read` tells "gone" apart from "unreadable", and every decision uses it (Ruling S5-11).
 enum ProcessArguments {
+    /// What reading a process's argv came to: `gone` only when the process no longer exists (or is a zombie); a live process
+    /// whose argv cannot be read is `unreadable`, never "not litestream".
+    enum Read: Equatable { case argv([String]), gone, unreadable }
+
+    /// How long a failed read of a live process is retried (awake seconds). KERN_PROCARGS2 fails (EIO, or a partial argv) for
+    /// a few ms while a process is mid-exec, e.g. a `#!/bin/sh` script while macOS's /bin/sh launcher execs bash; longer under load.
+    static let patience: TimeInterval = 1
+
+    /// `once` (a raw argv read by default; `TurnContainment` passes `ProcessTable.environment`, another KERN_PROCARGS2 read)
+    /// retried every 10 ms for `patience` while the process lives.
+    static func read(_ pid: Int32, patience: TimeInterval = patience,
+                     once: (Int32) -> [String]? = { ProcessArguments.once($0) }) -> Read {
+        let deadline = AwakeTime.uptime() + patience
+        while true {
+            if let argv = once(pid) { return .argv(argv) }
+            switch ProcessTable.lookup(pid) {
+            case .absent: return .gone
+            case .found(let e) where e.isZombie: return .gone
+            default: break
+            }
+            if AwakeTime.uptime() >= deadline { return .unreadable }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    }
+
+    /// The argv, or nil for a gone process or a failed read (callers that decide anything use `read`).
     static func of(_ pid: Int32) -> [String]? {
+        if case .argv(let argv) = read(pid) { return argv }
+        return nil
+    }
+
+    /// One KERN_PROCARGS2 read, no retry.
+    static func once(_ pid: Int32) -> [String]? {
         #if canImport(Darwin)
         var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
         var size = 0

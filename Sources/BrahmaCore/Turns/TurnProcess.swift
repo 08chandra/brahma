@@ -115,35 +115,51 @@ final class TurnContainment: @unchecked Sendable {
         return ids
     }
 
-    /// The processes of the turn alive in `table` (never the leader, which the caller reaps, nor this process).
-    func members(_ table: [ProcessEntry]) -> [ProcessEntry] {
+    /// The processes of the turn alive in `table` (never the leader, which the caller reaps, nor this process): `mine`. And
+    /// `undecided`: started since the turn, matched by nothing else, and its environment (the marker's last resort) could not
+    /// be read although it is alive. KERN_PROCARGS2 fails for a live process while it is mid-exec, so an unreadable
+    /// environment is never "not ours" (Ruling S5-11); nor does it prove the process is the turn's, so it is never killed:
+    /// the sweep keeps looking. A failed read is retried for `patience` awake seconds (`ProcessArguments.read`).
+    func members(_ table: [ProcessEntry], patience: TimeInterval = 0,
+                 environment: (pid_t) -> [String]? = { ProcessTable.environment($0) })
+        -> (mine: [ProcessEntry], undecided: [ProcessEntry]) {
         let known = lock.withLock { tracked }
-        return table.filter { p in
-            guard p.pid != leader, p.pid != me, p.uid == uid, !p.isZombie else { return false }
-            if known[p.pid] == p.start || p.pgid == leader || ProcessTable.session(p) == leader { return true }
-            if let probe, probe.classify(p.pid) == .mine { return true }
+        var mine: [ProcessEntry] = [], undecided: [ProcessEntry] = []
+        for p in table {
+            guard p.pid != leader, p.pid != me, p.uid == uid, !p.isZombie else { continue }
+            if known[p.pid] == p.start || p.pgid == leader || ProcessTable.session(p) == leader { mine.append(p); continue }
+            if let probe, probe.classify(p.pid) == .mine { mine.append(p); continue }
             // The environment is the last resort: macOS no longer shows other processes' environments (Linux does).
-            return p.start >= since && (ProcessTable.environment(p.pid)?.contains(marker) ?? false)
+            guard p.start >= since else { continue }
+            switch ProcessArguments.read(p.pid, patience: patience, once: environment) {
+            case .argv(let env): if env.contains(marker) { mine.append(p) }
+            case .gone: continue
+            case .unreadable: undecided.append(p)
+            }
         }
+        return (mine, undecided)
     }
 
     /// Stops watching and kills (SIGKILL) every process of the turn, round after round, until none is left or `rounds` pass.
     /// Each kill re-reads the process first, so a pid that was reused meanwhile is left alone. Returns what is still alive.
     /// A process table that cannot be read rules nothing out: `[-1]`, inconclusive (S4 fix round 1, I2), as `finish` and
-    /// `TurnRecords.reap` read it. `snapshot` is injectable for tests.
-    func sweep(rounds: Int = 50, snapshot: () -> [ProcessEntry]? = ProcessTable.snapshot) -> [pid_t] {
+    /// `TurnRecords.reap` read it. So does a process whose environment stayed unreadable (`members`' `undecided`, re-read
+    /// every round and, at the end, for `ProcessArguments.patience`): `-1`, never "nothing left", and never killed.
+    /// `snapshot` and `environment` are injectable for tests.
+    func sweep(rounds: Int = 50, snapshot: () -> [ProcessEntry]? = ProcessTable.snapshot,
+               environment: (pid_t) -> [String]? = { ProcessTable.environment($0) }) -> [pid_t] {
         stopWatching()
-        var left: [ProcessEntry] = []
         for _ in 0..<rounds {
             guard let table = snapshot() else { return [-1] }
             observe(table)
-            left = members(table)
-            if left.isEmpty { return [] }
+            let (left, undecided) = members(table, environment: environment)
+            if left.isEmpty, undecided.isEmpty { return [] }
             for p in left where ProcessTable.entry(p.pid)?.start == p.start { kill(p.pid, SIGKILL) }
             Thread.sleep(forTimeInterval: 0.02)
         }
         guard let table = snapshot() else { return [-1] }
-        return members(table).map(\.pid)
+        let (left, undecided) = members(table, patience: ProcessArguments.patience, environment: environment)
+        return left.map(\.pid) + (undecided.isEmpty ? [] : [-1])
     }
 }
 

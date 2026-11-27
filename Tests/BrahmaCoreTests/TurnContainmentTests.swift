@@ -321,6 +321,40 @@ private let perl = "/usr/bin/perl"
         #expect(containment.sweep(rounds: 1, snapshot: { ProcessTable.snapshot() }).isEmpty, "a readable table with nothing of the turn")
     }
 
+    /// S5 fix round 5 (Ruling S5-11): the marker in a process's environment is the last resort, read with KERN_PROCARGS2,
+    /// which fails for a live process while it is mid-exec. A process started since the turn whose environment cannot be read
+    /// is never "not ours": the sweep is inconclusive (`-1`), and the process is not killed (nothing proves it is the turn's).
+    /// One whose environment reads after a few failures is decided on what it then reads.
+    @Test func unreadableEnvironmentIsNeverNotOurs() throws {
+        let since = ProcessTable.startStamp(slack: 1)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sleep"); p.arguments = ["30"]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        try p.run()
+        defer { if p.isRunning { p.terminate() } }
+        let pid = p.processIdentifier
+        // A leader no process has: only the environment can tie `p` to the turn. Every other process reads without the marker.
+        let containment = TurnContainment(leader: 999_999, markerValue: "m", since: since)
+        let marked = ["\(TurnContainment.markerVariable)=m"]
+
+        #expect(containment.sweep(rounds: 2, environment: { _ in [] }) == [], "readable, without the marker: not the turn's")
+        #expect(kill(pid, 0) == 0)
+
+        #expect(containment.sweep(rounds: 2, environment: { $0 == pid ? nil : [] }) == [-1],
+                "an unreadable environment was taken for \"not ours\"")
+        #expect(kill(pid, 0) == 0, "a process whose environment could not be read was killed")
+
+        var failures = 3
+        let found = containment.sweep(rounds: 50, environment: { q in
+            guard q == pid else { return [] }
+            if failures > 0 { failures -= 1; return nil }
+            return marked
+        })
+        #expect(found == [])
+        p.waitUntilExit()
+        #expect(p.terminationReason == .uncaughtSignal, "a marked process whose first reads failed outlived its turn")
+    }
+
     /// Fix round 2 (B-N5): a record that cannot be read is moved aside (never left to block the agent forever); the caller is
     /// told which file it was.
     @Test func corruptRecordIsQuarantined() throws {

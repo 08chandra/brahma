@@ -763,12 +763,66 @@ import GRDB
         #expect(!pidAlive(pid))
     }
 
+    /// KERN_PROCARGS2 fails (EIO) for a live process while it is mid-exec, longer under load. A stale litestream proven ours
+    /// (pid and start time recorded) whose argv read fails a few times is still stopped, never spared as "not litestream" with a
+    /// second one started beside it; one whose argv never reads is not signalled, its record is kept (the only proof it is ours),
+    /// nothing is started and the owner is told; a relaunch that can read it stops it.
+    @Test func staleLitestreamWithUnreadableArgv() async throws {
+        let env = try BackupEnv()
+        let marks = try tempDir()
+        let (_, tools) = try fakeBin(["litestream": "touch '\(marks.path)/ready-'$$\n" + Self.longLoop])
+        let litestream = try #require(tools.litestream)
+        try BrahmaPaths.ensurePrivateDirectory(env.paths.runDir)
+        let config = WALShipping.configURL(paths: env.paths).path
+        func recordedStale() async throws -> OutsideChild {
+            let child = try OutsideChild(executable: litestream, arguments: WALShipping.replicateArguments(paths: env.paths))
+            try await waitUntil { FileManager.default.fileExists(atPath: marks.appending(path: "ready-\(child.pid)").path) }
+            let start = try #require(ProcessTable.entry(child.pid)?.start)
+            try Data("\(child.pid)\n\(config)\n\(start)\n".utf8).write(to: WALShipper.pidFile(paths: env.paths))
+            return child
+        }
+
+        // Transient: the stale one's first three reads fail (reapStale's, then each launch check's).
+        let stale = try await recordedStale()
+        defer { stale.end() }
+        let flaky = FlakyArgv(pid: stale.pid, failures: 3)
+        let first = WALShipper(executable: litestream, paths: env.paths, tools: tools, grace: 0.5, argvProbe: { flaky.read($0) })
+        first.start()
+        try await waitUntil { !stale.isRunning }
+        try #require(!stale.isRunning, "a stale litestream proven ours was spared on an unreadable argv")
+        #expect(stale.endedBySignal == true)
+        first.stop()
+
+        // Persistent: never signalled, record kept, nothing started, the owner told.
+        let stuck = try await recordedStale()
+        defer { stuck.end() }
+        let paused = Paused(), stuckPID = stuck.pid
+        let blind = WALShipper(executable: litestream, paths: env.paths, tools: tools, grace: 0.5, onPaused: { paused.set($0) },
+                               argvProbe: { $0 == stuckPID ? nil : ProcessArguments.once($0) })
+        blind.start()
+        #expect(paused.reason == .argvUnreadable(pid: stuck.pid))
+        #expect(!blind.isSupervising, "no second litestream was started")
+        #expect(stuck.isRunning && pidAlive(stuck.pid), "a process whose argv could not be read was signalled")
+        #expect(FileManager.default.fileExists(atPath: WALShipper.pidFile(paths: env.paths).path), "the record was kept")
+        #expect(WALShipper.pausedNotice(.argvUnreadable(pid: stuck.pid)).body.contains("Relaunch Brahma"))
+        blind.stop()
+        let relaunch = WALShipper(executable: litestream, paths: env.paths, tools: tools, grace: 0.5)
+        relaunch.start()
+        try await waitUntil { !stuck.isRunning }
+        #expect(!stuck.isRunning, "the relaunch stopped it through the kept record")
+        relaunch.stop()
+    }
+
     @Test func stalePidHandled() async throws {
         let env = try BackupEnv()
         // Both children must stay alive until the test itself ends them, however slow the suite runs (a child that ended by
         // itself would make "killed" and "never killed" pass or fail by timing).
-        let (_, tools) = try fakeBin(["litestream": Self.longLoop])
+        // Each fake marks `ready-<its pid>` from inside the script: argv already reads as litestream while macOS's /bin/sh
+        // launcher is still exec'ing bash, and KERN_PROCARGS2 fails during that exec; the scenario starts after it.
+        let marks = try tempDir()
+        let (_, tools) = try fakeBin(["litestream": "touch '\(marks.path)/ready-'$$\n" + Self.longLoop])
         let litestream = try #require(tools.litestream)
+        func ran(_ child: OutsideChild) -> Bool { FileManager.default.fileExists(atPath: marks.appending(path: "ready-\(child.pid)").path) }
         try BrahmaPaths.ensurePrivateDirectory(env.paths.runDir)
         /// The record this engine writes: pid, config, and the leader's start time (`start` nil: the two-line form of older engines).
         func writePID(_ pid: Int32, start: Double?) throws {
@@ -783,7 +837,7 @@ import GRDB
         // The scenario needs a stale process that IS litestream for this config by the time the shipper looks: wait on that
         // event (its argv), not on time.
         let config = WALShipping.configURL(paths: env.paths).path
-        try await waitUntil { ProcessArguments.of(stale.pid).map { WALShipper.isLitestream($0, config: config) } ?? false }
+        try await waitUntil { ran(stale) }
         try #require(ProcessArguments.of(stale.pid).map { WALShipper.isLitestream($0, config: config) } == true)
         try writePID(stale.pid, start: try #require(ProcessTable.entry(stale.pid)?.start))
         // An unrelated process whose pid sits in the file is never killed.
@@ -803,7 +857,7 @@ import GRDB
         // owner is told (`onPaused`). The same for a record whose start time is not that process's.
         let unproven = try OutsideChild(executable: litestream, arguments: WALShipping.replicateArguments(paths: env.paths))
         defer { unproven.end() }
-        try await waitUntil { ProcessArguments.of(unproven.pid).map { WALShipper.isLitestream($0, config: config) } ?? false }
+        try await waitUntil { ran(unproven) }
         for start in [nil, (try #require(ProcessTable.entry(unproven.pid)?.start)) - 7] as [Double?] {
             try writePID(unproven.pid, start: start)
             let paused = Paused()
@@ -818,6 +872,9 @@ import GRDB
         let notice = WALShipper.pausedNotice(.foreign(pid: unproven.pid))
         #expect(notice.title == "WAL shipping paused" && notice.body.contains("pid \(unproven.pid)") && notice.body.contains("relaunch Brahma"))
         #expect(!notice.body.contains("settings"))
+        // The unproven litestream has been checked: it goes now, or it would block the launch below as foreign (the wait on
+        // the new record then ran its whole 120 s).
+        unproven.end()
 
         try await waitUntil { ProcessArguments.of(unrelated.pid)?.first == "/bin/sleep" }
         try writePID(unrelated.pid, start: nil)
@@ -954,6 +1011,18 @@ private final class Probed: @unchecked Sendable {
     private var _pids: [Int32] = []
     func add(_ pid: Int32) { lock.withLock { _pids.append(pid) } }
     var pids: [Int32] { lock.withLock { _pids } }
+}
+
+/// An argv reader whose reads of `pid` fail `failures` times first (as KERN_PROCARGS2 does mid-exec).
+private final class FlakyArgv: @unchecked Sendable {
+    private let lock = NSLock()
+    private let pid: Int32
+    private var left: Int
+    init(pid: Int32, failures: Int) { self.pid = pid; left = failures }
+    func read(_ p: Int32) -> [String]? {
+        let fail: Bool = lock.withLock { guard p == pid, left > 0 else { return false }; left -= 1; return true }
+        return fail ? nil : ProcessArguments.once(p)
+    }
 }
 
 /// What `WALShipper` reported through `onPaused`.
