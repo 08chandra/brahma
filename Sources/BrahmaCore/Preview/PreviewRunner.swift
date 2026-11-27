@@ -10,7 +10,8 @@ import Glibc
 /// company's engine-accepted `main` (`company.mainCommit`, PR-22) under the data home, keyed by surface, commit and start
 /// (`EngineLayout.previewRunId`, PR-16), never shared and deleted when the run stops; its build and server run through
 /// 5-lite's `SandboxedRunner` with `PreviewPolicy.server` (writes only its run, listens only on its own loopback port), except
-/// that a Full company's preview runs unsandboxed exactly when its checks would (PR-5, `unsandboxed(store:company:surface:)`).
+/// that a Full company's preview runs unsandboxed exactly when its checks would (PR-5: its setter, resolved with
+/// `PrincipalResolver.resolve(.preview(surfaceId:))`, and the company narrow to Full under the ceiling; S6).
 ///
 /// `reconcile` is one pass over every company (the orchestrator's "preview" tick step runs it as a tracked task, PR-6):
 /// - a paused company's surfaces are stopped (`stopped`);
@@ -425,6 +426,10 @@ public actor PreviewRunner: EmergencyStopObserver {
                 return
             }
         }
+        // The surface's subject principals, resolved once for this start (S6): its setter. Unsandboxed only when the setter and
+        // the company narrow to Full under the ceiling; in a Full company an unconfirmed setter runs sandboxed with the B1 line.
+        let principals = PrincipalResolver(store: engineStore, ceiling: ceiling).resolve(.preview(surfaceId: surface.id))
+        PrincipalResolver.noteSandboxed(principals, store: engineStore, subject: "Preview \(surface.name)", kind: .preview, now: clock())
         let policies = PreviewPolicy.forKind(kind, layout: layout, run: run, company: company, sandbox: sandbox, port: port,
                                              surface: surface.name)
         var environment = PreviewContext.environment(base: baseEnvironment, port: port)
@@ -432,7 +437,7 @@ public actor PreviewRunner: EmergencyStopObserver {
         let context = PreviewContext(surface: surface, company: company, layout: layout, run: run, commit: commit, port: port,
                                      policy: policies.policy, environment: environment, logURL: logURL, timeouts: timeouts,
                                      outputURL: layout.previewOutput(name: surface.name), appPolicy: policies.appPolicy,
-                                     unsandboxed: Self.unsandboxed(store: engineStore, company: company, surface: surface, ceiling: ceiling),
+                                     unsandboxed: principals.runsUnsandboxed,
                                      onSpawn: { pid, start in await self.spawned(id, pid: pid, start: start) }, redactor: engineStore.redactor)
         runs[id]?.context = context
         let update = await adapter.start(context)
@@ -623,32 +628,6 @@ public actor PreviewRunner: EmergencyStopObserver {
         #else
         return false
         #endif
-    }
-
-    // MARK: Routing (PR-5)
-
-    /// A Full company's preview runs unsandboxed exactly when its checks would (`Orchestrator.checkRoute`): the company runs
-    /// Full and so does the role of the agent who set the surface (an owner-set surface follows the company), both narrowed
-    /// by the engine's `ceiling`.
-    static func unsandboxed(store: Store, company: Company, surface: PreviewSurface, ceiling: PermissionProfile?) -> Bool {
-        unsandboxed(store: store, company: company, setById: surface.setById, ceiling: ceiling)
-    }
-
-    /// The shared rule (previews, main smokes, release builds): the company runs Full and so does the role of `setById`, a
-    /// known agent (the owner follows the company), each narrowed by the engine's `ceiling` (`brahma run --profile`, B2),
-    /// which never widens. No setter, an agent the company has no record of, or a lookup that fails: sandboxed (B1). One
-    /// copy for every agent-written command the engine runs outside a check (PR-5).
-    static func unsandboxed(store: Store, company: Company, setById: String?, ceiling: PermissionProfile?) -> Bool {
-        func narrowed(_ p: PermissionProfile) -> PermissionProfile { ceiling.map { PermissionProfile.narrower(p, $0) } ?? p }
-        guard narrowed(company.permissionProfile) == .full else { return false }
-        guard let setById else { return false }
-        if setById == "owner" { return true }
-        do {
-            guard let role = try store.agent(id: setById)?.role else { return false }
-            return narrowed(company.profile(forRole: role)) == .full
-        } catch {
-            return false
-        }
     }
 }
 

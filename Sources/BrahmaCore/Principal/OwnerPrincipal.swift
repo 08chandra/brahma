@@ -28,6 +28,10 @@ public enum OwnerPrincipalError: Error, Equatable, CustomStringConvertible {
 /// entry point set that role before they open any Store — and for a process the owner-shell guard refuses (BRAHMA_AGENT_ID set, or
 /// inside a running turn's process tree). So no `CompanyTools` handler, and no code a turn runs, can act as the owner however a
 /// future tool were wired: the parameter can't be forged, only minted.
+///
+/// This is the REQUESTER-side capability ("this process may act as the owner"). The SUBJECT-side value ("these bytes are the
+/// owner's") is `Principal.owner(companyId:)` (Plan S Task S6, `BrahmaSafety`), which `PrincipalResolver` derives from the
+/// engine's records; neither stands in for the other, and the resolver never mints or consults this type (Ruling A6).
 public struct OwnerPrincipal: Sendable, Equatable {
     private init() {}
 

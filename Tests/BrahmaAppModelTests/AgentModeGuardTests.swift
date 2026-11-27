@@ -56,7 +56,7 @@ import GRDB
         var owner = ""
         for case let rel as String in walker where rel.hasSuffix(".swift") {
             let text = try String(contentsOf: sources.appending(path: rel), encoding: .utf8)
-            if rel.hasSuffix("Collab/OwnerPrincipal.swift") { owner = text; continue }
+            if rel.hasSuffix("Principal/OwnerPrincipal.swift") { owner = text; continue }
             for token in ["simulatedAgent", "simulatingAgentProcess", "roleOverride"] { #expect(!text.contains(token), "\(rel) names \(token)") }
         }
         #expect(!owner.contains("roleOverride"))

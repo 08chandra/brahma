@@ -88,9 +88,9 @@ extension Orchestrator {
             // (`MergeRun`, Plan 4a: recorded `running` before its check starts; its place is always an export).
             struct Record { var id: String; var companyId: String; var itemId: String?; var requestedBy: String?; var purpose: String
                             var recordedDirectory: String?
-                            /// A merge queue run: its principal is derived from the record (never from a lease alone) and an
-                            /// unknown one runs sandboxed.
-                            var mergeKind: MergeRun.Kind?; var batchId: String?; var candidate: String?; var isMergeRun = false }
+                            /// A merge queue run: its principals are resolved from the record (`.mergeRun`, never from a lease
+                            /// alone) and an unknown one runs sandboxed.
+                            var isMergeRun = false }
             let record: Record
             let place: (GitWorkspace) -> URL
             if let run = try? store.writer.read({ try VerificationRun.fetchOne($0, key: runId) }) {
@@ -106,7 +106,7 @@ extension Orchestrator {
             } else if let run = try? store.writer.read({ try MergeRun.fetchOne($0, key: runId) }) {
                 guard run.status == .running else { return .refused("the merge run \(runId) is not running (\(run.status?.rawValue ?? "unknown"))") }
                 record = Record(id: run.id, companyId: run.companyId, itemId: run.itemId, requestedBy: nil, purpose: "merge", recordedDirectory: nil,
-                                mergeKind: run.kind, batchId: run.batchId, candidate: run.candidateCommit, isMergeRun: true)
+                                isMergeRun: true)
                 place = { $0.exportPath(runId: run.id) }
             } else {
                 return .refused("no engine record of a check running in \(runId)")
@@ -123,76 +123,19 @@ extension Orchestrator {
                 guard same(recorded, cwd) else { return .refused("run \(runId) did not record \(cwd) as its directory") }
             }
 
-            func narrowed(_ p: PermissionProfile) -> PermissionProfile { ceiling.map { PermissionProfile.narrower(p, $0) } ?? p }
-            if narrowed(company.permissionProfile) == .full {
-                if record.isMergeRun {
-                    // A merge check runs unsandboxed only if EVERY principal whose code it executes narrows to Full.
-                    // Every principal whose code the run executes: the setter (main and main-at-base), the candidate's own members
-                    // (the run's item and every item of its batch), and every item whose code reached `main` earlier, by the
-                    // queue or before it (`landedItemIds`: all of it is in the candidate or in `main` at the base). Any lookup
-                    // error, unknown author or missing principal: sandboxed.
-                    let usesItems = record.mergeKind == .main || record.mergeKind == .item
-                    var itemIds = Set(usesItems ? record.itemId.map { [$0] } ?? [] : [])
-                    var ids: [String] = []
-                    var missing = false
-                    if usesItems, let batchId = record.batchId {
-                        do { itemIds.formUnion(try store.writer.read { try MergeRequest.filter(Column("batchId") == batchId).fetchAll($0) }.map(\.itemId)) }
-                        catch { missing = true }
-                    }
-                    do { itemIds.formUnion(try store.landedItemIds(companyId: company.id)) } catch { missing = true }
-                    switch record.mergeKind {
-                    case .main: if let setter = company.mainCheckSetById { ids.append(setter) } else { missing = true }
-                    case .item: break
-                    case .mainAtBase:
-                        if let setter = company.mainCheckSetById { ids.append(setter) } else { missing = true }
-                        // A head the queue did not land has an author the engine does not know.
-                        do { if try !store.isQueueLandedHead(companyId: company.id, candidate: record.candidate) { missing = true } }
-                        catch { missing = true }
-                    default: missing = true
-                    }
-                    if record.mergeKind != .mainAtBase && !usesItems { missing = true }
-                    if usesItems && record.itemId == nil && record.batchId == nil { missing = true }
-                    for id in itemIds.sorted() {
-                        do {
-                            let holder = try store.lease(itemId: id)?.agentId, author = try store.workItem(id: id)?.ownerId
-                            if holder == nil && author == nil { missing = true }
-                            ids.append(contentsOf: [holder, author].compactMap { $0 })
-                        } catch { missing = true }
-                    }
-                    var allFull = !missing && !ids.isEmpty
-                    for id in ids where allFull {
-                        do {
-                            guard let role = try store.agent(id: id)?.role else { allFull = false; break }
-                            if narrowed(company.profile(forRole: role)) != .full { allFull = false }
-                        } catch { allFull = false }
-                    }
-                    if allFull { return .unsandboxed }
-                } else {
-                    // B1 (spec §7.1): the check runs unsandboxed only when its author is confirmed: the holder (the lease's
-                    // agent, else who requested the run) is a known agent whose role narrows to Full. No holder, an unknown
-                    // agent or a lookup that fails runs it sandboxed and says so on the company's activity; a known holder
-                    // whose role is not Full is the ordinary sandboxed route (no note).
-                    let unconfirmed: String?
-                    do {
-                        let holder = try record.itemId.flatMap { try store.lease(itemId: $0) }?.agentId ?? record.requestedBy
-                        if let holder {
-                            if let role = try store.agent(id: holder)?.role {
-                                if narrowed(company.profile(forRole: role)) == .full { return .unsandboxed }
-                                unconfirmed = nil
-                            } else {
-                                unconfirmed = "no agent \(holder) in the company's records"
-                            }
-                        } else {
-                            unconfirmed = "no agent holds or requested it"
-                        }
-                    } catch {
-                        unconfirmed = "the lookup failed: \(error)"
-                    }
-                    if let unconfirmed {
-                        noteSandboxed(store: store, companyId: record.companyId, itemId: record.itemId, requestedBy: record.requestedBy,
-                                      runId: runId, reason: unconfirmed)
-                    }
-                }
+            // The run's subject principals, resolved once for this check (spec §6.2.3, S6): a merge run's by 4a's rule (the
+            // setter, the candidate's items and every landed item, each item's holder and author), a verification run's its
+            // holder (the lease's agent, else who requested it). The check runs unsandboxed only when every principal and the
+            // company itself narrow to Full under the ceiling (`runsUnsandboxed`). In a Full company, an unconfirmed author of a
+            // verification run (no holder, an unknown agent, a failed lookup) runs it sandboxed with the B1 activity line; a
+            // merge run's unknown principals ran sandboxed before S6 too, and still do without a line (4a).
+            let principals = PrincipalResolver(store: store, ceiling: ceiling)
+                .resolve(record.isMergeRun ? .mergeRun(runId: record.id) : .verificationRun(runId: record.id))
+            if principals.runsUnsandboxed { return .unsandboxed }
+            if !record.isMergeRun, principals.unconfirmedInFullCompany != nil {
+                PrincipalResolver.noteSandboxed(principals, store: store, subject: itemSubject(store: store, companyId: record.companyId,
+                                                                                               itemId: record.itemId, runId: runId),
+                                                kind: .work, agentId: record.requestedBy)
             }
 
             // The workspace may sit behind a link the owner chose; everything under it is built logically and must be real.
@@ -211,18 +154,15 @@ extension Orchestrator {
         }
     }
 
-    /// B1: the activity line on the run's company for a check that ran sandboxed because the engine could not confirm its
-    /// author (`SafeRead.sandboxedNote`; the subject is the item's key, else the run). A line that cannot be recorded is
-    /// logged; the route stands.
-    private static func noteSandboxed(store: Store, companyId: String, itemId: String?, requestedBy: String?, runId: String, reason: String) {
-        let subject: String
-        do { subject = try itemId.flatMap { try store.workItem(id: $0) }?.key ?? "run \(runId)" } catch { subject = "run \(runId)" }
-        let text = SafeRead.sandboxedNote(subject: subject, reason: reason)
+    /// The subject of a check's B1 line: its item's key (company-scoped), else the run.
+    private static func itemSubject(store: Store, companyId: String, itemId: String?, runId: String) -> String {
+        guard let itemId else { return "run \(runId)" }
         do {
-            try store.appendEvent(ActivityEvent(companyId: companyId, agentId: requestedBy, turnId: nil, kind: .work, text: text,
-                                                createdAt: Store.now()))
+            return try store.writer.read { db in
+                try WorkItem.filter(Column("id") == itemId && Column("companyId") == companyId).fetchOne(db)
+            }?.key ?? "run \(runId)"
         } catch {
-            FileHandle.standardError.write(Data("brahma orchestrator: could not record \"\(text)\" (\(error))\n".utf8))
+            return "run \(runId)"
         }
     }
 

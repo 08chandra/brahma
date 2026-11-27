@@ -404,23 +404,32 @@ import Glibc
         await o.previewRunner.stopAll()
     }
 
-    /// Fix I2: the Full-mode route mirrors the checks' (`Orchestrator.checkRoute`).
+    /// Fix I2: the Full-mode route mirrors the checks' (`Orchestrator.checkRoute`). S6 re-point: `PreviewRunner.unsandboxed`
+    /// is gone (spec §7.3); the start resolves `.preview(surfaceId:)` and takes the shared Full route (`runsUnsandboxed`), so the
+    /// company's profiles are recorded and the owner-set surface is a second surface the owner set.
     @Test func routingFollowsChecks() throws {
         let x = try Fx()
         let byAgent = try x.surface("web")
-        var byOwner = byAgent; byOwner.setById = "owner"
-        var c = x.company
-        c.permissionProfile = .workspace
-        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent, ceiling: nil))
-        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner, ceiling: nil))
-        c.permissionProfile = .sandboxed
-        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent, ceiling: nil))
-        c.permissionProfile = .full
-        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent, ceiling: nil), "Full company, Full role")
-        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner, ceiling: nil), "an owner-set surface follows the company")
-        c.roleProfiles = [x.devops.role: .workspace]
-        #expect(!PreviewRunner.unsandboxed(store: x.store, company: c, surface: byAgent, ceiling: nil), "Full company, non-Full setter role")
-        #expect(PreviewRunner.unsandboxed(store: x.store, company: c, surface: byOwner, ceiling: nil))
+        let byOwner = try x.store.upsertPreviewSurface(companyId: x.company.id, by: .owner,
+                                                       PreviewDraft(name: "site", run: "sleep 300", url: "http://127.0.0.1:{port}/"), now: x.now)
+        #expect(byOwner.setById == "owner")
+        func unsandboxed(_ surface: PreviewSurface) -> Bool {
+            PrincipalResolver(store: x.store, ceiling: nil).resolve(.preview(surfaceId: surface.id)).runsUnsandboxed
+        }
+        func profile(_ p: PermissionProfile, roles: [String: PermissionProfile]? = nil) throws {
+            try x.store.updateSandbox(companyId: x.company.id, SandboxPatch(profile: p, roleProfiles: roles), userHome: try tempDir())
+        }
+        try profile(.workspace)
+        #expect(!unsandboxed(byAgent))
+        #expect(!unsandboxed(byOwner))
+        try profile(.sandboxed)
+        #expect(!unsandboxed(byAgent))
+        try profile(.full)
+        #expect(unsandboxed(byAgent), "Full company, Full role")
+        #expect(unsandboxed(byOwner), "an owner-set surface follows the company")
+        try profile(.full, roles: [x.devops.role: .workspace])
+        #expect(!unsandboxed(byAgent), "Full company, non-Full setter role")
+        #expect(unsandboxed(byOwner))
     }
 
     @Test func fullCompanyPreviewRunsUnsandboxed() async throws {

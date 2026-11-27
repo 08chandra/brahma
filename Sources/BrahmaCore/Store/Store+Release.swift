@@ -255,7 +255,11 @@ extension Store {
             // The engine's own failure, not main's: a merge run goes back to the queue (the tick backs off, fix I1).
             return try requeueOrError(run, tail: "could not export \(run.sha7)", now: clock())
         }
-        let unsandboxed = PreviewRunner.unsandboxed(store: self, company: company, setById: company.smokeCheckSetById, ceiling: checks.ceiling)
+        // The smoke's subject principals, resolved once for this run (S6): the smoke check's setter. Unsandboxed only when it and
+        // the company narrow to Full under the ceiling; in a Full company an unconfirmed setter runs sandboxed with the B1 line.
+        let principals = PrincipalResolver(store: self, ceiling: checks.ceiling).resolve(.mainSmoke(companyId: company.id))
+        PrincipalResolver.noteSandboxed(principals, store: self, subject: "The main smoke check", kind: .release, now: clock())
+        let unsandboxed = principals.runsUnsandboxed
         let runner = unsandboxed ? checks.unsandboxed : checks.sandbox
         let policy = Self.smokePolicy(company: company, export: export)
         let environment = ChildEnvironment.make(base: checks.environment,

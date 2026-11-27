@@ -74,12 +74,22 @@ import GRDB
 
     // MARK: Previews (B1, B2)
 
+    /// S6 re-point: `PreviewRunner.unsandboxed(store:company:setById:ceiling:)` is gone (spec §7.3); its rule is the resolver's
+    /// setter row (previews, main smokes and release builds share it) and the shared Full route (`runsUnsandboxed`). `setById`
+    /// is recorded as the company's smoke-check setter (the setter column that can be nil) and resolved as `.mainSmoke`.
+    private func setterRunsUnsandboxed(_ s: S, setById: String?, ceiling: PermissionProfile?) throws -> Bool {
+        try s.store.writer.write { db in
+            try db.execute(sql: "UPDATE company SET smokeCheckSetById = ? WHERE id = ?", arguments: [setById, s.company.id])
+        }
+        return PrincipalResolver(store: s.store, ceiling: ceiling).resolve(.mainSmoke(companyId: s.company.id)).runsUnsandboxed
+    }
+
     /// A surface or smoke with no setter: the engine cannot confirm who wrote its command, so it runs sandboxed even in a
     /// Full company.
     @Test func previewWithNilSetterInFullCompanyIsSandboxed() throws {
         let s = try S(profile: .full)
         #expect(s.company.permissionProfile == .full)
-        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: nil, ceiling: nil) == false)
+        #expect(try setterRunsUnsandboxed(s, setById: nil, ceiling: nil) == false)
     }
 
     /// The engine's ceiling (`brahma run --profile`) narrows previews as it narrows checks: a Full company and a Full setter
@@ -87,30 +97,29 @@ import GRDB
     @Test func previewHonoursCeiling() throws {
         let s = try S(profile: .full)
         #expect(s.company.profile(forRole: s.eng.role) == .full)
-        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: .sandboxed) == false)
-        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: .workspace) == false)
-        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: .full) == true)
-        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: nil) == true)
+        #expect(try setterRunsUnsandboxed(s, setById: s.eng.id, ceiling: .sandboxed) == false)
+        #expect(try setterRunsUnsandboxed(s, setById: s.eng.id, ceiling: .workspace) == false)
+        #expect(try setterRunsUnsandboxed(s, setById: s.eng.id, ceiling: .full) == true)
+        #expect(try setterRunsUnsandboxed(s, setById: s.eng.id, ceiling: nil) == true)
         // The owner's command is narrowed by the ceiling too.
-        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: "owner", ceiling: .sandboxed) == false)
+        #expect(try setterRunsUnsandboxed(s, setById: "owner", ceiling: .sandboxed) == false)
     }
 
     /// Unchanged: an owner-set command follows its Full company.
     @Test func ownerSetterStillFollowsCompany() throws {
         let s = try S(profile: .full)
-        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: "owner", ceiling: nil) == true)
-        var sandboxed = s.company
-        sandboxed.permissionProfile = .sandboxed
-        #expect(PreviewRunner.unsandboxed(store: s.store, company: sandboxed, setById: "owner", ceiling: nil) == false)
+        #expect(try setterRunsUnsandboxed(s, setById: "owner", ceiling: nil) == true)
+        try s.store.updateSandbox(companyId: s.company.id, SandboxPatch(profile: .sandboxed), userHome: try tempDir())
+        #expect(try setterRunsUnsandboxed(s, setById: "owner", ceiling: nil) == false)
     }
 
     /// An agent id the company has no record of, or a lookup that throws, runs sandboxed.
     @Test func previewWithUnknownOrUnreadableSetterIsSandboxed() async throws {
         let s = try S(profile: .full)
-        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: "ghost-agent", ceiling: nil) == false)
-        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: nil) == true)
+        #expect(try setterRunsUnsandboxed(s, setById: "ghost-agent", ceiling: nil) == false)
+        #expect(try setterRunsUnsandboxed(s, setById: s.eng.id, ceiling: nil) == true)
         try await s.store.writer.write { db in try db.execute(sql: "ALTER TABLE agent RENAME TO agent_unreachable") }
-        #expect(PreviewRunner.unsandboxed(store: s.store, company: s.company, setById: s.eng.id, ceiling: nil) == false)
+        #expect(try setterRunsUnsandboxed(s, setById: s.eng.id, ceiling: nil) == false)
     }
 
     /// The B1 text, exactly.
