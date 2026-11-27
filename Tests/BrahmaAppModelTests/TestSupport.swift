@@ -10,9 +10,19 @@ let keychainTrapArmed: Bool = {
     return true
 }()
 
+/// Ruling S-c1: the engine's tools refuse (`ToolPathsError.notInstalled`) until the process installed them with the real
+/// forbidden roots, as the orchestrator, the CLI's `openStore` and the app do (`installForEngine`). Tests that run engine git or
+/// ask for a tool outside an orchestrator get one install, from the process's PATH with no forbidden roots (the test seam: no
+/// test puts a tool of a test workspace on the process's own PATH). Armed by every temp dir, like the traps.
+let toolPathsInstalled: Bool = {
+    if !ToolPaths.isInstalled { ToolPaths.install(forbiddenRoots: []) }
+    return true
+}()
+
 /// A directory for this test case under the process root (`TestScratch.swift`), removed when the case ends.
 func tempDir() throws -> URL {
     _ = keychainTrapArmed
+    _ = toolPathsInstalled
     return try Scratch.dir()
 }
 

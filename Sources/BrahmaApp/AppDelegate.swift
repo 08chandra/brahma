@@ -99,6 +99,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 FileHandle.standardError.write(Data(($0 + "\n").utf8))
             }
             let store = try Store(path: paths.database.path, catalog: catalog, backupsDir: paths.backupsDir)
+            // B9 (Ruling S-c1): the engine's tools, with every company workspace and the data home as forbidden roots, before
+            // anything in the app can run git (the merge panel, diffs) or look for claude; nothing is looked up before this.
+            // The login shell's PATH replaces this install once it is in (`applicationDidFinishLaunching`).
+            ToolLocator.installEngineTools(paths: paths, store: store)
             // Owner writes from the app fail closed until the secrets are loaded: a non-interactive load now (it cannot prompt
             // or block on a dialog); the engine retries in the background, and the banner's Load secrets asks the owner.
             // `logFailures: false`: the engine logs failures and writes the hold notice; the banner reflects the store's state.
@@ -153,6 +157,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model.restartEngine = { [weak model, ownerKeyStore = booted.ownerKeyStore, secretVault = booted.secretVault] store in
                 guard let model else { return nil }
                 let engine = EngineHost.rebuilt(paths: model.paths, store: store, ownerKeyStore: ownerKeyStore, secretVault: secretVault)
+                // The restored store's companies are the forbidden roots now (B9, Ruling S-c1).
+                ToolLocator.installEngineTools(paths: model.paths, store: store)
                 await engine.start(tools: EngineSetup.resolveTools())
                 return engine
             }
@@ -174,6 +180,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                           current: env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
                 }.value
                 setenv("PATH", merged, 1)
+                // Re-installed from the merged PATH (it replaces the launch install, so a claude only the login shell finds is
+                // seen without a relaunch, N1), before the tools are resolved for the engine.
+                ToolLocator.installEngineTools(paths: model.paths, store: model.store)
                 await engine.start(tools: EngineSetup.resolveTools())
                 Harness.runIfRequested(options: options, model: model)
             }

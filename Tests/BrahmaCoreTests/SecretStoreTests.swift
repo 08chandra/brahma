@@ -63,7 +63,7 @@ import Testing
         let company = try store.createCompany(name: "Acme", goal: "g", workspacesRoot: try tempDir())
         let agent = try store.hire(companyId: company.id, name: "eng-1", role: "engineer", model: "sonnet")
         func env(_ e: [String: String]) throws -> [String: String] {
-            let path = try MCPConfig.write(paths: p, executable: "/x/brahma", agent: agent, turnToken: "tok", environment: e)
+            let path = try MCPConfig.write(paths: p, executable: "/x/brahma", agent: agent, turnToken: "tok", git: nil, environment: e)
             let json = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path))) as? [String: Any]
             let server = ((json?["mcpServers"] as? [String: Any])?["company"] as? [String: Any])
             return server?["env"] as? [String: String] ?? [:]

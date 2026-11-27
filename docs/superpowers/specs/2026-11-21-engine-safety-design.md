@@ -561,7 +561,7 @@ Each caller maps them to its existing user-facing texts. A helper failure never 
     - are owned by root or the current user;
     - are not group- or world-writable;
     - are not inside any company workspace or data home.
-  - Amendment (Ruling S5-1): a group-writable directory is accepted when its group is macOS `admin` (gid 80, Homebrew's `/opt/homebrew/bin`; its members can already sudo); never a world-writable one. The executable is judged where it resolves: the file meets the same owner and mode rule and its directory the directory rule.
+  - Amendment (Ruling S5-1, narrowed by S5-1b): a group-writable directory or executable is accepted when its group is macOS `admin` (gid 80; its members can already sudo) and its resolved path lies inside the Homebrew prefix only (`/opt/homebrew/`, `/usr/local/`, component-bounded); anywhere else a group-writable path is refused, whatever its group; never a world-writable one. The executable is judged where it resolves: the file meets the same owner and mode rule and its directory the directory rule.
   - The first regular executable `git`, `claude`, `unzip`, `tar` and `curl` found there is used. `curl` prefers `/usr/bin/curl` (LibreSSL, file CA bundle) for `httpsProbe`.
   - The macOS `/usr/bin/git` shim is replaced by its real target (`xcrun --find git`, run once). Inside the helper sandbox the shim would need xcrun's cache writes.
   - `sandbox-exec`, `/bin/sh`, `/usr/bin/unzip` and `/usr/bin/tar` are fixed absolute paths.

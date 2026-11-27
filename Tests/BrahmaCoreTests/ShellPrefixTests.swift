@@ -23,9 +23,9 @@ private struct PrefixWorld {
 
     var home: String { layout.agentHome.path }
 
-    func server(_ exe: String) -> ShellPrefix.MCPServer {
+    func server(_ exe: String, git: String? = "/opt/git/bin/git") -> ShellPrefix.MCPServer {
         ShellPrefix.MCPServer(executable: exe, database: paths.database.path, companyId: company.id, agentId: "a1",
-                              ownerHome: "/Users/owner")
+                              ownerHome: "/Users/owner", git: git)
     }
     var cache: String { layout.agentCache.path }
 
@@ -114,7 +114,7 @@ private struct PrefixWorld {
                 if [ "${BRAHMA_SECRET_STORE:-}" = file ]; then set -- "$@" BRAHMA_SECRET_STORE=file; fi
                 if [ -n "${BRAHMA_MCP_REVIEW_ITEM:-}" ]; then set -- "$@" "BRAHMA_MCP_REVIEW_ITEM=$BRAHMA_MCP_REVIEW_ITEM"; fi
                 if [ "${BRAHMA_MCP_AUDIT:-}" = 1 ]; then set -- "$@" BRAHMA_MCP_AUDIT=1; fi
-                exec "$@" '/opt/brahma/bin/brahma' mcp --db '\(w.paths.database.path)' --company 'c1' --agent 'a1';;
+                exec "$@" '/opt/brahma/bin/brahma' mcp --db '\(w.paths.database.path)' --company 'c1' --agent 'a1' --git '/opt/git/bin/git';;
               esac
               echo "brahma: refused" >&2; exit 126
             fi
@@ -167,7 +167,7 @@ private struct PrefixWorld {
                    "BRAHMA_MCP_AGENT": "other", "BRAHMA_HOME": "/agent/home", "BRAHMA_AGENT_ID": "other", "LD_PRELOAD": "/agent/x.so",
                    "BRAHMA_SECRET_STORE": "file", "BRAHMA_MCP_REVIEW_ITEM": "K-1"]
         let expected = """
-            args:mcp --db \(w.paths.database.path) --company c1 --agent a1
+            args:mcp --db \(w.paths.database.path) --company c1 --agent a1 --git /opt/git/bin/git
             BRAHMA_AGENT_ID=a1
             BRAHMA_HOME=\(w.paths.home.path)
             BRAHMA_MCP_REVIEW_ITEM=K-1
@@ -211,6 +211,16 @@ private struct PrefixWorld {
         #expect(throws: SandboxError.self) {
             _ = try ShellPrefix.script(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [], mcpServer: odd)
         }
+        // Ruling S5-4 (B9): the engine's git rides in the fixed argv, single-quoted; one that could break out of the quotes (or
+        // is not absolute) refuses the prefix, and an engine with no git passes no `--git` (the server's git then refuses).
+        for bad in ["/opt/gi't/git", "/opt/$(id)/git", "/opt/`id`/git", "git", "/opt/g\u{0}it"] {
+            #expect(throws: SandboxError.self, "\(bad)") {
+                _ = try ShellPrefix.script(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [], mcpServer: w.server(exe.path, git: bad))
+            }
+        }
+        let noGit = try ShellPrefix.script(layout: w.layout, paths: w.paths, shell: "/bin/zsh", keepNames: [], mcpServer: w.server(exe.path, git: nil))
+        #expect(!noGit.contains("--git"))
+        #expect(noGit.contains("--agent 'a1';;"))
     }
 
     /// I1: the sentinel check's tools come by absolute path, never through the inherited PATH (a `cat` the agent planted in

@@ -190,7 +190,7 @@ extension Orchestrator {
             throw SandboxRefusal(reason: "cannot see sandboxed processes on this Mac (the containment self-test failed), so no "
                                  + "sandboxed turn starts")
         }
-        let store = self.store, paths = self.paths, mcp = mcpExecutable
+        let store = self.store, paths = self.paths, mcp = mcpExecutable, engineGit = self.engineGit
         let others = try store.companies().filter { $0.id != company.id }.map { URL(fileURLWithPath: $0.workspacePath, isDirectory: false) }
         let layout = SandboxLayout(paths: paths, company: company, agentHandle: agent.name, trialRoot: trialRoot)
         let now = clock()
@@ -216,7 +216,7 @@ extension Orchestrator {
                 let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: keep,
                                                    mcpServer: ShellPrefix.MCPServer(executable: mcp, database: paths.database.path,
                                                                                     companyId: company.id, agentId: agent.id,
-                                                                                    ownerHome: env.userHome.path))
+                                                                                    ownerHome: env.userHome.path, git: engineGit))
                 // The owner's grants that apply to this turn (Task 9). A read path that no longer is what was approved (a link,
                 // an alias or a file is where the directory was) is revoked and the owner told; one that is missing for now or
                 // newly overlaps a protected place is only left out of this turn. The turn runs either way.

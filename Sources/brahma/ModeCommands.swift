@@ -8,7 +8,8 @@ struct ModeGroup: AsyncParsableCommand {
         commandName: "mode", abstract: "Work-mode probe gates and Ultra status.",
         subcommands: [Gates.self, UltraStatusCommand.self])
 
-    /// The installed CLI's fingerprint (a `stat`; the probe gates' key).
+    /// The installed CLI's fingerprint (a `stat`; the probe gates' key). After `openStore` (it installs the tools with the
+    /// real forbidden roots, Ruling S-c1).
     static func fingerprint() throws -> (path: String, key: String) {
         let path = try ExtLint.claudePath() ?? "claude"
         do { return (path, try CLIFingerprint.of(claudePath: path).key) } catch { throw fail("\(error)") }
@@ -21,8 +22,8 @@ struct ModeGroup: AsyncParsableCommand {
         @Flag(help: "Run the gates that have not passed (live: uses a little of your plan).") var run = false
 
         func run() async throws {
-            let (path, key) = try ModeGroup.fingerprint()
             let (store, paths) = try openStore()
+            let (path, key) = try ModeGroup.fingerprint()
             if run {
                 try requireOwnerShell()
                 signal(SIGPIPE, SIG_IGN)

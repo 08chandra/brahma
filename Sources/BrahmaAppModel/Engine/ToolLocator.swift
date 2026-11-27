@@ -14,16 +14,32 @@ public enum ToolLocator {
     /// The `claude` the engine is given (B9). `BRAHMA_CLAUDE` is the owner's override: it must be an absolute path (a relative
     /// one is refused) to an executable, and a bad one never falls back. Without it, the bare name `claude`, which
     /// `ClaudeProcessRunner` resolves through `ToolPaths` (the safe absolute PATH directories) at each start; `engineTool`
-    /// (that same lookup) only says whether there is one now. No PATH walk of its own.
+    /// (that same lookup) only says whether there is one now; before the app installed its tools (`installEngineTools`) there
+    /// is none (Ruling S-c1). No PATH walk of its own.
     public static func claude(environment: [String: String],
-                              engineTool: (String) -> String? = { ToolPaths.engineTool(named: $0) },
+                              engineTool: (String) throws -> String? = { try ToolPaths.engineTool(named: $0) },
                               isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) })
         -> Result<String, EngineSetupError> {
         if let override = environment["BRAHMA_CLAUDE"], !override.isEmpty {
             guard override.hasPrefix("/") else { return .failure(.claudeOverrideNotAbsolute(override)) }
             return isExecutable(override) ? .success(override) : .failure(.claudeNotFound)
         }
-        return engineTool("claude") == nil ? .failure(.claudeNotFound) : .success("claude")
+        let found: String?
+        do { found = try engineTool("claude") } catch { found = nil }
+        return found == nil ? .failure(.claudeNotFound) : .success("claude")
+    }
+
+    /// Installs the engine's tools for this app process (B9, Ruling S-c1): resolved from `path` (this process's `PATH`) with
+    /// the data home, the workspaces directory and every company's workspace as forbidden roots. The app calls it at launch
+    /// (before any app-side git), again once the login shell's `PATH` is set (that one replaces the first), and before an
+    /// engine restart, each time before `EngineSetup.resolveTools()`. A store that cannot list its companies installs nothing
+    /// (every tool then refuses with `notInstalled`, never a lookup without the workspaces).
+    @discardableResult
+    public static func installEngineTools(paths: BrahmaPaths, store: Store,
+                                          path: String = ProcessInfo.processInfo.environment["PATH"] ?? "") -> Result<ToolPaths, ToolPathsError> {
+        let workspaces: [String]
+        do { workspaces = try store.companies().map(\.workspacePath) } catch { return .failure(.notInstalled) }
+        return ToolPaths.installForEngine(paths: paths, workspacePaths: workspaces, path: path)
     }
 
     /// Asks the user's login shell for its PATH. Output goes to a temp file, not a pipe: a grandchild (such as

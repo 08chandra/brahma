@@ -181,10 +181,10 @@ struct GitCommand: Sendable {
     }
 
     /// The engine's git (`ToolPaths.git`, B9): resolved once per process from the safe absolute `PATH` directories, by
-    /// absolute path, at least 2.43, never `/usr/bin/env git` and never a lookup in the child's working directory.
+    /// absolute path, at least 2.43, never `/usr/bin/env git` and never a lookup in the child's working directory. Before the
+    /// process installed its tools (with the real forbidden roots) every git refuses (`notInstalled`, Ruling S-c1).
     static func tools() -> Result<ToolPaths, ToolPathsError> {
-        if !ToolPaths.isResolved { EngineGitGuard.willRunGit("git --version (tool paths)") }
-        return ToolPaths.engine()
+        ToolPaths.engine()
     }
 
     /// The absolute git every engine call starts, or the reason there is none (as a `GitError` of `command`).

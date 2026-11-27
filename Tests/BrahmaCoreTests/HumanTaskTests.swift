@@ -649,9 +649,10 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:], st
         #expect(show.status == 0, "\(show.stderr)")
         #expect(show.stdout.contains("API tokens — dash.cloudflare.com  https://dash.cloudflare.com/profile/api-tokens"))
         #expect(show.stdout.contains("CLOUDFLARE_API_TOKEN (secretEngine, required)"))
-        // Owner-write: refused in an agent's shell; a secret is never taken from argv.
+        // Owner-write: refused in an agent's shell; a secret is never taken from argv. The refusal comes before stdin would be
+        // read, so none is passed (S5 fix round 2, C1: no late write racing the child's exit).
         let inAgent = try brahma(["task", "done", "Acme", "A-2", "--secret", "CLOUDFLARE_API_TOKEN", "--field", "account_id=\(Self.accountId)"],
-                                 home: home, env: ["BRAHMA_AGENT_ID": "a1"], stdin: "cf-token-123456789\n")
+                                 home: home, env: ["BRAHMA_AGENT_ID": "a1"])
         #expect(inAgent.status == 1); #expect(inAgent.stderr.contains("owner commands can't run inside an agent turn"))
         let argv = try brahma(["task", "done", "Acme", "A-2", "--field", "CLOUDFLARE_API_TOKEN=cf-token-123456789"], home: home)
         #expect(argv.status != 0); #expect(argv.stderr.contains("CLOUDFLARE_API_TOKEN is a secret: pass --secret CLOUDFLARE_API_TOKEN"))

@@ -18,6 +18,7 @@ struct MCP: ParsableCommand {
     var audit = false
     @Option(name: .customLong("show-request"), help: "The concierge's show request (only with --agent concierge).")
     var showRequest: String?
+    @Option(help: "The engine's git, by absolute path (re-checked here; never looked up on PATH).") var git: String?
 
     func run() throws {
         signal(SIGPIPE, SIG_IGN)
@@ -135,6 +136,15 @@ struct MCP: ParsableCommand {
         // tool call, not the next turn, and every call is refused while any secret is not loaded (fail closed).
         let secretPaths = BrahmaPaths(home: URL(fileURLWithPath: db).deletingLastPathComponent(),
                                       workspaces: BrahmaPaths.fromEnvironment().workspaces)
+        // Ruling S5-4: before any git, this server's git is the engine's (`--git`), re-checked with the engine's rules against
+        // the data homes, the workspaces directory and this company's workspace. None given, or one refused: every git of this
+        // server refuses (`gitMissing`); nothing is ever looked up on PATH.
+        let companyWorkspace: String?
+        do { companyWorkspace = try store.company(id: company)?.workspacePath } catch { companyWorkspace = nil }
+        if case .failure(let problem) = ToolPaths.installForMCPServer(git: git, paths: BrahmaPaths.fromEnvironment(),
+                                                                       databaseHome: secretPaths.home, companyWorkspace: companyWorkspace) {
+            FileHandle.standardError.write(Data("brahma mcp: the engine's git is unavailable here, so its git tools refuse: \(problem)\n".utf8))
+        }
         let vault: any SecretVault
         do {
             let selection = try PlatformSecretVault.resolve(paths: secretPaths)   // non-interactive: never prompts

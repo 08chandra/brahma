@@ -264,9 +264,9 @@ import GRDB
         #expect(!r.store.verifyTurnCredential(token: token, companyId: r.company.id, agentId: r.rev.id))
         #expect(!r.store.verifyTurnCredential(token: token, companyId: r.company.id, agentId: r.rev.id, kind: "review", itemId: other.id))
         let paths = r.world.paths
-        let path = try MCPConfig.write(paths: paths, executable: "/usr/local/bin/brahma", agent: r.rev, turnToken: token, reviewItem: i.key)
+        let path = try MCPConfig.write(paths: paths, executable: "/usr/local/bin/brahma", agent: r.rev, turnToken: token, git: nil, reviewItem: i.key)
         #expect(path == paths.runDir.appending(path: "\(r.rev.id).review.mcp.json").path)
-        let work = try MCPConfig.write(paths: paths, executable: "/usr/local/bin/brahma", agent: r.rev, turnToken: token)
+        let work = try MCPConfig.write(paths: paths, executable: "/usr/local/bin/brahma", agent: r.rev, turnToken: token, git: nil)
         #expect(work == paths.runDir.appending(path: "\(r.rev.id).mcp.json").path)
         #expect(!(try String(contentsOfFile: work, encoding: .utf8)).contains("--review-item"))
     }

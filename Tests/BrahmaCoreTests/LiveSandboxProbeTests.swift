@@ -38,7 +38,8 @@ struct LiveSandboxProbeTests {
         let prefix = try ShellPrefix.write(layout: layout, paths: paths, shell: env.shell, keepNames: [],
                                            mcpServer: ShellPrefix.MCPServer(executable: brahma, database: paths.database.path,
                                                                             companyId: company.id, agentId: agent.id,
-                                                                            ownerHome: env.userHome.path))
+                                                                            ownerHome: env.userHome.path,
+                                                                            git: try ToolPaths.engine().get().git))
         let scope = try SandboxScope.forTurn(layout: layout, paths: paths, otherWorkspaces: [], backupTargets: [], kind: .work,
                                              item: item, company: company, grants: GrantInputs(), darwinUserTemp: env.darwinUserTemp,
                                              claudeTmpRoot: env.claudeTmpRoot)
@@ -64,7 +65,8 @@ struct LiveSandboxProbeTests {
                 Finally reply with one line: RESULTS a=<ok|fail> b-design=<ran|refused> b-doctor=<ran|refused> d=<ok|fail>
                 """,
             appendSystemPrompt: "You are a test agent running a scripted probe.",
-            mcpConfigPath: try MCPConfig.write(paths: paths, executable: brahma, agent: agent, turnToken: token),
+            mcpConfigPath: try MCPConfig.write(paths: paths, executable: brahma, agent: agent, turnToken: token,
+                                               git: try ToolPaths.engine().get().git),
             workingDirectory: cwd.path, profile: .sandboxed,
             environment: ["BRAHMA_AGENT_ID": agent.id, "BRAHMA_HOME": paths.home.path, "BRAHMA_WORKSPACES": paths.workspaces.path])
         // (On failure, claude's own log of the server is under ~/Library/Caches/claude-cli-nodejs/<cwd>/mcp-logs-company/.)

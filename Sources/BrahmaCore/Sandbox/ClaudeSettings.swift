@@ -318,23 +318,26 @@ public enum ShellPrefix {
 
     /// The engine's own company MCP server as the prefix starts it: the executable and, baked into the fixed argv, the database,
     /// company and agent it serves (fix round 2, A-N1), so a forged env block cannot choose them; `ownerHome` is its `HOME`.
+    /// `git` is the engine's resolved git (`ToolPaths.git`, Ruling S5-4), passed as `--git`: the server runs that one, re-checked,
+    /// and never looks one up; nil (the engine has none) passes no `--git`, so the server's git refuses.
     public struct MCPServer: Equatable, Sendable {
         public var executable: String
         public var database: String
         public var companyId: String
         public var agentId: String
         public var ownerHome: String
+        public var git: String?
 
-        public init(executable: String, database: String, companyId: String, agentId: String, ownerHome: String) {
+        public init(executable: String, database: String, companyId: String, agentId: String, ownerHome: String, git: String?) {
             self.executable = executable; self.database = database; self.companyId = companyId; self.agentId = agentId
-            self.ownerHome = ownerHome
+            self.ownerHome = ownerHome; self.git = git
         }
     }
 
     /// The script: the brief's body, with these changes (live probes, Step 1; fix round 1):
     /// - Claude Code starts stdio MCP servers through the prefix too, outside the sandbox. A process carrying the per-turn
     ///   `BRAHMA_TURN_TOKEN` (only the company server's env block has it; never claude's own environment) is either the engine's
-    ///   own server, started by the FIXED argv `<exe> mcp --db <db> --company <c> --agent <a>` under `env -i` with a fixed
+    ///   own server, started by the FIXED argv `<exe> mcp --db <db> --company <c> --agent <a> --git <git>` under `env -i` with a fixed
     ///   allowlist (PATH, the owner's HOME, the engine's BRAHMA_AGENT_ID/HOME/WORKSPACES, and from the block only the token, a
     ///   `file` secret store, the review item and the audit flag, which the credential checks), or refused (126). The line Claude
     ///   hands over is only compared, never evaluated. Without `mcpServer` every token-carrying line is refused.
@@ -351,7 +354,9 @@ public enum ShellPrefix {
         let home = ws.appending(path: layout.homeRelative).path
         let cache = ws.appending(path: "\(layout.homeRelative)/cache").path
         let sentinel = paths.sentinel.path
-        let serverPaths = mcpServer.map { [$0.executable, $0.database, $0.ownerHome, paths.home.path, paths.workspaces.path] } ?? []
+        let serverPaths = mcpServer.map { m in
+            [m.executable, m.database, m.ownerHome, paths.home.path, paths.workspaces.path] + [m.git].compactMap { $0 }
+        } ?? []
         for value in [home, cache, sentinel, shell] + serverPaths
         where SandboxPath.isUnsafe(value) || !value.hasPrefix("/") || value.contains("$") || value.contains("`") {
             throw SandboxError.unsafePathCharacter(value)
@@ -365,6 +370,7 @@ public enum ShellPrefix {
         let keep = keepNames.filter { $0.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil }
         let serverCase = mcpServer.map { m in
             let exe = m.executable
+            let git = m.git.map { " --git '\($0)'" } ?? ""
             let forms = ["\"\(exe) mcp\"", "\"\(exe) mcp \"*", "\"'\(exe)' mcp\"", "\"'\(exe)' mcp \"*", "\"'\(exe)' 'mcp'\"",
                          "\"'\(exe)' 'mcp' \"*"].joined(separator: "|")
             return """
@@ -373,7 +379,7 @@ public enum ShellPrefix {
                     if [ "${BRAHMA_SECRET_STORE:-}" = file ]; then set -- "$@" BRAHMA_SECRET_STORE=file; fi
                     if [ -n "${BRAHMA_MCP_REVIEW_ITEM:-}" ]; then set -- "$@" "BRAHMA_MCP_REVIEW_ITEM=$BRAHMA_MCP_REVIEW_ITEM"; fi
                     if [ "${BRAHMA_MCP_AUDIT:-}" = 1 ]; then set -- "$@" BRAHMA_MCP_AUDIT=1; fi
-                    exec "$@" '\(exe)' mcp --db '\(m.database)' --company '\(m.companyId)' --agent '\(m.agentId)';;
+                    exec "$@" '\(exe)' mcp --db '\(m.database)' --company '\(m.companyId)' --agent '\(m.agentId)'\(git);;
                   esac
 
                 """

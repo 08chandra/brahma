@@ -412,7 +412,10 @@ public enum Doctor {
     static func execProcess(executable: String, arguments: [String], timeout: TimeInterval,
                             blocking: Blocking = Doctor.execBlocking) async throws -> String? {
         let outcome: Result<String?, ExecTimedOut> = await blocking.run {
-            guard let path = executable.hasPrefix("/") ? executable : ToolPaths.engineTool(named: executable) else { return .success(nil) }
+            // Before the process installed its tools (Ruling S-c1) a bare name cannot run, as one not found cannot.
+            let found: String?
+            do { found = executable.hasPrefix("/") ? executable : try ToolPaths.engineTool(named: executable) } catch { found = nil }
+            guard let path = found else { return .success(nil) }
             let r = GroupExec.run(executable: path, arguments: arguments,
                                   environment: ChildEnvironment.make(base: ProcessInfo.processInfo.environment, purpose: .claude),
                                   output: .capture(cap: 4 << 20, stderr: false), timeout: timeout, killGrace: execKillGrace)

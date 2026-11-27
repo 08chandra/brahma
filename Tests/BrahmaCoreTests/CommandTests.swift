@@ -58,13 +58,14 @@ private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,
         let home = try tempDir()
         let paths = BrahmaPaths(home: home, workspaces: home)
         let path = try MCPConfig.write(paths: paths, executable: "/usr/bin/brahma", agent: makeAgent(started: false),
-                                    turnToken: "tok123")
+                                    turnToken: "tok123", git: "/opt/git/bin/git")
         #expect(path == paths.runDir.appending(path: "a1.mcp.json").path)
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
         let obj = try JSONSerialization.jsonObject(with: data) as? NSDictionary
         let expected: NSDictionary = ["mcpServers": ["company": [
             "command": "/usr/bin/brahma",
-            "args": ["mcp", "--db", paths.database.path, "--company", "c1", "--agent", "a1"],
+            // Ruling S5-4 (B9): the engine's git rides in the argv; the server re-checks it and never looks one up.
+            "args": ["mcp", "--db", paths.database.path, "--company", "c1", "--agent", "a1", "--git", "/opt/git/bin/git"],
             // 1b fix round 2 (A-N1): the database, company and agent are baked into the prefix's fixed argv, never taken
             // from an env block; only the token (and a review item or the audit flag) rides here.
             "env": ["BRAHMA_TURN_TOKEN": "tok123"] as NSDictionary,
@@ -72,6 +73,9 @@ private let disallowed = "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,
         #expect(obj == expected)
         let attrs = try FileManager.default.attributesOfItem(atPath: path)
         #expect((attrs[.posixPermissions] as? Int) == 0o600)
+        // An engine without a git passes none: the server's git then refuses.
+        let none = try MCPConfig.write(paths: paths, executable: "/usr/bin/brahma", agent: makeAgent(started: false), turnToken: "t", git: nil)
+        #expect(!(try String(contentsOfFile: none, encoding: .utf8)).contains("--git"))
     }
 
     /// `brahma mcp`'s parameters: its flags, or (started by the shell prefix's fixed argv) its env block; both given must agree.

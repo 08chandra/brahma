@@ -61,6 +61,40 @@ import Foundation
         #expect(throws: ToolPathsError.claudeMissing) { try ClaudeProcessRunner.executable("claude", engineTool: none) }
     }
 
+    /// N1 (Ruling S-c1): the app installs the engine's tools at launch (Finder's PATH), again once the login shell's PATH is
+    /// set, and before an engine restart. A re-install replaces the first, so a claude only the login shell's PATH has is
+    /// found without a relaunch; before any install nothing is found and app-side git refuses (with `notInstalled`'s text,
+    /// not a crash). The engine forgets a remembered "claude not found" when it is started again with the tools.
+    @MainActor @Test func reinstallAfterTheLoginShellPathFindsClaude() async throws {
+        let (store, paths) = try makeHome()
+        let scratch = try tempDir()
+        let finder = scratch.appending(path: "finder", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: finder, withIntermediateDirectories: true)
+        let login = scratch.appending(path: "login", directoryHint: .isDirectory)
+        try FakeTools.install(at: login.appending(path: "claude"), "exit 0")
+        let (before, first, second, started) = try ToolPaths.withIsolatedSlot {
+            () throws -> (String, Result<String, EngineSetupError>, Result<String, EngineSetupError>, String) in
+            // App-side git before the first install (the merge panel's branch line): refused, never run.
+            var gitBefore = ""
+            do { _ = try BranchInspector.info(git: GitWorkspace(root: scratch), key: "ACME-1") } catch { gitBefore = "\(error)" }
+            #expect(ToolLocator.claude(environment: [:]) == .failure(.claudeNotFound), "nothing is looked up before the install")
+            ToolLocator.installEngineTools(paths: paths, store: store, path: finder.path)
+            let first = ToolLocator.claude(environment: [:])
+            ToolLocator.installEngineTools(paths: paths, store: store, path: "\(finder.path):\(login.path)")
+            return (gitBefore, first, ToolLocator.claude(environment: [:]), try ClaudeProcessRunner.executable("claude"))
+        }
+        #expect(before.contains("nothing is looked up on PATH"), "\(before)")
+        #expect(first == .failure(.claudeNotFound))
+        #expect(second == .success("claude"))
+        #expect(started == login.appending(path: "claude").path)
+        let failing = DoctorReport(cliVersion: nil, items: [DoctorItem(name: "version", status: .fail, detail: "stub")], checkedAt: .now)
+        let host = EngineHost(paths: paths, store: store, probe: { _ in failing }, ownerKeyStore: InMemoryOwnerKeyStore())
+        await host.start(tools: .failure(.claudeNotFound))
+        #expect(await host.recheck() == nil)
+        await host.start(tools: .success(EngineTools(claudePath: "claude", mcpExecutable: "/x/brahma")))
+        #expect(await host.recheck() != nil, "the remembered claudeNotFound was replaced")
+    }
+
     @Test func loginPathParsedBetweenMarkers() {
         #expect(ToolLocator.parseMarkedPath("Welcome!\n__BRAHMA_PATH__/opt/homebrew/bin:/usr/bin__END__\n") == "/opt/homebrew/bin:/usr/bin")
         #expect(ToolLocator.parseMarkedPath("no markers") == nil)

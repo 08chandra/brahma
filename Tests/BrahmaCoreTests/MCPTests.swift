@@ -412,3 +412,85 @@ func binaryQuotasComeFromTheCredential() throws {
     let recorded = try w.store.issueTurnCredential(turnId: ctoTurn.id, quotas: ModeQuotas(posts: 2, itemsCreated: 0, comments: 0))
     #expect(try binaryPosts(bin, dbPath: dbPath, w, agent: w.cto, token: recorded, extraEnv: permissive, posts: 3) == [true, true, false])
 }
+
+/// Ruling S5-4 (S5 review I3): `brahma mcp` runs the engine's git, passed as `--git` and checked again against the data home,
+/// the database's home, the workspaces directory and the company's workspace. One planted in any of them, none at all, or no
+/// company workspace known: every git of the server refuses (`gitMissing`), and nothing is looked up on PATH.
+@Test(.scratch) func mcpServerGitIsTheEnginesRechecked() throws {
+    let dir = try tempDir()
+    let paths = BrahmaPaths(home: dir.appending(path: "home"), workspaces: dir.appending(path: "wss"))
+    let databaseHome = dir.appending(path: "db", directoryHint: .isDirectory)
+    let workspace = paths.workspaces.appending(path: "acme", directoryHint: .isDirectory)
+    let engineGit = try ToolPaths.engine().get().git
+    var planted: [String] = []
+    for root in [paths.home, databaseHome, workspace, paths.workspaces] {
+        let git = root.appending(path: "bin/git")
+        try FakeTools.install(at: git, "echo 'git version 2.50.1'")
+        planted.append(git.path)
+    }
+    func refuses() -> Bool {
+        do { _ = try GitCommand.executable(command: "status"); return false } catch {
+            return "\(error)".contains("no git found in a safe PATH directory")
+        }
+    }
+    try ToolPaths.withIsolatedSlot { () throws in
+        // Before any install: refused (`notInstalled`), never a lookup.
+        do { _ = try GitCommand.executable(command: "status"); Issue.record("ran before the install") } catch {
+            #expect("\(error)".contains("nothing is looked up on PATH"), "\(error)")
+        }
+        ToolPaths.installForMCPServer(git: engineGit, paths: paths, databaseHome: databaseHome, companyWorkspace: workspace.path)
+        #expect(try GitCommand.executable(command: "status") == engineGit)
+        for git in planted + ["git", "bin/git"] {
+            ToolPaths.installForMCPServer(git: git, paths: paths, databaseHome: databaseHome, companyWorkspace: workspace.path)
+            #expect(refuses(), "\(git)")
+        }
+        ToolPaths.installForMCPServer(git: nil, paths: paths, databaseHome: databaseHome, companyWorkspace: workspace.path)
+        #expect(refuses(), "no --git: no fallback")
+        ToolPaths.installForMCPServer(git: engineGit, paths: paths, databaseHome: databaseHome, companyWorkspace: nil)
+        #expect(refuses(), "no company workspace known")
+    }
+}
+
+/// Ruling S5-4, the built binary (`brahmaExecutableURL`, so it also runs under a scratch build path): a valid `--git` is taken
+/// quietly; one in a world-writable directory or the company's workspace, or none (with a usable git first on PATH), leaves
+/// the server's git refusing, which it says on stderr. The server still serves either way.
+@Test(.scratch) func binaryMCPTakesOnlyTheEnginesGit() throws {
+    let bin = brahmaExecutableURL()
+    try #require(FileManager.default.isExecutableFile(atPath: bin.path), "build the brahma product first")
+    let dir = try tempDir()
+    let dbPath = dir.appending(path: "t.sqlite").path
+    let w = try MCPWorld(path: dbPath)
+    _ = try w.store.transition(agentId: w.ceo.id, to: .ready)
+    let (_, turn) = try #require(try w.store.beginTurn(agentId: w.ceo.id, now: Store.now()))
+    let token = try w.store.issueTurnCredential(turnId: turn.id)
+    let engineGit = try ToolPaths.engine().get().git
+    // Outside the database's home (a forbidden root too): only the directory mode or the PATH is under test here.
+    let tools = try tempDir()
+    let safe = tools.appending(path: "safe", directoryHint: .isDirectory)
+    try FakeTools.install(at: safe.appending(path: "git"), "echo 'git version 2.50.1'")
+    let open = tools.appending(path: "open", directoryHint: .isDirectory)
+    try FakeTools.install(at: open.appending(path: "git"), "echo 'git version 2.50.1'")
+    chmod(open.path, 0o777)  // exec-bit fixture: the directory mode is under test
+    let planted = URL(fileURLWithPath: w.company.workspacePath).appending(path: "bin/git")
+    try FakeTools.install(at: planted, "echo 'git version 2.50.1'")
+    func serverStderr(_ extra: [String]) throws -> String {
+        let p = Process()
+        p.executableURL = bin
+        // The file stores (`cliEnvironment`), a usable git first on PATH, and the turn's token.
+        p.environment = cliEnvironment(home: dir).merging(["PATH": "\(safe.path):/usr/bin:/bin", "BRAHMA_TURN_TOKEN": token]) { _, new in new }
+        p.arguments = ["mcp", "--db", dbPath, "--company", w.company.id, "--agent", w.ceo.id] + extra
+        let err = Pipe()
+        p.standardInput = FileHandle.nullDevice; p.standardOutput = FileHandle.nullDevice; p.standardError = err
+        try p.run()
+        let e = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        #expect(p.terminationStatus == 0, "\(extra)")
+        return String(decoding: e, as: UTF8.self)
+    }
+    let good = try serverStderr(["--git", engineGit])
+    #expect(!good.contains("git is unavailable"), "\(good)")
+    for extra in [["--git", open.appending(path: "git").path], ["--git", planted.path], []] {
+        let e = try serverStderr(extra)
+        #expect(e.contains("the engine's git is unavailable here") && e.contains("no git found in a safe PATH directory"), "\(extra): \(e)")
+    }
+}

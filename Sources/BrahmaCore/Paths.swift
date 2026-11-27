@@ -91,9 +91,22 @@ public struct BrahmaPaths: Sendable, Equatable {
 extension ToolPaths {
     /// The engine's tools (B9, spec §6.5), resolved once from this process's `PATH` with every company workspace and the data
     /// home (and the default workspaces directory) as forbidden roots, and installed as `ToolPaths.engine()`: the
-    /// orchestrator at its start, the CLI when it opens the store.
+    /// orchestrator at its start, the CLI when it opens the store, the app at launch and again once the login shell's `PATH`
+    /// is in. Until one of them ran, nothing is looked up (Ruling S-c1: `ToolPathsError.notInstalled`).
     @discardableResult
-    public static func installForEngine(paths: BrahmaPaths, workspacePaths: [String]) -> Result<ToolPaths, ToolPathsError> {
-        install(forbiddenRoots: [paths.home, paths.workspaces] + workspacePaths.map { URL(fileURLWithPath: $0, isDirectory: true) })
+    public static func installForEngine(paths: BrahmaPaths, workspacePaths: [String],
+                                        path: String = ProcessInfo.processInfo.environment["PATH"] ?? "") -> Result<ToolPaths, ToolPathsError> {
+        install(forbiddenRoots: [paths.home, paths.workspaces] + workspacePaths.map { URL(fileURLWithPath: $0, isDirectory: true) },
+                path: path)
+    }
+
+    /// `brahma mcp`'s tools (Ruling S5-4): only the git the engine passed (`--git`), re-checked against the data home, the
+    /// database's own home, the workspaces directory and the company's workspace (`installFromEngine`). No git given, no
+    /// company workspace known, or a refused one: every git of the server refuses (`gitMissing`); never a `PATH` walk.
+    @discardableResult
+    public static func installForMCPServer(git: String?, paths: BrahmaPaths, databaseHome: URL,
+                                           companyWorkspace: String?) -> Result<ToolPaths, ToolPathsError> {
+        let roots = [paths.home, databaseHome, paths.workspaces] + (companyWorkspace.map { [URL(fileURLWithPath: $0, isDirectory: true)] } ?? [])
+        return installFromEngine(git: companyWorkspace == nil ? nil : git, forbiddenRoots: roots)
     }
 }

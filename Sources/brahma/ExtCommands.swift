@@ -80,11 +80,13 @@ struct ExtLint: AsyncParsableCommand {
         let staged = scratch.appending(path: "staged", directoryHint: .isDirectory)
         do { try ExtensionImporter.copyTree(from: source, to: staged) } catch let e as ExtensionError { throw fail(e.message) }
         var result = ExtensionValidator.validate(staged: staged)
-        // I1: Claude's own checks run only on a package the validator passed.
-        if !noClaude, let claude = try Self.claudePath(), result.errors.isEmpty, result.manifest != nil {
-            let runner: any SandboxedRunner
-            if let (store, p) = try? openStore(lazySecrets: true) { runner = Orchestrator.ownerSandboxRunner(store: store, paths: p) }
-            else { runner = UnavailableSandboxRunner() }
+        // I1: Claude's own checks run only on a package the validator passed. S-c1: the store is opened first, which installs
+        // the tools with every company workspace and the data home as forbidden roots, so a claude planted there is never
+        // the one found; a store that does not open leaves the tools uninstalled and the checks skipped.
+        let ready = !noClaude && result.errors.isEmpty && result.manifest != nil
+        let opened = ready ? try? openStore(lazySecrets: true) : nil
+        if ready, let (store, p) = opened, let claude = try Self.claudePath() {
+            let runner: any SandboxedRunner = Orchestrator.ownerSandboxRunner(store: store, paths: p)
             let checks = await ExtensionValidator.claudeChecks(staged: staged, check: ClaudeCheck(runner: runner, claudePath: claude,
                                                                                                   scratch: scratch.appending(path: "claude")))
             result.issues += checks.issues
@@ -108,12 +110,14 @@ struct ExtLint: AsyncParsableCommand {
     /// The `claude` the CLI starts (B9), by absolute path: `BRAHMA_CLAUDE` (the owner's override, for tests and unusual
     /// installs) must be an absolute path (a relative one is refused) to an executable (else none); otherwise the engine's
     /// `ToolPaths` claude, from the safe absolute PATH directories. Nil when there is none. No PATH walk of its own.
+    /// Ruling S-c1: only after `openStore` installed the tools with the real forbidden roots (every company workspace and the
+    /// data home); asked before, it refuses (`notInstalled`), never a lookup without them.
     static func claudePath() throws -> String? {
         if let p = ProcessInfo.processInfo.environment["BRAHMA_CLAUDE"], !p.isEmpty {
             guard p.hasPrefix("/") else { throw fail("BRAHMA_CLAUDE must be an absolute path to the claude CLI; '\(p)' is not") }
             return FileManager.default.isExecutableFile(atPath: p) ? p : nil
         }
-        return ToolPaths.engineTool(named: "claude")
+        do { return try ToolPaths.engineTool(named: "claude") } catch { throw fail("\(error)") }
     }
 }
 

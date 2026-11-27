@@ -27,9 +27,10 @@ public struct CLIFingerprint: Equatable, Sendable {
     }
 
     /// `claudePath` as given when it holds a `/`, else the one the runner starts for that bare name (`ToolPaths`, B9: the safe
-    /// absolute PATH directories, never a PATH walk of its own); resolved, then `stat`ed.
+    /// absolute PATH directories, never a PATH walk of its own); resolved, then `stat`ed. A bare name throws
+    /// `ToolPathsError.notInstalled` before the process installed its tools (Ruling S-c1).
     public static func of(claudePath: String) throws -> CLIFingerprint {
-        let candidate = claudePath.contains("/") ? claudePath : ToolPaths.engineTool(named: claudePath)
+        let candidate = claudePath.contains("/") ? claudePath : try ToolPaths.engineTool(named: claudePath)
         guard let candidate, let real = realpath(candidate, nil) else { throw Unavailable(claudePath: claudePath) }
         let resolved = String(cString: real)
         free(real)

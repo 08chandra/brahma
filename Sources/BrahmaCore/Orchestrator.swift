@@ -163,6 +163,12 @@ public actor Orchestrator {
 
     /// The engine's tools (B9), resolved once at init (`ToolPaths.installForEngine`); `start` logs them.
     public nonisolated let tools: Result<ToolPaths, ToolPathsError>
+    /// The engine's git, handed to every turn's `brahma mcp` as `--git` (Ruling S5-4); nil when the engine has none (the
+    /// server's git then refuses too).
+    nonisolated var engineGit: String? {
+        if case .success(let resolved) = tools { return resolved.git }
+        return nil
+    }
 
     static let usageRetry: TimeInterval = 15 * 60
     static let hour: TimeInterval = 3600
@@ -195,10 +201,13 @@ public actor Orchestrator {
         self.stopPollSleep = stopPollSleep
         // B9 (spec §6.5): the engine's tools by absolute path, resolved once here from the safe PATH directories outside
         // every company workspace and the data home, and installed for every child the engine starts (git, claude, tar …).
-        // A store that cannot list its companies yet still keeps the data home and the workspaces directory out.
-        let workspacePaths: [String]
-        do { workspacePaths = try store.companies().map(\.workspacePath) } catch { workspacePaths = [] }
-        self.tools = ToolPaths.installForEngine(paths: paths, workspacePaths: workspacePaths)
+        // A store that cannot list its companies installs nothing (Ruling S-c1: never without the real forbidden roots); the
+        // engine then has what an earlier install of this process set (the CLI's `openStore`), else `notInstalled`.
+        do {
+            self.tools = ToolPaths.installForEngine(paths: paths, workspacePaths: try store.companies().map(\.workspacePath))
+        } catch {
+            self.tools = ToolPaths.engine()
+        }
         let engineBlocking = Blocking()
         self.blocking = engineBlocking
         let engineId = UUID().uuidString
@@ -1403,7 +1412,7 @@ public actor Orchestrator {
             try store.setTurnMode(turnId: turn.id, decision: mode)
             var request = try turnRequest(
                 mcpConfigPath: try MCPConfig.write(paths: paths, executable: mcpExecutable, agent: agent, turnToken: turnToken,
-                                                   reviewItem: review?.item.key, audit: audit != nil,
+                                                   git: engineGit, reviewItem: review?.item.key, audit: audit != nil,
                                                    environment: mcpEnvironment))
             // The test keys the holder took with `use_secret` (Task 4-wire): only a work turn on the leased item, applied by the
             // runner after `ChildEnvironment`'s drop step; a plan, review, audit or notice turn gets none. Read after the sandbox

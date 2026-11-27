@@ -703,8 +703,10 @@ public enum ExtensionValidator {
     }
 
     /// The directory of the resolved `claude` binary as the one readable policy entry, `[]` when it is `/`, or nil when reading it
-    /// whole would reach the owner's home, an ancestor of it, or a protected path.
+    /// whole would reach the owner's home, an ancestor of it, or a protected path, or when `claudePath` is not absolute (N2: a
+    /// bare or relative name would be judged against the current directory).
     static func readableClaudeDirectory(_ claudePath: String, userHome: URL) -> [URL]? {
+        guard claudePath.hasPrefix("/") else { return nil }
         let dir = URL(fileURLWithPath: claudePath).resolvedForSandbox.deletingLastPathComponent()
         if dir.path == "/" { return [] }
         let home = userHome.resolvedForSandbox.path

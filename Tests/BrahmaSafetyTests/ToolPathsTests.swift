@@ -23,8 +23,10 @@ import Foundation
 
     static func resolved(_ path: String, forbidden: [URL] = [], xcrun: @escaping (String) -> String? = { _ in nil },
                          version: @escaping (String) -> String? = ToolPathsTests.fixedVersion,
-                         group: gid_t? = ToolPaths.trustedWriterGroup) throws -> ToolPaths {
-        switch ToolPaths.resolve(path: path, forbiddenRoots: forbidden, xcrunFind: xcrun, gitVersion: version, trustedGroup: group) {
+                         group: gid_t? = ToolPaths.trustedWriterGroup,
+                         prefixes: [String] = ToolPaths.trustedGroupPrefixes) throws -> ToolPaths {
+        switch ToolPaths.resolve(path: path, forbiddenRoots: forbidden, xcrunFind: xcrun, gitVersion: version, trustedGroup: group,
+                                 trustedPrefixes: prefixes) {
         case .success(let tools): return tools
         case .failure(let error): throw error
         }
@@ -136,35 +138,73 @@ import Foundation
     }
 
     /// Ruling S5-1: a group-writable directory is a candidate only when its group is the trusted writer group (macOS `admin`,
-    /// Homebrew's prefix); never a world-writable one, never one inside a forbidden root. Tests pass the fixture's own group.
+    /// Homebrew's prefix); never a world-writable one, never one inside a forbidden root. Tests pass the fixture's own group
+    /// and the scratch directory as the trusted prefix (Ruling S5-1b's seam).
     @Test func trustedWriterGroupDirectoryAccepted() throws {
         let scratch = try tempDir()
+        let prefixes = [scratch.path]
         let brew = try Self.bin(scratch.appending(path: "brew", directoryHint: .isDirectory), ["git", "claude"])
         chmod(brew.path, 0o775)  // exec-bit fixture: the directory mode is under test
         let group = try Self.gid(brew)
-        let tools = try Self.resolved(brew.path, group: group)
+        let tools = try Self.resolved(brew.path, group: group, prefixes: prefixes)
         #expect(tools.git == brew.appending(path: "git").path)
         #expect(tools.claude == brew.appending(path: "claude").path)
-        #expect(ToolPaths.candidateDirectories(path: brew.path, forbiddenRoots: [], trustedGroup: group) == [brew.path])
+        #expect(ToolPaths.candidateDirectories(path: brew.path, forbiddenRoots: [], trustedGroup: group, trustedPrefixes: prefixes)
+                == [brew.path])
         // No trusted group, or another group: the group-writable directory is refused.
         #expect(ToolPaths.resolve(path: brew.path, forbiddenRoots: [], xcrunFind: { _ in nil }, gitVersion: Self.fixedVersion,
-                                  trustedGroup: nil) == .failure(.gitMissing))
+                                  trustedGroup: nil, trustedPrefixes: prefixes) == .failure(.gitMissing))
         #expect(ToolPaths.resolve(path: brew.path, forbiddenRoots: [], xcrunFind: { _ in nil }, gitVersion: Self.fixedVersion,
-                                  trustedGroup: group + 1) == .failure(.gitMissing))
+                                  trustedGroup: group + 1, trustedPrefixes: prefixes) == .failure(.gitMissing))
         // World-writable stays refused, whatever its group.
         chmod(brew.path, 0o777)  // exec-bit fixture: the directory mode is under test
         #expect(ToolPaths.resolve(path: brew.path, forbiddenRoots: [], xcrunFind: { _ in nil }, gitVersion: Self.fixedVersion,
-                                  trustedGroup: group) == .failure(.gitMissing))
+                                  trustedGroup: group, trustedPrefixes: prefixes) == .failure(.gitMissing))
         chmod(brew.path, 0o775)  // exec-bit fixture: the directory mode is under test
         // Inside a forbidden root: refused, the trusted group notwithstanding.
         #expect(ToolPaths.resolve(path: brew.path, forbiddenRoots: [scratch], xcrunFind: { _ in nil }, gitVersion: Self.fixedVersion,
-                                  trustedGroup: group) == .failure(.gitMissing))
+                                  trustedGroup: group, trustedPrefixes: prefixes) == .failure(.gitMissing))
         // The same holds for the executable itself: group-writable only with the trusted group.
         let file = try Self.bin(scratch.appending(path: "file", directoryHint: .isDirectory), ["git"])
         try FakeTools.fixtureMode(0o775, at: file.appending(path: "git"))
-        #expect(try Self.resolved(file.path, group: try Self.gid(file)).git == file.appending(path: "git").path)
+        #expect(try Self.resolved(file.path, group: try Self.gid(file), prefixes: prefixes).git == file.appending(path: "git").path)
         #expect(ToolPaths.resolve(path: file.path, forbiddenRoots: [], xcrunFind: { _ in nil }, gitVersion: Self.fixedVersion,
-                                  trustedGroup: nil) == .failure(.gitMissing))
+                                  trustedGroup: nil, trustedPrefixes: prefixes) == .failure(.gitMissing))
+    }
+
+    /// Ruling S5-1b: the trusted group's exception holds only inside the Homebrew prefix (`trustedGroupPrefixes`), judged on
+    /// resolved paths with component boundaries. The same 0775 directory with the matching group outside it, under a
+    /// sibling `<prefix>X`, or reached through a link from inside it, is refused; so is a group-writable executable outside.
+    @Test func trustedGroupOnlyInsideTheHomebrewPrefix() throws {
+        let scratch = try tempDir()
+        let prefix = scratch.appending(path: "brew", directoryHint: .isDirectory)
+        let inside = try Self.bin(prefix.appending(path: "bin", directoryHint: .isDirectory), ["git"])
+        let outside = try Self.bin(scratch.appending(path: "other/bin", directoryHint: .isDirectory), ["git"])
+        let sibling = try Self.bin(scratch.appending(path: "brewX/bin", directoryHint: .isDirectory), ["git"])
+        for dir in [inside, outside, sibling] { chmod(dir.path, 0o775) }  // exec-bit fixture: the directory mode is under test
+        let group = try Self.gid(inside)
+        func resolve(_ dir: URL) -> Result<ToolPaths, ToolPathsError> {
+            ToolPaths.resolve(path: dir.path, forbiddenRoots: [], xcrunFind: { _ in nil }, gitVersion: Self.fixedVersion,
+                              trustedGroup: group, trustedPrefixes: [prefix.path])
+        }
+        #expect(try resolve(inside).get().git == inside.appending(path: "git").path)
+        #expect(resolve(outside) == .failure(.gitMissing), "outside the prefix")
+        #expect(resolve(sibling) == .failure(.gitMissing), "<prefix>X is not inside <prefix>")
+        // A link inside the prefix to the group-writable directory outside it: judged where it resolves.
+        let link = prefix.appending(path: "linked")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+        #expect(resolve(link) == .failure(.gitMissing), "resolved outside the prefix")
+        // The executable itself: group-writable inside the prefix with the group, refused outside.
+        let fileIn = try Self.bin(prefix.appending(path: "files", directoryHint: .isDirectory), ["git"])
+        let fileOut = try Self.bin(scratch.appending(path: "files", directoryHint: .isDirectory), ["git"])
+        for dir in [fileIn, fileOut] { try FakeTools.fixtureMode(0o775, at: dir.appending(path: "git")) }
+        #expect(try resolve(fileIn).get().git == fileIn.appending(path: "git").path)
+        #expect(resolve(fileOut) == .failure(.gitMissing))
+        // The engine's git handed to `brahma mcp` meets the same rule.
+        #expect(ToolPaths.validateEngineGit(fileOut.appending(path: "git").path, forbiddenRoots: [], gitVersion: Self.fixedVersion,
+                                            trustedGroup: group, trustedPrefixes: [prefix.path]) == .failure(.gitMissing))
+        #expect(ToolPaths.trustedGroupPrefixes == ["/opt/homebrew", "/usr/local"])
+        #expect(ToolPaths.safeDirectoryRule.contains("Homebrew prefix only"))
     }
 
     /// The default trusted group is macOS `admin` (gid 80), constant, and none elsewhere (Ruling S5-1).
@@ -243,4 +283,75 @@ import Foundation
         }
     }
     #endif
+
+    /// Ruling S-c1: before this process installed its tools with the real forbidden roots, nothing is resolved and nothing is
+    /// looked up on PATH: `engine()` and `engineTool` refuse (`notInstalled`). An install replaces the last one (the app's
+    /// post-login-shell PATH wins), and its forbidden roots hold for every later lookup.
+    @Test func resolvingBeforeInstallThrows() throws {
+        let scratch = try tempDir()
+        let none = try Self.bin(scratch.appending(path: "none", directoryHint: .isDirectory), [])
+        let withClaude = try Self.bin(scratch.appending(path: "b", directoryHint: .isDirectory), ["claude", "npm"])
+        try ToolPaths.withIsolatedSlot { () throws in
+            #expect(!ToolPaths.isInstalled)
+            #expect(ToolPaths.engine() == .failure(.notInstalled))
+            #expect(throws: ToolPathsError.notInstalled) { try ToolPaths.engineTool(named: "claude") }
+            #expect(throws: ToolPathsError.notInstalled) { try ToolPaths.engineTool(named: "npm") }
+            #expect(ToolPaths.gitCandidates.isEmpty)
+            #expect("\(ToolPathsError.notInstalled)".contains("nothing is looked up on PATH"))
+            // PATH A (no claude), then PATH B (one): the second install is what counts.
+            ToolPaths.install(forbiddenRoots: [], path: none.path)
+            #expect(ToolPaths.isInstalled)
+            #expect(ToolPaths.engine() == .failure(.gitMissing))
+            #expect(try ToolPaths.engineTool(named: "claude") == nil)
+            ToolPaths.install(forbiddenRoots: [], path: "\(none.path):\(withClaude.path)")
+            #expect(try ToolPaths.engineTool(named: "claude") == withClaude.appending(path: "claude").path)
+            #expect(try ToolPaths.engineTool(named: "npm") == withClaude.appending(path: "npm").path)
+            // The same directory inside a forbidden root of the last install: never looked in.
+            ToolPaths.install(forbiddenRoots: [scratch], path: withClaude.path)
+            #expect(try ToolPaths.engineTool(named: "claude") == nil)
+            #expect(try ToolPaths.engineTool(named: "npm") == nil)
+        }
+    }
+
+    /// Ruling S5-4: a process the engine started (`brahma mcp`) takes the engine's git and checks it again under the same
+    /// rules (owner and mode, Ruling S5-1, its resolved directory, the forbidden roots, the shim, 2.43); anything else is
+    /// `gitMissing` (or `gitTooOld`), never a PATH walk.
+    @Test func engineGitIsRevalidated() throws {
+        let scratch = try tempDir()
+        let safe = try Self.bin(scratch.appending(path: "safe", directoryHint: .isDirectory), ["git"])
+        let ws = scratch.appending(path: "ws", directoryHint: .isDirectory)
+        let planted = try Self.bin(ws.appending(path: "bin", directoryHint: .isDirectory), ["git"])
+        let open = try Self.bin(scratch.appending(path: "open", directoryHint: .isDirectory), ["git"])
+        chmod(open.path, 0o777)  // exec-bit fixture: the directory mode is under test
+        let link = scratch.appending(path: "relay", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: link, withIntermediateDirectories: true)
+        chmod(link.path, 0o755)  // exec-bit fixture: the directory mode is under test
+        try FileManager.default.createSymbolicLink(at: link.appending(path: "git"), withDestinationURL: planted.appending(path: "git"))
+        func check(_ git: String?, version: (String) -> String? = Self.fixedVersion) -> Result<ToolPaths, ToolPathsError> {
+            ToolPaths.validateEngineGit(git, forbiddenRoots: [ws], gitVersion: version)
+        }
+        let good = try check(safe.appending(path: "git").path).get()
+        #expect(good.git == safe.appending(path: "git").path); #expect(good.gitVersion == "2.50.1"); #expect(good.claude == nil)
+        for refused in [planted.appending(path: "git").path, open.appending(path: "git").path, link.appending(path: "git").path,
+                        "git", "bin/git", "", scratch.appending(path: "missing/git").path] {
+            #expect(check(refused) == .failure(.gitMissing), "\(refused)")
+        }
+        #expect(check(nil) == .failure(.gitMissing))
+        #expect(check(safe.appending(path: "git").path, version: { _ in "2.39.5" }) == .failure(.gitTooOld("2.39.5")))
+        #expect(check(safe.appending(path: "git").path, version: { _ in nil }) == .failure(.gitTooOld("unknown")))
+        #if os(macOS)
+        #expect(check(ToolPaths.gitShim) == .failure(.gitMissing), "the shim would need xcrun")
+        #endif
+        // Installed, it is the process's tools (and nothing else is looked up: there is no PATH).
+        try ToolPaths.withIsolatedSlot { () throws in
+            ToolPaths.installFromEngine(git: safe.appending(path: "git").path, forbiddenRoots: [ws], gitVersion: Self.fixedVersion)
+            #expect(try ToolPaths.engine().get().git == safe.appending(path: "git").path)
+            #expect(ToolPaths.gitCandidates == [safe.appending(path: "git").path])
+            #expect(try ToolPaths.engineTool(named: "git") == nil)
+            ToolPaths.installFromEngine(git: planted.appending(path: "git").path, forbiddenRoots: [ws], gitVersion: Self.fixedVersion)
+            #expect(ToolPaths.engine() == .failure(.gitMissing))
+            ToolPaths.installFromEngine(git: nil, forbiddenRoots: [ws], gitVersion: Self.fixedVersion)
+            #expect(ToolPaths.engine() == .failure(.gitMissing))
+        }
+    }
 }

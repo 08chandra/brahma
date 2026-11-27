@@ -231,14 +231,15 @@ public struct ClaudeProcessRunner: TurnRunning {
     /// The executable a configured `claudePath` names: an absolute path as is; a bare name (`claude`) the engine's
     /// `ToolPaths.claude` (B9: resolved once at engine start from the safe absolute PATH directories); anything else is
     /// refused (`Spawn.validate`). Never `/usr/bin/env`.
-    /// `engineTool` is `ToolPaths.engineTool(named:)` (a seam for tests).
+    /// `engineTool` is `ToolPaths.engineTool(named:)` (a seam for tests); it throws `notInstalled` before the process
+    /// installed its tools (Ruling S-c1), which refuses the start.
     static func executable(_ claudePath: String,
-                           engineTool: (String) -> String? = { ToolPaths.engineTool(named: $0) }) throws -> String {
+                           engineTool: (String) throws -> String? = { try ToolPaths.engineTool(named: $0) }) throws -> String {
         if claudePath.hasPrefix("/") { return claudePath }
         if claudePath.isEmpty || claudePath.contains("/"), case .deny(let why) = Spawn.validate(claudePath) {
             throw Spawn.Failure(message: why)
         }
-        guard let found = engineTool(claudePath) else { throw ToolPathsError.claudeMissing }
+        guard let found = try engineTool(claudePath) else { throw ToolPathsError.claudeMissing }
         return found
     }
 

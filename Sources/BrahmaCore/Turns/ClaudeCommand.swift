@@ -97,12 +97,15 @@ public enum MCPConfig {
     /// A review turn passes `reviewItem` (the item key): its server runs `--review-item <KEY>` and writes `<agentId>.review.mcp.json`.
     /// An audit turn passes `audit`: its server runs `--audit` and writes `<agentId>.audit.mcp.json`.
     /// The turn's mode quotas are not here: they ride on the credential row the token names.
-    public static func write(paths: BrahmaPaths, executable: String, agent: Agent, turnToken: String,
+    /// `git` is the engine's resolved git (Ruling S5-4), passed as `--git` (the server re-checks it and never looks one up); nil
+    /// passes none, and the server's git refuses.
+    public static func write(paths: BrahmaPaths, executable: String, agent: Agent, turnToken: String, git: String?,
                              reviewItem: String? = nil, audit: Bool = false,
                              environment: [String: String] = ProcessInfo.processInfo.environment) throws -> String {
         try FileManager.default.createDirectory(at: paths.runDir, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         var args = ["mcp", "--db", paths.database.path, "--company", agent.companyId, "--agent", agent.id]
+        if let git { args += ["--git", git] }
         if let reviewItem { args += ["--review-item", reviewItem] } else if audit { args.append("--audit") }
         var env = [tokenVariable: turnToken]
         // A sandboxed turn's shell prefix starts the server by a fixed argv with the database, company and agent baked in (1b

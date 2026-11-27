@@ -239,6 +239,50 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(!fm.fileExists(atPath: home.appending(path: ".claude").path))
     }
 
+    /// Ruling S-c1: `ext lint` looks for claude only after the store installed the tools with every company workspace (labs
+    /// included) and the data home as forbidden roots, so a claude planted on PATH in any of them is never the one it runs.
+    @Test func plantedClaudeUnderAForbiddenRootIsNeverResolved() throws {
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        let created = try brahma(["company", "create", "Acme", "--goal", "g", "--agents", "0"], home: home)
+        try #require(created.status == 0, "\(created.stderr)")
+        let paths = ownerPaths(home)
+        let workspace = URL(fileURLWithPath: try #require(try Store(path: paths.database.path).companies().first).workspacePath)
+        let marker = try tempDir().appending(path: "planted-claude-ran")
+        let f = try PluginFixture()
+        for dir in [workspace.appending(path: "bin"), workspace.appending(path: ".brahma/labs/eng/bin"), paths.home.appending(path: "bin")] {
+            try FakeTools.install(at: dir.appending(path: "claude"), "touch '\(marker.path)'; echo 2.1.999")
+            let r = try brahma(["ext", "lint", f.root.path], home: home, env: ["PATH": "\(dir.path):/usr/bin:/bin"])
+            #expect(r.status == 0, "\(dir.path): \(r.stdout + r.stderr)")
+            #expect(r.stderr.contains("claude not found on PATH"), "\(dir.path): \(r.stderr)")
+            #expect(!FileManager.default.fileExists(atPath: marker.path), "\(dir.path)")
+        }
+    }
+
+    /// N2: without a claude the doctor reports it missing and runs nothing by a bare name (no `plugin-details-inert`, whose
+    /// readable directory a bare name would take from the current directory); a non-executable override is named, never
+    /// replaced by a PATH claude.
+    @Test func doctorWithoutClaudeRunsNothingByABareName() throws {
+        let someone = URL(fileURLWithPath: "/Users/someone", isDirectory: true)
+        #expect(ExtensionValidator.readableClaudeDirectory("claude", userHome: someone) == nil)
+        #expect(ExtensionValidator.readableClaudeDirectory("bin/claude", userHome: someone) == nil)
+        #expect(ExtensionValidator.readableClaudeDirectory("/opt/tools/bin/claude", userHome: someone)?.map(\.path) == ["/opt/tools/bin"])
+        let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
+        let home = owner.url
+        let d = try brahma(["doctor"], home: home)
+        #expect(d.status == 1)
+        #expect(d.stdout.contains("FAIL  version  claude was not found: no claude found in a safe PATH directory"), "\(d.stdout)")
+        #expect(!d.stdout.contains("plugin-details-inert"), "\(d.stdout)")
+        let marker = try tempDir().appending(path: "path-claude-ran")
+        let safe = try tempDir().appending(path: "safe", directoryHint: .isDirectory)
+        try FakeTools.install(at: safe.appending(path: "claude"), "touch '\(marker.path)'; echo 2.1.999")
+        let o = try brahma(["doctor"], home: home, env: ["BRAHMA_CLAUDE": "/nonexistent/claude", "PATH": "\(safe.path):/usr/bin:/bin"])
+        #expect(o.status == 1)
+        #expect(o.stdout.contains("FAIL  version  claude was not found: BRAHMA_CLAUDE (/nonexistent/claude) is not an executable file"), "\(o.stdout)")
+        #expect(!o.stdout.contains("plugin-details-inert"), "\(o.stdout)")
+        #expect(!FileManager.default.fileExists(atPath: marker.path), "the PATH claude never ran")
+    }
+
     @Test func cliAddAndApproveRefusal() throws {
         let owner = try OwnerTestHome(); defer { withExtendedLifetime(owner) {} }
         let home = owner.url
