@@ -1,0 +1,168 @@
+{
+  "argv" : [
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--model",
+    "haiku",
+    "--fallback-model",
+    "sonnet",
+    "--setting-sources",
+    "",
+    "--settings",
+    "<RUN>/<AGENT>.settings.json",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "<RUN>/<AGENT>.mcp.json",
+    "--disallowed-tools",
+    "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,RemoteTrigger,PushNotification,SendMessage,ListAgents,EnterWorktree,ExitWorktree,DesignSync,ReportFindings,Task,Agent,TaskStop,Workflow",
+    "--session-id",
+    "<ID>",
+    "--append-system-prompt",
+    "ROLE",
+    "--permission-mode",
+    "bypassPermissions",
+    "--effort",
+    "low",
+    "--max-turns",
+    "10",
+    "--max-budget-usd",
+    "0.30"
+  ],
+  "env" : {
+    "BRAHMA_AGENT_ID" : "<AGENT>",
+    "BRAHMA_HOME" : "<HOME>",
+    "BRAHMA_WORKSPACES" : "<WORKSPACES>",
+    "CLAUDE_CODE_DISABLE_FAST_MODE" : "1",
+    "CLAUDE_CODE_DISABLE_WORKFLOWS" : "1",
+    "DEVELOPER_DIR" : "/Applications/Xcode.app/Contents/Developer",
+    "HOME" : "<USERHOME>",
+    "LANG" : "en_US.UTF-8",
+    "LC_ALL" : "en_US.UTF-8",
+    "LOGNAME" : "owner",
+    "PATH" : "/usr/bin:/bin:/usr/sbin:/sbin",
+    "SHELL" : "/bin/zsh",
+    "TERM" : "xterm-256color",
+    "TMPDIR" : "<TMP>/",
+    "USER" : "owner"
+  },
+  "envNames" : [
+    "BRAHMA_AGENT_ID",
+    "BRAHMA_HOME",
+    "BRAHMA_WORKSPACES",
+    "CLAUDE_CODE_DISABLE_FAST_MODE",
+    "CLAUDE_CODE_DISABLE_WORKFLOWS",
+    "DEVELOPER_DIR",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "USER"
+  ],
+  "mcpConfig" : {
+    "mcpServers" : {
+      "company" : {
+        "args" : [
+          "mcp",
+          "--db",
+          "<HOME>/brahma.sqlite",
+          "--company",
+          "<COMPANY>",
+          "--agent",
+          "<AGENT>"
+        ],
+        "command" : "/usr/local/bin/brahma",
+        "env" : {
+          "BRAHMA_TURN_TOKEN" : "<TOKEN>"
+        }
+      }
+    }
+  },
+  "settings" : {
+    "availableModels" : [
+      "haiku",
+      "sonnet",
+      "opus"
+    ],
+    "disableBundledSkills" : true,
+    "disableSkillShellExecution" : true,
+    "disableWorkflows" : true,
+    "enabledPlugins" : {
+      "cc-plugin-agents-md@builtin" : false,
+      "cc-plugin-claude-platform@builtin" : false,
+      "cc-plugin-claude-test@builtin" : false,
+      "cc-plugin-diff@builtin" : false,
+      "cc-plugin-easel@builtin" : false,
+      "cc-plugin-mermaid@builtin" : false,
+      "cc-plugin-mods-guide@builtin" : false,
+      "cc-plugin-plugin-authoring@builtin" : false,
+      "cc-plugin-privacy@builtin" : false,
+      "cc-plugin-responsive-mode@builtin" : false,
+      "cc-plugin-telemetry@builtin" : false,
+      "cc-plugin-tips@builtin" : false,
+      "cc-plugin-you-should-know@builtin" : false
+    },
+    "fastMode" : false,
+    "hooks" : {
+      "PostToolUse" : [
+        {
+          "hooks" : [
+            {
+              "args" : [
+                "hook",
+                "post-tool",
+                "--db",
+                "<HOME>/brahma.sqlite",
+                "--agent",
+                "<AGENT>"
+              ],
+              "command" : "/usr/local/bin/brahma",
+              "onFailure" : "block",
+              "type" : "command"
+            }
+          ],
+          "matcher" : "WebFetch|WebSearch|Bash|mcp__.*|Skill|Task|Agent"
+        }
+      ],
+      "PreToolUse" : [
+        {
+          "hooks" : [
+            {
+              "args" : [
+                "hook",
+                "pre-tool",
+                "--mode",
+                "quick",
+                "--taint-file",
+                "<RUN>/taint/<AGENT>",
+                "--db",
+                "<HOME>/brahma.sqlite",
+                "--agent",
+                "<AGENT>"
+              ],
+              "command" : "/usr/local/bin/brahma",
+              "onFailure" : "block",
+              "type" : "command"
+            }
+          ],
+          "matcher" : "Agent|Task|Workflow"
+        }
+      ]
+    },
+    "maxEffortLevel" : "low",
+    "permissions" : {
+      "deny" : [
+        "Bash(claude *)",
+        "Bash(*/claude *)"
+      ]
+    },
+    "workflowKeywordTriggerEnabled" : false
+  },
+  "shape" : "e2ec34610eaf1a4f"
+}

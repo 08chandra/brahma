@@ -1,0 +1,128 @@
+{
+  "argv" : [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--model",
+    "sonnet",
+    "--fallback-model",
+    "sonnet",
+    "--setting-sources",
+    "",
+    "--settings",
+    "{\"availableModels\":[\"haiku\",\"sonnet\",\"opus\"],\"disableBundledSkills\":true,\"disableSkillShellExecution\":true,\"disableWorkflows\":true,\"enabledPlugins\":{\"cc-plugin-agents-md@builtin\":false,\"cc-plugin-claude-platform@builtin\":false,\"cc-plugin-claude-test@builtin\":false,\"cc-plugin-diff@builtin\":false,\"cc-plugin-easel@builtin\":false,\"cc-plugin-mermaid@builtin\":false,\"cc-plugin-mods-guide@builtin\":false,\"cc-plugin-plugin-authoring@builtin\":false,\"cc-plugin-privacy@builtin\":false,\"cc-plugin-responsive-mode@builtin\":false,\"cc-plugin-telemetry@builtin\":false,\"cc-plugin-tips@builtin\":false,\"cc-plugin-you-should-know@builtin\":false},\"fastMode\":false,\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"args\":[\"hook\",\"pre-tool\",\"--mode\",\"standard\"],\"command\":\"/usr/local/bin/brahma\",\"onFailure\":\"block\",\"type\":\"command\"}],\"matcher\":\"Agent|Task|Workflow\"}]},\"maxEffortLevel\":\"medium\",\"permissions\":{\"deny\":[\"Bash(claude *)\",\"Bash(*/claude *)\"]},\"workflowKeywordTriggerEnabled\":false}",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "<CANARY>/empty.mcp.json",
+    "--disallowed-tools",
+    "CronCreate,CronDelete,CronList,ScheduleWakeup,Monitor,RemoteTrigger,PushNotification,SendMessage,ListAgents,EnterWorktree,ExitWorktree,DesignSync,ReportFindings,Task,Agent,TaskStop,Workflow",
+    "--session-id",
+    "<ID>",
+    "--permission-mode",
+    "acceptEdits",
+    "--allowed-tools",
+    "Bash,Read,Edit,Write,Glob,Grep,mcp__company",
+    "--add-dir",
+    "<CANARY>",
+    "--effort",
+    "medium",
+    "--max-turns",
+    "40",
+    "--max-budget-usd",
+    "2.00"
+  ],
+  "env" : {
+    "BRAHMA_AGENT_ID" : "doctor-canary",
+    "CLAUDE_CODE_DISABLE_FAST_MODE" : "1",
+    "CLAUDE_CODE_DISABLE_WORKFLOWS" : "1",
+    "DEVELOPER_DIR" : "/Applications/Xcode.app/Contents/Developer",
+    "HOME" : "<USERHOME>",
+    "LANG" : "en_US.UTF-8",
+    "LC_ALL" : "en_US.UTF-8",
+    "LOGNAME" : "owner",
+    "PATH" : "/usr/bin:/bin:/usr/sbin:/sbin",
+    "SHELL" : "/bin/zsh",
+    "TERM" : "xterm-256color",
+    "TMPDIR" : "<TMP>/",
+    "USER" : "owner"
+  },
+  "envNames" : [
+    "BRAHMA_AGENT_ID",
+    "CLAUDE_CODE_DISABLE_FAST_MODE",
+    "CLAUDE_CODE_DISABLE_WORKFLOWS",
+    "DEVELOPER_DIR",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "USER"
+  ],
+  "mcpConfig" : {
+    "mcpServers" : {
+
+    }
+  },
+  "settings" : {
+    "availableModels" : [
+      "haiku",
+      "sonnet",
+      "opus"
+    ],
+    "disableBundledSkills" : true,
+    "disableSkillShellExecution" : true,
+    "disableWorkflows" : true,
+    "enabledPlugins" : {
+      "cc-plugin-agents-md@builtin" : false,
+      "cc-plugin-claude-platform@builtin" : false,
+      "cc-plugin-claude-test@builtin" : false,
+      "cc-plugin-diff@builtin" : false,
+      "cc-plugin-easel@builtin" : false,
+      "cc-plugin-mermaid@builtin" : false,
+      "cc-plugin-mods-guide@builtin" : false,
+      "cc-plugin-plugin-authoring@builtin" : false,
+      "cc-plugin-privacy@builtin" : false,
+      "cc-plugin-responsive-mode@builtin" : false,
+      "cc-plugin-telemetry@builtin" : false,
+      "cc-plugin-tips@builtin" : false,
+      "cc-plugin-you-should-know@builtin" : false
+    },
+    "fastMode" : false,
+    "hooks" : {
+      "PreToolUse" : [
+        {
+          "hooks" : [
+            {
+              "args" : [
+                "hook",
+                "pre-tool",
+                "--mode",
+                "standard"
+              ],
+              "command" : "/usr/local/bin/brahma",
+              "onFailure" : "block",
+              "type" : "command"
+            }
+          ],
+          "matcher" : "Agent|Task|Workflow"
+        }
+      ]
+    },
+    "maxEffortLevel" : "medium",
+    "permissions" : {
+      "deny" : [
+        "Bash(claude *)",
+        "Bash(*/claude *)"
+      ]
+    },
+    "workflowKeywordTriggerEnabled" : false
+  },
+  "shape" : "e00cb727d2112ef4"
+}
