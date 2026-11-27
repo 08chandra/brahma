@@ -61,9 +61,18 @@ public enum UsageSignalMode: String, Codable, Sendable, CaseIterable {
     case rateLimitEvents, proxyMetered, none
 }
 
-/// `compile` refuses: the runtime cannot build this turn (a gate it needs has not passed, an auth route it lacks).
-public enum RuntimeCompileError: Error, Equatable {
+/// `compile` refuses: the runtime cannot build this turn (a gate it needs has not passed, an auth route it lacks), or the request
+/// does not compile at all (a model off the allowlist, a sandboxed turn missing part of its sandbox). Described by its text alone,
+/// so a refusal reads exactly as the compiler's own error did before the seam.
+public enum RuntimeCompileError: Error, Equatable, CustomStringConvertible {
     case unavailable(String)
+    case invalid(String)
+
+    public var description: String {
+        switch self {
+        case .unavailable(let why), .invalid(let why): why
+        }
+    }
 }
 
 /// What today's canary request builder takes (`SandboxCanary.prepare(paths:environment:hookExecutable:spec:)`): the data home,

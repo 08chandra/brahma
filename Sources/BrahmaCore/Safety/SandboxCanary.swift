@@ -519,6 +519,13 @@ public struct SandboxCanary: SandboxCanaryRunning {
         return "the canary's turn would not have the asking turn's settings shape, so no pass could be recorded for it (no model call)"
     }
 
+    /// The shape of the canary's own turn for an asking key: a plain sandboxed turn (no fan-out is built, `verifies(launch:)`),
+    /// a plan turn when the spec is one, on the subscription, under the asked settings shape, so its `key` is the asked key.
+    static func canaryTurnShape(spec: TurnSpec, askedShape: String) -> TurnShape {
+        TurnShape(profile: .sandboxed, kind: spec.plan ? .plan : .work, mode: nil, launch: nil, settingsShape: askedShape,
+                  auth: .subscription)
+    }
+
     /// Only plain turns: no fan-out (Task, Ultra) shape is built yet (`fanOutLaunches`).
     public func verifies(launch: String?) -> Bool { launch == nil }
 
@@ -542,8 +549,16 @@ public struct SandboxCanary: SandboxCanaryRunning {
                                      DoctorItem(name: "sandbox-canary", status: .fail, detail: why),
                                      Self.helpersItem(loaded, results: [])], verified: nil)
         }
+        // Plan X1 Task 3: the canary's turn is built through the runtime's `canaryShape(for:)` (Claude's is `prepare` itself).
+        let shape = Self.canaryTurnShape(spec: spec, askedShape: key.shape)
         let prepared: Result<Prepared, any Error> = await Doctor.execBlocking.run {
-            Result { try Self.prepare(paths: paths, environment: env, hookExecutable: hook, spec: spec) }
+            Result {
+                guard let runtime = RuntimeCatalog.runtime(RuntimeCatalog.claude) else {
+                    throw TurnError.runtimeUnavailable(RuntimeCatalog.claude)
+                }
+                return try runtime.canaryShape(for: shape)
+                    .request(CanaryInputs(paths: paths, environment: env, hookExecutable: hook, spec: spec))
+            }
         }
         var items: [DoctorItem] = []
         var results: [CanaryProbeResult] = []

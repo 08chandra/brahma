@@ -27,10 +27,12 @@ public struct LaunchSpec: Sendable, Equatable {
     public var sandbox: LaunchSandbox
     public var workingDirectory: String
     public var stdin: String
+    /// The turn's own wall clock, when the compiled turn names one (a mode's, the concierge's); nil: the launcher's default.
+    public var wallClock: Duration?
 
     public init(executable: String, arguments: [String], environment: [String: String], files: [LaunchFile], sandbox: LaunchSandbox,
-                workingDirectory: String, stdin: String) {
+                workingDirectory: String, stdin: String, wallClock: Duration? = nil) {
         self.executable = executable; self.arguments = arguments; self.environment = environment; self.files = files
-        self.sandbox = sandbox; self.workingDirectory = workingDirectory; self.stdin = stdin
+        self.sandbox = sandbox; self.workingDirectory = workingDirectory; self.stdin = stdin; self.wallClock = wallClock
     }
 }

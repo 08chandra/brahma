@@ -59,6 +59,9 @@ public enum TurnError: Error, Equatable {
     /// grants and Ultra approval kept), retried after the fixed 15 s infrastructure delay (`EngineHealth.infraCooldown`), and
     /// the owner alerted after `Orchestrator.maxUnrecordedTurns` in a row.
     case startNotRecorded
+    /// Plan X1 Task 3: the request names a runtime the catalog does not have (`RuntimeCatalog.runtime`): nothing was compiled
+    /// or spawned (fail closed).
+    case runtimeUnavailable(RuntimeId)
 }
 
 extension TurnError: CustomStringConvertible {
@@ -75,13 +78,24 @@ extension TurnError: CustomStringConvertible {
             "an earlier turn of this agent was still in flight after \(seconds) s; this turn did not start"
         case .leaderNotRecorded(let reason): "the turn's leader could not be recorded (\(reason)); the turn was stopped"
         case .startNotRecorded: "the start time of the turn's process could not be read, so it could not be recorded; the turn was stopped before it ran"
+        case .runtimeUnavailable(let id): "runtime \(id.rawValue) is not available"
         }
     }
 }
 
-/// Runs `claude -p` as a child process: prompt on stdin, stream-json on stdout.
-public struct ClaudeProcessRunner: TurnRunning {
-    /// Command name looked up via `/usr/bin/env`, or an absolute path launched directly.
+/// The runner's name before Plan X1 Task 3, kept for its callers.
+public typealias ClaudeProcessRunner = RuntimeProcessRunner
+
+/// How the runner starts a turn's leader, with the signature of `TurnChild.spawn`: executable, argv, environment, working
+/// directory, the child's stdin, stdout and stderr descriptors, the sandbox probe and the record's start stamp.
+typealias TurnSpawn = @Sendable (_ executable: String, _ arguments: [String], _ environment: [String: String], _ workingDirectory: String,
+                                 _ stdin: Int32, _ stdout: Int32, _ stderr: Int32, _ probe: SandboxProbe?, _ since: Double) throws -> TurnChild
+
+/// Runs a turn's runtime CLI as a child process: prompt on stdin, its stream on stdout. Plan X1 Task 3: the launch is compiled
+/// by the request's runtime (`RuntimeCatalog.runtime(request.runtime)`; an unknown one fails closed before anything starts) and
+/// its stdout parsed by that runtime's parser. Today the catalog has Claude (`claude -p`, stream-json) alone.
+public struct RuntimeProcessRunner: TurnRunning {
+    /// The Claude CLI: a command name looked up via `/usr/bin/env`, or an absolute path launched directly.
     public var claudePath: String
     /// The wall clock of a turn whose request names none (`TurnProfile.wallClock`): the Plan 1 fallback.
     public var maxTurnDuration: Duration
@@ -93,6 +107,9 @@ public struct ClaudeProcessRunner: TurnRunning {
     public var wallClockSleep: @Sendable (Duration) async throws -> Void = { try await AwakeTime.sleep(for: $0) }
     /// The leader's exact start time right after the spawn (`ProcessTable.entry(pid)?.start`); tests inject a failing read.
     var startTimeProbe: @Sendable (pid_t) -> Double? = { ProcessTable.entry($0)?.start }
+    /// Starts the turn's leader (Ruling 28: the spawn seam). Production is `TurnChild.spawn`; tests inject one that counts.
+    var spawn: TurnSpawn = { try TurnChild.spawn(executable: $0, arguments: $1, environment: $2, workingDirectory: $3,
+                                                 stdin: $4, stdout: $5, stderr: $6, probe: $7, since: $8) }
 
     private static let live = LiveCount()
     /// Every agent's turns in flight and what their sweeps could not kill.
@@ -157,17 +174,19 @@ public struct ClaudeProcessRunner: TurnRunning {
     }
 
     public func control(_ request: TurnRequest, messages: [JSONValue], timeout: Duration) async -> ControlTranscript? {
-        let profile = TurnProfileCompiler.profile(for: request)
-        guard (try? TurnProfileCompiler.validate(profile)) != nil else { return ControlTranscript(exitStatus: nil, lines: []) }
-        var args = TurnProfileCompiler.arguments(profile)
-        args.insert(contentsOf: ["--input-format", "stream-json"], at: 1)
+        // The control protocol (`--input-format stream-json` control requests) is Claude's: another runtime has none.
+        let runtime = ClaudeRuntime(executable: claudePath, baseEnvironment: baseEnvironment)
+        guard request.runtime == runtime.id,
+              let launch = try? runtime.compileControl(request, RuntimeProbe(runtime: runtime.id)) else {
+            return ControlTranscript(exitStatus: nil, lines: [])
+        }
+        let args = launch.arguments
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let input = messages.compactMap { try? encoder.encode($0) }.map { String(decoding: $0, as: UTF8.self) + "\n" }.joined()
         let ids = Set(messages.compactMap { $0.objectValue?["request_id"]?.stringValue })
-        let claude = claudePath
-        let env = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment, engineClaudeVars: profile.environment,
-                                        purpose: .claude, allowBuiltinAgentsSwitch: profile.builtinAgentsDisabled)
+        let claude = launch.executable
+        let env = launch.environment
         let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
         return await Task.detached { () -> ControlTranscript? in
             let process = Process()
@@ -214,9 +233,13 @@ public struct ClaudeProcessRunner: TurnRunning {
 
     private func execute(_ request: TurnRequest, yield: (StreamEvent) -> Void) async throws {
         var request = request
-        // One compiled profile: its argv and its engine-set environment (the only source of `CLAUDE_CODE_*` controls).
-        var profile = TurnProfileCompiler.profile(for: request)
-        try TurnProfileCompiler.validate(profile)
+        // The request's runtime, from the catalog: one it does not have compiles and starts nothing (fail closed).
+        guard let runtime = RuntimeCatalog.runtime(request.runtime, claudePath: claudePath, baseEnvironment: baseEnvironment) else {
+            throw TurnError.runtimeUnavailable(request.runtime)
+        }
+        let caps = RuntimeProbe(runtime: runtime.id)
+        // One compiled launch: its argv, its filtered environment (the only source of `CLAUDE_CODE_*` controls), its sandbox.
+        var launch = try runtime.compile(request, caps)
         let agentId = request.agent.id
         // Nothing of an earlier turn of this agent may still run when this one starts (1a re-review, binding): claim the agent's
         // slot (one step: nothing running, then begin), then kill what earlier turns, of this engine or an earlier one, left.
@@ -230,7 +253,7 @@ public struct ClaudeProcessRunner: TurnRunning {
         if !earlier.survivors.isEmpty { throw TurnError.earlierTurnStillRunning(pids: earlier.survivors) }
         // The scope may be some time old: its link walk again, and the cwd it starts in must be the scope's own. A grant read
         // path that is no longer pinned (a link put in its place) is dropped for this turn, and the settings written again.
-        if profile.permission == .sandboxed, var scope = request.sandbox {
+        if case .claudeSettings = launch.sandbox, var scope = request.sandbox {
             let dropped = try scope.recheckBeforeSpawnDroppingGrants()
             for url in dropped {
                 yield(.sandboxNote("@\(request.agent.name): read-path grant \(url.path) left out of this turn at its start: a link or "
@@ -240,25 +263,25 @@ public struct ClaudeProcessRunner: TurnRunning {
                 let gone = Set(dropped.map(\.path))
                 request.sandbox = scope
                 request.addDirs.removeAll { gone.contains($0) }
-                profile = TurnProfileCompiler.profile(for: request)
-                try TurnProfileCompiler.validate(profile)
+                launch = try runtime.compile(request, caps)
                 if let path = request.settingsFilePath {
-                    try SettingsFile.write(try TurnProfileCompiler.settingsJSON(profile), to: URL(fileURLWithPath: path))
+                    guard let file = launch.files.first(where: { $0.path == path }) else {
+                        throw TurnProfileError.sandboxIncomplete("no settings file")
+                    }
+                    try SettingsFile.writePrivate(file.contents, to: URL(fileURLWithPath: path))
                 }
             }
         }
-        let args = TurnProfileCompiler.arguments(profile)
+        let args = launch.arguments
         let executable: String, argv: [String]
-        if claudePath.hasPrefix("/") {
-            executable = claudePath
-            argv = [claudePath] + leadingArguments + args
+        if launch.executable.hasPrefix("/") {
+            executable = launch.executable
+            argv = [launch.executable] + leadingArguments + args
         } else {
             executable = "/usr/bin/env"
-            argv = ["env", claudePath] + leadingArguments + args
+            argv = ["env", launch.executable] + leadingArguments + args
         }
-        let environment = ChildEnvironment.make(base: baseEnvironment, extra: profile.environment,
-                                                engineClaudeVars: profile.environment, purpose: .claude, secrets: request.secrets,
-                                                allowBuiltinAgentsSwitch: profile.builtinAgentsDisabled)
+        let environment = launch.environment
 
         // The parent's ends are close-on-exec, so no other child ever holds them; the child's ends are dup'ed onto 0, 1, 2.
         func makePipe() throws -> (read: Int32, write: Int32) {
@@ -276,7 +299,8 @@ public struct ClaudeProcessRunner: TurnRunning {
             throw error
         }
         // A sandboxed turn's processes are also known by their sandbox: its unremovable marker (Task 2's mechanism).
-        let probe = profile.permission == .sandboxed ? request.containmentMarker.map { SandboxProbe(machMarker: $0) } : nil
+        let confined = if case .claudeSettings = launch.sandbox { true } else { false }
+        let probe = confined ? request.containmentMarker.map { SandboxProbe(machMarker: $0) } : nil
         // Recorded before the spawn (and the leader added right after), so an engine that dies mid-turn leaves the next one
         // enough to kill what is left (B-I1). A turn that cannot be recorded does not start.
         let since = ProcessTable.startStamp(slack: 1)
@@ -285,9 +309,7 @@ public struct ClaudeProcessRunner: TurnRunning {
         do {
             if let dir = request.turnRecordDirectory { try TurnRecords.add(record, agentId: agentId, in: dir) }
             try Task.checkCancellation()
-            child = try TurnChild.spawn(executable: executable, arguments: argv, environment: environment,
-                                        workingDirectory: profile.workingDirectory,
-                                        stdin: inPipe.read, stdout: outPipe.write, stderr: errPipe.write, probe: probe, since: since)
+            child = try spawn(executable, argv, environment, launch.workingDirectory, inPipe.read, outPipe.write, errPipe.write, probe, since)
         } catch {
             for fd in [inPipe.read, inPipe.write, outPipe.read, outPipe.write, errPipe.read, errPipe.write] { close(fd) }
             if let dir = request.turnRecordDirectory { try? TurnRecords.replace(record, with: nil, agentId: agentId, in: dir) }
@@ -355,14 +377,14 @@ public struct ClaudeProcessRunner: TurnRunning {
         #endif
         // A turn stopped because it could not be recorded never gets its prompt (Task 9c fix round 4): it is booked as not
         // launched, so it must not do any work in the grace before its kill lands.
-        let prompt = unrecorded == nil && !startUnreadable ? Data(request.prompt.utf8) : Data()
+        let prompt = unrecorded == nil && !startUnreadable ? Data(launch.stdin.utf8) : Data()
         DispatchQueue.global().async {
             if !prompt.isEmpty { try? input.write(contentsOf: prompt) }
             try? input.close()
         }
 
         let timedOut = Flag()
-        let wallClock = profile.wallClock ?? maxTurnDuration
+        let wallClock = launch.wallClock ?? maxTurnDuration
         let sleep = wallClockSleep
         let watchdog = Task {
             try await sleep(wallClock)
@@ -372,12 +394,12 @@ public struct ClaudeProcessRunner: TurnRunning {
         defer { watchdog.cancel() }
 
         var state = TurnStreamState()
+        var parser = runtime.parser()
         await withTaskCancellationHandler {
             for await line in lines {
                 guard unrecorded == nil, !startUnreadable else { continue }
                 if request.emitRawLines { yield(.raw(line)) }
-                guard let events = StreamParser.parseAll(line: line) else { continue }
-                for event in events {
+                for event in parser.parse(line: line, now: .now) {
                     state.apply(event)
                     yield(event)
                 }

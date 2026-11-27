@@ -330,18 +330,24 @@ private struct Capture {
 
 private func json(_ text: String) throws -> Any { try JSONSerialization.jsonObject(with: Data(text.utf8)) }
 
-/// Today's path: profile → validate → argv, settings JSON, the child environment and the MCP config file.
+/// Since Task 3 the path runs through the runtime seam: `ClaudeRuntime.compile` (the mode canary's control session through
+/// `compileControl`, the runner's own builder) → the launch's argv, its settings (the settings file the launch carries, or the
+/// inline `--settings`), its child environment and the MCP config its argv names; the shape is `TurnShape.of(_:auth:)`'s key.
+/// Task 1 recorded the goldens on today's direct path (`TurnProfileCompiler.profile(for:)` → `validate` → `arguments`,
+/// `settingsJSON`, `ChildEnvironment.make(purpose: .claude)`); they match unchanged.
 private func capture(_ r: TurnRequest, world: GoldenWorld, controlSession: Bool = false) throws -> Capture {
-    let profile = TurnProfileCompiler.profile(for: r)
-    try TurnProfileCompiler.validate(profile)
-    var argv = TurnProfileCompiler.arguments(profile)
-    // `ClaudeProcessRunner.control` (the mode canary's session) adds the input format after `-p`.
-    if controlSession { argv.insert(contentsOf: ["--input-format", "stream-json"], at: 1) }
-    let env = ChildEnvironment.make(base: world.baseEnvironment, extra: profile.environment, engineClaudeVars: profile.environment,
-                                    purpose: .claude, secrets: r.secrets, allowBuiltinAgentsSwitch: profile.builtinAgentsDisabled)
-    let mcp = try String(contentsOfFile: r.mcpConfigPath, encoding: .utf8)
-    return Capture(argv: argv, settings: try json(try TurnProfileCompiler.settingsJSON(profile)), env: env, mcpConfig: try json(mcp),
-                   shape: CanaryShape.key(profile.settings, launch: CanaryShape.launch(r.mode)))
+    let runtime = ClaudeRuntime(baseEnvironment: world.baseEnvironment)
+    let caps = RuntimeProbe(runtime: RuntimeCatalog.claude)
+    let spec = controlSession ? try runtime.compileControl(r, caps) : try runtime.compile(r, caps)
+    func value(after flag: String) throws -> String {
+        let i = try #require(spec.arguments.firstIndex(of: flag), "no \(flag) in the argv")
+        return try #require(spec.arguments.indices.contains(i + 1) ? spec.arguments[i + 1] : nil, "no value after \(flag)")
+    }
+    let settingsArgument = try value(after: "--settings")
+    let settingsText = spec.files.first { $0.path == settingsArgument }.map { String(decoding: $0.contents, as: UTF8.self) } ?? settingsArgument
+    let mcp = try String(contentsOfFile: try value(after: "--mcp-config"), encoding: .utf8)
+    return Capture(argv: spec.arguments, settings: try json(settingsText), env: spec.environment, mcpConfig: try json(mcp),
+                   shape: try TurnShape.of(r, auth: .subscription).key)
 }
 
 private func capture(cell: ParityCell, world: GoldenWorld) throws -> Capture {

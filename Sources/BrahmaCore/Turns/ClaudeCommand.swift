@@ -76,6 +76,9 @@ public struct TurnRequest: Sendable {
     /// Plan C Task C4c: a concierge run. `TurnProfileCompiler.profile(for:)` then compiles `conciergeProfile` (no built-in
     /// tools, no role card, no session to resume, `--max-turns 4`, Haiku) instead of an agent's turn.
     public var concierge: ConciergeTurn? = nil
+    /// Plan X1 Task 3: the runtime the turn runs on. The runner compiles and parses through `RuntimeCatalog.runtime(runtime)`;
+    /// a runtime the catalog does not have never launches (fail closed).
+    public var runtime: RuntimeId = RuntimeCatalog.claude
 
     public init(agent: Agent, company: Company, prompt: String, appendSystemPrompt: String?,
                 mcpConfigPath: String, workingDirectory: String, profile: PermissionProfile,
