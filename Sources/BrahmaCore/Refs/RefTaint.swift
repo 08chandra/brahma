@@ -450,20 +450,25 @@ extension Store {
         do { target = try bases.target ?? git.head("item/\(item.key)") } catch { return "outside content" }
         let rows = try unclearedCommits(companyId: item.companyId)
         // Fix round 2 (R1-2): both trees are displayed (context and `-` lines come from the base), so every commit either side
-        // holds since its merge base with main counts, plus the pair's symmetric range.
-        if let source = try Self.displayedRangeSource(git, bases.base, target, rows: rows) { return source }
-        // Restore epochs and orphaned items (Rulings 22–25) judge the branch as a whole, up to the target.
+        // holds since its merge base with main counts, plus the pair's symmetric range. Fix round 3 (Ruling C5b-7): the commits
+        // of every orphaned item (a taint record a rewrite left behind) count in that set too, and a lookup that fails is tainted.
+        let orphans: [(source: String, commits: Set<String>)]
+        do { orphans = Array(try orphanedItems(companyId: item.companyId, rows: rows).values) } catch {
+            return rows.first { $0.itemId == item.id }?.source ?? rows.first?.source ?? Self.taintCheckFailedSource
+        }
+        if let source = try Self.displayedRangeSource(git, bases.base, target, rows: rows, orphans: orphans) { return source }
+        // Never clean on a narrower check: `commitSource` (the item's own orphaned record, restore epochs, every orphaned
+        // item's commits over the branch up to the target, fail-closed on any failure) has the last word.
         var committed = WorkRef(kind: .diff, id: item.key)
         committed.rev = target
-        guard try openRestoreEpochs(companyId: item.companyId).isEmpty, try orphanedItems(companyId: item.companyId, rows: rows)[item.id] == nil
-        else { return try commitSource(committed, item: item) }
-        return nil
+        return try commitSource(committed, item: item)
     }
 
     /// R1-2: the source of the first uncleared tainted commit whose content a diff of `a` against `b` can display: the
     /// symmetric range `a...b`, and each side's own commits since its merge base with `main` (`merge-base(main, side)..side`).
     /// A side with no merge base with `main`, a pair with none, or a range that can't be listed reads as tainted (fail closed).
-    static func displayedRangeSource(_ git: SafeGit, _ a: String, _ b: String, rows: [TaintedCommit]) throws -> String? {
+    static func displayedRangeSource(_ git: SafeGit, _ a: String, _ b: String, rows: [TaintedCommit],
+                                     orphans: [(source: String, commits: Set<String>)] = []) throws -> String? {
         guard !rows.isEmpty else { return nil }
         do {
             var shas: [String] = []
@@ -475,7 +480,9 @@ extension Store {
                 let mainBase = try git.mergeBase("main", side)
                 if mainBase != side { shas += try git.revList(mainBase, side) }
             }
-            return rows.first { row in shas.contains { $0.hasPrefix(row.sha) } }?.source
+            if let hit = rows.first(where: { row in shas.contains { $0.hasPrefix(row.sha) } }) { return hit.source }
+            // Ruling C5b-7: a commit of an orphaned item's branch (its tainted record names shas a rewrite replaced).
+            return orphans.first { other in shas.contains { other.commits.contains($0) } }?.source
         } catch {
             return "outside content"
         }
@@ -490,7 +497,9 @@ extension Store {
         let git = try refGit(URL(fileURLWithPath: company.workspacePath, isDirectory: true))
         do {
             let refs = try reachabilityRefs(companyId: companyId)
-            return try Self.displayedRangeSource(git, try git.verifyRev(from, reachableFrom: refs), try git.verifyRev(to, reachableFrom: refs), rows: rows)
+            let orphans = Array(try orphanedItems(companyId: companyId, rows: rows).values)
+            return try Self.displayedRangeSource(git, try git.verifyRev(from, reachableFrom: refs), try git.verifyRev(to, reachableFrom: refs),
+                                                 rows: rows, orphans: orphans)
         } catch {
             return "outside content"
         }

@@ -398,4 +398,57 @@ final class PassthroughRecordingRunner: GitProcessRunning, @unchecked Sendable {
             #expect(try f.fx.resolve(.eng1, try f.fx.ref(stray)).visibility == .refused, "\(stray)")
         }
     }
+
+    // MARK: Fix round 3
+
+    /// Ruling C5b-7: a compare is never clean on a narrower check than `commitSource`. A commit of another item whose taint
+    /// record was orphaned by a rewrite (so no row names the rewritten sha) lands on this item's branch: every compare that
+    /// shows it is marked.
+    @Test func orphanedOtherItemCommitTaintsCompare() throws {
+        let f = try ChangesFixture(edits: false)
+        let other = try f.store.createWorkItem(companyId: f.c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Other"))
+        let wt2 = try f.fx.git.ws.addWorktree(key: other.key)
+        try f.fx.git.write("other.txt", "from the other item\n", in: wt2)
+        try f.fx.git.git(["add", "-A"], in: wt2)
+        try f.fx.git.git(["commit", "-q", "-m", "other work"], in: wt2)
+        let x = try f.fx.git.git(["rev-parse", "HEAD"], in: wt2)
+        try f.store.recordTaintedCommits(companyId: f.c.id, itemId: other.id, agentId: f.fx.eng3.id, turnId: nil, headBefore: try f.fx.head("main"),
+                                         headAfter: x, source: "docs.swift.org", git: SafeGit(workspace: f.cf.workspace), now: f.cf.now)
+        // The other item's history is rewritten: the tainted row names a sha no longer on any branch.
+        try f.fx.git.git(["commit", "-q", "--amend", "-m", "rewritten"], in: wt2)
+        let rewritten = try f.fx.git.git(["rev-parse", "HEAD"], in: wt2)
+        #expect(rewritten != x)
+        // The rewritten commit lands on this item's branch.
+        try f.fx.git.git(["merge", "-q", "--no-edit", rewritten], in: f.wt)
+        try f.fx.git.write("src/a.ts", "one\nTWO\nthree\nfour\nfive\n", in: f.wt)
+        for m in [CompareMode.head, .main, .lastCheck, .revisions(from: "r2", to: "worktree")] {
+            let s = try f.snapshot(m)
+            #expect(s.tainted && s.taintReason == Self.taintReason, "\(m)")
+        }
+        #expect(try f.fx.resolve(.owner, try f.fx.ref("ENG-1:diff@worktree?vs=head")).tainted)
+        #expect(try f.cf.open(.eng1, "ENG-1:changes").tainted)
+    }
+
+    /// Ruling C5b-7 (2): a taint lookup that fails reads as tainted, never as an error — here another item's branch sits on an
+    /// unrelated root, so `orphanedItems` can't judge it.
+    @Test func orphanLookupFailureReadsTainted() throws {
+        let f = try ChangesFixture()
+        let other = try f.store.createWorkItem(companyId: f.c.id, by: .owner, draft: WorkItemDraft(type: .task, title: "Other"))
+        let wt2 = try f.fx.git.ws.addWorktree(key: other.key)
+        try f.fx.git.write("other.txt", "from the other item\n", in: wt2)
+        try f.fx.git.git(["add", "-A"], in: wt2)
+        try f.fx.git.git(["commit", "-q", "-m", "other work"], in: wt2)
+        let x = try f.fx.git.git(["rev-parse", "HEAD"], in: wt2)
+        try f.store.recordTaintedCommits(companyId: f.c.id, itemId: other.id, agentId: f.fx.eng3.id, turnId: nil, headBefore: try f.fx.head("main"),
+                                         headAfter: x, source: "docs.swift.org", git: SafeGit(workspace: f.cf.workspace), now: f.cf.now)
+        // The other item's branch is reset onto a root unrelated to main: its merge base can't be computed.
+        let root = try f.fx.git.git(["commit-tree", try f.fx.git.git(["rev-parse", "main^{tree}"]), "-m", "unrelated root"])
+        try f.fx.git.git(["update-ref", "refs/heads/item/\(other.key)", root])
+        for m in [CompareMode.main, .head, .lastCheck, .revisions(from: "base", to: "head"), .revisions(from: "r1", to: "r2"), .revisions(from: "r1", to: "worktree")] {
+            let s = try f.snapshot(m)
+            #expect(s.tainted, "\(m) must read tainted, not throw or read clean")
+        }
+        #expect(try f.fx.resolve(.owner, try f.fx.ref("ENG-1:changes")).tainted)
+        #expect(try f.store.refTaint(try f.fx.ref("diff:\(f.r1)..\(f.r2)"), companyId: f.c.id).tainted)
+    }
 }
