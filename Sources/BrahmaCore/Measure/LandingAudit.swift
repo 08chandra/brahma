@@ -163,9 +163,9 @@ public struct LandingAudit {
         guard !recs.batchLanding, recs.pendingMain == nil || recs.pendingMain != tip else { throw MeasureError.mergeBatchOpen }
         // One more than the bound: a full listing says the walk did not reach the root.
         let walk = try git.firstParentHistory(from: tip, limit: maxCommits + 1)
-        if walk.count <= maxCommits, let root = walk.last, !(try git.commitParents(root)).isEmpty {
-            throw MeasureError.historyCut(String(root.prefix(7)))
-        }
+        // The root's parents as its object records them, read only when the walk reached a root.
+        let rootParents = walk.count <= maxCommits ? try walk.last.map { try git.commitParents($0) } ?? [] : []
+        try checkRoot(walk: walk, parents: rootParents, maxCommits: maxCommits)
         let candidates = legacyCandidates(walk: walk, records: recs)
         var result = classify(walk: walk, records: recs, maxCommits: maxCommits,
                               commitTimes: try git.commitTimes(of: Array(candidates.prefix(GitWorkspace.maxSubjectLookup))))
@@ -173,6 +173,13 @@ public struct LandingAudit {
         let listed = Array(result.unverified.prefix(maxListed))
         result.subjects = try git.subjects(of: listed)
         return result
+    }
+
+    /// A walk no longer than `maxCommits` reached the root of first-parent history; that root must have no parent in its own
+    /// object (`parents`, `GitWorkspace.commitParents`), else the history was cut and is not audited. A longer walk stopped at
+    /// the bound and judges nothing. Pure (Task 6 review #13).
+    static func checkRoot(walk: [String], parents: [String], maxCommits: Int) throws {
+        if walk.count <= maxCommits, let root = walk.last, !parents.isEmpty { throw MeasureError.historyCut(String(root.prefix(7))) }
     }
 
     /// The company's records, in one read. `since` (nil: the whole history) picks `stopBefore`. Every query is the company's own.
@@ -187,19 +194,20 @@ public struct LandingAudit {
             if let imported = recs.importedCommit { recs.recorded.insert(imported) }
 
             let landings = try Store.landings(db, companyId: companyId, in: nil)
-            let steps = Store.landedSteps.map { "'\($0.rawValue)'" }.joined(separator: ", ")
+            // The step names are bound, never spliced into the text (Task 6 review #16).
+            let steps = Store.landedSteps.map(\.rawValue)
+            let marks = steps.map { _ in "?" }.joined(separator: ", ")
             var raw: [String: MergeBatch] = [:]
-            for b in try MergeBatch.fetchAll(db, sql: "SELECT * FROM mergeBatch WHERE companyId = ? AND step IN (\(steps))",
-                                             arguments: [companyId]) {
+            for b in try MergeBatch.fetchAll(db, sql: "SELECT * FROM mergeBatch WHERE companyId = ? AND step IN (\(marks))",
+                                             arguments: StatementArguments([companyId]) + StatementArguments(steps)) {
                 raw[b.id] = b
                 // Ruling R38a: every landed-step batch's commits are the store's, passed and merged or not.
                 if let base = b.base { recs.recorded.insert(base) }
                 if let land = b.landCommit { recs.recorded.insert(land) }
                 recs.recorded.formUnion(b.candidates.values.filter { !$0.isEmpty })
             }
-            let landingNow = try Int.fetchOne(db, sql: """
-                SELECT COUNT(*) FROM mergeBatch WHERE companyId = ? AND step IN ('\(MergeStep.backedUp.rawValue)', '\(MergeStep.landing.rawValue)')
-                """, arguments: [companyId])
+            let landingNow = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM mergeBatch WHERE companyId = ? AND step IN (?, ?)",
+                                              arguments: [companyId, MergeStep.backedUp.rawValue, MergeStep.landing.rawValue])
             recs.batchLanding = (landingNow ?? 0) > 0
             var passed = Set<String>()
             for row in try Row.fetchAll(db, sql: """

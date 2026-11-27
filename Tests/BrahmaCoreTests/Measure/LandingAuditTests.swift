@@ -223,4 +223,14 @@ import GRDB
         }
         #expect(try audit(rig).unverified == [c1])
     }
+
+    /// Task 6 review #13: the root check, pure. A walk that reached its root (no longer than the bound) must end at a commit with
+    /// no parent; a root with one is a cut history. A walk past the bound never reached a root, so it judges nothing.
+    @Test func checkRootDrivesHistoryCut() throws {
+        let a = String(repeating: "a", count: 40), b = String(repeating: "b", count: 40), c = String(repeating: "c", count: 40)
+        #expect(throws: MeasureError.historyCut("bbbbbbb")) { try LandingAudit.checkRoot(walk: [a, b], parents: [c], maxCommits: 10) }
+        try LandingAudit.checkRoot(walk: [a, b], parents: [], maxCommits: 10)
+        try LandingAudit.checkRoot(walk: [a, b, c], parents: [c], maxCommits: 2)
+        try LandingAudit.checkRoot(walk: [], parents: [], maxCommits: 10)
+    }
 }

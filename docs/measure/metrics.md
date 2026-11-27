@@ -191,22 +191,74 @@ is estimated, sampled or inferred from text. This page is the definition of reco
 
 ### 15. Single-agent baseline (owner addition 11/24; spec §8.6.4 "Baselines" is the authority)
 
-`brahma measure <co> --compare <baseline-co>` prints both companies' reports side by side, metric by metric, each with its own
-denominator and status. Nothing is normalised or extrapolated; a difference is shown only where both sides are `ok`.
+`brahma measure <co> --compare <baseline-co>` prints both companies' reports side by side over **the same window** (the first
+company's: `--since` applies to both) and **the same metric ids**, row by row: `| metric | <co> | <baseline> (baseline) |`.
+Each cell is exactly what that company's own report shows, with its own denominator and status (`97.4% (38/39)` beside
+`insufficient data (n=4)`). Nothing is normalised, subtracted or extrapolated. A detail row only one side has is `—` on the
+other. `--mission --compare` compares the mission subset the same way. `--format json` carries both reports in full
+(`report`, `baseline`, `baselineName`, `baselineNotMeasured`). Comparing a company with itself is refused (exit 2).
 
-**The owner's procedure** (no script spends usage on the owner's behalf):
+**Status of the baseline column:** a company that does not exist prints `not measured: no company named '<name>'` in every
+baseline cell (the JSON's `baseline` is null); a baseline with no landing in the window prints `not measured: <name> has no
+landings in the window` in every baseline cell (its report is still in the JSON). Nothing is ever estimated.
 
-1. Create a one-agent company on the same pack and the same repository (`brahma company create … --import <repo>` or the
-   app's New company sheet; staff it with one agent).
-2. Import the same backlog into it (the same items, same acceptance criteria and checks), so both companies start from the
-   same work.
-3. Run it under the same pacing preset and billing mode for the same budget or wall-clock span.
-4. `brahma measure <co> --compare <baseline-co> --since <the start date>`.
+**The owner's procedure** (no script runs the baseline and nothing here spends usage on the owner's behalf):
 
-**Status:** a missing baseline company, or one with no landings in the window, prints `not measured: baseline <name> has no
-landings in the window` (or `not measured: no company named <name>`). Spec §8.6.4 also names a *single Claude Code session*
-baseline; Brahma has no record of such a session, so that comparison is an owner step outside `brahma measure` and is
-`not applicable` here.
+1. Create a one-agent company on the same pack and the same repository: `brahma company create Solo --goal "<the same goal>"
+   --agents 0 --from-repo <the same repo>` (or the app's New company sheet), then hire its one agent:
+   `brahma hire Solo solo --role engineer --model auto`.
+2. Give it the same backlog: the same items with the same acceptance criteria and checks (`brahma items add Solo …` for each),
+   so both companies start from the same work.
+3. Run it (`brahma run`, or the app) under the same pacing preset and billing mode for the same budget or wall-clock span.
+4. `brahma measure <co> --compare Solo --since <the day both started>` (add `--mission` for the mission subset, `--format json`
+   for both reports in full).
+
+Spec §8.6.4 also names a *single Claude Code session* baseline; Brahma has no record of such a session, so that comparison is
+an owner step outside `brahma measure` and is `not applicable` here.
+
+### 16. The mission subset and the soak harness (Plan X6a Task 7; spec §10 row 5 (2))
+
+`brahma measure <co> --mission [--since …] [--format md|json]` prints only what a long run is judged on, in this order: **Items
+landed** (a count of the window's landed items, rulings R13/R24, with the number of landings in its basis), **Owner touches per
+landed item** (§6), **Usage per landed item** (§5), **Green-main rate** (§1), **Turns wasted on rate limits** and **Reserve
+breaches** (the two target-0 rows of Safety, §9, taken as they are), **Idle while actionable** (§12). Each row is the full
+report's own measurement over the same window; the header reads `# mission <co>` and the JSON carries `"subset": "mission"`.
+
+The soak harness checks that a company survives a crash, a restart and a reboot without losing work or asking the owner for
+more than a login. There is no engine service on this tree (ruling R8): the engine is `brahma run` (or the app); it is running
+while something holds the `flock` on `<home>/orchestrator.lock`, and it started at the modification time of
+`<home>/run/.sentinel`, which every engine start writes anew (rulings R16, R40).
+
+- `--soak-checkpoint <file>` writes, 0600 and into a directory that must exist, the company's `main` tip, every item branch head,
+  every `verifiedCommit`, every lease (item → agent), every release's deploy-started count, the merge batches short of `done`,
+  the turns in progress and the engine's start (null with no engine running). It prints one line.
+- `--soak-verify <file> [--format json]` judges the company now against that checkpoint. Exit **0** pass, **1** fail, **3** wait,
+  **2** could not verify (no such file, another company's checkpoint, a store or git error). The seven checks:
+  1. `settled` — the engine has run at least 300 s since its start (no engine running, or not yet 300 s: **wait**, never fail);
+  2. `noLostCommits` — every checkpoint commit is still an object of the repository (`git cat-file --batch-check`), and `main`
+     still contains the checkpoint's tip, unless a restore recorded after the checkpoint (`restoreMain`/`restoreEvent`,
+     `restoreEpoch`) explains the rewind;
+  3. `leasesRecovered` — no item `inProgress` without a lease, no lease held by a killed or missing agent, and every lease of the
+     checkpoint still held by the same agent or released with its item no longer `inProgress`;
+  4. `noStuckMerges` — no merge batch short of `done` for more than 600 s since the later of its last step and the engine's
+     start (a batch the kill left at `prepared` that recovery finished passes);
+  5. `noDuplicateOutsideActions` — no release's deploy step started again after the checkpoint, and no two non-rolled-back
+     releases of one commit to one project started deploying with one of them after the checkpoint (L's release records; there
+     is no execution counter). Channel actions: `not applicable` (X4 absent);
+  6. `interruptedTurnsRecorded` — every turn running at the checkpoint has ended (the restart records `interrupted`), no turn
+     started before the engine's start is still in progress, no agent is `running` without a turn in progress;
+  7. `companyRunning` — the company is `running`, has started a turn since the engine's start, no engine alert was filed for it
+     since the checkpoint, and the engine is not on hold (owner-wide).
+- `--mission`, `--compare`, `--verify-landings`, `--log-owner-minutes`, `--soak-checkpoint` and `--soak-verify` are exclusive
+  (`--mission --compare` excepted); a combination is refused with exit 2.
+
+`scripts/soak/run-72h.sh <co> [--hours 72] [--kill-at 24] [--state <dir>] [--resume]` is the owner's 72-hour run. It refuses
+to start without `BRAHMA_LIVE=1` (a real company run spends usage). It starts `brahma run` itself and records its pid, keeps the
+Mac awake with `caffeinate -i` for its own lifetime, takes a checkpoint every hour, at `--kill-at` checks the recorded pid's
+command line is `brahma run` and sends SIGKILL to that pid only, starts `brahma run` again and asks for the verdict after the
+settle time; at hour 48 it prints the reboot instruction and exits, and `--resume` (after the reboot and login) verifies against
+the last checkpoint and continues. At the end it stops its engine with SIGTERM (after the same check), prints `--mission` over
+the soak's days and every verdict. It writes only under `--state` (default `~/.brahma-soak/<co>`).
 
 ---
 

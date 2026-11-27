@@ -21,6 +21,14 @@ public enum MeasureError: Error, Equatable, CustomStringConvertible {
     case historyCut(String)
     /// `--verify-landings`: a merge batch is moving `main`.
     case mergeBatchOpen
+    /// `--soak-verify`: the file is missing, unreadable or not a soak checkpoint (Task 7).
+    case badCheckpoint(String)
+    /// `--soak-verify`: the checkpoint was taken of another company.
+    case checkpointOfAnotherCompany(String)
+    /// `--soak-checkpoint` / `--soak-verify`: the directory the owner named does not exist.
+    case noSuchDirectory(String)
+    /// `--soak-checkpoint` / `--soak-verify`: whether an engine runs could not be read (the lock file could not be opened).
+    case engineStateUnreadable(String)
 
     public var description: String {
         switch self {
@@ -32,6 +40,11 @@ public enum MeasureError: Error, Equatable, CustomStringConvertible {
             return "the repository of company \(id) holds a .git/shallow or .git/info/grafts file, which rewrites its history; remove it, then audit again"
         case .historyCut(let root): return "main's history ends at \(root), which has a parent: the history is cut and cannot be audited"
         case .mergeBatchOpen: return "a merge batch is open; run again after it finishes"
+        case .badCheckpoint(let why): return "not a soak checkpoint: \(why)"
+        case .checkpointOfAnotherCompany(let name):
+            return "the checkpoint was taken of another company; verify it with 'brahma measure <that company> --soak-verify', not \(name)"
+        case .noSuchDirectory(let path): return "the directory \(path) does not exist; make it first"
+        case .engineStateUnreadable(let why): return "cannot tell whether an engine is running: \(why)"
         case .badDay(let s): return "--day must be a date (YYYY-MM-DD), not '\(s)'"
         case .dayAfterToday(let s): return "--day '\(s)' is after today; owner time can be logged only for a day that has begun"
         case .badMinutes(let n):
@@ -85,11 +98,13 @@ public struct MeasureReport: Codable, Equatable, Sendable {
     public var metrics: [MetricValue]
     public var generatedAt: Date
     public var brahmaBuild: String
+    /// nil: the full report (`MetricId.all`). `mission`: the mission subset (`MissionReport`, Task 7); the markdown header names it.
+    public var subset: String?
 
     public init(companyId: String, company: String, window: MeasureWindow, timeZone: String, metrics: [MetricValue], generatedAt: Date,
-                brahmaBuild: String) {
+                brahmaBuild: String, subset: String? = nil) {
         self.companyId = companyId; self.company = company; self.window = window; self.timeZone = timeZone; self.metrics = metrics
-        self.generatedAt = generatedAt.wholeSeconds; self.brahmaBuild = brahmaBuild
+        self.generatedAt = generatedAt.wholeSeconds; self.brahmaBuild = brahmaBuild; self.subset = subset
     }
 
     /// Where every metric is defined.
@@ -98,12 +113,8 @@ public struct MeasureReport: Codable, Equatable, Sendable {
     /// `# measure <company> — <since>…<until>`, a line of provenance, one table row per metric with its detail rows indented
     /// under it, and the link to the definitions. The company name is not sanitized here: the CLI passes every line through `safe()`.
     public func markdown() -> String {
-        let zone = TimeZone(identifier: timeZone) ?? TimeZone(identifier: "UTC") ?? .current
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = zone
-        f.dateFormat = "yyyy-MM-dd HH:mm"
-        var lines = ["# measure \(company) — \(f.string(from: window.since))…\(f.string(from: window.until))"]
+        let zone = zoneForDisplay
+        var lines = ["# \(subset ?? "measure") \(company) — \(windowText)"]
         lines.append("time zone \(zone.identifier) · generated \(Self.iso(generatedAt)) · brahma \(brahmaBuild)")
         lines.append("")
         lines.append("| metric | value | basis |")
@@ -121,6 +132,18 @@ public struct MeasureReport: Codable, Equatable, Sendable {
         return lines.joined(separator: "\n") + "\n"
     }
 
+    /// The owner's zone the window is shown in (UTC when the stored name is unknown).
+    var zoneForDisplay: TimeZone { TimeZone(identifier: timeZone) ?? TimeZone(identifier: "UTC") ?? .current }
+
+    /// `2026-11-01 00:00…2026-11-27 14:05` in the owner's zone.
+    var windowText: String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = zoneForDisplay
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return "\(f.string(from: window.since))…\(f.string(from: window.until))"
+    }
+
     /// ISO 8601 dates, sorted keys, pretty-printed: `decode` gives back an equal report.
     public func json() throws -> Data {
         let e = JSONEncoder()
@@ -136,7 +159,7 @@ public struct MeasureReport: Codable, Equatable, Sendable {
     }
 
     /// `2026-11-27T22:05:00Z` (a fresh formatter each time: the class is not Sendable).
-    static func iso(_ date: Date) -> String {
+    public static func iso(_ date: Date) -> String {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         f.timeZone = TimeZone(identifier: "UTC")

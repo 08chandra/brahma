@@ -3122,6 +3122,42 @@ public struct GitWorkspace: Sendable {
         return out.status == 0 && !out.text.isEmpty ? out.text : nil
     }
 
+    /// The most commits `missingCommits` checks in one call.
+    public static let maxCommitCheck = 20_000
+
+    /// The commits of `commits` (commit ids) that are not commit objects of the repository, whatever ref names them or none:
+    /// missing, or another kind of object (Plan X6a's soak check that no commit was lost). One `git cat-file
+    /// --batch-check=%(objecttype)` over all of them; a listing that does not answer each one throws.
+    public func missingCommits(_ commits: [String]) throws -> [String] {
+        guard commits.count <= Self.maxCommitCheck else {
+            throw GitError.failed(command: "cat-file --batch-check", status: -1, stderr: "more than \(Self.maxCommitCheck) commits asked for")
+        }
+        for c in commits { try Self.validCommit(c) }
+        guard !commits.isEmpty else { return [] }
+        let out = try main.run(["cat-file", "--batch-check=%(objecttype)"], maxOutput: commits.count * 160 + 64,
+                               stdin: .data(Data(commits.map { $0 + "\n" }.joined().utf8)))
+        let answers = out.text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard !out.cut, answers.count == commits.count else {
+            throw GitError.failed(command: "cat-file --batch-check", status: -1, stderr: "the object listing does not answer every commit")
+        }
+        return zip(commits, answers).filter { $0.1 != "commit" }.map(\.0)
+    }
+
+    /// Every item branch (`refs/heads/item/<key>`) and the commit it names, by item key, in one listing
+    /// (`git for-each-ref refs/heads/item/`). A line that is not `<commit id> refs/heads/item/<key>` is left out.
+    public func itemBranchHeads() throws -> [String: String] {
+        let prefix = "refs/heads/item/"
+        let out = try main.run(["for-each-ref", "--format=%(objectname) %(refname)", prefix])
+        var heads: [String: String] = [:]
+        for line in out.text.split(separator: "\n") {
+            let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+            guard parts.count == 2, parts[1].hasPrefix(prefix),
+                  parts[0].range(of: "^[0-9a-f]{40}([0-9a-f]{24})?\\z", options: .regularExpression) != nil else { continue }
+            heads[String(parts[1].dropFirst(prefix.count))] = parts[0]
+        }
+        return heads
+    }
+
     // MARK: Backups
 
     /// Every ref and the object it names (`for-each-ref`), one `<id> <ref>` per line: what a backup bundle holds, so an equal

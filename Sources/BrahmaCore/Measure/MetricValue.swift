@@ -22,6 +22,10 @@ public struct MetricId: RawRepresentable, Hashable, Codable, Sendable {
     public static let itemsPerDollar = MetricId(rawValue: "itemsPerDollar")
     public static let itemsPerPlanHour = MetricId(rawValue: "itemsPerPlanHour")
     public static let ownerMinutes = MetricId(rawValue: "ownerMinutes")
+    // The mission subset's own rows (Task 7, `MissionReport`): not in `all`; the full report shows the last two as rows of `safety`.
+    public static let itemsLanded = MetricId(rawValue: "itemsLanded")
+    public static let wastedRateLimitTurns = MetricId(rawValue: "wastedRateLimitTurns")
+    public static let reserveBreaches = MetricId(rawValue: "reserveBreaches")
 
     /// Every metric, in the order the report lists them.
     public static let all: [MetricId] = [
@@ -47,6 +51,9 @@ public struct MetricId: RawRepresentable, Hashable, Codable, Sendable {
         case .itemsPerDollar: return "Landed items per $LE"
         case .itemsPerPlanHour: return "Landed items per plan-hour"
         case .ownerMinutes: return "Owner minutes per landed item"
+        case .itemsLanded: return "Items landed"
+        case .wastedRateLimitTurns: return "Turns wasted on rate limits"
+        case .reserveBreaches: return "Reserve breaches"
         default: return rawValue
         }
     }

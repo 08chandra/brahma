@@ -97,6 +97,10 @@ public enum UsageMetrics {
 
     // MARK: Safety
 
+    /// The two target-0 rows of `safety` the mission subset also shows (`MissionReport`), by their label.
+    static let wastedLabel = "turns wasted on rate limits"
+    static let breachesLabel = "reserve breaches"
+
     /// Counts with targets, never rates. The headline is the measured target-0 events (reserve breaches, turns wasted on rate
     /// limits); every row is shown with its own source, and a row with no source says so.
     public static func safety(_ ctx: MeasureContext) throws -> MetricValue {
@@ -126,10 +130,10 @@ public enum UsageMetrics {
                 var basis = "owner-wide: usage snapshots of the owner's account observed at or past the owner reserve line "
                     + "(seven-day utilization ≥ 1 − reserve), one per new snapshot, shown in every company's report"
                 if start > w.since { basis += "; recorded since \(Store.measureDay(start, in: tz))" }
-                breaches = .count(id, label: "reserve breaches", total.sum, basis: basis, target: 0)
+                breaches = .count(id, label: breachesLabel, total.sum, basis: basis, target: 0)
                 breachCount = total.sum
             } else {
-                breaches = .notMeasured(id, label: "reserve breaches", reason: "recorder not running",
+                breaches = .notMeasured(id, label: breachesLabel, reason: "recorder not running",
                                         basis: "owner-wide; the measure recorder has never run on this database")
             }
             let detail: [MetricValue] = [
@@ -145,7 +149,7 @@ public enum UsageMetrics {
                 breaches,
                 .notApplicable(id, label: "cap overruns",
                                reason: "no cap-overrun record (X1 providerCap and gatewayCharge absent; the scheduler never admits above a mode cap)"),
-                .count(id, label: "turns wasted on rate limits", Double(wasted),
+                .count(id, label: wastedLabel, Double(wasted),
                        basis: "turns the rate limit rejected (outcome = usageLimited)", target: 0),
                 .notApplicable(id, label: "channel refusals", reason: "channels (X4) absent"),
             ]

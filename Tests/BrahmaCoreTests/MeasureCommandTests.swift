@@ -205,8 +205,9 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(badSince.status == 2 && badSince.stdout.isEmpty && badSince.stderr.contains("--since"), "\(badSince.stderr)")
         let unknown = try brahma(["measure", "Nope", "--verify-landings"], home: rig.home)
         #expect(unknown.status == 2 && unknown.stdout.isEmpty && unknown.stderr.contains("no company named 'Nope'"), "\(unknown.stderr)")
+        // Task 6 review #14: refused inside an agent turn is "could not audit" too (exit 2), never "unverified" (exit 1).
         let agent = try brahma(["measure", "Acme", "--verify-landings"], home: rig.home, env: ["BRAHMA_AGENT_ID": "a1"])
-        #expect(agent.status == 1 && agent.stderr.contains("owner commands can't run inside an agent turn") && agent.stdout.isEmpty)
+        #expect(agent.status == 2 && agent.stderr.contains("owner commands can't run inside an agent turn") && agent.stdout.isEmpty)
         #expect(try brahma(["measure", "--help"], home: rig.home).stdout.contains("--verify-landings"))
     }
 
@@ -234,17 +235,190 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         let ws = URL(fileURLWithPath: rig.company.workspacePath, isDirectory: true)
         try "x\n".write(to: ws.appending(path: "x.txt"), atomically: true, encoding: .utf8)
         try GitFixture.plainGit(["add", "--", "x.txt"], in: ws)
-        try GitFixture.plainGit(["commit", "-q", "--no-verify", "-m", "a\u{1b}[31mb\u{9b}2Jc\u{7f}d\u{202e}gnp.exe"], in: ws)
-        let hazards: [Character] = ["\u{1b}", "\u{9b}", "\u{7f}", "\u{202e}"]
+        // Task 6 review #15: the bidi marks U+200E, U+200F and the Arabic letter mark U+061C are escaped too.
+        try GitFixture.plainGit(["commit", "-q", "--no-verify", "-m", "a\u{1b}[31mb\u{9b}2Jc\u{7f}d\u{202e}gnp.exe\u{200e}x\u{200f}y\u{061c}z"], in: ws)
+        let hazards: [Unicode.Scalar] = ["\u{1b}", "\u{9b}", "\u{7f}", "\u{202e}", "\u{200e}", "\u{200f}", "\u{061c}"]
         let md = try brahma(["measure", "Acme", "--verify-landings"], home: rig.home)
         #expect(md.status == 1)
-        #expect(!hazards.contains { md.stdout.contains($0) }, "\(md.stdout.debugDescription)")
-        #expect(md.stdout.contains("a [31mb 2Jc d\\u202egnp.exe"), "\(md.stdout.debugDescription)")
+        #expect(!md.stdout.unicodeScalars.contains { hazards.contains($0) }, "\(md.stdout.debugDescription)")
+        #expect(md.stdout.contains("a [31mb 2Jc d\\u202egnp.exe\\u200ex\\u200fy\\u061cz"), "\(md.stdout.debugDescription)")
         let js = try brahma(["measure", "Acme", "--verify-landings", "--format", "json"], home: rig.home)
         #expect(js.status == 1)
-        #expect(!hazards.contains { js.stdout.contains($0) }, "\(js.stdout.debugDescription)")
+        #expect(!js.stdout.unicodeScalars.contains { hazards.contains($0) }, "\(js.stdout.debugDescription)")
         let decoded = try JSONDecoder().decode(LandingAuditResult.self, from: Data(js.stdout.utf8))
-        #expect(decoded.subjects.values.first == "a [31mb 2Jc d\u{202e}gnp.exe", "\(decoded.subjects)")
+        #expect(decoded.subjects.values.first == "a [31mb 2Jc d\u{202e}gnp.exe\u{200e}x\u{200f}y\u{061c}z", "\(decoded.subjects)")
+    }
+
+    // MARK: Task 7 — mission, baseline comparison, soak
+
+    /// `count` items of `company` landed in one batch a day ago (inside the default 28-day window).
+    @discardableResult
+    func landRecently(_ rig: Rig, company: Company, count: Int, number: Int) throws -> [WorkItem] {
+        let now = Date()
+        let items = try MeasureFixtures.items(rig.store, company: company, count: count, now: now.addingTimeInterval(-3 * 86_400))
+        try MeasureFixtures.land(rig.store, company: company, items: items, number: number, enqueuedAt: now.addingTimeInterval(-2 * 86_400),
+                                 landedAt: now.addingTimeInterval(-86_400))
+        return items
+    }
+
+    /// A second company made through the CLI, as the owner makes the one-agent baseline.
+    func baseline(_ rig: Rig, _ name: String = "Solo") throws -> Company {
+        let made = try brahma(["company", "create", name, "--goal", "g", "--agents", "0"], home: rig.home)
+        #expect(made.status == 0, "\(made.stderr)")
+        return try #require(try rig.store.companies().first { $0.name == name })
+    }
+
+    /// The markdown table rows (`| … |`), without the header and separator.
+    func rows(_ md: String) -> [String] {
+        Array(md.split(separator: "\n").map(String.init).filter { $0.hasPrefix("|") }.dropFirst(2))
+    }
+
+    /// `--mission` (spec §10 row 5 (2)): only the mission subset, in its order, under a `# mission` header.
+    @Test func missionPrintsSubset() throws {
+        let rig = try Rig()
+        try landRecently(rig, company: rig.company, count: 3, number: 1)
+        let md = try brahma(["measure", "Acme", "--mission"], home: rig.home)
+        #expect(md.status == 0, "\(md.stderr)")
+        #expect(md.stdout.hasPrefix("# mission Acme — "), "\(md.stdout)")
+        let labels = rows(md.stdout).compactMap { $0.split(separator: "|").first.map { $0.trimmingCharacters(in: .whitespaces) } }
+            .filter { !$0.hasPrefix("↳") }
+        #expect(labels == MissionReport.ids.map(\.label), "\(labels)")
+        #expect(md.stdout.contains("| \(MetricId.itemsLanded.label) | 3 |"), "\(md.stdout)")
+        for id in [MetricId.reviewCatch, .revertRate, .modelRanking, .queueHealth] { #expect(!md.stdout.contains("| \(id.label) |"), "\(id.rawValue)") }
+
+        let js = try brahma(["measure", "Acme", "--mission", "--format", "json"], home: rig.home)
+        #expect(js.status == 0, "\(js.stderr)")
+        let report = try MeasureReport.decode(Data(js.stdout.utf8))
+        #expect(report.subset == "mission")
+        #expect(report.metrics.map(\.id) == MissionReport.ids)
+        #expect(report.metrics.first { $0.id == .itemsLanded }?.numerator == 3)
+        #expect(report.metrics.first { $0.id == .wastedRateLimitTurns }?.target == 0)
+        // The full report is unchanged: no mission-only id, no subset.
+        let full = try MeasureReport.decode(Data(try brahma(["measure", "Acme", "--format", "json"], home: rig.home).stdout.utf8))
+        #expect(full.metrics.map(\.id) == MetricId.all && full.subset == nil)
+    }
+
+    /// `--compare <baseline>` (owner ruling R7(e)): both companies over the same window, the same metric ids, each value as its own
+    /// report shows it (with its own denominator); the JSON carries both reports.
+    @Test func compareBaselineSideBySide() throws {
+        let rig = try Rig()
+        let solo = try baseline(rig)
+        try landRecently(rig, company: rig.company, count: 3, number: 1)
+        try landRecently(rig, company: solo, count: 2, number: 1)
+        let since = Store.measureDay(Date().addingTimeInterval(-10 * 86_400), in: TimeZone(identifier: "UTC")!)
+        func report(_ name: String) throws -> MeasureReport {
+            let r = try brahma(["measure", name, "--since", since, "--format", "json"], home: rig.home)
+            #expect(r.status == 0, "\(r.stderr)")
+            return try MeasureReport.decode(Data(r.stdout.utf8))
+        }
+        let acme = try report("Acme"), alone = try report("Solo")
+        let md = try brahma(["measure", "Acme", "--since", since, "--compare", "Solo"], home: rig.home)
+        #expect(md.status == 0, "\(md.stderr)")
+        #expect(md.stdout.hasPrefix("# measure Acme vs Solo (baseline) — \(since) 00:00…"), "\(md.stdout)")
+        #expect(md.stdout.contains("| metric | Acme | Solo (baseline) |"), "\(md.stdout)")
+        func cell(_ s: String) -> String { s.isEmpty ? "—" : s.replacingOccurrences(of: "|", with: "\\|") }
+        for (a, b) in zip(acme.metrics, alone.metrics) {
+            #expect(a.id == b.id)
+            #expect(md.stdout.contains("| \(cell(a.label)) | \(cell(a.display)) | \(cell(b.display)) |"), "\(a.id.rawValue): \(md.stdout)")
+        }
+        // Each value keeps its own denominator: 3 landed items on one side, 2 on the other.
+        let touches = try #require(rows(md.stdout).first { $0.hasPrefix("| \(MetricId.ownerTouches.label) |") })
+        #expect(touches.contains("n=3") && touches.contains("n=2"), "\(touches)")
+
+        let js = try brahma(["measure", "Acme", "--since", since, "--compare", "Solo", "--format", "json"], home: rig.home)
+        #expect(js.status == 0, "\(js.stderr)")
+        let both = try MeasureComparison.decode(Data(js.stdout.utf8))
+        #expect(both.report.companyId == rig.company.id && both.baseline?.companyId == solo.id)
+        #expect(both.report.window == both.baseline?.window, "the same window for both")
+        #expect(both.report.metrics == acme.metrics && both.baseline?.metrics == alone.metrics)
+        #expect(both.baselineNotMeasured == nil)
+        // --mission --compare: the mission subset side by side.
+        let mission = try brahma(["measure", "Acme", "--mission", "--compare", "Solo"], home: rig.home)
+        #expect(mission.status == 0 && mission.stdout.hasPrefix("# mission Acme vs Solo (baseline) — "), "\(mission.stdout) \(mission.stderr)")
+        #expect(mission.stdout.contains("| \(MetricId.itemsLanded.label) | 3 | 2 |"), "\(mission.stdout)")
+    }
+
+    /// A baseline that does not exist, or one with no landings in the window, is `not measured` in every baseline cell: never
+    /// estimated, never a zero.
+    @Test func missingBaselineIsNotMeasured() throws {
+        let rig = try Rig()
+        try landRecently(rig, company: rig.company, count: 2, number: 1)
+        let unknown = try brahma(["measure", "Acme", "--compare", "Nope"], home: rig.home)
+        #expect(unknown.status == 0, "\(unknown.stderr)")
+        let unknownRows = rows(unknown.stdout)
+        #expect(!unknownRows.isEmpty)
+        #expect(unknownRows.allSatisfy { $0.hasSuffix("| not measured: no company named 'Nope' |") }, "\(unknown.stdout)")
+        let js = try MeasureComparison.decode(Data(try brahma(["measure", "Acme", "--compare", "Nope", "--format", "json"], home: rig.home).stdout.utf8))
+        #expect(js.baseline == nil && js.baselineNotMeasured == "no company named 'Nope'")
+        #expect(js.report.metrics.map(\.id) == MetricId.all)
+
+        _ = try baseline(rig)
+        let empty = try brahma(["measure", "Acme", "--compare", "Solo"], home: rig.home)
+        #expect(empty.status == 0, "\(empty.stderr)")
+        #expect(rows(empty.stdout).allSatisfy { $0.hasSuffix("| not measured: Solo has no landings in the window |") }, "\(empty.stdout)")
+        let ejs = try MeasureComparison.decode(Data(try brahma(["measure", "Acme", "--compare", "Solo", "--format", "json"], home: rig.home).stdout.utf8))
+        #expect(ejs.baseline?.company == "Solo", "the baseline's own report is still carried")
+        #expect(ejs.baselineNotMeasured == "Solo has no landings in the window")
+        // Comparing a company with itself is refused.
+        let same = try brahma(["measure", "Acme", "--compare", "acme"], home: rig.home)
+        #expect(same.status == 2 && same.stdout.isEmpty && same.stderr.contains("--compare"), "\(same.stderr)")
+    }
+
+    /// `--soak-checkpoint <file>` writes the checkpoint 0600 into the directory the owner named; `--soak-verify <file>` with no
+    /// engine running is `wait` (exit 3); a file that is not a checkpoint of this company is refused (exit 2).
+    @Test func soakCheckpointAndVerifyCLI() throws {
+        let rig = try Rig()
+        let state = try tempDir().appending(path: "soak", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        let file = state.appending(path: "h01.json")
+        let cp = try brahma(["measure", "Acme", "--soak-checkpoint", file.path], home: rig.home)
+        #expect(cp.status == 0, "\(cp.stderr)")
+        #expect(cp.stdout.hasPrefix("soak checkpoint written: "), "\(cp.stdout)")
+        let mode = try #require(try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber)
+        #expect(mode.intValue & 0o777 == 0o600)
+        let before = try SoakCheckpoint.read(from: file)
+        #expect(before.companyId == rig.company.id && before.engineStartedAt == nil && !before.mainTip.isEmpty)
+
+        let wait = try brahma(["measure", "Acme", "--soak-verify", file.path], home: rig.home)
+        #expect(wait.status == 3, "\(wait.stdout) \(wait.stderr)")
+        #expect(wait.stdout.hasPrefix("soak verify: wait"), "\(wait.stdout)")
+        #expect(wait.stdout.contains("wait settled: no engine is running"), "\(wait.stdout)")
+        let js = try brahma(["measure", "Acme", "--soak-verify", file.path, "--format", "json"], home: rig.home)
+        #expect(js.status == 3)
+        #expect(try SoakVerdict.decode(Data(js.stdout.utf8)).result == .wait)
+
+        // Refused, exit 2: a missing file, another company's checkpoint, a directory that does not exist, inside an agent turn.
+        let missing = try brahma(["measure", "Acme", "--soak-verify", state.appending(path: "nope.json").path], home: rig.home)
+        #expect(missing.status == 2 && missing.stdout.isEmpty, "\(missing.stderr)")
+        _ = try baseline(rig)
+        let other = state.appending(path: "solo.json")
+        #expect(try brahma(["measure", "Solo", "--soak-checkpoint", other.path], home: rig.home).status == 0)
+        let wrong = try brahma(["measure", "Acme", "--soak-verify", other.path], home: rig.home)
+        #expect(wrong.status == 2 && wrong.stderr.contains("another company"), "\(wrong.stderr)")
+        let nodir = try brahma(["measure", "Acme", "--soak-checkpoint", state.appending(path: "no/such/dir/x.json").path], home: rig.home)
+        #expect(nodir.status == 2 && nodir.stderr.contains("does not exist"), "\(nodir.stderr)")
+        let agent = try brahma(["measure", "Acme", "--soak-verify", file.path], home: rig.home, env: ["BRAHMA_AGENT_ID": "a1"])
+        #expect(agent.status == 2 && agent.stdout.isEmpty)
+    }
+
+    /// The modes are exclusive where combining makes no sense: refused with exit 2 and nothing on stdout. `--mission --compare`
+    /// is the one combination that means something.
+    @Test func modeCombinationsRefused() throws {
+        let rig = try Rig()
+        _ = try baseline(rig)
+        let f = try tempDir().appending(path: "cp.json").path
+        for bad in [["--verify-landings", "--compare", "Solo"], ["--verify-landings", "--mission"], ["--soak-checkpoint", f, "--soak-verify", f],
+                    ["--soak-verify", f, "--since", "all"], ["--soak-checkpoint", f, "--format", "json"], ["--soak-checkpoint", f, "--mission"],
+                    ["--mission", "--log-owner-minutes", "5"], ["--compare", "Solo", "--log-owner-minutes", "5"],
+                    ["--soak-checkpoint", f, "--compare", "Solo"], ["--soak-verify", f, "--verify-landings"], ["--mission", "--day", "2025-11-01"],
+                    ["--soak-verify", f, "--log-owner-minutes", "5"]] {
+            let r = try brahma(["measure", "Acme"] + bad, home: rig.home)
+            #expect(r.status == 2, "\(bad): \(r.stderr)")
+            #expect(r.stdout.isEmpty, "\(bad): \(r.stdout)")
+        }
+        #expect(!FileManager.default.fileExists(atPath: f), "a refused --soak-checkpoint wrote its file")
+        let help = try brahma(["measure", "--help"], home: rig.home).stdout
+        for flag in ["--soak-checkpoint", "--soak-verify", "--mission", "--compare"] { #expect(help.contains(flag), "\(flag)") }
     }
 
     /// A fresh handle on the rig's database (the CLI wrote through its own).
