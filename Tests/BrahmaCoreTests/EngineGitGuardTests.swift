@@ -15,7 +15,10 @@ import Foundation
     /// - A git process (`"git"` as a program argument) is started only there too.
     /// - In the engine (`Orchestrator*.swift`) every call that runs git sits inside a `blocking.run` / `blocking.tryRun`
     ///   closure, or inside one of the blocking-only helpers below, which are themselves only called from such a closure.
-    static let gitCommandFiles: Set<String> = ["Sources/BrahmaCore/Git/GitWorkspace.swift", "Sources/BrahmaCore/Refs/SafeGit.swift"]
+    /// Plan X8 (Ruling 2): the engine-side push op builds its command line with `GitCommand.commandLine()` and its live runner
+    /// resolves git as `GitCommand` does; neither builds its own argv for a bare `git`.
+    static let gitCommandFiles: Set<String> = ["Sources/BrahmaCore/Git/GitWorkspace.swift", "Sources/BrahmaCore/Refs/SafeGit.swift",
+                                               "Sources/BrahmaCore/PR/GitPush.swift", "Sources/BrahmaCore/PR/LivePushRunner.swift"]
     static let blockingOnlyHelpers = ["prepareReview", "prepareAudit", "escalate", "touchesScope", "finishPlanTurn"]
     /// What runs git when called (GitWorkspace methods, the store's git steps, Plan L's `EngineExport` and the helpers above).
     static let gitCalls = #"\bEngineExport\.(export|remove)\b|\.(ensureRepo|addWorktree|removeWorktree|itemWorktrees|deleteBranch|addRunWorktree|removeRunWorktrees?|addEngineExport|commitAll|headCommit|resetHard|planBarrier|enforcePlanBarrier|isDirty|head\(of|mergeBase|isAncestor|nameStatus|blobs|treeHasDirectory|diff\(base|changeStats|log\(base|commitsBehind|mergeConflicts|fileDiff|checkedOutRef|mainIsSymbolic|landVerified|quarantineRoot|mergeQuarantine|prepareRepo|checkMain|ensureCheckSnapshot|finishMerge|recoverMerges\(\)|assessAutoMerge|acceptMainCommit|installedGitVersion|installedGitMerges|hooksPath|setHooksPath|writeReleaseRefs|adoptMain|restoreMain|swapMainLocked|verifyRev|blobSize|catFile|lsTree|revList|logShas|recentPaths|hashObject|updateShareRef|deleteShareRef|expireAndPrune|worktreeDiff|show\(commit|catBlob|shareTarget|recordTaintedCommits|recordTurnTaints?|leaseHeads|carryTaintThroughRebase|branchExists)\b|\bMainGuard\.check\(|\bCompanyHooks\.install\(|\bTurnContext\.load\(|\b(prepareReview|prepareAudit|finishPlanTurn|touchesScope)\(|\bescalate\(itemId:"#

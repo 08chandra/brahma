@@ -60,15 +60,16 @@ public struct LivePushRunner: GitPushRunning {
         } catch let e as ProcessGroupChild.SpawnFailure {
             throw GitError.failed(command: "push", status: -1, stderr: e.message)
         }
-        let deadline = Date().addingTimeInterval(SafeGit.seconds(timeout))
+        // Awake time: a Mac that sleeps through the push does not time it out with git merely frozen.
+        let deadline = AwakeTime.deadline(after: timeout)
         var timedOut = false
         var pause: useconds_t = 5_000
         while !child.hasExited() {
-            if Date() >= deadline {
+            if AwakeTime.now >= deadline {
                 timedOut = true
                 child.signalGroup(SIGTERM)
-                let grace = Date().addingTimeInterval(2)
-                while !child.hasExited(), Date() < grace { usleep(20_000) }
+                let grace = AwakeTime.deadline(after: .seconds(2))
+                while !child.hasExited(), AwakeTime.now < grace { usleep(20_000) }
                 if !child.hasExited() { child.signalGroup(SIGKILL) }
                 break
             }

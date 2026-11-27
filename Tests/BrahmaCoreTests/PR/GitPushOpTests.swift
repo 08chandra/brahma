@@ -198,7 +198,7 @@ final class RecordingPushRunner: GitPushRunning, @unchecked Sendable {
         let hooks = repo.gitDir.appending(path: "hooks")
         try FileManager.default.createDirectory(at: hooks, withIntermediateDirectories: true)
         try "#!/bin/sh\ntouch \"$0.ran\"\n".write(to: hooks.appending(path: "pre-push"), atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hooks.appending(path: "pre-push").path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hooks.appending(path: "pre-push").path)   // exec-bit fixture: a planted hook that must never run
         let runner = RecordingPushRunner()
         _ = try Self.push(runner).run(repo.request(), token: try Self.handle())
         let call = try #require(runner.pushes.first)

@@ -200,7 +200,7 @@ import GRDB
         try FileManager.default.createDirectory(at: hooks, withIntermediateDirectories: true)
         let marker = env.fx.root.appending(path: ".git/hook-ran")
         try "#!/bin/sh\ntouch '\(marker.path)'\n".write(to: hooks.appending(path: "pre-push"), atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hooks.appending(path: "pre-push").path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hooks.appending(path: "pre-push").path)   // exec-bit fixture: a planted hook that must never run
         let sha = try env.commit(["a.txt": "a\n"])
         var push = GitPush(runner: LivePushRunner(), tempRoot: try tempDir())
         push.loopbackRemote = server.base
