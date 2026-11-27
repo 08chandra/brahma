@@ -278,7 +278,7 @@ import Foundation
                                                    streamed: false, into: reply, redact: { $0 })
         }
         task.cancel()
-        #expect(try await task.value == nil)
+        #expect(try await task.value == .none)
         rig.finish()
         await #expect(throws: TestPeerError.eof) { try await rig.peer.readHead() }
     }
@@ -294,9 +294,11 @@ import Foundation
         let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
         chunks.forEach { continuation.yield($0) }
         continuation.finish()
-        let usage = try await AnthropicAdapter().translate(status: status, headers: headers, body: stream, streamed: true, into: rig.reply,
-                                                           redact: { $0 })
-        #expect(usage == GatewayUsage(inputTokens: 25, outputTokens: 87, cacheReadTokens: 2000, cacheWriteTokens: 100))
+        let outcome = try await AnthropicAdapter().translate(status: status, headers: headers, body: stream, streamed: true, into: rig.reply,
+                                                             redact: { $0 })
+        // The terminal message_delta usage then message_stop, and a normal end: final (Ruling X1-37).
+        #expect(outcome == UsageOutcome(usage: GatewayUsage(inputTokens: 25, outputTokens: 87, cacheReadTokens: 2000, cacheWriteTokens: 100),
+                                        complete: true))
         rig.finish()
         let response = try await rig.peer.readResponse()
         #expect(response.status == 200 && response.head.headers["content-type"] == "text/event-stream")
@@ -309,12 +311,32 @@ import Foundation
         let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
         continuation.yield(fixture.prefix(40)); continuation.yield(fixture.dropFirst(40))
         continuation.finish()
-        let usage = try await AnthropicAdapter().translate(status: 200, headers: ["content-type": "application/json"], body: stream,
-                                                           streamed: false, into: rig.reply, redact: { $0 })
-        #expect(usage == GatewayUsage(inputTokens: 12, outputTokens: 34, cacheReadTokens: 5, cacheWriteTokens: 6))
+        let outcome = try await AnthropicAdapter().translate(status: 200, headers: ["content-type": "application/json"], body: stream,
+                                                             streamed: false, into: rig.reply, redact: { $0 })
+        #expect(outcome == UsageOutcome(usage: GatewayUsage(inputTokens: 12, outputTokens: 34, cacheReadTokens: 5, cacheWriteTokens: 6),
+                                        complete: true))
         rig.finish()
         let response = try await rig.peer.readResponse()
         #expect(response.status == 200 && Data(response.body) == fixture)
+    }
+
+    /// Ruling X1-37: a stream's usage is final only after the terminal `message_delta` usage, then `message_stop`, then a
+    /// normal end; the usage of `message_start` alone, or a stream without `message_stop`, is not.
+    @Test func streamUsageIsFinalOnlyAfterItsTerminalReport() {
+        var tap = AnthropicUsageTap()
+        tap.read(event: #"{"type":"message_start","message":{"usage":{"input_tokens":25,"output_tokens":1}}}"#)
+        #expect(tap.outcome(endedNormally: true).complete == false, "message_start alone")
+        tap.read(event: #"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":87}}"#)
+        #expect(tap.outcome(endedNormally: true).complete == false, "no message_stop")
+        tap.read(event: #"{"type":"message_stop"}"#)
+        #expect(tap.outcome(endedNormally: false).complete == false, "ended early")
+        #expect(tap.outcome(endedNormally: true) == UsageOutcome(usage: GatewayUsage(inputTokens: 25, outputTokens: 87, cacheReadTokens: 0,
+                                                                                    cacheWriteTokens: 0), complete: true))
+        var stopOnly = AnthropicUsageTap()
+        stopOnly.read(event: #"{"type":"message_start","message":{"usage":{"input_tokens":25,"output_tokens":1}}}"#)
+        stopOnly.read(event: #"{"type":"message_stop"}"#)
+        #expect(stopOnly.outcome(endedNormally: true).complete == false, "message_stop without the terminal usage")
+        #expect(UsageOutcome(usage: nil, complete: true).complete == false, "no usage is never final")
     }
 
     /// Usage the provider reports out of range is clamped, never negative or absurd; a body with no usage yields none.

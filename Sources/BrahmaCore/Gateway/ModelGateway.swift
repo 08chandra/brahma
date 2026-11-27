@@ -12,8 +12,9 @@ import Foundation
 /// or echoed — upstream text is redacted with its value before it is relayed or logged.
 ///
 /// Metering (Task 9): a request that never left the gateway is released (Ruling 23); one handed to the transport is charged
-/// its usage, or its estimate when the usage is missing (Ruling 52(a)) — except an answer with an error status, which the
-/// provider does not bill (settled at zero), and `count_tokens`, which costs nothing. At most `GatewayLimits.maxUpstreamRequests`
+/// its final usage, or at least its estimate when there is none — usage missing (Ruling 52(a)) or a response that ended
+/// early (Ruling X1-37) — except an answer with an error status, which the provider does not bill (settled at zero), and
+/// `count_tokens`, which costs nothing. At most `GatewayLimits.maxUpstreamRequests`
 /// requests are upstream at once; past it a request gets a 429 (Ruling 52(f): transient, so `claude` backs off and retries).
 public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     public let registry: TurnTokenRegistry
@@ -127,12 +128,13 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     enum Settlement: Equatable {
         /// Nothing reached the provider: the reservation is dropped (Ruling 23).
         case release
-        /// The provider may have served it: charged this usage, or the estimate when nil (Ruling 52(a)).
-        case charge(GatewayUsage?)
+        /// The provider may have served it: charged its final usage, else at least the estimate (Ruling 52(a), X1-37).
+        case charge(UsageOutcome)
     }
 
-    /// Nothing billed: an error answer, or `count_tokens`.
-    static let noUsage = GatewayUsage(inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0)
+    /// Nothing billed, and final: an error answer, or `count_tokens`.
+    static let noUsage = UsageOutcome(usage: GatewayUsage(inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0),
+                                      complete: true)
 
     /// Ruling 52(f): more than `maxUpstream` requests upstream at once.
     static let busy = GatewayError.refused(status: 429, type: "rate_limit_error", message: "Brahma: gateway busy")
@@ -140,7 +142,7 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
     private func settle(_ reservation: GatewayMeter.Reservation, _ settlement: Settlement) {
         switch settlement {
         case .release: meter.release(reservation)
-        case .charge(let usage): meter.settle(reservation, usage: usage)
+        case .charge(let outcome): meter.settle(reservation, outcome)
         }
     }
 
@@ -176,7 +178,7 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         let outgoing = try adapter.upstream(canonical, body: tree, model: target.model, endpoint: r.endpoint, headers: r.headers,
                                             provider: provider, key: key)
         guard isLive(reply) else { return }
-        settlement = .charge(nil)
+        settlement = .charge(.none)
         let response: UpstreamResponse
         do {
             response = try await upstream.send(outgoing)
@@ -193,17 +195,17 @@ public final class ModelGateway: GatewayHandler, @unchecked Sendable {
         // The provider bills neither an error answer nor a token count.
         if response.status >= 400 || r.endpoint == .countTokens { settlement = .charge(Self.noUsage) }
         let streamed = r.endpoint == .messages && canonical.stream == true
-        let usage: GatewayUsage?
+        let outcome: UsageOutcome
         do {
-            usage = try await adapter.translate(status: response.status, headers: response.headers, body: response.body,
+            outcome = try await adapter.translate(status: response.status, headers: response.headers, body: response.body,
                                                 streamed: streamed, into: reply, redact: redact)
         } catch {
             throw Self.redacted(error, redact)
         }
-        if r.endpoint == .messages { settlement = .charge(usage) }
-        let counts = usage.map { "in=\($0.inputTokens) out=\($0.outputTokens) cacheRead=\($0.cacheReadTokens) cacheWrite=\($0.cacheWriteTokens)" }
+        if r.endpoint == .messages { settlement = .charge(outcome) }
+        let counts = outcome.usage.map { "in=\($0.inputTokens) out=\($0.outputTokens) cacheRead=\($0.cacheReadTokens) cacheWrite=\($0.cacheWriteTokens)" }
         log("gateway: turn \(grant.turnId) \(provider.id)/\(target.model) \(response.status) " + (counts ?? "no usage")
-            + (reply.isCut ? " (cut)" : ""))
+            + (outcome.complete ? "" : " (ended early)") + (reply.isCut ? " (cut)" : ""))
     }
 
     /// Whether the request should go on: false once the reply was cut (revocation, stop, grace over) or the task was

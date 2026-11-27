@@ -88,7 +88,7 @@ public struct AnthropicAdapter: ProviderAdapter {
     // MARK: Responses
 
     public func translate(status: Int, headers: [String: String], body: AsyncThrowingStream<Data, Error>, streamed: Bool,
-                          into reply: GatewayReply, redact: @Sendable (String) -> String) async throws(GatewayError) -> GatewayUsage? {
+                          into reply: GatewayReply, redact: @Sendable (String) -> String) async throws(GatewayError) -> UsageOutcome {
         guard (200...299).contains(status) else {
             throw await Self.upstreamError(status: status, body: body, redact: redact)
         }
@@ -96,19 +96,21 @@ public struct AnthropicAdapter: ProviderAdapter {
             return try await relayEvents(body, into: reply, redact: redact)
         }
         let whole = try await Self.collect(body, limit: Self.maxResponseBytes)
+        // A whole message's usage is final; a body cut short parses to none (and the meter charges the estimate).
+        let outcome = AnthropicUsageTap.outcome(ofMessage: whole)
         // A cancelled task's stream ends early: what was collected may be cut short, so it is never relayed as a 200. Its
-        // usage is still returned when the body is a whole message (Ruling 52(a)); a cut-short body parses to none, and the
-        // meter charges the estimate.
-        guard !Task.isCancelled, !reply.isCut else { return AnthropicUsageTap.usage(ofMessage: whole) }
+        // usage is still returned when the body is a whole message (Ruling 52(a)).
+        guard !Task.isCancelled, !reply.isCut else { return outcome }
         guard !whole.isEmpty else { throw .upstream(status: 502, message: "Brahma: the provider sent an empty response") }
         await reply.send(status: status, json: whole)
-        return AnthropicUsageTap.usage(ofMessage: whole)
+        return outcome
     }
 
     /// Relays the event stream as whole events, reading the usage on the way; an upstream failure mid-stream ends the stream
-    /// with an `error` event. Stops (returning what it read) when the reply is cut or the task is cancelled.
+    /// with an `error` event. Stops (returning what it read, incomplete) when the reply is cut or the task is cancelled. The
+    /// usage is complete only when the stream ended normally after its terminal usage report (Ruling X1-37).
     private func relayEvents(_ body: AsyncThrowingStream<Data, Error>, into reply: GatewayReply,
-                             redact: @Sendable (String) -> String) async throws(GatewayError) -> GatewayUsage? {
+                             redact: @Sendable (String) -> String) async throws(GatewayError) -> UsageOutcome {
         var tap = AnthropicUsageTap()
         var pending = Data()
         var started = false
@@ -123,9 +125,9 @@ public struct AnthropicAdapter: ProviderAdapter {
                     await reply.event(CanonicalStreamEvent.error(type: "api_error", message: "Brahma: the provider stream failed").sse())
                     await reply.endEvents()
                 }
-                return tap.usage
+                return tap.outcome(endedNormally: false)
             }
-            if Task.isCancelled || reply.isCut { return tap.usage }
+            if Task.isCancelled || reply.isCut { return tap.outcome(endedNormally: false) }
             guard let chunk else { break }
             pending.append(chunk)
             var out = Data()
@@ -140,18 +142,20 @@ public struct AnthropicAdapter: ProviderAdapter {
             }
             guard !out.isEmpty else { continue }
             if !started {
-                guard await reply.startEvents() else { return tap.usage }
+                guard await reply.startEvents() else { return tap.outcome(endedNormally: false) }
                 started = true
             }
-            guard await reply.event(out) else { return tap.usage }
+            guard await reply.event(out) else { return tap.outcome(endedNormally: false) }
         }
         if !started {
             guard !pending.isEmpty else { throw .upstream(status: 502, message: "Brahma: the provider sent an empty stream") }
-            guard await reply.startEvents() else { return tap.usage }
+            guard await reply.startEvents() else { return tap.outcome(endedNormally: false) }
         }
         if !pending.isEmpty { await reply.event(tap.relay(pending, redact: redact)) }
         await reply.endEvents()
-        return tap.usage
+        // The provider's stream ended normally: its usage is final if its terminal report arrived (whatever the client did
+        // with the last bytes, the provider has billed for exactly this).
+        return tap.outcome(endedNormally: true)
     }
 
     /// The index just past the first event's terminating blank line (`\n\n` or `\r\n\r\n`), or nil.
@@ -210,6 +214,9 @@ public struct AnthropicAdapter: ProviderAdapter {
 struct AnthropicUsageTap {
     private var counts: [String: Int] = [:]
     private var seen = false
+    /// The terminal usage report (`message_delta` with usage) arrived, and then `message_stop`.
+    private var finalReport = false
+    private var stopped = false
 
     static let fields = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
 
@@ -238,10 +245,18 @@ struct AnthropicUsageTap {
         guard let object = Self.object(Data(json.utf8)), let type = object["type"] as? String else { return nil }
         switch type {
         case "message_start": merge((object["message"] as? [String: Any])?["usage"])
-        case "message_delta": merge(object["usage"])
+        case "message_delta":
+            if object["usage"] is [String: Any] { finalReport = true }
+            merge(object["usage"])
+        case "message_stop": stopped = finalReport
         default: break
         }
         return type
+    }
+
+    /// What the stream's usage came to: complete only when it `endedNormally` after the terminal report and `message_stop`.
+    func outcome(endedNormally: Bool) -> UsageOutcome {
+        UsageOutcome(usage: usage, complete: endedNormally && finalReport && stopped)
     }
 
     /// The usage of a whole (non-streamed) message, or nil when it reports none.
@@ -249,6 +264,12 @@ struct AnthropicUsageTap {
         var tap = AnthropicUsageTap()
         tap.merge(object(body)?["usage"])
         return tap.usage
+    }
+
+    /// A whole message's usage is its final word; a body with none (or cut short, so not JSON) is incomplete.
+    static func outcome(ofMessage body: Data) -> UsageOutcome {
+        let usage = usage(ofMessage: body)
+        return UsageOutcome(usage: usage, complete: usage != nil)
     }
 
     private mutating func merge(_ usage: Any?) {

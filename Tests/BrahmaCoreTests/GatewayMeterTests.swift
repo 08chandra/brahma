@@ -354,26 +354,127 @@ import GRDB
         #expect(abs(try #require(try rig.charges().first).usd - leftover.estimateUSD) < 1e-12, "a late settle changes nothing")
     }
 
-    /// A client that disconnects mid-stream: the request is settled with the usage seen so far (`message_start`'s).
-    @Test func disconnectSettlesWithSeenUsage() async throws {
-        let feed = UpstreamFeed()
-        let rig = try ModelGatewayRig([.feed(status: 200, headers: ["content-type": "text/event-stream"], feed)])
+    // MARK: Ruling X1-37: a response that ends early costs at least its reservation
+
+    static let startEvent = #"event: message_start"# + "\n" + #"data: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":25,"output_tokens":1,"cache_read_input_tokens":2000,"cache_creation_input_tokens":100}}}"# + "\n\n"
+    static let deltaEvent = #"event: content_block_delta"# + "\n" + #"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"# + "\n\n"
+    /// A streamed request big enough for its reservation to matter: 1000 output tokens (≈ $0.02 on Opus).
+    static let streamed = #"{"model":"claude-opus-5-5","max_tokens":1000,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#
+    static var streamedEstimate: Double { GatewayMeter.estimate(opus, maxTokens: 1000, inputBytes: streamed.utf8.count) }
+
+    /// Whether `task` ends within `seconds` (awake): a connection that never ends fails the test instead of hanging it.
+    static func ends(_ task: Task<Void, Never>, within seconds: Int = 60) async -> Bool {
+        let done = Locked(false)
+        Task { await task.value; done.with { $0 = true } }
+        return await eventually(within: seconds) { done.with { $0 } }
+    }
+
+    /// Starts a streamed request on `feed` and reads its head and first event (the reservation is open meanwhile).
+    static func startStream(_ rig: ModelGatewayRig, _ feed: UpstreamFeed, token: GatewayToken) async throws -> (TestPeer, Task<Void, Never>) {
         let (peer, served) = rig.connect()
-        await peer.write(rawRequest(token: rig.grant().value, body: ModelGatewayTests.body("claude-opus-5-5", extra: #","stream":true"#)))
-        let start = #"{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":25,"output_tokens":1,"cache_read_input_tokens":2000,"cache_creation_input_tokens":100}}}"#
-        feed.send("event: message_start\ndata: \(start)\n\n")
+        await peer.write(rawRequest(token: token.value, body: streamed))
+        feed.send(startEvent)
         #expect(try await peer.readHead().status == 200)
         _ = try await peer.readChunk()
+        return (peer, served)
+    }
+
+    /// The one charge, once settled: `estimated` at the reservation (the usage seen was far below it), never the near-zero
+    /// cost of `message_start`'s usage.
+    static func expectChargedTheReservation(_ rig: ModelGatewayRig, sourceLocation: SourceLocation = #_sourceLocation) async throws {
+        #expect(await eventually { (try? rig.charges().first?.state) == "estimated" }, sourceLocation: sourceLocation)
+        let row = try #require(try rig.charges().first, sourceLocation: sourceLocation)
+        #expect(row.estimated && abs(row.usd - streamedEstimate) < 1e-12, "\(row)", sourceLocation: sourceLocation)
+        let seen = opus.cost(GatewayUsage(inputTokens: 25, outputTokens: 1, cacheReadTokens: 2000, cacheWriteTokens: 100))
+        #expect(seen < streamedEstimate / 10, sourceLocation: sourceLocation)
+    }
+
+    /// A client that disconnects mid-stream is charged at least the reservation, not the usage seen so far.
+    @Test func disconnectSettlesAtLeastTheReservation() async throws {
+        let feed = UpstreamFeed()
+        let rig = try ModelGatewayRig([.feed(status: 200, headers: ["content-type": "text/event-stream"], feed)])
+        let (peer, served) = try await Self.startStream(rig, feed, token: rig.grant())
         #expect(try rig.charges().map(\.state) == ["reserved"], "still streaming: the reservation is open")
         peer.close()
-        // The next event cannot be written: the gateway stops relaying and settles.
-        feed.send("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n")
-        await served.value
-        #expect(await eventually { (try? rig.charges().first?.state) == "settled" })
-        let row = try #require(try rig.charges().first)
-        #expect(row.inputTokens == 25 && row.outputTokens == 1 && row.cacheReadTokens == 2000 && row.cacheWriteTokens == 100)
-        #expect(abs(row.usd - Self.opus.cost(GatewayUsage(inputTokens: 25, outputTokens: 1, cacheReadTokens: 2000, cacheWriteTokens: 100))) < 1e-12)
+        feed.send(Self.deltaEvent)   // cannot be written: the gateway stops relaying and settles
+        #expect(await Self.ends(served), "the connection never ended")
+        try await Self.expectChargedTheReservation(rig)
+        #expect(rig.logLines.contains { $0.contains("settled at estimate: stream ended early") }, "\(rig.logLines)")
         feed.finish()
+    }
+
+    /// An upstream that fails midway is charged at least the reservation.
+    @Test func upstreamFailureMidwayChargesAtLeastTheReservation() async throws {
+        let feed = UpstreamFeed()
+        let rig = try ModelGatewayRig([.feed(status: 200, headers: ["content-type": "text/event-stream"], feed)])
+        let (peer, served) = try await Self.startStream(rig, feed, token: rig.grant())
+        feed.fail()
+        #expect(String(decoding: try await peer.readChunk(), as: UTF8.self).contains("the provider stream failed"))
+        peer.close()
+        #expect(await Self.ends(served), "the connection never ended")
+        try await Self.expectChargedTheReservation(rig)
+    }
+
+    /// STOP (every token revoked) mid-stream: charged at least the reservation.
+    @Test func stopMidwayChargesAtLeastTheReservation() async throws {
+        let feed = UpstreamFeed()
+        let rig = try ModelGatewayRig([.feed(status: 200, headers: ["content-type": "text/event-stream"], feed)])
+        let (peer, served) = try await Self.startStream(rig, feed, token: rig.grant())
+        rig.registry.revokeAll(reason: "owner stop")
+        #expect(await peer.seesEOF())
+        #expect(await Self.ends(served), "the connection never ended")
+        try await Self.expectChargedTheReservation(rig)
+        feed.finish()
+    }
+
+    /// A stream that finishes normally — terminal usage, `message_stop` — is charged exactly its parsed usage, even far below
+    /// the reservation.
+    @Test func normalFinishChargesTheExactUsage() async throws {
+        let fixture = try AnthropicFixture.data("stream-tools", "sse")
+        let rig = try ModelGatewayRig([FakeUpstream.sse(fixture)])
+        let r = try await rig.exchange(Self.streamed, token: rig.grant())
+        #expect(r.status == 200 && Data(r.body) == fixture)
+        let row = try #require(try rig.charges().first)
+        let usage = GatewayUsage(inputTokens: 25, outputTokens: 87, cacheReadTokens: 2000, cacheWriteTokens: 100)
+        #expect(row.state == "settled" && !row.estimated && row.inputTokens == 25 && row.outputTokens == 87)
+        #expect(abs(row.usd - Self.opus.cost(usage)) < 1e-12 && row.usd < Self.streamedEstimate)
+        // The same stream without its message_stop is not final.
+        let cut = fixture.prefix(upTo: try #require(fixture.range(of: Data("event: message_stop".utf8))).lowerBound)
+        let short = try ModelGatewayRig([FakeUpstream.sse(Data(cut))])
+        #expect(try await short.exchange(Self.streamed, token: short.grant()).status == 200)
+        let estimated = try #require(try short.charges().first)
+        #expect(estimated.state == "estimated" && abs(estimated.usd - Self.streamedEstimate) < 1e-12)
+    }
+
+    /// A response that ended early but had already reported more than its reservation is charged what it reported.
+    @Test func earlyEndAboveTheReservationChargesTheUsageSeen() throws {
+        let rig = try Rig()
+        let r = try rig.meter.reserve(rig.grant(), model: "claude-opus-5-5", maxTokens: 10, inputBytes: 30)
+        let seen = GatewayUsage(inputTokens: 100_000, outputTokens: 500, cacheReadTokens: 0, cacheWriteTokens: 0)
+        rig.meter.settle(r, UsageOutcome(usage: seen, complete: false))
+        let row = try #require(try rig.charges().first)
+        #expect(row.state == "estimated" && row.inputTokens == 100_000 && abs(row.usd - Self.opus.cost(seen)) < 1e-12)
+        #expect(row.usd > r.estimateUSD)
+    }
+
+    /// Cutting stream after stream does not dodge the cap: each costs its reservation, and the cap refuses the next.
+    @Test func repeatedCutStreamsReachTheCap() async throws {
+        let feeds = (0..<3).map { _ in UpstreamFeed() }
+        let rig = try ModelGatewayRig(feeds.map { .feed(status: 200, headers: ["content-type": "text/event-stream"], $0) },
+                                      caps: ProviderCaps(monthlyUSD: 100, dailyUSD: 2.5 * Self.streamedEstimate))
+        let token = rig.grant()
+        for (index, feed) in feeds.enumerated() {
+            let (peer, served) = try await Self.startStream(rig, feed, token: token)
+            peer.close()
+            feed.send(Self.deltaEvent)
+            #expect(await Self.ends(served), "the connection never ended")
+            feed.finish()
+        }
+        #expect(await eventually { ((try? rig.charges()) ?? []).allSatisfy { $0.state == "estimated" } })
+        let refused = try await rig.exchange(Self.streamed, token: token)
+        #expect(refused.status == 400 && refused.errorType == "rate_limit_error", "\(refused.text)")
+        #expect(refused.text.contains("Brahma: anthropic daily cap of $"), "\(refused.text)")
+        #expect(rig.upstream.requests.count == 3)
     }
 
     /// No usage: the row is `estimated` at the reservation — from the meter, and from a forwarded response that reported none

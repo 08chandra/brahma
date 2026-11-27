@@ -63,11 +63,29 @@ public enum GatewayError: Error, Equatable, Sendable {
     }
 }
 
+/// What a response's usage came to (Ruling X1-37): the usage the adapter read, and whether it is the provider's final word —
+/// the terminal usage report of a stream that then ended normally (Anthropic: the last `message_delta` with usage, then
+/// `message_stop`; the OpenAI adapter's final usage chunk; Gemini's last `usageMetadata`), or the usage of a whole
+/// non-streamed message. Anything else (a client cut, a cancel or STOP, an upstream failure midway, a missing terminal event)
+/// is incomplete: the usage seen so far can be far below what the provider bills, so the meter charges at least the
+/// reservation for it.
+public struct UsageOutcome: Sendable, Equatable {
+    public var usage: GatewayUsage?
+    public var complete: Bool
+
+    public init(usage: GatewayUsage?, complete: Bool) {
+        self.usage = usage; self.complete = complete && usage != nil
+    }
+
+    /// Nothing read and nothing final.
+    public static let none = UsageOutcome(usage: nil, complete: false)
+}
+
 /// Translates between the gateway's canonical request and one provider's API (Plan X1 Task 8).
 ///
 /// `upstream` receives the provider key as `key` and must put it only into the returned request's credential header: never
 /// into the body, the URL, an error, or anything kept. `translate` relays the response to the client through `reply` and
-/// returns the usage it read (nil when the provider reported none); it throws only before it has written anything, and every
+/// returns the usage it read and whether it is final (`UsageOutcome`); it throws only before it has written anything, and every
 /// upstream text it relays or throws has passed through `redact` first.
 public protocol ProviderAdapter: Sendable {
     var id: AdapterId { get }
@@ -81,5 +99,5 @@ public protocol ProviderAdapter: Sendable {
                   provider: Provider, key: String) throws(GatewayError) -> UpstreamRequest
 
     func translate(status: Int, headers: [String: String], body: AsyncThrowingStream<Data, Error>, streamed: Bool,
-                   into reply: GatewayReply, redact: @Sendable (String) -> String) async throws(GatewayError) -> GatewayUsage?
+                   into reply: GatewayReply, redact: @Sendable (String) -> String) async throws(GatewayError) -> UsageOutcome
 }

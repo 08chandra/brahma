@@ -429,13 +429,16 @@ import GRDB
         #expect(busy.status == 429 && busy.errorType == "rate_limit_error" && busy.text.contains("Brahma: gateway busy"), "\(busy.text)")
         let held = try rig.charges()
         #expect(rig.upstream.requests.count == 2 && held.count == 2)
-        // Which connection got which feed is a race: end both, then the slots are free again.
+        // Which connection got which feed is a race: finish both normally, then the slots are free again.
         for feed in feeds {
             feed.send("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")
+            feed.send("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n")
+            feed.send("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
             feed.finish()
         }
+        // Each client reads its whole stream before closing (closing early would end the stream early: charged the estimate).
         for (peer, served) in open {
-            #expect(try await peer.readHead().status == 200)
+            #expect(try await peer.readResponse().status == 200)
             peer.close()
             await served.value
         }

@@ -82,6 +82,8 @@ final class UpstreamFeed: Sendable {
 
     func send(_ text: String) { continuation.yield(Data(text.utf8)) }
     func finish() { continuation.finish() }
+    /// The upstream connection fails midway.
+    func fail() { continuation.finish(throwing: URLError(.networkConnectionLost)) }
 }
 
 /// Fixtures under `Fixtures/anthropic/`.

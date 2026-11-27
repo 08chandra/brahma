@@ -257,12 +257,24 @@ extension Store {
         }
     }
 
-    /// Settles an open reservation at its reserved amount (`estimated`): the request went out and no usage came back.
+    /// Settles an open reservation as `estimated`: the request went out and no final usage came back. With `seen` (the usage
+    /// read before the response ended early, costing `usd`, more than the reservation) the row takes that usage and amount;
+    /// otherwise it keeps its reserved amount and tokens.
     @discardableResult
-    func estimateCharge(id: Int64) throws -> Bool {
-        try writer.write { db in
-            try db.execute(sql: "UPDATE gatewayCharge SET state = 'estimated', estimated = 1 WHERE id = ? AND state = 'reserved'",
-                           arguments: [id])
+    func estimateCharge(id: Int64, seen: (usage: GatewayUsage, usd: Double)? = nil) throws -> Bool {
+        if let seen { guard seen.usd.isFinite, seen.usd >= 0 else { throw WorkError.invalid("a charge is zero or more dollars") } }
+        return try writer.write { db in
+            if let seen {
+                try db.execute(sql: """
+                    UPDATE gatewayCharge SET state = 'estimated', estimated = 1, usd = ?, inputTokens = ?, outputTokens = ?,
+                      cacheReadTokens = ?, cacheWriteTokens = ?
+                    WHERE id = ? AND state = 'reserved'
+                    """, arguments: [seen.usd, seen.usage.inputTokens, seen.usage.outputTokens, seen.usage.cacheReadTokens,
+                                     seen.usage.cacheWriteTokens, id])
+            } else {
+                try db.execute(sql: "UPDATE gatewayCharge SET state = 'estimated', estimated = 1 WHERE id = ? AND state = 'reserved'",
+                               arguments: [id])
+            }
             return db.changesCount > 0
         }
     }

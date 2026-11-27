@@ -9,9 +9,12 @@ import Foundation
 ///   the reservation is written to the database (`gatewayCharge`, `state = 'reserved'`, the estimate as `usd`) in the same
 ///   immediate transaction, so concurrent requests can never all slip under the cap on the same spend. The worst overrun of a
 ///   period is one request's charge plus what requests used beyond their estimates (an in-flight response is never cut).
-/// - **Settle.** The row becomes `settled` at the cost of the provider's usage (clamped by `GatewayUsage`), or `estimated` at
-///   the reserved amount when the usage is missing (Ruling 52(a): never zero). Only a `reserved` row changes, so settling is
-///   idempotent. A request that never left the gateway is released (Ruling 23: a refused request is never charged).
+/// - **Settle.** The row becomes `settled` at the cost of the provider's final usage (clamped by `GatewayUsage`). Without a
+///   final usage — missing (Ruling 52(a): never zero) or a response that ended early (Ruling X1-37: a client cut, a cancel or
+///   STOP, an upstream failure midway, no terminal usage event) — it becomes `estimated` at max(cost of the usage seen,
+///   reserved amount): `estimated` always means "charged at least the reservation, not from a final usage report", and the
+///   log says "settled at estimate: stream ended early". Only a `reserved` row changes, so settling is idempotent. A
+///   request that never left the gateway is released (Ruling 23: a refused request is never charged).
 /// - **Recover.** At gateway start every `reserved` row left by a gateway that died becomes `estimated` at its reserved
 ///   amount, so a `kill -9` never under-records spend.
 ///
@@ -122,19 +125,29 @@ public final class GatewayMeter: Sendable {
 
     // MARK: Settle
 
-    /// Settles `r` at the cost of `usage`, or at its estimate (`estimated`) when `usage` is nil or its cost is not a dollar
-    /// amount. Idempotent: only an open reservation changes.
+    /// Settles `r` with the provider's final `usage` (`settled` at its cost), or at its estimate (`estimated`) when `usage`
+    /// is nil or its cost is not a dollar amount. Idempotent: only an open reservation changes.
     public func settle(_ r: Reservation, usage: GatewayUsage?) {
+        settle(r, UsageOutcome(usage: usage, complete: true))
+    }
+
+    /// Settles `r` with what its response came to: a final usage at its cost; anything else (Ruling X1-37) as `estimated` at
+    /// max(cost of the usage seen, the reservation) — a response cut short never costs less than it reserved.
+    public func settle(_ r: Reservation, _ outcome: UsageOutcome) {
         do {
-            if let usage {
-                let cost = r.price.cost(usage)
-                if cost.isFinite, cost >= 0 {
-                    try store.settleCharge(id: r.id, usage: usage, usd: cost)
-                    return
-                }
+            let seen = outcome.usage.map { (usage: $0, usd: r.price.cost($0)) }
+            if let seen, !(seen.usd.isFinite && seen.usd >= 0) {
                 log("gateway meter: charge \(r.id) has a usage cost that is not a dollar amount; charged at its estimate")
+                try store.estimateCharge(id: r.id)
+            } else if outcome.complete, let seen {
+                try store.settleCharge(id: r.id, usage: seen.usage, usd: seen.usd)
+            } else if let seen, seen.usd > r.estimateUSD {
+                log("gateway meter: charge \(r.id) settled at the usage seen ($\(Self.money(seen.usd)), above its estimate): stream ended early")
+                try store.estimateCharge(id: r.id, seen: seen)
+            } else {
+                if seen != nil { log("gateway meter: charge \(r.id) settled at estimate: stream ended early") }
+                try store.estimateCharge(id: r.id)
             }
-            try store.estimateCharge(id: r.id)
         } catch {
             log("gateway meter: charge \(r.id) could not be settled; it stays reserved at $\(Self.money(r.estimateUSD)) (\(error))")
         }
