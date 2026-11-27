@@ -106,8 +106,9 @@ public final class RevertDetector {
     }
 
     /// Scans `landed` (any order; scanned oldest first) and pairs each landed item with the earliest later landing that is its
-    /// exact inverse within `limits.lookback`. Throws only `SourceError.unavailable`: nothing could be read at all (no repository,
-    /// a refused config, or every range tried failed).
+    /// exact inverse within `limits.lookback`. Throws `SourceError.unavailable` when nothing could be read at all (no repository,
+    /// a refused config, or every range tried failed), and `CancellationError` before the next item's git calls once the
+    /// calling task is cancelled (the app left the company or window being measured).
     public func inversePairs(_ landed: [LandedRange]) throws -> Scan {
         let ordered = Self.ordered(landed)
         var forward: [String: String] = [:], inverse: [String: String] = [:]
@@ -116,6 +117,7 @@ public final class RevertDetector {
         var stoppedAt: String? = nil
         var firstFailure: String? = nil
         for (index, range) in ordered.enumerated() {
+            if Task.isCancelled { throw CancellationError() }
             if index >= limits.maxItems {
                 stoppedAt = "\(limits.maxItems) landed items"
                 notScanned = ordered[index...].map(\.itemId)

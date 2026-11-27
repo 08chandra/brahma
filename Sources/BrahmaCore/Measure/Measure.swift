@@ -190,7 +190,11 @@ public enum Measure {
     public static func report(store: Store, git: GitWorkspace, companyId: String, window: MeasureWindow, now: Date) throws -> MeasureReport {
         guard let company = try store.company(id: companyId) else { throw MeasureError.unknownCompany(companyId) }
         let ctx = MeasureContext(store: store, git: git, company: company, window: window, now: now)
-        let metrics = try MetricId.all.map { try function(for: $0)(ctx) }
+        // Between metrics: a report the app no longer wants (its company or window was left) stops here (`MeasureModel`).
+        let metrics = try MetricId.all.map { id -> MetricValue in
+            if Task.isCancelled { throw CancellationError() }
+            return try function(for: id)(ctx)
+        }
         return MeasureReport(companyId: company.id, company: company.name, window: window, timeZone: store.ownerTimeZone().identifier,
                              metrics: metrics, generatedAt: now, brahmaBuild: build)
     }

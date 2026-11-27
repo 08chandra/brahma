@@ -30,6 +30,66 @@ final class ComputeProbe: @unchecked Sendable {
     }
 }
 
+/// A door the test opens: `wait()` returns once it is open, or throws when its task is cancelled.
+final class MeasureGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _open = false
+    private var _waits = 0
+    var waits: Int { lock.withLock { _waits } }
+    func open() { lock.withLock { _open = true } }
+    var isOpen: Bool { lock.withLock { _open } }
+    func wait() async throws {
+        lock.withLock { _waits += 1 }
+        while !isOpen {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+    /// The blocking form, for a compute (which runs synchronously off the main actor). `cooperative`: give up with
+    /// `CancellationError` when the computing task is cancelled, as `Measure.report` does between metrics.
+    func block(cooperative: Bool) throws {
+        lock.withLock { _waits += 1 }
+        while !isOpen {
+            if cooperative, Task.isCancelled { throw CancellationError() }
+            usleep(2_000)
+        }
+    }
+}
+
+/// Company-active uptime the test sets by hand, for `MeasureModel.Throttle`.
+final class UptimeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: TimeInterval = 0
+    var value: TimeInterval {
+        get { lock.withLock { _value } }
+        set { lock.withLock { _value = newValue } }
+    }
+}
+
+/// A compute that records each run's (company, span) and finishes (company, span) runs only when their gate is open.
+final class BlockingProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _started: [String] = []
+    private var _finished: [String] = []
+    let gates: [String: MeasureGate]
+    let cooperative: Bool
+    init(gates: [String: MeasureGate], cooperative: Bool) { self.gates = gates; self.cooperative = cooperative }
+    var started: [String] { lock.withLock { _started } }
+    var finished: [String] { lock.withLock { _finished } }
+
+    var compute: MeasureModel.Compute {
+        { [self] _, _, companyId, span, now in
+            let key = "\(companyId)/\(span.rawValue)"
+            lock.withLock { _started.append(key) }
+            defer { lock.withLock { _finished.append(key) } }
+            try gates[key]?.block(cooperative: cooperative)
+            let days: Double = span == .days7 ? 7 : 28
+            return MeasureReport(companyId: companyId, company: key, window: MeasureWindow(since: now.addingTimeInterval(-days * 86_400), until: now),
+                                 timeZone: "UTC", metrics: [.count(.safety, 0, basis: key, target: 0)], generatedAt: now, brahmaBuild: "dev")
+        }
+    }
+}
+
 /// Plan X6a Task 8: Budget › MEASURE — `Measure.report` computed off the main actor, every value its `display` string verbatim
 /// (so the denominator is always shown), refreshed when the app's work or usage snapshot changes, the CLI's error text, and the
 /// 7 / 28 days / all window picker.
@@ -110,6 +170,9 @@ final class ComputeProbe: @unchecked Sendable {
         let probe = ComputeProbe()
         probe.answer = .success(Self.sample(companyId: world.company.id))
         app.measureCompute = probe.compute
+        // Ruling R43: changes measure at most once a minute; the test's clock and delay are its own.
+        let uptime = UptimeBox(), delay = MeasureGate()
+        app.measureThrottle = MeasureModel.Throttle(uptime: { uptime.value }, sleep: { _ in try await delay.wait() })
         #expect(app.measure == nil, "nothing is measured before Budget is opened")
         await world.refresh()
         #expect(probe.runs == 0)
@@ -126,15 +189,20 @@ final class ComputeProbe: @unchecked Sendable {
         await world.refresh()
         #expect(probe.runs == opened)
 
-        // Work changed: measured again.
+        // Work changed a minute after the last measurement: measured again at once.
+        uptime.value = 61
         try world.item("New work")
         await world.refresh()
         try await eventually { probe.runs == opened + 1 && !measure.isLoading }
 
-        // Usage changed: measured again.
+        // Usage changed within the minute: one delayed measurement, at the minute's end.
+        uptime.value = 70
         try world.store.saveRateLimit(RateLimitInfo(status: "allowed", resetsAt: nil, rateLimitType: nil, isUsingOverage: false,
                                                     fiveHourUtilization: 0.2, sevenDayUtilization: 0.4, observedAt: Self.now))
         await world.refresh()
+        try await eventually { delay.waits == 1 }
+        #expect(probe.runs == opened + 1)
+        delay.open()
         try await eventually { probe.runs == opened + 2 && !measure.isLoading }
 
         // Off Budget, a change is not measured.
@@ -196,5 +264,108 @@ final class ComputeProbe: @unchecked Sendable {
         // Picking the window already shown measures nothing.
         await model.setWindow(.all)
         #expect(probe.runs == 3)
+    }
+
+    /// Ruling R43 (fix round 1 #1): a burst of work/usage changes measures once within 60 s, then once more at the minute's end
+    /// (one queued run, never more); the window picker and Refresh measure at once.
+    @Test func autoRefreshThrottled() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, _, _) = try seedAcme(store, paths)
+        let probe = ComputeProbe()
+        probe.answer = .success(Self.sample(companyId: acme.id))
+        let uptime = UptimeBox(), delay = MeasureGate()
+        let model = MeasureModel(store: store, paths: paths, compute: probe.compute, clock: { Self.now },
+                                 throttle: MeasureModel.Throttle(uptime: { uptime.value }, sleep: { _ in try await delay.wait() }))
+        #expect(MeasureModel.Throttle.live.interval == 60)
+
+        await model.show(companyId: acme.id)   // opening Budget measures at once
+        #expect(probe.runs == 1)
+        uptime.value = 10
+        for _ in 0..<5 { model.changed() }
+        try await eventually { delay.waits == 1 }
+        #expect(probe.runs == 1, "a burst within the minute measures nothing now")
+        #expect(delay.waits == 1, "one delayed run is queued, never more")
+
+        // Refresh and the window picker do not wait.
+        await model.load()
+        #expect(probe.runs == 2)
+        await model.setWindow(.days7)
+        #expect(probe.runs == 3)
+        #expect(delay.waits == 1)
+
+        // The queued run measures at the minute's end, once.
+        delay.open()
+        try await eventually { probe.runs == 4 && !model.isLoading }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(probe.runs == 4)
+
+        // A change a minute after the last measurement measures at once.
+        uptime.value = 200
+        model.changed()
+        try await eventually { probe.runs == 5 && !model.isLoading }
+    }
+
+    /// Fix round 1 #2: switching the window mid-run cancels the run and shows the new window's report without waiting for the old
+    /// computation, whose late result is dropped.
+    @Test func switchingWindowDoesNotWaitForTheOldRun() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, _, _) = try seedAcme(store, paths)
+        let slow = MeasureGate()
+        // The 28-day run ignores cancellation (as a long git call would) and finishes only when the test opens its gate.
+        let probe = BlockingProbe(gates: ["\(acme.id)/days28": slow], cooperative: false)
+        let model = MeasureModel(store: store, paths: paths, compute: probe.compute, clock: { Self.now })
+        let first = Task { await model.show(companyId: acme.id) }
+        try await eventually { probe.started.count == 1 }
+        await model.setWindow(.days7)
+        #expect(model.report?.company == "\(acme.id)/days7")
+        #expect(model.window == .days7 && !model.isLoading && model.errorMessage == nil)
+        #expect(probe.finished == ["\(acme.id)/days7"], "the old run is still computing")
+
+        slow.open()
+        await first.value
+        try await eventually { probe.finished.count == 2 }
+        #expect(model.report?.company == "\(acme.id)/days7", "the old run's late result is dropped")
+        #expect(model.errorMessage == nil, "a cancelled run is not an error")
+    }
+
+    /// Fix round 1 #4: a load, then another company, then another window, all while the first run computes. Each request starts
+    /// its own run and cancels the one before it, so there are exactly 3 runs (one per company and window asked for). The
+    /// cancelled two end with `CancellationError` and are dropped; only the latest company's latest window is shown.
+    @Test func staleResultsDroppedAndCoalesced() async throws {
+        let (store, paths) = try makeHome()
+        let (acme, _, _, _) = try seedAcme(store, paths)
+        let globex = try #require(try store.companies().first { $0.name == "Globex" })
+        let gate = MeasureGate()
+        let keys = ["\(acme.id)/days28", "\(globex.id)/days28", "\(globex.id)/days7"]
+        let probe = BlockingProbe(gates: Dictionary(uniqueKeysWithValues: keys.map { ($0, gate) }), cooperative: true)
+        let model = MeasureModel(store: store, paths: paths, compute: probe.compute, clock: { Self.now })
+        let a = Task { await model.show(companyId: acme.id) }
+        try await eventually { probe.started.count == 1 }
+        let b = Task { await model.show(companyId: globex.id) }
+        try await eventually { probe.started.count == 2 }
+        #expect(model.report == nil && model.companyId == globex.id)
+        let c = Task { await model.setWindow(.days7) }
+        try await eventually { probe.started.count == 3 }
+        gate.open()
+        _ = await (a.value, b.value, c.value)
+        try await eventually { probe.finished.count == 3 && !model.isLoading }
+        #expect(probe.started == keys)
+        #expect(model.report?.company == "\(globex.id)/days7")
+        #expect(model.errorMessage == nil)
+
+        // Two loads of the same company and window while one computes return at once and fold into one more run after it.
+        let again = MeasureGate()
+        let same = BlockingProbe(gates: ["\(acme.id)/days28": again], cooperative: true)
+        let folded = MeasureModel(store: store, paths: paths, compute: same.compute, clock: { Self.now })
+        let first = Task { await folded.show(companyId: acme.id) }
+        try await eventually { same.started.count == 1 }
+        await folded.load()
+        await folded.load()
+        #expect(same.started.count == 1)
+        again.open()
+        await first.value
+        try await eventually { !folded.isLoading && same.finished.count == 2 }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(same.started.count == 2, "the two loads during the run made one more run, not two")
     }
 }

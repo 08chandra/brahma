@@ -97,6 +97,8 @@ public final class AppModel {
     public internal(set) var measure: MeasureModel?
     /// How MEASURE computes a report (`MeasureModel.live`, the CLI's `Measure.report`; tests inject a counting one).
     @ObservationIgnored public var measureCompute: MeasureModel.Compute = MeasureModel.live
+    /// How often a work or usage change may re-measure (`MeasureModel.Throttle.live`: once a minute; tests set their own clock).
+    @ObservationIgnored public var measureThrottle: MeasureModel.Throttle = .live
     /// The open replay: an agent's day (People › agent inspector › REPLAY) or an item's history (Work › item inspector ›
     /// HISTORY). Dropped when the company or store changes.
     public internal(set) var replay: ReplayModel?

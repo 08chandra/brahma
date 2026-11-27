@@ -299,8 +299,9 @@ finished before that day (landing time, not author dates).
 engine's activity text (`main adopted at <sha7> by the owner`, or `the owner accepted refs/brahma/quarantine/… into main at
 <sha7>`). Such a legacy accept covers **one** commit: the single walked commit
 with that seven-digit prefix, committed before the acceptance (rulings R38, R39). A legacy adopt that brought several commits
-into `main` therefore leaves the others **unverified**. Nothing guesses them in. The remedy is to audit from after it:
-`--verify-landings --since <a day after the last legacy adopt>`, which starts the walk at the first landing after that day.
+into `main` therefore leaves the others **unverified**. Nothing guesses them in. The remedy is
+`--verify-landings --since <a day after the first queue landing that followed the legacy adopt>` (the walk stops below the
+newest landing that finished before that day, so a landing must lie between the adopt and that day).
 
 **Exit codes:** **0** every audited commit is verified, owner-accepted or imported and the walk reached the first commit; **1**
 unverified commits, or the walk stopped at its bound; **2** could not audit — no `main` (or no repository), an unknown company, a

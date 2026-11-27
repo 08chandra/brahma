@@ -20,7 +20,9 @@ public struct MeasureRow: Equatable, Sendable, Identifiable {
 
 /// Budget › MEASURE (Plan X6a Task 8): the selected company's `brahma measure` report, computed off the main actor with the same
 /// `Measure.report` the CLI runs, over the window the owner picks (7 days, 28 days, all). The app model measures again when the
-/// work or usage snapshot changes while Budget is shown (`AppModel.refreshSnapshot`). A failure shows the CLI's own text.
+/// work or usage snapshot changes while Budget is shown (`AppModel.refreshSnapshot`), at most once a minute (ruling R43); the
+/// picker, Refresh and opening Budget measure at once. Leaving a company or window cancels its run. A failure shows the CLI's
+/// own text.
 @MainActor @Observable
 public final class MeasureModel {
     /// The window picker's choices; `days28` is the CLI's default window (`MeasureWindow.defaultDays`).
@@ -46,6 +48,19 @@ public final class MeasureModel {
     nonisolated static let valueMax = 400
     nonisolated static let basisMax = 2000
 
+    /// How often a work or usage change may measure (ruling R43): at most once per `interval` seconds of `uptime`, with at most
+    /// one run queued for the end of the interval. `sleep` waits that long (tests give a door of their own).
+    public struct Throttle: Sendable {
+        public var interval: TimeInterval
+        public var uptime: @Sendable () -> TimeInterval
+        public var sleep: @Sendable (TimeInterval) async throws -> Void
+        public init(interval: TimeInterval = 60, uptime: @escaping @Sendable () -> TimeInterval,
+                    sleep: @escaping @Sendable (TimeInterval) async throws -> Void) {
+            self.interval = interval; self.uptime = uptime; self.sleep = sleep
+        }
+        public static let live = Throttle(uptime: { AwakeTime.uptime() }, sleep: { try await Task.sleep(for: .seconds($0)) })
+    }
+
     public private(set) var companyId: String?
     public private(set) var report: MeasureReport?
     public private(set) var window: Span = .days28
@@ -53,20 +68,42 @@ public final class MeasureModel {
     public var errorMessage: String?
     /// Expanded rows, by `MeasureRow.id`.
     public private(set) var expanded: Set<String> = []
+    /// One row per metric, with the detail rows of every expanded row under it; rebuilt when the report or an expansion changes.
+    public private(set) var rows: [MeasureRow] = []
+    /// `yyyy-MM-dd HH:mm…yyyy-MM-dd HH:mm` in the report's time zone (the owner's), as the CLI's header shows it; nil before a report.
+    public private(set) var windowLine: String?
+    /// The report's company name, cleaned; nil before a report.
+    public private(set) var companyLine: String?
+
+    /// One computation: its task (cancelled when the owner leaves its company or window) and what it measures.
+    private struct Run {
+        let task: Task<Result<MeasureReport, any Error>, Never>
+        let companyId: String
+        let span: Span
+    }
 
     @ObservationIgnored private let store: Store
     @ObservationIgnored private let paths: BrahmaPaths
     @ObservationIgnored private let compute: Compute
     @ObservationIgnored private let clock: @Sendable () -> Date
-    /// A change arrived while a report was computing: compute once more when it ends.
+    @ObservationIgnored private let throttle: Throttle
+    @ObservationIgnored private var current: Run?
+    /// Bumped by every run; a run whose number is no longer the newest is dropped when it ends.
+    @ObservationIgnored private var generation = 0
+    /// A load of the same company and window arrived while it was computing: compute once more when it ends.
     @ObservationIgnored private var reloadPending = false
+    /// `throttle.uptime()` when the last run started.
+    @ObservationIgnored private var lastMeasured: TimeInterval?
+    /// The one run queued for the end of the throttle interval.
+    @ObservationIgnored private var delayed: Task<Void, Never>?
 
     public init(store: Store, paths: BrahmaPaths, compute: @escaping Compute = MeasureModel.live,
-                clock: @escaping @Sendable () -> Date = { .now }) {
+                clock: @escaping @Sendable () -> Date = { .now }, throttle: Throttle = .live) {
         self.store = store
         self.paths = paths
         self.compute = compute
         self.clock = clock
+        self.throttle = throttle
     }
 
     /// The CLI's report: the company's workspace repository, the window the CLI would parse, `Measure.report`.
@@ -82,54 +119,82 @@ public final class MeasureModel {
         return try Measure.report(store: store, git: git, companyId: company.id, window: window, now: now)
     }
 
-    /// Shows `companyId`: another company drops the shown report and expansions first. Always measures.
+    /// Shows `companyId` (opening Budget): measured at once. Another company cancels the run and the queued run of the one
+    /// before, and drops its report and expansions.
     public func show(companyId: String) async {
         if self.companyId != companyId {
+            current?.task.cancel()
+            delayed?.cancel()
+            delayed = nil
             self.companyId = companyId
-            report = nil
-            errorMessage = nil
             expanded = []
+            apply(report: nil)
+            errorMessage = nil
         }
         await load()
     }
 
-    /// The picker: shows `span`, measured now. The window already shown measures nothing.
+    /// The picker: shows `span`, measured at once (the run of the old window is cancelled). The window shown measures nothing.
     public func setWindow(_ span: Span) async {
         guard span != window else { return }
+        current?.task.cancel()
         window = span
         await load()
     }
 
-    /// Measures the shown company over the shown window, off the main actor. A call while one runs is folded into one more run
-    /// after it, so a burst of changes measures at most twice. A result for a company or window the owner has since left is dropped.
-    public func load() async {
+    /// A work or usage change (ruling R43): measures at once when the last run started at least `throttle.interval` ago, else
+    /// queues one run for the end of the interval (a run already queued absorbs this change).
+    public func changed() {
         guard companyId != nil else { return }
-        if isLoading {
+        let now = throttle.uptime()
+        guard let last = lastMeasured, now - last < throttle.interval else {
+            Task { await load() }
+            return
+        }
+        guard delayed == nil else { return }
+        let (wait, sleep) = (throttle.interval - (now - last), throttle.sleep)
+        delayed = Task { [weak self] in
+            do { try await sleep(wait) } catch { return }   // cancelled: another company was shown
+            guard let self else { return }
+            self.delayed = nil
+            await self.load()
+        }
+    }
+
+    /// Measures the shown company over the shown window now (Refresh), off the main actor. A load of the same company and window
+    /// while that one computes is folded into one more run after it. A run for another company or window is cancelled and
+    /// its result dropped whenever it ends: the new run does not wait for it. A cancelled run is not an error.
+    public func load() async {
+        guard let companyId else { return }
+        let span = window
+        if let current, current.companyId == companyId, current.span == span {
             reloadPending = true
             return
         }
+        current?.task.cancel()
+        reloadPending = false
+        generation += 1
+        let mine = generation
+        lastMeasured = throttle.uptime()
+        let (now, store, paths, compute) = (clock(), self.store, self.paths, self.compute)
+        let task = Task.detached { Result<MeasureReport, any Error> { try compute(store, paths, companyId, span, now) } }
+        current = Run(task: task, companyId: companyId, span: span)
         isLoading = true
-        defer { isLoading = false }
-        repeat {
-            reloadPending = false
-            guard let companyId else { return }
-            let (span, now, store, paths, compute) = (window, clock(), self.store, self.paths, self.compute)
-            let result: Result<MeasureReport, any Error> = await Task.detached {
-                Result { try compute(store, paths, companyId, span, now) }
-            }.value
-            guard companyId == self.companyId, span == window else {
-                reloadPending = true
-                continue
-            }
-            switch result {
-            case .success(let measured):
-                report = measured
-                errorMessage = nil
-            case .failure(let error):
-                report = nil
-                errorMessage = Self.errorText(error)
-            }
-        } while reloadPending
+        let result = await task.value
+        guard mine == generation else { return }   // superseded: the newer run owns the panel
+        current = nil
+        isLoading = false
+        switch result {
+        case .success(let measured):
+            apply(report: measured)
+            errorMessage = nil
+        case .failure(let error) where error is CancellationError:
+            break
+        case .failure(let error):
+            apply(report: nil)
+            errorMessage = Self.errorText(error)
+        }
+        if reloadPending { await load() }
     }
 
     /// The CLI's text for `error` (it prints `brahma: \(error)`), cleaned: an error can carry a company or workspace name.
@@ -140,22 +205,26 @@ public final class MeasureModel {
     /// Expands or folds a row's detail rows.
     public func toggle(_ id: String) {
         if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+        rows = Self.rows(report, expanded: expanded)
     }
 
     // MARK: Presentation
 
-    /// The report's company name, cleaned; nil before a report.
-    public var companyLine: String? { report.map { MapText.clean($0.company, max: Self.labelMax) } }
+    private func apply(report: MeasureReport?) {
+        self.report = report
+        rows = Self.rows(report, expanded: expanded)
+        windowLine = report.map(Self.windowText)
+        companyLine = report.map { MapText.clean($0.company, max: Self.labelMax) }
+    }
 
-    /// One row per metric, with the detail rows of every expanded row under it.
-    public var rows: [MeasureRow] {
+    static func rows(_ report: MeasureReport?, expanded: Set<String>) -> [MeasureRow] {
         guard let report else { return [] }
         var out: [MeasureRow] = []
         func add(_ m: MetricValue, id: String, depth: Int) {
             let open = expanded.contains(id)
-            out.append(MeasureRow(id: id, label: MapText.clean(m.label, max: Self.labelMax),
-                                  value: MapText.clean(m.display, max: Self.valueMax),
-                                  basis: MapText.clean(m.basis, max: Self.basisMax), depth: depth,
+            out.append(MeasureRow(id: id, label: MapText.clean(m.label, max: labelMax),
+                                  value: MapText.clean(m.display, max: valueMax),
+                                  basis: MapText.clean(m.basis, max: basisMax), depth: depth,
                                   secondary: m.status != .ok, expandable: !m.detail.isEmpty, expanded: open))
             guard open else { return }
             for (i, d) in m.detail.enumerated() { add(d, id: "\(id)/\(i)", depth: depth + 1) }
@@ -164,13 +233,20 @@ public final class MeasureModel {
         return out
     }
 
-    /// `yyyy-MM-dd HH:mm…yyyy-MM-dd HH:mm` in the report's time zone (the owner's), as the CLI's header shows it.
-    public var windowLine: String? {
-        guard let report else { return nil }
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: report.timeZone) ?? TimeZone(identifier: "UTC") ?? .current
-        f.dateFormat = "yyyy-MM-dd HH:mm"
+    /// One formatter per time zone, made on first use (main actor only).
+    private static var formatters: [String: DateFormatter] = [:]
+
+    static func windowText(_ report: MeasureReport) -> String {
+        let f: DateFormatter
+        if let hit = formatters[report.timeZone] {
+            f = hit
+        } else {
+            f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.timeZone = TimeZone(identifier: report.timeZone) ?? TimeZone(identifier: "UTC") ?? .current
+            f.dateFormat = "yyyy-MM-dd HH:mm"
+            formatters[report.timeZone] = f
+        }
         return "\(f.string(from: report.window.since))…\(f.string(from: report.window.until))"
     }
 
@@ -184,16 +260,17 @@ extension AppModel {
     @discardableResult
     public func ensureMeasure() -> MeasureModel? {
         guard let companyId = selectedCompanyId else { return nil }
-        let model = measure ?? MeasureModel(store: store, paths: paths, compute: measureCompute)
+        let model = measure ?? MeasureModel(store: store, paths: paths, compute: measureCompute, throttle: measureThrottle)
         measure = model
         // Opening Budget measures; a second ensure while that runs (the view's own task) adds nothing.
         if model.companyId != companyId || !model.isLoading { Task { await model.show(companyId: companyId) } }
         return model
     }
 
-    /// Called when a refreshed snapshot's work or usage differs: measures again while Budget shows the selected company.
+    /// Called when a refreshed snapshot's work or usage differs: measures again while Budget shows the selected company, at
+    /// most once a minute (ruling R43, `MeasureModel.changed()`).
     func measureAfterChange(companyId: String?) {
         guard sidebarSelection == .budget, let measure, let companyId, measure.companyId == companyId else { return }
-        Task { await measure.load() }
+        measure.changed()
     }
 }

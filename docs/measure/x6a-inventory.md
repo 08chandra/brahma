@@ -642,7 +642,7 @@ ancestry/environment check is the "refuses inside an agent turn" the plan asks f
   `Measure.report(…)` in `Task.detached`, a fourth `Panel(title: "MEASURE")` appended after `StoragePanel` in `BudgetView`
   (ruling R10). As built (Task 8): `MeasureModel` (`Sources/BrahmaAppModel/Measure/MeasureModel.swift`) owned by `AppModel.measure`
   (`ensureMeasure()`), titled `MeasureModel.title` = `"MEASURE"`; `MeasurePanel` (`Sources/BrahmaApp/Views/MeasurePanel.swift`)
-  after `StoragePanel`; `BudgetModel.panels` is unchanged. Refreshed when `refreshSnapshot` sees the work or usage snapshot change
+  after `StoragePanel`; `BudgetModel.panels` is unchanged. Refreshed, at most once a minute (ruling R43; `MeasureModel.changed()`), when `refreshSnapshot` sees the work or usage snapshot change
   while Budget is shown (no change topics on this tree, ruling R1).
 - `AppModel.storage` / `storageSizing`: `Sources/BrahmaAppModel/AppModel.swift:92–94`.
 

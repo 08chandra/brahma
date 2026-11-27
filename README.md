@@ -788,14 +788,18 @@ brahma items link <co> <KEY> regression-of|revert-of <LANDED-KEY>   record a reg
   more days back, or `all`); with the default window it reads `not measured` and says why.
 - **The Budget view's MEASURE panel** shows the same report for the selected company: one row per metric with the value exactly
   as the CLI prints it, the basis beside it, detail rows under a metric that has them, and a 7 days / 28 days / all window
-  picker. It measures again when the company's work or usage changes while Budget is open, or when you press Refresh.
+  picker. Opening Budget, the picker and Refresh measure at once. A change to the company's work or usage while Budget is open
+  measures again at most once a minute (one more measurement queued for the minute's end). Leaving a company or window stops
+  its measurement.
 - **`--verify-landings`** walks `main`'s first-parent history back to the company's first commit and classifies each commit:
   landed by the merge queue (verified), accepted by you (`brahma main accept`, `brahma merge adopt-main`, a quarantine accept;
   recorded in `mainAccept`), the imported first commit, or unverified. It prints `landings verified: <p>% (<n>/<d>)` and lists
   each unverified commit. Exit **0**: every commit is classified. Exit **1**: there are unverified commits, or the walk stopped at
   its bound of 10,000 commits. Exit **2**: it could not audit (no `main`, an unknown company, a git failure, planted history
   files, a merge batch moving `main`). An adopt from before `mainAccept` existed covers only the one commit its activity line
-  names. If such an adopt brought in several commits, audit from after it with `--since <a day after it>`.
+  names. If such an adopt brought in several commits, audit with `--since <a day after the first queue landing that followed
+  the legacy adopt>` (the walk stops below the newest landing that finished before that day, so a landing must lie between the
+  adopt and that day).
 - **`--log-owner-minutes <n>`** adds `n` minutes (1–1440) of your own time to that day's count (today when `--day` is omitted).
   It is the only source of the owner-minutes metric: Brahma never records or estimates your time, and no agent can write it.
   Without a log the row reads `not measured: no owner-time records`.

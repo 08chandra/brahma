@@ -39,6 +39,31 @@ import Testing
         #expect(scan.stoppedAt == nil)
     }
 
+    /// Task 8 fix round 1 #2: a cancelled scan (the app left the company or window it was measuring) stops before the next
+    /// landed item's git calls and throws `CancellationError`, which no metric turns into a value.
+    @Test func cancelledScanStopsBeforeTheNextItem() async throws {
+        final class Calls: @unchecked Sendable {
+            private let lock = NSLock()
+            private var n = 0
+            func next() -> Int { lock.withLock { n += 1; return n } }
+            var count: Int { lock.withLock { n } }
+        }
+        let calls = Calls()
+        let t0 = self.t0, day = self.day
+        let task = Task { () throws -> RevertDetector.Scan in
+            let detector = RevertDetector(limits: .standard, source: { _, _ in
+                // Two git calls per item; the task is cancelled during the first item's second call.
+                if calls.next() == 2 { withUnsafeCurrentTask { $0?.cancel() } }
+                return "patch"
+            })
+            return try detector.inversePairs((0..<10).map {
+                LandedRange(itemId: "I\($0)", merged: String(repeating: "a", count: 40), landedAt: t0.addingTimeInterval(Double($0) * day))
+            })
+        }
+        await #expect(throws: CancellationError.self) { _ = try await task.value }
+        #expect(calls.count == 2, "no git call after the cancellation")
+    }
+
     /// A change that undoes only part of a landing is not an exact inverse: only a link can claim it.
     @Test func partialRevertNotClaimed() throws {
         let repo = try GitFixture(files: ["x.txt": "x\n", "y.txt": "y\n"])

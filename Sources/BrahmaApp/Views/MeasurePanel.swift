@@ -115,5 +115,7 @@ private struct MeasureRowView: View {
         .onTapGesture { if row.expandable { toggle() } }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(row.expandable ? .isButton : [])
+        .accessibilityValue(row.expandable ? Text(verbatim: row.expanded ? "expanded" : "collapsed") : Text(verbatim: ""))
+        .accessibilityAction { if row.expandable { toggle() } }
     }
 }

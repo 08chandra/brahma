@@ -26,6 +26,7 @@ public enum MissionReport {
         }
         var metrics: [MetricValue] = []
         for id in ids {
+            if Task.isCancelled { throw CancellationError() }
             switch id {
             case .itemsLanded: metrics.append(try itemsLanded(ctx))
             case .wastedRateLimitTurns: metrics.append(row(UsageMetrics.wastedLabel, as: id))
