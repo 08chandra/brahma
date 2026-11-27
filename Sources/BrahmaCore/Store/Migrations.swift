@@ -2082,6 +2082,21 @@ enum Migrations {
                 BEGIN DELETE FROM measureCounter WHERE companyId = OLD.id; END
                 """)
         }
+        m.registerMigration("vX6a-main-accept") { db in
+            // Plan X6a Task 6 (ruling R38). One row per owner acceptance of `main` (`brahma main accept`, `brahma merge
+            // adopt-main`, a quarantine accept): the full commit `main` was recorded at and the head the record held before, so
+            // the landing audit binds an acceptance to exact commits. Written in the transaction that writes `mainCommit`.
+            // `measureEpoch('mainAccept')` marks when these records began: acceptances before it exist only as activity text.
+            try db.create(table: "mainAccept") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("companyId", .text).notNull().indexed().references("company", onDelete: .cascade)
+                t.column("commit", .text).notNull()                // full commit id
+                t.column("previousHead", .text)                    // company.mainCommit before the accept; nil when none was recorded
+                t.column("kind", .text).notNull()                  // adopt | quarantineAccept
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.execute(sql: "INSERT OR REPLACE INTO measureEpoch (name, at) VALUES ('mainAccept', ?)", arguments: [Store.now()])
+        }
     }
 }
 

@@ -195,15 +195,56 @@ private func brahma(_ args: [String], home: URL, env: [String: String] = [:]) th
         #expect(dirty.stdout.contains("unverified: \(sha.prefix(7)) sneak"), "\(dirty.stdout)")
         #expect(!dirty.stdout.contains("\u{1b}") && !dirty.stdout.contains("\u{07}"), "escapes reach the terminal: \(dirty.stdout.debugDescription)")
 
-        // Refused: with the write flags; inside an agent turn. Nothing on stdout.
+        // Refused, exit 2 (could not audit): with the write flags, a bad --since, an unknown company. Nothing on stdout.
         for bad in [["--log-owner-minutes", "5"], ["--day", "2025-11-01"]] {
             let r = try brahma(["measure", "Acme", "--verify-landings"] + bad, home: rig.home)
-            #expect(r.status != 0 && r.stdout.isEmpty, "\(bad): \(r.stdout)")
+            #expect(r.status == 2 && r.stdout.isEmpty, "\(bad): \(r.stdout)")
             #expect(r.stderr.contains("--verify-landings"), "\(bad): \(r.stderr)")
         }
+        let badSince = try brahma(["measure", "Acme", "--verify-landings", "--since", "yesterday"], home: rig.home)
+        #expect(badSince.status == 2 && badSince.stdout.isEmpty && badSince.stderr.contains("--since"), "\(badSince.stderr)")
+        let unknown = try brahma(["measure", "Nope", "--verify-landings"], home: rig.home)
+        #expect(unknown.status == 2 && unknown.stdout.isEmpty && unknown.stderr.contains("no company named 'Nope'"), "\(unknown.stderr)")
         let agent = try brahma(["measure", "Acme", "--verify-landings"], home: rig.home, env: ["BRAHMA_AGENT_ID": "a1"])
         #expect(agent.status == 1 && agent.stderr.contains("owner commands can't run inside an agent turn") && agent.stdout.isEmpty)
         #expect(try brahma(["measure", "--help"], home: rig.home).stdout.contains("--verify-landings"))
+    }
+
+    /// `--verify-landings --since <date>` (review #9): with no landing before the date the walk still reaches the first commit;
+    /// a planted `.git/shallow` is refused with exit 2 (review #2, ruling R38).
+    @Test func verifyLandingsSinceAndPlantedHistory() throws {
+        let rig = try Rig()
+        let since = try brahma(["measure", "Acme", "--verify-landings", "--since", "2025-11-01"], home: rig.home)
+        #expect(since.status == 0 && since.stdout == "landings verified: none to verify (0/0); owner-accepted 0; imported 1\n",
+                "\(since.stdout) \(since.stderr)")
+        let ws = URL(fileURLWithPath: rig.company.workspacePath, isDirectory: true)
+        let root = try GitFixture.plainGit(["rev-parse", "refs/heads/main"], in: ws)
+        let shallow = ws.appending(path: ".git/shallow")
+        try "\(root)\n".write(to: shallow, atomically: true, encoding: .utf8)
+        let refused = try brahma(["measure", "Acme", "--verify-landings"], home: rig.home)
+        #expect(refused.status == 2 && refused.stdout.isEmpty, "\(refused.stdout)")
+        #expect(refused.stderr.contains("shallow"), "\(refused.stderr)")
+        #expect(FileManager.default.fileExists(atPath: shallow.path))
+    }
+
+    /// X6a-2 / review #3: a subject carrying ESC, CSI (U+009B), DEL and a bidi override (U+202E) reaches neither the markdown nor
+    /// the JSON raw: C0/C1/DEL become spaces, the bidi override is written `\u202e`; the JSON still decodes.
+    @Test func verifyLandingsEscapesSubjects() throws {
+        let rig = try Rig()
+        let ws = URL(fileURLWithPath: rig.company.workspacePath, isDirectory: true)
+        try "x\n".write(to: ws.appending(path: "x.txt"), atomically: true, encoding: .utf8)
+        try GitFixture.plainGit(["add", "--", "x.txt"], in: ws)
+        try GitFixture.plainGit(["commit", "-q", "--no-verify", "-m", "a\u{1b}[31mb\u{9b}2Jc\u{7f}d\u{202e}gnp.exe"], in: ws)
+        let hazards: [Character] = ["\u{1b}", "\u{9b}", "\u{7f}", "\u{202e}"]
+        let md = try brahma(["measure", "Acme", "--verify-landings"], home: rig.home)
+        #expect(md.status == 1)
+        #expect(!hazards.contains { md.stdout.contains($0) }, "\(md.stdout.debugDescription)")
+        #expect(md.stdout.contains("a [31mb 2Jc d\\u202egnp.exe"), "\(md.stdout.debugDescription)")
+        let js = try brahma(["measure", "Acme", "--verify-landings", "--format", "json"], home: rig.home)
+        #expect(js.status == 1)
+        #expect(!hazards.contains { js.stdout.contains($0) }, "\(js.stdout.debugDescription)")
+        let decoded = try JSONDecoder().decode(LandingAuditResult.self, from: Data(js.stdout.utf8))
+        #expect(decoded.subjects.values.first == "a [31mb 2Jc d\u{202e}gnp.exe", "\(decoded.subjects)")
     }
 
     /// A fresh handle on the rig's database (the CLI wrote through its own).

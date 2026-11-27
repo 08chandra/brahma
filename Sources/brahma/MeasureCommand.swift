@@ -31,12 +31,17 @@ struct MeasureCommand: ParsableCommand {
 
     func run() throws {
         let owner = try requireOwnerShell(quietly: false)
-        let (store, _) = try openStore()
-        let c = try resolveCompanyOrExplain(store, company)
+        let (store, paths) = try openStore()
+        let c: Company
+        do { c = try resolveCompanyOrExplain(store, company) } catch let exit as ExitCode {
+            // The audit's exit 2 is "could not audit" (ruling R38); the message is already printed.
+            throw verifyLandings ? ExitCode(Self.couldNotAudit) : exit
+        }
         let now = Date()
         // The audit is read-only: the write flags are refused with it, never silently ignored.
         guard !verifyLandings || (logOwnerMinutes == nil && day == nil) else {
-            throw fail("--verify-landings is a read-only audit; it takes no --log-owner-minutes or --day")
+            _ = fail("--verify-landings is a read-only audit; it takes no --log-owner-minutes or --day")
+            throw ExitCode(Self.couldNotAudit)
         }
         if let minutes = logOwnerMinutes {
             // A log is a write, not a report: the report's flags are refused, never silently ignored.
@@ -49,47 +54,76 @@ struct MeasureCommand: ParsableCommand {
             return
         }
         guard day == nil else { throw fail("--day is only for --log-owner-minutes") }
-        if verifyLandings { return try audit(store, c, now: now) }
+        if verifyLandings { return try audit(store, c, paths: paths, now: now) }
         let window: MeasureWindow
         do {
             window = try MeasureWindow.parse(since, now: now, companyCreated: c.createdAt, tz: store.ownerTimeZone())
         } catch { throw fail("\(error)") }
-        let git = GitWorkspace(root: URL(fileURLWithPath: c.workspacePath, isDirectory: true))
+        let git = GitWorkspace(root: URL(fileURLWithPath: c.workspacePath, isDirectory: true), exportHome: paths.home)
         let report: MeasureReport
         do { report = try Measure.report(store: store, git: git, companyId: c.id, window: window, now: now) } catch { throw fail("\(error)") }
         switch format ?? .md {
         case .md:
             // Line by line: `safe()` turns newlines into spaces, and the company name is in the header.
-            print(safeLines(report.markdown()), terminator: "")
+            print(terminalEscaped(safeLines(report.markdown())), terminator: "")
         case .json:
-            // JSON escapes every control character itself.
-            print(String(decoding: try report.json(), as: UTF8.self))
+            // JSON escapes C0 controls itself, but not DEL, C1, line separators or bidi controls: those are escaped here.
+            print(terminalEscaped(String(decoding: try report.json(), as: UTF8.self)))
         }
     }
 }
 
 extension MeasureCommand {
-    /// `--verify-landings`: the audit's lines through `safe()` (commit subjects are agent-controlled), or its JSON.
-    func audit(_ store: Store, _ c: Company, now: Date) throws {
+    /// The audit's exit code when it could not audit (ruling R38): no main, an unknown company, a git failure, planted history
+    /// files, a merge batch moving `main`, a bad `--since`. 0 is every commit classified; 1 is unverified commits or a bounded
+    /// walk.
+    static let couldNotAudit: Int32 = 2
+
+    /// `--verify-landings`: the audit's lines through `safe()` (commit subjects are agent-controlled), or its JSON with the
+    /// subjects sanitized; either way the scalars `safe()` keeps but a terminal acts on are escaped (`terminalEscaped`).
+    func audit(_ store: Store, _ c: Company, paths: BrahmaPaths, now: Date) throws {
         var since: Date?
         if let raw = self.since, raw != "all" {
             do {
                 since = try MeasureWindow.parse(raw, now: now, companyCreated: c.createdAt, tz: store.ownerTimeZone()).since
-            } catch { throw fail("\(error)") }
+            } catch { _ = fail("\(error)"); throw ExitCode(Self.couldNotAudit) }
         }
-        let git = GitWorkspace(root: URL(fileURLWithPath: c.workspacePath, isDirectory: true))
-        let result: LandingAuditResult
-        do { result = try LandingAudit.run(store: store, git: git, companyId: c.id, since: since) } catch { throw fail("\(error)") }
+        let git = GitWorkspace(root: URL(fileURLWithPath: c.workspacePath, isDirectory: true), exportHome: paths.home)
+        var result: LandingAuditResult
+        do { result = try LandingAudit.run(store: store, git: git, companyId: c.id, since: since) } catch {
+            _ = fail("\(error)")
+            throw ExitCode(Self.couldNotAudit)
+        }
         switch format ?? .md {
         case .md:
-            for line in result.lines() { print(safe(line)) }
+            for line in result.lines() { print(terminalEscaped(safe(line))) }
         case .json:
+            result.subjects = result.subjects.mapValues(TerminalText.sanitize)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
-            print(String(decoding: try encoder.encode(result), as: UTF8.self))
+            print(terminalEscaped(String(decoding: try encoder.encode(result), as: UTF8.self)))
         }
         guard result.allClassified else { throw ExitCode.failure }
     }
+}
+
+/// Scalars a terminal may act on that JSON leaves raw and `safe()` does not touch: DEL and C1 controls, the line and paragraph
+/// separators, bidi embeddings, overrides and isolates.
+func isTerminalHazard(_ scalar: Unicode.Scalar) -> Bool {
+    switch scalar.value {
+    case 0x7F...0x9F, 0x2028, 0x2029, 0x202A...0x202E, 0x2066...0x2069: return true
+    default: return false
+    }
+}
+
+/// `text` with every `isTerminalHazard` scalar written as `\uXXXX`: inert on a terminal, and inside a JSON string the same
+/// character after decoding.
+func terminalEscaped(_ text: String) -> String {
+    var out = String.UnicodeScalarView()
+    for scalar in text.unicodeScalars {
+        if isTerminalHazard(scalar) { out.append(contentsOf: String(format: "\\u%04x", scalar.value).unicodeScalars) } else { out.append(scalar) }
+    }
+    return String(out)
 }
 
 /// Multi-line engine text for the terminal: every line sanitized, the line structure kept.

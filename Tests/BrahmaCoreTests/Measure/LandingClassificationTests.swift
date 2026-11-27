@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import GRDB
 @testable import BrahmaCore
 
 /// The landing audit's classification (Plan X6a Task 6), pure: a first-parent commit list (newest first, as `rev-list
@@ -106,34 +107,132 @@ import Testing
         #expect(r.verified == 4 && r.unverified == [sha(61)], "\(r)")
     }
 
-    /// An owner's adopt of `main` (`main adopted at <sha7> by the owner`) covers its head and the unbroken run of otherwise
-    /// unclassified commits below it, stopping at the first verified one. A quarantine accept covers only the head it names. An
-    /// activity row an agent wrote, or the engine's own re-affirmation, covers nothing.
-    @Test func ownerAcceptRules() throws {
-        let (store, company, items) = try rig(items: 1)
-        let root = sha(1)
-        let (b1, _) = try MeasureFixtures.land(store, company: company, items: items, number: 1, enqueuedAt: t0, landedAt: t0,
-                                               commits: [sha(71)], base: root)
+    /// A structured owner accept (`mainAccept`, ruling R38) as `Store.recordMainAccept` writes it.
+    func accept(_ store: Store, _ company: Company, _ commit: String, previous: String?, kind: MainAcceptKind = .adopt) throws {
+        try store.writer.write { db in
+            try db.execute(sql: """
+                INSERT INTO mainAccept (companyId, "commit", previousHead, kind, createdAt) VALUES (?, ?, ?, ?, ?)
+                """, arguments: [company.id, commit, previous, kind, t0])
+        }
+    }
+
+    /// The reviewer's walk (review #1, ruling R38a) over an inconsistent record: the owner adopted H with `previousHead` V, but
+    /// C2 and C1 are a landed batch's candidates (no passed run) and X sits between them and V. The accept covers H; its run
+    /// stops at C2, a commit the store records, which its own record decides (unverified); X below stays unverified.
+    @Test func acceptRunStopsAtRecordedCommit() throws {
+        let (store, company, items) = try rig(items: 3)
+        let (root, v, x, c1, c2, h) = (sha(1), sha(2), sha(3), sha(4), sha(5), sha(6))
+        let (b1, _) = try MeasureFixtures.land(store, company: company, items: [items[0]], number: 1, enqueuedAt: t0, landedAt: t0,
+                                               commits: [v], base: root)
         try MeasureFixtures.mergeRun(store, company: company, batch: b1, kind: .item, finishedAt: t0)
-        func activity(_ kind: ActivityKind, _ text: String, agent: String? = nil) throws {
+        try MeasureFixtures.land(store, company: company, items: [items[1], items[2]], number: 2, enqueuedAt: t0, landedAt: t0,
+                                 commits: [c1, c2], base: v)
+        try accept(store, company, h, previous: v)
+        let r = LandingAudit.classify(walk: [h, c2, c1, x, v, root], records: try records(store, company))
+        #expect(r.ownerAccepted == [h] && r.unverified == [c2, c1, x] && r.verified == 1 && r.imported == [root], "\(r)")
+        #expect(!r.allClassified)
+        // A store-recorded commit is never owner-accepted, even when an accept names it.
+        try accept(store, company, c2, previous: v)
+        let again = LandingAudit.classify(walk: [h, c2, c1, x, v, root], records: try records(store, company))
+        #expect(again.ownerAccepted == [h] && again.unverified == [c2, c1, x], "\(again)")
+    }
+
+    /// An adopt over two commits made outside Brahma above the recorded head V covers the head and both; V stays verified.
+    @Test func adoptOverOutsideCommits() throws {
+        let (store, company, items) = try rig(items: 1)
+        let (root, v, o1, o2, h) = (sha(1), sha(2), sha(3), sha(4), sha(5))
+        let (b1, _) = try MeasureFixtures.land(store, company: company, items: items, number: 1, enqueuedAt: t0, landedAt: t0,
+                                               commits: [v], base: root)
+        try MeasureFixtures.mergeRun(store, company: company, batch: b1, kind: .item, finishedAt: t0)
+        try accept(store, company, h, previous: v)
+        let r = LandingAudit.classify(walk: [h, o2, o1, v, root], records: try records(store, company))
+        #expect(r.ownerAccepted == [h, o2, o1] && r.verified == 1 && r.unverified.isEmpty && r.allClassified, "\(r)")
+        #expect(r.summary == "landings verified: 100% (1/1); owner-accepted 3; imported 1")
+        // The run ends at the previous head even with nothing recorded there, and at another accept's commit.
+        let (store2, company2, _) = try rig(items: 0)
+        try accept(store2, company2, h, previous: o1)
+        try accept(store2, company2, sha(9), previous: nil, kind: .quarantineAccept)
+        let r2 = LandingAudit.classify(walk: [h, o2, o1, sha(9), sha(8), root], records: try records(store2, company2))
+        #expect(r2.ownerAccepted == [h, o2, sha(9), sha(8)] && r2.unverified == [o1], "\(r2)")
+    }
+
+    /// Only the structured full commit id counts: a walked commit that shares the accepted commit's first seven digits is not
+    /// accepted.
+    @Test func onlyStructuredFullShaCounts() throws {
+        let (store, company, _) = try rig(items: 0)
+        let accepted = sha(70), twin = String(sha(70).prefix(7)) + String(repeating: "b", count: 33)
+        try accept(store, company, accepted, previous: twin)
+        let r = LandingAudit.classify(walk: [twin, sha(1)], records: try records(store, company))
+        #expect(r.ownerAccepted.isEmpty && r.unverified == [twin], "\(r)")
+        let r2 = LandingAudit.classify(walk: [accepted, twin, sha(1)], records: try records(store, company))
+        #expect(r2.ownerAccepted == [accepted] && r2.unverified == [twin], "\(r2)")
+    }
+
+    /// Acceptances from before `mainAccept` exist only as activity text (ruling R38). One matches only the single walked commit
+    /// with its seven-digit prefix, committed before the acceptance, and covers that commit alone (no run). Two walked commits
+    /// sharing the prefix match neither. An agent's row, the engine's re-affirmation, a malformed row and any row written after
+    /// `mainAccept` began match nothing.
+    @Test func legacyAcceptRules() throws {
+        let (store, company, _) = try rig(items: 0)
+        func activity(_ kind: ActivityKind, _ text: String, agent: String? = nil, at: Date? = nil) throws {
             try store.writer.write { db in
-                try ActivityEvent(companyId: company.id, agentId: agent, turnId: nil, kind: kind, text: text, createdAt: t0).insert(db)
+                try ActivityEvent(companyId: company.id, agentId: agent, turnId: nil, kind: kind, text: text, createdAt: at ?? t0).insert(db)
             }
         }
-        let q = sha(75)
-        try activity(.merge, "main adopted at \(sha(74).prefix(7)) by the owner")
-        try activity(.work, "the owner accepted refs/brahma/quarantine/20261101-101010 (\(q.prefix(12))) into main at \(q.prefix(7))")
-        try activity(.merge, "main adopted at \(sha(76).prefix(7)) by the engine")
-        try activity(.merge, "main adopted at \(sha(77).prefix(7)) by the owner", agent: "agent-1")
-        try activity(.merge, "main adopted at \(sha(78).prefix(7)) by the owner, really")
+        let epoch: Date = try #require(try store.writer.read { db in try Row.fetchOne(db, sql: "SELECT at FROM measureEpoch WHERE name = 'mainAccept'")?["at"] })
+        let unique = sha(10), below = sha(11), late = sha(12), q = sha(13), agentHead = sha(14), engineHead = sha(15), newer = sha(16)
+        let twinA = sha(20), twinB = String(sha(20).prefix(7)) + String(repeating: "c", count: 33)
+        try activity(.merge, "main adopted at \(unique.prefix(7)) by the owner")
+        try activity(.merge, "main adopted at \(late.prefix(7)) by the owner")
+        try activity(.work, "the owner accepted refs/brahma/quarantine/20230101-000000 (\(q.prefix(12))) into main at \(q.prefix(7))")
+        try activity(.merge, "main adopted at \(agentHead.prefix(7)) by the owner", agent: "agent-1")
+        try activity(.merge, "main adopted at \(engineHead.prefix(7)) by the engine")
+        try activity(.merge, "main adopted at \(twinA.prefix(7)) by the owner")
+        try activity(.merge, "main adopted at \(newer.prefix(7)) by the owner", at: epoch.addingTimeInterval(60))
         let recs = try records(store, company)
-        #expect(recs.accepts.count == 2, "the engine's, the agent's and the malformed rows are not owner accepts: \(recs.accepts)")
-        let walk = [sha(78), sha(77), q, sha(76), sha(74), sha(73), sha(72), sha(71), root]
-        let r = LandingAudit.classify(walk: walk, records: recs)
-        #expect(r.ownerAccepted == [q, sha(74), sha(73), sha(72)], "\(r)")
-        #expect(r.unverified == [sha(78), sha(77), sha(76)], "\(r)")
-        #expect(r.verified == 1 && r.imported == [root])
-        #expect(r.summary == "landings verified: 25% (1/4); owner-accepted 4; imported 1")
+        #expect(recs.legacyAccepts.count == 4, "\(recs.legacyAccepts)")
+        let walk = [newer, engineHead, agentHead, twinA, twinB, q, late, unique, below, sha(1)]
+        let candidates = LandingAudit.legacyCandidates(walk: walk, records: recs)
+        #expect(Set(candidates) == [unique, late, q], "the twins match neither: \(candidates)")
+        let times = [unique: t0.addingTimeInterval(-60), late: t0.addingTimeInterval(60), q: t0.addingTimeInterval(-1)]
+        let r = LandingAudit.classify(walk: walk, records: recs, commitTimes: times)
+        #expect(r.ownerAccepted == [q, unique], "\(r)")
+        #expect(r.unverified == [newer, engineHead, agentHead, twinA, twinB, late, below], "no run below a legacy accept: \(r)")
+    }
+
+    /// Ruling R24 within a chain: a landed id the batch did not merge (link 0) verifies nothing, but its candidate still bounds
+    /// the merged link 1's range, which stops there.
+    @Test func nonMergedLinkBoundsTheNextRange() throws {
+        let (store, company, items) = try rig(items: 2)
+        let (root, c1, x, c2) = (sha(1), sha(2), sha(3), sha(4))
+        let (batch, requests) = try MeasureFixtures.land(store, company: company, items: items, number: 1, enqueuedAt: t0, landedAt: t0,
+                                                         commits: [c1, c2], base: root)
+        try MeasureFixtures.mergeRun(store, company: company, batch: batch, kind: .item, finishedAt: t0)
+        try store.writer.write { db in
+            try db.execute(sql: "UPDATE mergeRequest SET status = 'queued', batchId = NULL WHERE companyId = ? AND id = ?",
+                           arguments: [company.id, requests[0].id])
+        }
+        let r = LandingAudit.classify(walk: [c2, x, c1, root], records: try records(store, company))
+        #expect(r.verified == 2 && r.unverified == [c1] && r.imported == [root], "\(r)")
+    }
+
+    /// Review #5: a landed id with no candidate stays in the chain as a gap: the next link, with no commit below it to stop at,
+    /// covers only its own candidate.
+    @Test func candidateGapCoversOnlyTheTop() throws {
+        let (store, company, items) = try rig(items: 2)
+        let (root, x, c2) = (sha(1), sha(2), sha(3))
+        let (batch, requests) = try MeasureFixtures.land(store, company: company, items: items, number: 1, enqueuedAt: t0, landedAt: t0,
+                                                         commits: [sha(9), c2], base: root)
+        try MeasureFixtures.mergeRun(store, company: company, batch: batch, kind: .item, finishedAt: t0)
+        try store.writer.write { db in
+            guard var b = try MergeBatch.fetchOne(db, key: batch.id) else { throw FakeError(description: "no batch") }
+            b.candidates.removeValue(forKey: requests[0].id)
+            try b.update(db)
+        }
+        let recs = try records(store, company)
+        #expect(recs.batches.first?.chain.map(\.commit) == [nil, c2], "\(recs.batches)")
+        let r = LandingAudit.classify(walk: [c2, x, root], records: recs)
+        #expect(r.verified == 1 && r.unverified == [x], "\(r)")
     }
 
     /// A company imported from an existing repository starts at `importedCommit`: that commit is imported and nothing below it
@@ -187,8 +286,9 @@ import Testing
             try ActivityEvent(companyId: zeta.id, agentId: nil, turnId: nil, kind: .merge,
                               text: "main adopted at \(sha(92).prefix(7)) by the owner", createdAt: t0).insert(db)
         }
-        let r = LandingAudit.classify(walk: [sha(91), sha(1)], records: try records(store, acme))
-        #expect(r.unverified == [sha(91)] && r.ownerAccepted.isEmpty, "\(r)")
+        try accept(store, zeta, sha(93), previous: nil)
+        let r = LandingAudit.classify(walk: [sha(93), sha(91), sha(1)], records: try records(store, acme))
+        #expect(r.unverified == [sha(93), sha(91)] && r.ownerAccepted.isEmpty, "\(r)")
     }
 
     /// The report: a summary line, the unverified commits (short sha and subject, at most `maxListed`), the history changes.

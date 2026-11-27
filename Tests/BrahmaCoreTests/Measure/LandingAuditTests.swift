@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import GRDB
 @testable import BrahmaCore
 
 /// `LandingAudit.run` over a real repository (Plan X6a Task 6; ruling R3: an ordinary test over a `GitFixture`). The fixture's
@@ -81,6 +82,11 @@ import Testing
                 "the record still says c1: \(before.historyChanged)")
         let accepted = try rig.store.acceptMainCommit(companyId: rig.company.id)
         #expect(accepted.head == o2)
+        // Ruling R38: the accept is recorded with the full commit and the record it replaced.
+        let row = try #require(try rig.store.writer.read { db in
+            try Row.fetchOne(db, sql: "SELECT \"commit\", previousHead, kind FROM mainAccept WHERE companyId = ?", arguments: [rig.company.id])
+        })
+        #expect(row["commit"] as String == o2 && row["previousHead"] as String? == c1 && row["kind"] as String == "adopt")
         let r = try audit(rig)
         #expect(r.ownerAccepted == [o2, o1] && r.unverified.isEmpty && r.verified == 1, "\(r)")
         #expect(r.historyChanged.isEmpty, "\(r)")
@@ -165,9 +171,56 @@ import Testing
     @Test func missingMainThrows() throws {
         let store = try Store.inMemory()
         let company = try MeasureFixtures.company(store, name: "Acme")
-        #expect(throws: (any Error).self) {
+        #expect(throws: MeasureError.noMainBranch(company.id)) {
             try LandingAudit.run(store: store, git: GitWorkspace(root: URL(fileURLWithPath: company.workspacePath)), companyId: company.id,
                                  since: nil)
         }
+        let empty = try GitFixture(ensure: false)
+        try empty.git(["init", "-q"])
+        #expect(throws: MeasureError.noMainBranch(company.id)) {
+            try LandingAudit.run(store: store, git: empty.ws, companyId: company.id, since: nil)
+        }
+    }
+
+    /// Review #2: a planted `.git/shallow` or `.git/info/grafts` makes git end the history wherever it says (a fake root). The
+    /// audit refuses before walking, and reads, never removes, the file. The root it does reach must have no parent in its object.
+    @Test func plantedHistoryRefused() throws {
+        for planted in ["shallow", "info/grafts"] {
+            let rig = try rig()
+            let c1 = try commit(rig, "a.txt", "ACME-1")
+            let c2 = try commit(rig, "b.txt", "outside")
+            try land(rig, number: 1, commits: [c1], base: rig.root)
+            let file = rig.repo.root.appending(path: ".git/\(planted)")
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try "\(c1)\n".write(to: file, atomically: true, encoding: .utf8)
+            #expect(throws: MeasureError.plantedHistory(rig.company.id), "\(planted)") { try audit(rig) }
+            #expect(FileManager.default.fileExists(atPath: file.path), "the audit is read-only")
+            try FileManager.default.removeItem(at: file)
+            #expect(try audit(rig).unverified == [c2])
+        }
+        let rig = try rig()
+        let c1 = try commit(rig, "a.txt", "ACME-1")
+        #expect(try rig.repo.ws.commitParents(rig.root).isEmpty)
+        #expect(try rig.repo.ws.commitParents(c1) == [rig.root])
+    }
+
+    /// A merge batch moving `main` (step `backedUp` or `landing`), or `main` at the head the engine is about to record: the
+    /// audit waits for it rather than reporting a half-landed batch.
+    @Test func openMergeBatchRefused() throws {
+        let rig = try rig()
+        let c1 = try commit(rig, "a.txt", "ACME-1")
+        try rig.store.writer.write { db in
+            try MergeBatch(companyId: rig.company.id, number: 9, step: .landing, requestIds: ["r"], startedAt: t0).insert(db)
+        }
+        #expect(throws: MeasureError.mergeBatchOpen) { try audit(rig) }
+        try rig.store.writer.write { db in
+            try db.execute(sql: "UPDATE mergeBatch SET step = 'done' WHERE companyId = ?", arguments: [rig.company.id])
+            try db.execute(sql: "UPDATE company SET pendingMainCommit = ? WHERE id = ?", arguments: [c1, rig.company.id])
+        }
+        #expect(throws: MeasureError.mergeBatchOpen) { try audit(rig) }
+        try rig.store.writer.write { db in
+            try db.execute(sql: "UPDATE company SET pendingMainCommit = NULL WHERE id = ?", arguments: [rig.company.id])
+        }
+        #expect(try audit(rig).unverified == [c1])
     }
 }

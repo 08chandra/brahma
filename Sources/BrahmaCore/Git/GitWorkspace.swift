@@ -1612,7 +1612,8 @@ public struct GitWorkspace: Sendable {
     }
 
     /// Whether a `shallow` or `info/grafts` is there (`removePlantedHistoryFiles` would remove something).
-    private var hasPlantedHistoryFiles: Bool {
+    /// Read-only (the landing audit refuses to walk a history these files rewrite).
+    var hasPlantedHistoryFiles: Bool {
         ["shallow", "info/grafts"].contains { (try? FileManager.default.attributesOfItem(atPath: gitDir.appending(path: $0).path)) != nil }
     }
 
@@ -4105,5 +4106,37 @@ extension GitWorkspace {
             subjects[sha] = String(text[text.index(after: space)...])
         }
         return subjects
+    }
+
+    /// The parents of `commit` (a commit id) as its object records them (`git cat-file commit <id>`: the `parent` lines of the
+    /// header), read past any graft or shallow file: an empty list is a true root.
+    public func commitParents(_ commit: String) throws -> [String] {
+        try Self.validCommit(commit)
+        let out = try main.run(["cat-file", "commit", commit], maxOutput: 1 << 20)
+        var parents: [String] = []
+        for line in String(decoding: out.stdout, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.isEmpty { break }                     // the header ends at the first blank line
+            if line.hasPrefix("parent ") { parents.append(String(line.dropFirst("parent ".count))) }
+        }
+        return parents
+    }
+
+    /// The committer time of each of `commits` (commit ids, at most `maxSubjectLookup`), by commit id
+    /// (`git log --no-walk=unsorted --format=%H %ct`). The time is the committer's claim, not the engine's.
+    public func commitTimes(of commits: [String]) throws -> [String: Date] {
+        guard commits.count <= Self.maxSubjectLookup else {
+            throw GitError.failed(command: "log --no-walk", status: -1, stderr: "more than \(Self.maxSubjectLookup) commits asked for")
+        }
+        for c in commits { try Self.validCommit(c) }
+        guard !commits.isEmpty else { return [:] }
+        let out = try main.run(["log", "--no-walk=unsorted", "--no-color", "--no-show-signature", "--format=%H %ct", "--end-of-options"]
+                               + commits + ["--"], maxOutput: 1 << 20)
+        var times: [String: Date] = [:]
+        for line in out.text.split(separator: "\n") {
+            let parts = line.split(separator: " ")
+            guard parts.count == 2, let seconds = TimeInterval(parts[1]) else { continue }
+            times[String(parts[0])] = Date(timeIntervalSince1970: seconds)
+        }
+        return times
     }
 }

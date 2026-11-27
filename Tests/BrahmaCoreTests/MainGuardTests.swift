@@ -147,6 +147,37 @@ import GRDB
         #expect(try check(m) == .ok)
     }
 
+    /// Plan X6a ruling R38: every owner acceptance writes a `mainAccept` row (full commit, the record it replaced, kind) in the
+    /// transaction that records `main`: the adopt and the quarantine accept. The engine's re-affirmation, a refused agent and an
+    /// accept of the head already recorded write none.
+    @Test func ownerAcceptsWriteMainAcceptRecords() throws {
+        let m = try MergeFixture()
+        func rows() throws -> [[String?]] {
+            try m.store.writer.read { db in
+                try Row.fetchAll(db, sql: "SELECT \"commit\", previousHead, kind FROM mainAccept WHERE companyId = ? ORDER BY id",
+                                 arguments: [m.company.id]).map { [$0["commit"], $0["previousHead"], $0["kind"]] }
+            }
+        }
+        let before = try main(m)
+        let owners = try foreignCommit(m, file: "owner.txt", message: "the owner's commit")
+        #expect(throws: WorkError.self) { try m.store.adoptMain(companyId: m.company.id, by: .agent(m.eng.id)) }
+        #expect(try rows().isEmpty)
+        #expect(try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) == owners)
+        #expect(try rows() == [[owners, before, "adopt"]])
+        #expect(try m.store.adoptMain(companyId: m.company.id, by: .system, now: m.now) == owners)
+        #expect(try m.store.adoptMain(companyId: m.company.id, by: .owner, now: m.now) == owners)
+        #expect(try rows().count == 1, "nothing new was accepted")
+
+        try fixture(m).write("q.txt", "the owner's uncommitted work")
+        let git = m.store.gitWorkspace(root: m.root, companyId: m.company.id)
+        try m.store.quarantineRoot(company: m.company, git: git, expectedMain: owners, now: m.now)
+        let ref = try #require(try fixture(m).git(["for-each-ref", "--format=%(refname)", "refs/brahma/quarantine/"]).split(separator: "\n").first.map(String.init))
+        let accepted = try m.store.acceptMainCommit(companyId: m.company.id, ref: ref)
+        #expect(accepted.head != owners)
+        #expect(try rows() == [[owners, before, "adopt"], [accepted.head, owners, "quarantineAccept"]])
+        #expect(try recorded(m) == accepted.head)
+    }
+
     /// Round 2: `brahma main accept` (3a's `acceptMainCommit`) and `adopt-main` share one guard: a symbolic `main`, a `main` that
     /// names no commit and an open merge batch refuse both; the plain accept records the head as an adoption by the owner.
     @Test func mainAcceptSharesTheAdoptGuard() throws {

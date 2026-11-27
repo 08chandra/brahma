@@ -8,7 +8,7 @@ public struct LandingAuditResult: Codable, Equatable, Sendable {
     public var commits: Int
     /// Commits the merge queue landed (`LandingAudit` says which count).
     public var verified: Int
-    /// Commits the owner accepted into `main` (`brahma main accept`, `brahma merge adopt-main`, a quarantine accept).
+    /// Commits the owner accepted into `main` (`brahma main accept`, `brahma merge adopt-main`, a quarantine accept; ruling R38).
     public var ownerAccepted: [String]
     /// The company's first commit: `company.importedCommit`, else the root of first-parent history.
     public var imported: [String]
@@ -59,11 +59,12 @@ public struct LandingAuditResult: Codable, Equatable, Sendable {
 
 /// The store's records the landing audit classifies commits against, read in one snapshot (`LandingAudit.records`).
 public struct LandingRecords: Equatable, Sendable {
-    /// One request of a landed batch, in `landedIds` order: its candidate commit, and whether this batch merged it (ruling R24).
+    /// One request of a landed batch, in `landedIds` order: its candidate commit (nil when `candidates` has none for it: a gap
+    /// that verifies nothing and bounds nothing), and whether this batch merged it (ruling R24).
     public struct Link: Equatable, Sendable {
-        public var commit: String
+        public var commit: String?
         public var merged: Bool
-        public init(commit: String, merged: Bool) { self.commit = commit; self.merged = merged }
+        public init(commit: String?, merged: Bool) { self.commit = commit; self.merged = merged }
     }
 
     /// A landing (`Store.landings`, rulings R13/R24) with every request of its `landedIds`.
@@ -79,23 +80,42 @@ public struct LandingRecords: Equatable, Sendable {
         }
     }
 
-    /// An owner's acceptance of a `main` head, named by its first seven hex digits (all the activity record keeps).
+    /// An owner acceptance as `mainAccept` records it (ruling R38): the full commit `main` was recorded at and the record it
+    /// replaced.
     public struct Accept: Equatable, Sendable {
+        public var commit: String
+        public var previousHead: String?
+        public var kind: MainAcceptKind
+        public init(commit: String, previousHead: String?, kind: MainAcceptKind) {
+            self.commit = commit; self.previousHead = previousHead; self.kind = kind
+        }
+    }
+
+    /// An owner acceptance from before `mainAccept` existed, known only from the engine's activity text: the head's first seven
+    /// hex digits and when it was accepted.
+    public struct LegacyAccept: Equatable, Sendable {
         public var prefix: String
-        /// `brahma main accept` / `brahma merge adopt-main`: the owner accepted `main` as it stood, so the run of otherwise
-        /// unclassified commits below the head is accepted with it. A quarantine accept covers only its head.
-        public var adopt: Bool
-        public init(prefix: String, adopt: Bool) { self.prefix = prefix; self.adopt = adopt }
+        public var at: Date
+        public init(prefix: String, at: Date) { self.prefix = prefix; self.at = at }
     }
 
     public var batches: [Batch] = []
     public var accepts: [Accept] = []
+    public var legacyAccepts: [LegacyAccept] = []
+    /// Every commit the store records other than an accept's own (ruling R38a): each `mergeBatch` at or after `landed` (passed,
+    /// merged or not) — its base, candidates and land commit —, `importedCommit`, and every restore's `mainCommit`. Such a
+    /// commit is decided by its own record, is never owner-accepted, and ends an accept's run.
+    public var recorded: Set<String> = []
     /// `company.importedCommit`.
     public var importedCommit: String?
     /// With `since`: the land commit of the newest landing that finished before it. The walk stops below it (exclusive).
     public var stopBefore: String?
     /// `company.mainCommit`: the head the engine recorded.
     public var recordedMain: String?
+    /// `company.pendingMainCommit`: the head the engine is about to move `main` to.
+    public var pendingMain: String?
+    /// A merge batch is moving `main` (step `backedUp` or `landing`).
+    public var batchLanding = false
     /// One line per restore of the company (`restoreMain` with its `restoreEvent`, `restoreEpoch`).
     public var restores: [String] = []
 
@@ -108,17 +128,20 @@ public struct LandingRecords: Equatable, Sendable {
 ///   request it merged — rulings R13, R24) whose batch has a passed `main` or `item` check at its land commit, each request it
 ///   merged verifies its candidate (`candidates[requestId]`; the last is the land commit, which 4a fast-forwards `main` to,
 ///   through every candidate before it) and the commits between that candidate and the one below it in the chain (the
-///   previous candidate, or the batch's base) on first-parent history: an item whose branch held several commits lands as a
-///   rebased chain of them. A request the batch did not merge (requeued from an abandoned batch) verifies nothing.
-/// - **owner-accepted**: named by an owner accept record (activity written by the engine itself, no agent or turn):
-///   `main adopted at <sha7> by the owner` (`brahma main accept` with no ref, `brahma merge adopt-main`) covers that head and
-///   the unbroken run of otherwise unclassified commits below it (what changed outside Brahma and was accepted);
-///   `the owner accepted <quarantine ref> (<sha12>) into main at <sha7>` covers that head.
+///   previous candidate, or the batch's base) on first-parent history (ruling R35): an item whose branch held several commits
+///   lands as a rebased chain of them. A request the batch did not merge (requeued from an abandoned batch) verifies nothing.
+/// - **owner-accepted** (rulings R38, R38a): a `mainAccept` record's commit, and the first-parent run below it down to its
+///   `previousHead` (exclusive), stopping (exclusive) at the first commit the store records (`LandingRecords.recorded`) or
+///   another accept's commit. A store-recorded commit is never owner-accepted. An acceptance from before `mainAccept`
+///   (activity text, no agent or turn, the engine's exact wording) covers one commit only: the single walked commit with its
+///   seven-digit prefix, committed before the acceptance; two walked commits sharing the prefix match neither.
 /// - **imported**: the company's first `main` commit (ruling R16): `company.importedCommit`, else the root of first-parent
-///   history. Nothing below it is audited.
+///   history, which must have no parent in its object (a planted `shallow` or `info/grafts` file is refused before the walk).
 /// - **unverified**: everything else.
 ///
-/// Read-only: one store snapshot, then git (`GitWorkspace.firstParentHistory`, `subjects(of:)`); nothing is written.
+/// Read-only: one store snapshot, then git (`GitWorkspace.firstParentHistory`, `commitParents`, `commitTimes(of:)`,
+/// `subjects(of:)`); nothing is written. It cannot audit (throws `MeasureError`) without a `main`, over planted history files,
+/// over a cut history, or while a merge batch is moving `main`.
 public struct LandingAudit {
     /// The most first-parent commits one audit walks.
     public static let maxCommits = 10_000
@@ -132,10 +155,21 @@ public struct LandingAudit {
     /// `run` with its bound given (tests).
     public static func run(store: Store, git: GitWorkspace, companyId: String, since: Date?, maxCommits: Int) throws -> LandingAuditResult {
         let recs = try records(store: store, companyId: companyId, since: since)
-        guard let tip = try git.head(of: GitWorkspace.mainRef) else { throw MeasureError.noMainBranch(companyId) }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: git.gitDir.path, isDirectory: &isDirectory), isDirectory.boolValue,
+              let tip = try git.head(of: GitWorkspace.mainRef) else { throw MeasureError.noMainBranch(companyId) }
+        // A `shallow` or `info/grafts` file makes git end the history wherever it says: never walked.
+        guard !git.hasPlantedHistoryFiles else { throw MeasureError.plantedHistory(companyId) }
+        guard !recs.batchLanding, recs.pendingMain == nil || recs.pendingMain != tip else { throw MeasureError.mergeBatchOpen }
         // One more than the bound: a full listing says the walk did not reach the root.
         let walk = try git.firstParentHistory(from: tip, limit: maxCommits + 1)
-        var result = classify(walk: walk, records: recs, maxCommits: maxCommits)
+        if walk.count <= maxCommits, let root = walk.last, !(try git.commitParents(root)).isEmpty {
+            throw MeasureError.historyCut(String(root.prefix(7)))
+        }
+        let candidates = legacyCandidates(walk: walk, records: recs)
+        var result = classify(walk: walk, records: recs, maxCommits: maxCommits,
+                              commitTimes: try git.commitTimes(of: Array(candidates.prefix(GitWorkspace.maxSubjectLookup))))
+        if try git.mainIsSymbolic() { result.historyChanged.append("main is a symbolic ref (not Brahma's)") }
         let listed = Array(result.unverified.prefix(maxListed))
         result.subjects = try git.subjects(of: listed)
         return result
@@ -144,18 +178,29 @@ public struct LandingAudit {
     /// The company's records, in one read. `since` (nil: the whole history) picks `stopBefore`. Every query is the company's own.
     public static func records(store: Store, companyId: String, since: Date?) throws -> LandingRecords {
         try store.writer.read { db in
-            guard let company = try Row.fetchOne(db, sql: "SELECT importedCommit, mainCommit FROM company WHERE id = ?",
+            guard let company = try Row.fetchOne(db, sql: "SELECT importedCommit, mainCommit, pendingMainCommit FROM company WHERE id = ?",
                                                  arguments: [companyId]) else { throw MeasureError.unknownCompany(companyId) }
             var recs = LandingRecords()
             recs.importedCommit = company["importedCommit"]
             recs.recordedMain = company["mainCommit"]
+            recs.pendingMain = company["pendingMainCommit"]
+            if let imported = recs.importedCommit { recs.recorded.insert(imported) }
 
             let landings = try Store.landings(db, companyId: companyId, in: nil)
+            let steps = Store.landedSteps.map { "'\($0.rawValue)'" }.joined(separator: ", ")
             var raw: [String: MergeBatch] = [:]
-            for b in try MergeBatch.fetchAll(db, sql: "SELECT * FROM mergeBatch WHERE companyId = ? AND landCommit IS NOT NULL",
+            for b in try MergeBatch.fetchAll(db, sql: "SELECT * FROM mergeBatch WHERE companyId = ? AND step IN (\(steps))",
                                              arguments: [companyId]) {
                 raw[b.id] = b
+                // Ruling R38a: every landed-step batch's commits are the store's, passed and merged or not.
+                if let base = b.base { recs.recorded.insert(base) }
+                if let land = b.landCommit { recs.recorded.insert(land) }
+                recs.recorded.formUnion(b.candidates.values.filter { !$0.isEmpty })
             }
+            let landingNow = try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM mergeBatch WHERE companyId = ? AND step IN ('\(MergeStep.backedUp.rawValue)', '\(MergeStep.landing.rawValue)')
+                """, arguments: [companyId])
+            recs.batchLanding = (landingNow ?? 0) > 0
             var passed = Set<String>()
             for row in try Row.fetchAll(db, sql: """
                 SELECT DISTINCT batchId, candidateCommit FROM mergeRun
@@ -167,9 +212,8 @@ public struct LandingAudit {
             recs.batches = landings.compactMap { landing -> LandingRecords.Batch? in
                 guard let b = raw[landing.batchId] else { return nil }
                 let merged = Set(landing.items.map(\.requestId))
-                let chain = b.landedIds.compactMap { id -> LandingRecords.Link? in
-                    b.candidates[id].map { LandingRecords.Link(commit: $0, merged: merged.contains(id)) }
-                }
+                // A landed id with no candidate stays in the chain as a gap (review #5): it bounds the next link's range.
+                let chain = b.landedIds.map { id in LandingRecords.Link(commit: b.candidates[id], merged: merged.contains(id)) }
                 return LandingRecords.Batch(number: landing.number, base: b.base, chain: chain,
                                             passed: passed.contains("\(landing.batchId) \(landing.landCommit)"))
             }
@@ -178,13 +222,24 @@ public struct LandingAudit {
             }
 
             for row in try Row.fetchAll(db, sql: """
-                SELECT kind, text FROM activityEvent
+                SELECT "commit", previousHead, kind FROM mainAccept WHERE companyId = ? ORDER BY createdAt, id
+                """, arguments: [companyId]) {
+                let kind: String = row["kind"]
+                guard let k = MainAcceptKind(rawValue: kind) else { continue }
+                recs.accepts.append(LandingRecords.Accept(commit: row["commit"], previousHead: row["previousHead"], kind: k))
+            }
+            // Acceptances from before `mainAccept`: activity text only (ruling R38). No epoch row: every row is that old.
+            let epoch: Date? = try Row.fetchOne(db, sql: "SELECT at FROM measureEpoch WHERE name = 'mainAccept'")?["at"]
+            var legacySQL = """
+                SELECT kind, text, createdAt FROM activityEvent
                 WHERE companyId = ? AND agentId IS NULL AND turnId IS NULL AND kind IN ('merge', 'work')
                   AND (text LIKE 'main adopted at %' OR text LIKE 'the owner accepted %')
-                ORDER BY createdAt, id
-                """, arguments: [companyId]) {
-                let kind: String = row["kind"], text: String = row["text"]
-                if let accept = accept(kind: kind, text: text) { recs.accepts.append(accept) }
+                """
+            var legacyArguments: StatementArguments = [companyId]
+            if let epoch { legacySQL += " AND createdAt < ?"; legacyArguments += [epoch] }
+            for row in try Row.fetchAll(db, sql: legacySQL + " ORDER BY createdAt, id", arguments: legacyArguments) {
+                let kind: String = row["kind"], text: String = row["text"], at: Date = row["createdAt"]
+                if let prefix = acceptedPrefix(kind: kind, text: text) { recs.legacyAccepts.append(LandingRecords.LegacyAccept(prefix: prefix, at: at)) }
             }
 
             var restoreSQL = """
@@ -202,35 +257,56 @@ public struct LandingAudit {
             for (sql, args) in [(restoreSQL, arguments), (epochSQL, epochArguments)] {
                 for row in try Row.fetchAll(db, sql: sql, arguments: args) {
                     let at: Date = row["at"], main: String? = row["mainCommit"], unreadable: Bool = row["unreadable"]
+                    if let main { recs.recorded.insert(main) }
                     let to = main.map { "main restored to \($0.prefix(7))" } ?? "no main recorded"
                     restores.append((at, "restore at \(MeasureReport.iso(at))\(unreadable ? " (database unreadable)" : ""): \(to)"))
                 }
+            }
+            if since != nil {
+                // A restore before the window still records its commit (R38a), though it is not reported.
+                for main in try String.fetchAll(db, sql: """
+                    SELECT m.mainCommit FROM restoreMain m WHERE m.companyId = ? AND m.mainCommit IS NOT NULL
+                    UNION SELECT mainCommit FROM restoreEpoch WHERE companyId = ? AND mainCommit IS NOT NULL
+                    """, arguments: [companyId, companyId]) { recs.recorded.insert(main) }
             }
             recs.restores = restores.sorted { $0.at < $1.at }.map(\.line)
             return recs
         }
     }
 
-    /// An owner accept record, or nil: the engine's own wording, exactly (the engine's re-affirmation and anything else is none).
-    static func accept(kind: String, text: String) -> LandingRecords.Accept? {
+    /// The accepted head's seven-digit prefix in a pre-`mainAccept` owner accept row, or nil: the engine's own wording, exactly
+    /// (the engine's re-affirmation and anything else is none).
+    static func acceptedPrefix(kind: String, text: String) -> String? {
         func whole(_ pattern: String) -> Bool { text.range(of: pattern, options: .regularExpression) != nil }
         if kind == ActivityKind.merge.rawValue, whole(#"^main adopted at [0-9a-f]{7} by the owner\z"#) {
-            return LandingRecords.Accept(prefix: String(text.dropFirst("main adopted at ".count).prefix(7)), adopt: true)
+            return String(text.dropFirst("main adopted at ".count).prefix(7))
         }
         // The ref holds no space, so the first " into main at " is the engine's.
         if kind == ActivityKind.work.rawValue,
            whole(#"^the owner accepted refs/brahma/quarantine/[0-9A-Za-z-]+ \([0-9a-f]{12}\) into main at [0-9a-f]{7}(?: \([^)]*\))?\z"#),
            let at = text.range(of: " into main at ") {
-            return LandingRecords.Accept(prefix: String(text[at.upperBound...].prefix(7)), adopt: false)
+            return String(text[at.upperBound...].prefix(7))
         }
         return nil
+    }
+
+    /// The walked commits a legacy accept could name: the one commit with its prefix (two or more sharing it: none), not
+    /// recorded by the store. Their commit times decide (`classify`).
+    static func legacyCandidates(walk: [String], records: LandingRecords) -> [String] {
+        records.legacyAccepts.compactMap { legacy -> String? in
+            let matches = walk.filter { $0.hasPrefix(legacy.prefix) }
+            guard matches.count == 1, let only = matches.first, !records.recorded.contains(only) else { return nil }
+            return only
+        }
     }
 
     enum Class { case verified, ownerAccepted, imported, unverified }
 
     /// Classifies `walk` (`main`'s first-parent history, newest first, as `firstParentHistory` lists it, up to `maxCommits` + 1
-    /// commits: a list no longer than `maxCommits` reached the root) against `records`. Pure.
-    public static func classify(walk: [String], records: LandingRecords, maxCommits: Int = LandingAudit.maxCommits) -> LandingAuditResult {
+    /// commits: a list no longer than `maxCommits` reached the root) against `records`. `commitTimes`: the committer times of
+    /// `legacyCandidates` (a legacy accept matches only a commit made before it). Pure.
+    public static func classify(walk: [String], records: LandingRecords, maxCommits: Int = LandingAudit.maxCommits,
+                                commitTimes: [String: Date] = [:]) -> LandingAuditResult {
         var position: [String: Int] = [:]
         for (i, sha) in walk.enumerated() where position[sha] == nil { position[sha] = i }
         // Where the walk ends: below the `since` landing, at the first commit, or at the root.
@@ -267,24 +343,32 @@ public struct LandingAudit {
         // Verified: each merged request's chain, from its candidate down to (not including) the commit below it.
         for batch in records.batches where batch.passed {
             for (k, link) in batch.chain.enumerated() where link.merged {
-                guard let top = position[link.commit], top < audited else { continue }
+                guard let commit = link.commit, let top = position[commit], top < audited else { continue }
                 let below = k == 0 ? batch.base : batch.chain[k - 1].commit
                 var end = top + 1
                 if let below, let j = position[below], j > top { end = min(j, audited) }
                 for i in top..<end where classes[i] == nil { classes[i] = .verified }
             }
         }
-        // Owner-accepted: a named head; below an adopted one, the run of commits nothing else classifies.
-        var adoptRun = false
-        for i in 0..<audited {
-            if classes[i] != nil { adoptRun = false; continue }
-            if let accept = records.accepts.first(where: { walk[i].hasPrefix($0.prefix) }) {
+        // Owner-accepted (R38, R38a): an accept's commit and the run below it to its previous head, ending at any commit the
+        // store records (another accept's commit included) or that is already classified.
+        let acceptCommits = Set(records.accepts.map(\.commit))
+        for accept in records.accepts {
+            guard let top = position[accept.commit], top < audited, classes[top] == nil, !records.recorded.contains(accept.commit) else { continue }
+            classes[top] = .ownerAccepted
+            var i = top + 1
+            while i < audited, classes[i] == nil, walk[i] != accept.previousHead, !records.recorded.contains(walk[i]),
+                  !acceptCommits.contains(walk[i]) {
                 classes[i] = .ownerAccepted
-                // Two records can name one head; any adopt among them starts a run.
-                adoptRun = accept.adopt || records.accepts.contains { $0.adopt && walk[i].hasPrefix($0.prefix) }
-            } else if adoptRun {
-                classes[i] = .ownerAccepted
+                i += 1
             }
+        }
+        // Legacy accepts: one commit each, unique on the walk, committed before the acceptance.
+        for legacy in records.legacyAccepts {
+            let matches = walk.indices.filter { walk[$0].hasPrefix(legacy.prefix) }
+            guard matches.count == 1, let i = matches.first, i < audited, classes[i] == nil, !records.recorded.contains(walk[i]),
+                  let made = commitTimes[walk[i]], made < legacy.at else { continue }
+            classes[i] = .ownerAccepted
         }
 
         let commits = Array(walk.prefix(audited))

@@ -107,6 +107,8 @@ extension Store {
                 }
                 let who = sender == .owner ? "the owner" : "the engine"
                 try writer.write { db in
+                    // Plan X6a ruling R38: the owner's acceptance, bound to the full commit and the head it replaces.
+                    if sender == .owner { try Self.recordMainAccept(db, companyId: companyId, commit: target, kind: .adopt, now: now) }
                     try finalizeMainCommit(db, companyId: companyId, commit: target)
                     try resolveEngineAlerts(db, reasons: [Self.mainAlertReason(companyId)], now: now)
                     try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .merge,
@@ -238,6 +240,7 @@ extension Store {
         // restore re-reads the record under that lock).
         let record: (String) throws -> Void = { head in
             try self.writer.write { db in
+                try Self.recordMainAccept(db, companyId: companyId, commit: head, kind: .quarantineAccept, now: now)
                 try self.finalizeMainCommit(db, companyId: companyId, commit: head)
                 let earlier = open ? "" : " (\(ask.ref) was \(ask.status.rawValue) earlier)"
                 try ActivityEvent(companyId: companyId, agentId: nil, turnId: nil, kind: .work,

@@ -15,6 +15,12 @@ public enum MeasureError: Error, Equatable, CustomStringConvertible {
     case badMinutes(Int)
     /// `--verify-landings`: the company's workspace has no `main` branch (or no repository) to audit.
     case noMainBranch(String)
+    /// `--verify-landings`: the repository holds a `shallow` or `info/grafts` file, which rewrites where history ends.
+    case plantedHistory(String)
+    /// `--verify-landings`: first-parent history ends at a commit whose object has a parent (the history is cut).
+    case historyCut(String)
+    /// `--verify-landings`: a merge batch is moving `main`.
+    case mergeBatchOpen
 
     public var description: String {
         switch self {
@@ -22,6 +28,10 @@ public enum MeasureError: Error, Equatable, CustomStringConvertible {
         case .sinceAfterNow(let s): return "--since '\(s)' is after today; nothing can have happened yet"
         case .unknownCompany(let id): return "no company with id \(id)"
         case .noMainBranch(let id): return "the workspace of company \(id) has no main branch to audit"
+        case .plantedHistory(let id):
+            return "the repository of company \(id) holds a .git/shallow or .git/info/grafts file, which rewrites its history; remove it, then audit again"
+        case .historyCut(let root): return "main's history ends at \(root), which has a parent: the history is cut and cannot be audited"
+        case .mergeBatchOpen: return "a merge batch is open; run again after it finishes"
         case .badDay(let s): return "--day must be a date (YYYY-MM-DD), not '\(s)'"
         case .dayAfterToday(let s): return "--day '\(s)' is after today; owner time can be logged only for a day that has begun"
         case .badMinutes(let n):

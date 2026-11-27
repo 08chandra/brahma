@@ -36,9 +36,9 @@ enum MeasureFixtures {
     /// (never claimed), which the measure metrics do not read.
     /// `step` other than `done` (Task 2): the journal row as a batch that stopped there (`checked`: landCommit written, `main`
     /// not moved; `recorded`: landed, `finishedAt` not yet stamped) — the items are still marked as above.
-    @discardableResult
     /// `commits` (Task 6): the candidates are these real commits, one per item in order (the last is `landCommit`), and `base`
     /// the batch's base, so the landing audit can walk them in a `GitFixture` repository; nil keeps the made-up shas.
+    @discardableResult
     static func land(_ store: Store, company: Company, items: [WorkItem], number: Int, enqueuedAt: Date, landedAt: Date,
                      step: MergeStep = .done, commits: [String]? = nil, base: String? = nil)
         throws -> (batch: MergeBatch, requests: [MergeRequest]) {
