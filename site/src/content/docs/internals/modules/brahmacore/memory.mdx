@@ -1,0 +1,32 @@
+---
+title: Memory
+description: "Company memory: one scoped full-text index over every source, auto-ingest from the store, engine-recorded episodes, access classes, replay and the storage meter."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+`MemoryIndex` is one scoped full-text index (FTS5) over everything a company has written: messages, items, asks, decisions, hand-offs, retros, handbook, resources, remembered facts. Every query is bound to one company and filtered by the access engine; another company's doc answers like a missing one. `MemoryIngest`, the tick step, advances a cursor per source and upserts new docs; cursors survive a restore. `EpisodeRecorder` writes an `episode` entry after each successful turn, never through a model. `MemoryQuery` turns typed text into quoted FTS literals only. `Replay` renders one agent's day or one item's history; `StorageMeter` measures a company's footprint.
+
+## Key types
+
+- [`MemoryIndex`](/api/brahmacore/documentation/brahmacore/memoryindex/) — search and read by ref, filtered by access.
+- [`MemoryIngest`](/api/brahmacore/documentation/brahmacore/memoryingest/) and [`MemoryIngestDoc`](/api/brahmacore/documentation/brahmacore/memoryingestdoc/) — the tick step and one doc to index.
+- [`ReaderContext`](/api/brahmacore/documentation/brahmacore/readercontext/) and [`AccessClass`](/api/brahmacore/documentation/brahmacore/accessclass/) — who is reading, and who a doc belongs to.
+- [`MemoryEntry`](/api/brahmacore/documentation/brahmacore/memoryentry/) — one remembered fact or recorded episode.
+- [`EpisodeRecorder`](/api/brahmacore/documentation/brahmacore/episoderecorder/) — turn-end episodes.
+- [`Replay`](/api/brahmacore/documentation/brahmacore/replay/) — a day or an item as a list of lines.
+
+## How it connects
+
+- **Called by Orchestrator.** Each tick runs `MemoryIngest.run` per company; the restore hook resets its cursors; the turn-end step records an episode.
+- **Called by MCP.** `search_memory` and `recall` go through `MemoryIndex`.
+- **Called by Store and Resources.** `Store+Memory` holds `ingest`; owner resources are indexed as `MemoryIngestDoc`s.
+- **Called by Handbook.** `KBAccess` loads the reader's `ReaderContext` here.
+- **Read by the app.** The storage panel calls `StorageMeter.measure`.
+
+<ModuleFacts module="BrahmaCore" area="Memory" />
+
+<SourceLink path="Sources/BrahmaCore/Memory" />

@@ -1,0 +1,31 @@
+---
+title: Model
+description: "The record types everything else shares: company, agent, work item, ask, message, channel, turn, sprint, provenance and the known file kinds."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+Plain data. `Company`, `Agent`, `WorkItem`, `Ask`, `Message`, `Channel`, `Turn` and `Sprint` are GRDB records, one per table row, with their enums: `AgentState`, `WorkItemStatus` (exactly six; `inReview` and `done` are written only by the engine), `AskKind`, `TurnKind`, `UsageMode`. `WorkItemDraft` and `WorkItemPatch` describe a new item and a change to one. `Provenance` says where a piece of knowledge came from. `FileKinds` is the table of file types the owner can drop or an agent can publish. No behaviour lives here beyond validation and rendering of the values themselves.
+
+## Key types
+
+- [`Company`](/api/brahmacore/documentation/brahmacore/company/) and [`Agent`](/api/brahmacore/documentation/brahmacore/agent/) — the two central rows.
+- [`WorkItem`](/api/brahmacore/documentation/brahmacore/workitem/), [`WorkItemStatus`](/api/brahmacore/documentation/brahmacore/workitemstatus/) and [`WorkItemPatch`](/api/brahmacore/documentation/brahmacore/workitempatch/) — an item, its status, a change.
+- [`Ask`](/api/brahmacore/documentation/brahmacore/ask/) and [`AskKind`](/api/brahmacore/documentation/brahmacore/askkind/) — a decision waiting on someone.
+- [`Message`](/api/brahmacore/documentation/brahmacore/message/) and [`InboxItem`](/api/brahmacore/documentation/brahmacore/inboxitem/) — a post and one recipient's copy.
+- [`Turn`](/api/brahmacore/documentation/brahmacore/turn/) and [`TurnKind`](/api/brahmacore/documentation/brahmacore/turnkind/) — one agent turn and what it was for.
+- [`WorkError`](/api/brahmacore/documentation/brahmacore/workerror/) — why a work operation was refused.
+
+## How it connects
+
+- **Called by Store.** Every `Store+…` file fetches and persists these records; the ask lifecycle, for example, filters on `AskStatus`.
+- **Calls Work, Turns and Modes.** `Company` carries a Work `AutonomyPreset`, a Turns `PermissionProfile` and a share from Modes' `UltraCaps`.
+- **Calls Org.** `Agent.roleWeight` asks the built-in `PackCatalog`.
+- **Read by the app.** `BrahmaAppModel` imports `BrahmaCore` and renders these records in its snapshots.
+
+<ModuleFacts module="BrahmaCore" area="Model" />
+
+<SourceLink path="Sources/BrahmaCore/Model" />

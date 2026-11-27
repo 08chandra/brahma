@@ -1,0 +1,15 @@
+// Site-wide settings shared by astro.config.mjs, pages and components.
+// Later tasks import these names; keep them stable.
+export const site = {
+  title: 'Brahma',
+  description:
+    'The governed local AI org on your Mac. Agents propose, the engine verifies and lands the work, and you approve what only you can decide.',
+  // Public repository URL. Empty until the repository is public; components
+  // that link to source or show a GitHub icon are gated on this being non-empty.
+  repoURL: '' as string,
+  // Base path of the generated API reference (DocC output). For the two-project
+  // deployment (site/README.md) set it to the API project's URL followed by /api,
+  // e.g. 'https://brahma-api.pages.dev/api': DocC's pages live under /api/ there too.
+  apiBase: '/api' as string,
+  license: 'Apache-2.0',
+};

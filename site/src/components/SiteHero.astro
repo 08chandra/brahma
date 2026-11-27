@@ -1,0 +1,14 @@
+---
+/**
+ * Starlight `Hero` override. A page that sets `hero` in its frontmatter gets `data-has-hero`
+ * on <html> (16 px base, the one radial background) and Starlight's hero block. Pages that
+ * draw their own hero (Home, 404) pass a bare `hero: {}` — no tagline, image or actions —
+ * and this renders nothing for them; any other hero renders Starlight's default.
+ */
+import Default from '@astrojs/starlight/components/Hero.astro';
+
+const hero = Astro.locals.starlightRoute.entry.data.hero;
+const bare = !hero?.tagline && !hero?.image && (hero?.actions?.length ?? 0) === 0;
+---
+
+{!bare && <Default />}

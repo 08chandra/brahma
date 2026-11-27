@@ -1,7 +1,7 @@
 # Brahma: end-goal efficiency review
 
 Date: 2026-10-21 · Reviewer: principal systems architect (read-only review) · Scope: spec §1–§9 (through §6.27), improvements-from-research, research docs (existing projects, failures, design review, operating model and 150 edge cases), visual brief, Plans 1–2 (built), 3a amended, 4a, 4b (upcoming), 3b (deferred), and the built code in `Sources/**` and `Tests/**`.
-Not present, so not reviewed: the Plan 5-lite, Memory-lite and Plan M plan files, and `research-gstack-abilityai.md`.
+Not present, so not reviewed: the Plan 5-lite, Memory-lite and Plan M plan files, and `2026-10-21-skill-pack-abilityai.md`.
 
 End goal used as the yardstick: the owner states a goal, and a company of Claude Code agents researches, builds, launches, markets and operates the product, in any industry. The owner acts as a board. It runs on Max 20x plus optional services, on a Mac.
 

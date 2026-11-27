@@ -1,0 +1,31 @@
+---
+title: Org
+description: "Industry packs and role templates, the org generator and plan, role cards, repository import at company creation, and the demo seeds."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+An `IndustryPack` is what a company starts from: role templates with their tools and extensions, item types, the org shape, the default cadence and the handbook skeleton. `SoftwarePack` is the built-in one. `OrgGenerator` turns a pack and a seat budget into an `OrgPlan`, agents in creation order each pointing at a manager; `RoleCards` renders a role's card. `CompanyToolNames` is the authoritative grouping of MCP tool names by role kind. `RepoImport` stages and imports an existing repository when a company is created. `DemoSeed` builds the demo companies through the real engine paths only.
+
+## Key types
+
+- [`IndustryPack`](/api/brahmacore/documentation/brahmacore/industrypack/) and [`PackCatalog`](/api/brahmacore/documentation/brahmacore/packcatalog/) — a pack and the set of known packs.
+- [`RoleTemplate`](/api/brahmacore/documentation/brahmacore/roletemplate/) and [`RoleKind`](/api/brahmacore/documentation/brahmacore/rolekind/) — one role and its kind.
+- [`CompanyToolNames`](/api/brahmacore/documentation/brahmacore/companytoolnames/) — tool names by group.
+- [`OrgGenerator`](/api/brahmacore/documentation/brahmacore/orggenerator/) and [`OrgPlan`](/api/brahmacore/documentation/brahmacore/orgplan/) — from pack to planned agents.
+- [`RepoImport`](/api/brahmacore/documentation/brahmacore/repoimport/) — staging and importing a repository.
+- [`DemoSeed`](/api/brahmacore/documentation/brahmacore/demoseed/) — the demo companies.
+
+## How it connects
+
+- **Called by Store.** The store holds a `PackCatalog`, looks a company's pack up from it, and enforces `OrgGenerator.maxReports` when hiring.
+- **Called by Turns and MCP.** The system prompt's default tools come from `CompanyToolNames`, and the role prompt renders a `RoleTemplate`; `CompanyTools` builds its role filter from the same names.
+- **Called by the CLI.** `brahma company create` stages a repository with `RepoImport.stage` or seeds a demo with `DemoSeed.live`.
+- **Calls Git.** `RepoImport` imports through `GitWorkspace.importRepository`.
+
+<ModuleFacts module="BrahmaCore" area="Org" />
+
+<SourceLink path="Sources/BrahmaCore/Org" />

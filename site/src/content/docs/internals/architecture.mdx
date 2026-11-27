@@ -1,0 +1,79 @@
+---
+title: Architecture
+description: "One library, one database, three kinds of process: how the Mac app, the brahma CLI, the engine, agent turns, the MCP server, the store and the sandbox fit together."
+sidebar:
+  order: 1
+---
+
+import ArchitectureDiagram from '../../../components/ArchitectureDiagram.astro';
+
+Brahma is one Swift package. One library, `BrahmaCore`, has the engine, the work system, the store and the sandbox. Two executables link it: the Mac app and the `brahma` CLI. Every process reads and writes the same SQLite database, so the database is the message bus: there is no socket between the app, the CLI and the agents' tools.
+
+<ArchitectureDiagram>
+  Boxes are Swift targets, BrahmaCore areas or processes. Solid wires are in-process calls; dashed wires cross a process boundary. Accent: the one engine per machine.
+</ArchitectureDiagram>
+
+## BrahmaCore
+
+The library every other target links. Its source is split into 29 areas: 28 directories under `Sources/BrahmaCore/` plus the orchestrator, whose files sit at the top level. It depends on two things only: GRDB for SQLite and the `CSandboxCheck` C target. The areas below are the ones on the diagram; the [module pages](/internals/modules/brahmacore/) cover all of them, and the [API reference](/api/brahmacore/documentation/brahmacore/) lists the public types.
+
+### Orchestrator
+
+One actor per machine, across every company. At start it recovers turns an earlier engine left running. Each tick it reaps leases, sweeps reviews, asks and timers, applies the usage gate and the turn budget, then starts turns for the agents the scheduler picks; each turn runs as a child task. A lock file (`OrchestratorLock`) keeps two engines from running against one data home: the app embeds the orchestrator while it holds the lock, and `brahma run` takes the same lock in a terminal. Page: [Orchestrator](/internals/modules/brahmacore/orchestrator/).
+
+### Scheduler
+
+Pure functions the orchestrator calls each tick: `Scheduler.select` chooses which ready agents run, under the hard cap, the safety cap and the per-mode caps; `UsageGate` reads the usage window the CLI reports and decides whether new turns may start. Page: [Scheduler](/internals/modules/brahmacore/scheduler/).
+
+### Turns
+
+`TurnRunner` starts one `claude -p` process per agent turn, sends the prompt on stdin and parses the stream-json events it prints. The turn's argv, settings file and child environment come from one compiler in this area, from the agent's profile, mode and sandbox scope. It also links `CSandboxCheck`, the C shim that asks the kernel what another process's sandbox allows. Page: [Turns](/internals/modules/brahmacore/turns/).
+
+### MCP
+
+A minimal MCP server over newline-delimited JSON-RPC on stdio, and `CompanyTools`, the tools agents use to post messages, claim work, submit for review, ask the owner and so on. Every tool call is authorised against the acting agent and its company in the store; cross-company ids are refused. The server runs in its own process, `brahma mcp`, started by the `claude` process for each turn. Page: [MCP](/internals/modules/brahmacore/mcp/).
+
+### Store
+
+The one database, `brahma.sqlite`, opened through GRDB in WAL mode. Everything durable goes through it: companies, agents, messages, work items, leases, asks, turn records, usage, secrets' names (never their values, which live in the vault). Page: [Store](/internals/modules/brahmacore/store/).
+
+### Sandbox
+
+What a turn may touch (`SandboxScope`), compiled into the settings file and shell prefix the `claude` process runs with, and `SeatbeltRunner`, which runs engine checks and previews as `sandbox-exec -p <profile> /bin/sh -c <command>` with an egress proxy on loopback as their only way out. For what that means for an agent, see [sandbox](/docs/safety/sandbox/) and [profiles](/docs/safety/profiles/). Page: [Sandbox](/internals/modules/brahmacore/sandbox/).
+
+## The Mac app
+
+### BrahmaAppModel
+
+The app's state, with no AppKit or SwiftUI import. `AppModel` holds a `Store` and polls it into an immutable `Snapshot` the views render. `EngineHost` acquires the orchestrator lock and runs the orchestrator inside the app; when `brahma run` holds the lock, the app is a live client and retries. Pages: [BrahmaAppModel](/internals/modules/brahmaappmodel/), [API](/api/brahmaappmodel/documentation/brahmaappmodel/).
+
+### BrahmaApp
+
+The SwiftUI views and the menu bar extra: Mission Control, chat, backlog and board, Inbox, Handbook, Resources, settings sheets. It imports `BrahmaAppModel`, `BrahmaMapKit` and `BrahmaKeychain`; it has no public API of its own. Page: [BrahmaApp](/internals/modules/brahmaapp/).
+
+### BrahmaMapKit
+
+SpriteKit rendering of the live agent map and the only target besides the app that imports AppKit or SpriteKit. It reads the app model's snapshots. Pages: [BrahmaMapKit](/internals/modules/brahmamapkit/), [API](/api/brahmamapkit/documentation/brahmamapkit/).
+
+## The CLI
+
+`brahma` is the second executable over the same library. Owner commands (`brahma status`, `brahma items`, `brahma say`, …) open the store, do their work and exit. `brahma run` builds an orchestrator and runs it in the terminal under the same lock the app uses. `brahma mcp` is the company tools server, one process per turn. The [CLI reference](/docs/cli/) is generated from `brahma --help`. Page: [brahma](/internals/modules/brahma-cli/).
+
+## Platform targets
+
+### BrahmaKeychain
+
+The macOS Keychain behind two `BrahmaCore` protocols: `SecretVault` (secret values) and `OwnerKeyStore` (the owner key's hash). It is a separate target so the core stays portable. The app and the CLI pick it at start. Pages: [BrahmaKeychain](/internals/modules/brahmakeychain/), [API](/api/brahmakeychain/documentation/brahmakeychain/).
+
+### CSandboxCheck
+
+Three C functions over `sandbox_check`: is a process sandboxed, may it write a path, may it look up a Mach name. The engine uses them to recognise a turn's processes by their sandbox alone. Pages: [CSandboxCheck](/internals/modules/csandboxcheck/), [API](/api/csandboxcheck/documentation/csandboxcheck/).
+
+## Child processes
+
+The engine never runs agent code in its own process: each turn is a `claude -p` child; its Bash commands run through a shell prefix that applies `sandbox-exec` per command, and it starts `brahma mcp` over stdio from the MCP config the engine wrote for that turn. Engine-run checks and previews are children too, under Seatbelt with the egress proxy. Every child has its own process group, which the engine reaps; `CSandboxCheck` lets it tell a turn's processes apart by their sandbox.
+
+## Further reading
+
+- [Decisions](/internals/decisions/) — why the design is this way, one page per spec.
+- [Contributing](/internals/contributing/) — build, test and documentation conventions.

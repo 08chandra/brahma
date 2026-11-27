@@ -1,0 +1,30 @@
+---
+title: BrahmaMapKit
+description: "SpriteKit rendering of the live agent map: the org-chart scene, the interactive view, the SwiftUI wrapper, label textures, the palette and the offscreen renderer and bench."
+---
+
+import ModuleFacts from '../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../components/SourceLink.astro';
+
+## Purpose
+
+SpriteKit rendering of the live agent map, and the only target besides the app that imports AppKit or SpriteKit. `OrgScene` draws the org chart: Board on top, the reporting tree in team bands, collapsed subtrees as stubs, dotted lines for reviewers and navigators; `OrgLayout` from the app model decides where everything goes. `MapSKView` handles drag, zoom, hover, click and the right-click menu, and knows no scene type. `OrgView` wraps both for SwiftUI. `LabelTextures` caches text as textures; `MapPalette` builds `NSColor`s from `ThemeHex`; `MapSnapshotter` and `MapBench` render offscreen for tests and the bench.
+
+## Key types
+
+- [`OrgScene`](/api/brahmamapkit/documentation/brahmamapkit/orgscene/) — the org chart as an `SKScene`; incremental rebuilds, pooled card nodes, the live visuals.
+- [`MapSKView`](/api/brahmamapkit/documentation/brahmamapkit/mapskview/) — the `SKView`: pan, zoom about the cursor, hover at `30` Hz, click, double click, menu.
+- [`OrgView`](/api/brahmamapkit/documentation/brahmamapkit/orgview/) — the `NSViewRepresentable` that drives a scene from a `MapController`.
+- [`MapInteractive`](/api/brahmamapkit/documentation/brahmamapkit/mapinteractive/) — what the view needs from a scene: hit tests, a zoom, a note that the camera moved.
+- [`LabelTextures`](/api/brahmamapkit/documentation/brahmamapkit/labeltextures/) — text drawn once with CoreText at `2`× and reused as `SKTexture`s.
+- [`MapPalette`](/api/brahmamapkit/documentation/brahmamapkit/mappalette/) — `NSColor`s for the map, built only from `ThemeHex`.
+
+## How it connects
+
+- **Calls BrahmaAppModel.** `OrgScene` runs `controller.frame(now:)` each frame and plays the events, and lays out with `OrgLayout.make`; `MapSKView` builds its context menu from `controller.actions(for:)`; `MapPalette` reads `ThemeHex` and colours a `Department`; card text goes through `MapText.clean`; `MapBench` times frames with `FrameStats.make`.
+- **Calls BrahmaCore** for the agent model: `MapPalette.status` takes an `AgentState`.
+- **Called by BrahmaApp.** `AgentMapPanel` mounts an `OrgView`; `Harness` finds the `MapSKView` for `--map-bench`. Nothing else links this target.
+
+<ModuleFacts module="BrahmaMapKit" />
+
+<SourceLink path="Sources/BrahmaMapKit" />

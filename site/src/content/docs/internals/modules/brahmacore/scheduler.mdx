@@ -1,0 +1,31 @@
+---
+title: Scheduler
+description: "Pure functions the orchestrator calls each tick: which ready agents run under the caps, whether the usage window allows new turns, where weekly spend stands, and memory pressure."
+---
+
+import ModuleFacts from '../../../../../components/ModuleFacts.astro';
+import SourceLink from '../../../../../components/SourceLink.astro';
+
+## Purpose
+
+No state, no I/O. `Scheduler.select` takes the candidate agents, what is already running per company and a `SchedulerConfig`, and returns the agents to start under the hard cap, the safety cap and the per-mode caps the plan tier fixes. `UsageGate` reads the rate-limit window the CLI reports and decides whether new turns may start for a company in its usage mode, and `Pace` says where the weekly spend stands against the straight line the owner allows. `SafetyCap` derives the machine-wide cap. `MemoryPressureSource` reports the system's memory pressure so the engine can hold back.
+
+## Key types
+
+- [`Scheduler`](/api/brahmacore/documentation/brahmacore/scheduler/) and [`SchedulerConfig`](/api/brahmacore/documentation/brahmacore/schedulerconfig/) — `select`, and the caps it works under.
+- [`Candidate`](/api/brahmacore/documentation/brahmacore/candidate/) — one ready agent with its company and blocking count.
+- [`UsageGate`](/api/brahmacore/documentation/brahmacore/usagegate/) and [`UsageDecision`](/api/brahmacore/documentation/brahmacore/usagedecision/) — may new turns start.
+- [`Pace`](/api/brahmacore/documentation/brahmacore/pace/) and [`PaceState`](/api/brahmacore/documentation/brahmacore/pacestate/) — spend against the weekly line.
+- [`SafetyCap`](/api/brahmacore/documentation/brahmacore/safetycap/) — the machine-wide cap.
+- [`MemoryPressureSource`](/api/brahmacore/documentation/brahmacore/memorypressuresource/) — system memory pressure.
+
+## How it connects
+
+- **Called by Orchestrator.** Each tick builds `Candidate`s, evaluates `UsageGate.evaluateParts` and `UsageGate.pace` per company, then calls `Scheduler.select`; the engine holds a `MemoryPressureSource`.
+- **Called by Store and Work.** The stall report takes the usage decision and memory pressure as inputs; `Liveness`' stall input carries a `UsageDecision`.
+- **Calls Engine and Model.** `SchedulerConfig` reads `SafetyCap.current` and a `PlanTier`; the gate is keyed by the company's `UsageMode`.
+- **Calls Turns.** `Pace` is computed from the `RateLimitInfo` the stream parser extracted.
+
+<ModuleFacts module="BrahmaCore" area="Scheduler" />
+
+<SourceLink path="Sources/BrahmaCore/Scheduler" />

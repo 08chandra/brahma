@@ -1,0 +1,662 @@
+{
+  "command": {
+    "abstract": "Brahma command line.",
+    "arguments": [
+      {
+        "abstract": "Show help information.",
+        "isOptional": true,
+        "isRepeating": false,
+        "kind": "flag",
+        "names": [
+          {
+            "kind": "short",
+            "name": "h"
+          },
+          {
+            "kind": "long",
+            "name": "help"
+          }
+        ],
+        "parsingStrategy": "default",
+        "preferredName": {
+          "kind": "long",
+          "name": "help"
+        },
+        "shouldDisplay": true,
+        "valueName": "help"
+      }
+    ],
+    "commandName": "brahma",
+    "shouldDisplay": true,
+    "subcommands": [
+      {
+        "abstract": "Create and manage companies.",
+        "arguments": [
+          {
+            "abstract": "Show help information.",
+            "isOptional": true,
+            "isRepeating": false,
+            "kind": "flag",
+            "names": [
+              {
+                "kind": "short",
+                "name": "h"
+              },
+              {
+                "kind": "long",
+                "name": "help"
+              }
+            ],
+            "parsingStrategy": "default",
+            "preferredName": {
+              "kind": "long",
+              "name": "help"
+            },
+            "shouldDisplay": true,
+            "valueName": "help"
+          }
+        ],
+        "commandName": "company",
+        "shouldDisplay": true,
+        "subcommands": [
+          {
+            "arguments": [
+              {
+                "abstract": "Company name.",
+                "isOptional": false,
+                "isRepeating": false,
+                "kind": "positional",
+                "parsingStrategy": "default",
+                "shouldDisplay": true,
+                "valueName": "name"
+              },
+              {
+                "abstract": "What the company is for (optional with --demo live).",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "goal"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "goal"
+                },
+                "shouldDisplay": true,
+                "valueName": "goal"
+              },
+              {
+                "abstract": "Agents in the full org shape (0 for an empty company, otherwise 5 to 500; default 6).",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "agents"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "agents"
+                },
+                "shouldDisplay": true,
+                "valueName": "agents"
+              },
+              {
+                "abstract": "Industry pack id (default software).",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "pack"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "pack"
+                },
+                "shouldDisplay": true,
+                "valueName": "pack"
+              },
+              {
+                "abstract": "Print the org that would be created and change nothing.",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "flag",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "dry-run"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "dry-run"
+                },
+                "shouldDisplay": true,
+                "valueName": "dry-run"
+              },
+              {
+                "abstract": "A demo company. live: a four-agent org, hosting on the default provider, the hosting-account task and the owner's kickoff for a one-page waitlist site.",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "demo"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "demo"
+                },
+                "shouldDisplay": true,
+                "valueName": "demo"
+              },
+              {
+                "abstract": "Start from an existing repo: a local folder or an https:// URL. Brahma clones it into the company workspace; the original is never changed or pushed to.",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "from-repo"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "from-repo"
+                },
+                "shouldDisplay": true,
+                "valueName": "from-repo"
+              },
+              {
+                "abstract": "Show help information.",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "flag",
+                "names": [
+                  {
+                    "kind": "short",
+                    "name": "h"
+                  },
+                  {
+                    "kind": "long",
+                    "name": "help"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "help"
+                },
+                "shouldDisplay": true,
+                "valueName": "help"
+              }
+            ],
+            "commandName": "create",
+            "shouldDisplay": true,
+            "superCommands": [
+              "brahma",
+              "company"
+            ]
+          },
+          {
+            "arguments": [
+              {
+                "isOptional": false,
+                "isRepeating": false,
+                "kind": "positional",
+                "parsingStrategy": "default",
+                "shouldDisplay": true,
+                "valueName": "company"
+              },
+              {
+                "abstract": "low, balanced or max.",
+                "allValues": [
+                  "low",
+                  "balanced",
+                  "max"
+                ],
+                "completionKind": {
+                  "list": {
+                    "values": [
+                      "low",
+                      "balanced",
+                      "max"
+                    ]
+                  }
+                },
+                "isOptional": false,
+                "isRepeating": false,
+                "kind": "positional",
+                "parsingStrategy": "default",
+                "shouldDisplay": true,
+                "valueName": "mode"
+              },
+              {
+                "abstract": "Show help information.",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "flag",
+                "names": [
+                  {
+                    "kind": "short",
+                    "name": "h"
+                  },
+                  {
+                    "kind": "long",
+                    "name": "help"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "help"
+                },
+                "shouldDisplay": true,
+                "valueName": "help"
+              }
+            ],
+            "commandName": "mode",
+            "shouldDisplay": true,
+            "superCommands": [
+              "brahma",
+              "company"
+            ]
+          }
+        ],
+        "superCommands": [
+          "brahma"
+        ]
+      },
+      {
+        "abstract": "Show recent messages in a #channel or owner DM.",
+        "arguments": [
+          {
+            "isOptional": false,
+            "isRepeating": false,
+            "kind": "positional",
+            "parsingStrategy": "default",
+            "shouldDisplay": true,
+            "valueName": "company"
+          },
+          {
+            "abstract": "#channel or @handle.",
+            "isOptional": false,
+            "isRepeating": false,
+            "kind": "positional",
+            "parsingStrategy": "default",
+            "shouldDisplay": true,
+            "valueName": "target"
+          },
+          {
+            "abstract": "Number of messages (1-1000).",
+            "defaultValue": "30",
+            "isOptional": true,
+            "isRepeating": false,
+            "kind": "option",
+            "names": [
+              {
+                "kind": "long",
+                "name": "limit"
+              }
+            ],
+            "parsingStrategy": "default",
+            "preferredName": {
+              "kind": "long",
+              "name": "limit"
+            },
+            "shouldDisplay": true,
+            "valueName": "limit"
+          },
+          {
+            "abstract": "Show help information.",
+            "isOptional": true,
+            "isRepeating": false,
+            "kind": "flag",
+            "names": [
+              {
+                "kind": "short",
+                "name": "h"
+              },
+              {
+                "kind": "long",
+                "name": "help"
+              }
+            ],
+            "parsingStrategy": "default",
+            "preferredName": {
+              "kind": "long",
+              "name": "help"
+            },
+            "shouldDisplay": true,
+            "valueName": "help"
+          }
+        ],
+        "commandName": "log",
+        "shouldDisplay": true,
+        "superCommands": [
+          "brahma"
+        ]
+      },
+      {
+        "abstract": "Developer test hooks (BRAHMA_DEV=1).",
+        "arguments": [
+          {
+            "abstract": "Show help information.",
+            "isOptional": true,
+            "isRepeating": false,
+            "kind": "flag",
+            "names": [
+              {
+                "kind": "short",
+                "name": "h"
+              },
+              {
+                "kind": "long",
+                "name": "help"
+              }
+            ],
+            "parsingStrategy": "default",
+            "preferredName": {
+              "kind": "long",
+              "name": "help"
+            },
+            "shouldDisplay": true,
+            "valueName": "help"
+          }
+        ],
+        "commandName": "dev",
+        "shouldDisplay": false,
+        "subcommands": [
+          {
+            "abstract": "File an ask as an agent.",
+            "arguments": [
+              {
+                "isOptional": false,
+                "isRepeating": false,
+                "kind": "positional",
+                "parsingStrategy": "default",
+                "shouldDisplay": true,
+                "valueName": "company"
+              },
+              {
+                "abstract": "Handle of the agent filing it.",
+                "isOptional": false,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "by"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "by"
+                },
+                "shouldDisplay": true,
+                "valueName": "by"
+              },
+              {
+                "abstract": "prd, architecture, sprintPlan, release or other.",
+                "isOptional": false,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "kind"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "kind"
+                },
+                "shouldDisplay": true,
+                "valueName": "kind"
+              },
+              {
+                "isOptional": false,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "title"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "title"
+                },
+                "shouldDisplay": true,
+                "valueName": "title"
+              },
+              {
+                "isOptional": false,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "summary"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "summary"
+                },
+                "shouldDisplay": true,
+                "valueName": "summary"
+              },
+              {
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "category"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "category"
+                },
+                "shouldDisplay": true,
+                "valueName": "category"
+              },
+              {
+                "abstract": "low, medium or high.",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "risk"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "risk"
+                },
+                "shouldDisplay": true,
+                "valueName": "risk"
+              },
+              {
+                "abstract": "Document path inside the workspace.",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "document"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "document"
+                },
+                "shouldDisplay": true,
+                "valueName": "document"
+              },
+              {
+                "abstract": "Work item key.",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "item"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "item"
+                },
+                "shouldDisplay": true,
+                "valueName": "item"
+              },
+              {
+                "abstract": "Ask reference it replaces.",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "supersedes"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "supersedes"
+                },
+                "shouldDisplay": true,
+                "valueName": "supersedes"
+              },
+              {
+                "abstract": "An option label (repeatable).",
+                "isOptional": true,
+                "isRepeating": true,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "option"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "option"
+                },
+                "shouldDisplay": true,
+                "valueName": "option"
+              },
+              {
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "request-id"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "request-id"
+                },
+                "shouldDisplay": true,
+                "valueName": "request-id"
+              },
+              {
+                "abstract": "taste (default) or goalChanging.",
+                "defaultValue": "taste",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "option",
+                "names": [
+                  {
+                    "kind": "long",
+                    "name": "decision-class"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "decision-class"
+                },
+                "shouldDisplay": true,
+                "valueName": "decision-class"
+              },
+              {
+                "abstract": "Show help information.",
+                "isOptional": true,
+                "isRepeating": false,
+                "kind": "flag",
+                "names": [
+                  {
+                    "kind": "short",
+                    "name": "h"
+                  },
+                  {
+                    "kind": "long",
+                    "name": "help"
+                  }
+                ],
+                "parsingStrategy": "default",
+                "preferredName": {
+                  "kind": "long",
+                  "name": "help"
+                },
+                "shouldDisplay": true,
+                "valueName": "help"
+              }
+            ],
+            "commandName": "propose",
+            "shouldDisplay": true,
+            "superCommands": [
+              "brahma",
+              "dev"
+            ]
+          }
+        ],
+        "superCommands": [
+          "brahma"
+        ]
+      }
+    ]
+  },
+  "serializationVersion": 0
+}

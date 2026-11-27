@@ -1,0 +1,258 @@
+---
+/**
+ * The designed 404, in the app's empty-state voice: a mono "NO SUCH PAGE" label (its glyph
+ * and rule are text2 marks; the words are text1), an engraved serif numeral (text2 at
+ * ≥ 96 px, the large-text exception), and an inspector-style key–value panel — the path you
+ * asked for, the status, where to go, how to search. On the same agent-map grid as Home.
+ *
+ * The path is echoed by a one-line inline script; without JavaScript the row reads "this
+ * address". `disable404Route: true` in astro.config.mjs keeps Starlight from adding its own.
+ */
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import Chip from '../components/Chip.astro';
+import Panel from '../components/Panel.astro';
+
+const destinations = [
+  { name: 'Home', href: '/' },
+  { name: 'Quick start', href: '/start/' },
+  { name: 'Using Brahma', href: '/docs/' },
+];
+---
+
+<StarlightPage
+  frontmatter={{
+    title: '404 · Page not found',
+    description: 'There is no page at this address.',
+    template: 'splash',
+    hero: {},
+    pagefind: false,
+    head: [{ tag: 'meta', attrs: { name: 'robots', content: 'noindex' } }],
+  }}
+>
+  <div class="nf map-band not-content">
+    <div class="nf__numeral reveal" aria-hidden="true">404</div>
+
+    <div class="nf__body">
+      <p class="nf__label reveal" style="--i: 1">
+        <span class="nf__glyph" aria-hidden="true">∅</span>
+        <span>No such page</span>
+        <span class="nf__rule" aria-hidden="true"></span>
+      </p>
+      <h1 class="nf__title reveal" style="--i: 2">Nothing is filed at this address.</h1>
+
+      <div class="reveal" style="--i: 3">
+        <Panel title="Request" titleAs="p" dense class="nf__panel">
+          <dl class="kv">
+            <div class="kv__row">
+              <dt class="label">Path</dt>
+              <dd><code class="kv__path" data-nf-path>this address</code></dd>
+            </div>
+            <div class="kv__row">
+              <dt class="label">Status</dt>
+              <dd><Chip status="danger" label="404 not found" /></dd>
+            </div>
+            <div class="kv__row kv__row--list">
+              <dt class="label">Try</dt>
+              <dd>
+                <ul class="dest">
+                  {
+                    destinations.map((d) => (
+                      <li>
+                        <a class="dest__link" href={d.href}>
+                          <span class="dest__name">{d.name}</span>
+                          <span class="dest__href">{d.href}</span>
+                        </a>
+                      </li>
+                    ))
+                  }
+                </ul>
+              </dd>
+            </div>
+            <div class="kv__row">
+              <dt class="label">Search</dt>
+              <dd class="kv__hint">
+                Press <kbd>⌘</kbd><kbd>K</kbd> (<kbd>Ctrl</kbd><kbd>K</kbd> on other keyboards) or use Search at the
+                top of the page.
+              </dd>
+            </div>
+          </dl>
+        </Panel>
+      </div>
+    </div>
+  </div>
+</StarlightPage>
+
+<script is:inline>
+  (() => {
+    let path = location.pathname;
+    try {
+      path = decodeURI(path);
+    } catch {}
+    document.querySelector('[data-nf-path]').textContent = path;
+  })();
+</script>
+
+<style>
+  :global(html[data-has-hero]:not([data-has-sidebar])) {
+    --sl-content-width: var(--grid-max);
+  }
+
+  /* The grid behind it is the shared `.map-band` (starlight.css). */
+  .nf {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    column-gap: var(--grid-gutter);
+    row-gap: var(--s-5);
+    padding-block: var(--s-6) var(--s-8);
+  }
+  @media (min-width: 64em) {
+    .nf {
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      padding-block: var(--s-8) var(--s-9);
+      align-items: start;
+    }
+    .nf__numeral {
+      grid-column: 1 / span 5;
+    }
+    .nf__body {
+      grid-column: 6 / span 7;
+    }
+  }
+
+  .nf__numeral {
+    font-family: var(--font-display);
+    font-size: clamp(6rem, 4rem + 12vw, 13.5rem);
+    line-height: 0.8;
+    letter-spacing: -0.02em;
+    color: var(--text2); /* large text: 4.39:1 on bg0 */
+    font-variant-numeric: lining-nums;
+  }
+
+  .nf__body {
+    display: grid;
+    gap: var(--s-5);
+    min-width: 0;
+  }
+  .nf__label {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    font-weight: 500;
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+    color: var(--text1);
+  }
+  .nf__glyph {
+    color: var(--text2);
+  }
+  .nf__rule {
+    flex: 1;
+    height: 1px;
+    background: var(--text2);
+  }
+  .nf__title {
+    margin: 0;
+    font-size: var(--step-4);
+    line-height: 1.06;
+    max-width: 18ch;
+  }
+
+  .kv {
+    margin: 0;
+    display: grid;
+  }
+  .kv__row {
+    display: grid;
+    grid-template-columns: 5.5rem minmax(0, 1fr);
+    gap: var(--s-3);
+    align-items: baseline;
+    padding: var(--s-2);
+  }
+  .kv__row + .kv__row {
+    border-top: var(--hairline);
+  }
+  .kv__row--list {
+    align-items: start;
+  }
+  .kv__row--list dt {
+    padding-top: 0.5rem;
+  }
+  .kv dt,
+  .kv dd {
+    margin: 0;
+  }
+  .kv__path {
+    font-size: var(--text-ui);
+    color: var(--text0);
+    overflow-wrap: anywhere;
+  }
+  .kv__hint {
+    font-size: var(--text-ui);
+    line-height: 1.6;
+    color: var(--text1);
+  }
+  kbd {
+    display: inline-block;
+    min-width: 1.25rem;
+    padding: 0 0.3rem;
+    margin-inline: 0.0625rem;
+    border: var(--hairline-strong);
+    border-radius: var(--radius);
+    background: var(--bg3);
+    font-size: var(--step--1);
+    line-height: 1.35;
+    text-align: center;
+    color: var(--text0);
+  }
+
+  .dest {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+  }
+  .dest li {
+    margin: 0;
+  }
+  .dest__link {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--s-4);
+    min-height: 2rem;
+    align-items: center;
+    padding: 0 var(--s-2);
+    margin-inline: calc(-1 * var(--s-2));
+    border-radius: var(--radius);
+    color: var(--text0);
+    text-decoration: none;
+    transition: background-color var(--dur-fast) var(--ease);
+  }
+  .dest__link:hover {
+    background: var(--bg3);
+  }
+  .dest__name {
+    font-size: var(--text-ui);
+    font-weight: 500;
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+    text-decoration-color: var(--line-strong);
+    transition: text-decoration-color var(--dur-fast) var(--ease);
+  }
+  .dest__link:hover .dest__name {
+    text-decoration-color: var(--text-link);
+  }
+  .dest__href {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--text-link);
+  }
+  @media (pointer: coarse) {
+    .dest__link {
+      min-height: 2.75rem;
+    }
+  }
+</style>

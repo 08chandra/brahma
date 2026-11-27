@@ -1137,7 +1137,7 @@ engine before each turn (`TurnProfile`):
 - **Permission layers (each can only narrow, except explicit grants):**
   1. company permission profile (Sandboxed default / Workspace / Full);
   2. role defaults from the pack — role card + tool bundle (tools, skills,
-     plugins, connectors, risk levels) — gstack-style role cards and the
+     plugins, connectors, risk levels) — skill-pack-style role cards and the
      per-industry bundles live here (Plan G generates them);
   3. trust level (Plan 3b): budget, model, review depth;
   4. current work item: writable paths/branch, required check;
